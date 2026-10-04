@@ -1,0 +1,635 @@
+---
+title: 'Overleaf-benchmark: diepgaand onderzoek naar gelijktijdige LaTeX-compilatie in Overleaf (SaaS en self-hosted)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Samenvatting
+
+Zelf gehoste Overleaf-deployments worden doorgaans gedimensioneerd met één vuistregel: één CPU-core en één gigabyte geheugen per vijf tot tien gelijktijdige gebruikers. We laten zien dat deze regel niet alleen onnauwkeurig maar structureel onjuist is, omdat hij aanneemt dat één enkele resourcedimensie de capaciteit bepaalt, terwijl er in werkelijkheid twee onafhankelijke muren zijn, en omdat twee softwareparameters — geen van beide hardware — de uitkomst domineren met factoren tot vier.
+
+We meten een standaard Ayakaleaf Pro v6.2.2-deployment met sandboxed compilatie (TeX Live 2025) over 21 CPU/geheugenconfiguraties in QEMU/KVM-gasten waarvan de hostcores op een vaste klokfrequentie van 3,0 GHz zijn vergrendeld. De workload is een echte XeLaTeX-scriptie van 63 pagina's die gelijktijdig wordt gecompileerd door tot enkele honderden afzonderlijke gebruikersaccounts. We stellen vast dat onder 32 GiB gastgeheugen het aantal cores vrijwel irrelevant is — bij 16 GiB verschilt de gemeten capaciteit van gasten met 4, 8 en 16 vCPU's minder dan 8% — en dat de capaciteit in plaats daarvan wordt bepaald door een superlineaire geheugenmuur die voortkomt uit de gedeelde paginacache over de TeX Live-boom.
+
+Om na te gaan of deze wetmatigheden een schaalvergroting van een orde van grootte overleven, herhalen we de meetreeks op één server met 64 cores en 995 GiB. Deze verwerkt 1024 gelijktijdige koude compilaties met 100% succes — acht keer het aantal threads — en we bereiken het plafond nooit. Het bruikbare getal is niet dat plafond, maar het knikpunt eronder: de staartlatentie groeit met 20–40% per verdubbeling tot $N=256$, en daarna met 190% bij $N=512$. Een capaciteit die wordt gerapporteerd als "de grootste gelijktijdigheid die niet faalt" zou het bruikbare werkpunt daarom met een factor vier overschatten. Op die machine is geheugen nooit de bepalende resource; de limiet is de CPU samen met de snelheid waarmee de container-daemon nieuwe sandboxes kan toelaten, die rond de 200 verzadigt, ongeacht hoeveel compilaties er worden aangevraagd.
+
+Verder identificeren we twee effecten op implementatieniveau die onzichtbaar zijn voor capaciteitsplanning. Ten eerste hanteert CLSI een hardgecodeerd plafond van 65 gelijktijdige compilaties dat via geen enkele omgevingsvariabele kan worden ingesteld; daarboven krijgen gebruikers onmiddellijk HTTP 503 in plaats van in een wachtrij te worden geplaatst. Ten tweede is de geheugenlimiet per container in de Docker-runner sinds de introductie in 2018 ineffectief, zowel qua grootte als qua plaatsing, waardoor een out-of-memory-gebeurtenis de hele host platlegt in plaats van één compilatie. Het opheffen van het gelijktijdigheidsplafond en het verhogen van de standaard-compilatietime-out van 180 s naar 300 s vergroot de gemeten capaciteit van een gast met 8 vCPU / 48 GiB van 64 naar 268 gelijktijdige compilaties — een factor 4,2 zonder enige hardwarekosten.
+
+Tot slot laten we zien dat gelijktijdigheid in dit systeem niets anders oplevert dan time-sharing, en dat de workload uitsluitend door de klokfrequentie wordt begrensd. Een gefitte degradatiewet $T(N)=T_1\max(1,N/C)^{b}$ levert $b=0.914$ op, dicht bij een perfect proportionele vertraging, en een kloksweep over het volledige bereik van 1,0–5,5 GHz van de machine brengt dertig metingen samen op $T=(k/f)\max(1,N/C)$ met $k=27.9 GHz·s$ en een restspreiding van 5,1%. Een 5,5× hogere klok levert een 5,5× snellere compilatie op zonder afnemende meeropbrengst; in die zin kopen klok en cores verschillende dingen: de klok maakt de compilatie van elke gebruiker sneller, cores laten alleen meer gebruikers toe.
+
+## 1. Inleiding
+
+Overleaf is de dominante collaboratieve LaTeX-editor, en de on-premises distributie ervan wordt op grote schaal ingezet door universiteiten en onderzoeksgroepen die ongepubliceerde manuscripten niet naar een cloud van derden kunnen sturen. Het dimensioneren van zo'n deployment is een terugkerende praktische vraag: hoeveel mensen kunnen, gegeven een vast hardwarebudget, daadwerkelijk tegelijk op "Recompile" drukken?
+
+De officiële richtlijn is een lineaire regel — grofweg één core en één gigabyte per vijf tot tien gelijktijdige gebruikers — die veronderstelt dat de capaciteit soepel en gezamenlijk schaalt in beide resources. Onze metingen spreken dit op drie manieren tegen.
+
+### 1.1 Capaciteit wordt bepaald door twee onafhankelijke muren, niet één
+
+Een configuratie faalt ofwel doordat het geheugen uitgeput raakt, waarbij de Overleaf-stack zelf bezwijkt en HTTP 502 retourneert, ofwel doordat compilaties de time-out aan serverzijde overschrijden, waarbij CLSI `timedout` rapporteert terwijl er gigabytes geheugen ongebruikt blijven. Deze twee regimes hebben een volledig ander schaalgedrag en andere remedies. Cores toevoegen aan een geheugengebonden configuratie is niet alleen inefficiënt, het is soms zelfs contraproductief: we meten configuraties waarin een groter aantal cores de capaciteit _verlaagt_, omdat gelijktijdige compilaties met meer cores in lockstep vorderen, zodat hun piekgeheugengebruik samenvalt in plaats van elkaar af te wisselen.
+
+### 1.2 Softwareparameters domineren de hardware
+
+De compilatietime-out is een veld per gebruiker in MongoDB waarvan de standaardwaarde van 180 s CPU-gebonden configuraties stilzwijgend begrenst. Door deze te verhogen naar 300 s wordt de gemeten capaciteit op ongewijzigde hardware tot 4,2 keer zo groot. Daarnaast weigert CLSI door een hardgecodeerde constante meer dan 65 gelijktijdige compilaties. Elke capaciteitsstudie — en elke deployment — die met geen van beide rekening houdt, meet de software en niet de machine.
+
+### 1.3 Gelijktijdigheid is time-sharing, geen parallellisme
+
+Omdat een LaTeX-compilatie single-threaded is, maakt het bedienen van $N$ gelijktijdige gebruikers op $C$ cores het systeem niet sneller klaar; het laat elke gebruiker evenredig langer wachten. De vraag "hoeveel gelijktijdige gebruikers worden ondersteund" is daarom slecht gesteld zolang niet vastligt hoe lang een gebruiker bereid is te wachten. We maken deze afhankelijkheid expliciet en kwantificeren haar.
+
+### 1.4 Bijdragen
+
+* Een capaciteitsmatrix over 21 CPU/geheugenconfiguraties, gemeten onder klokvergrendelde en door herhaling geverifieerde omstandigheden, waarbij per configuratie de bepalende beperking wordt vastgesteld aan de hand van het faalpatroon.
+* Twee gefitte modellen: een capaciteitsmodel dat een superlineaire geheugenmuur scheidt van een CPU-plafond, en een latentiemodel dat zuiver time-sharinggedrag aantoont.
+* Identificatie en experimentele bevestiging van twee implementatieproblemen in het gedeployde systeem, waaronder een geheugenlimiet voor containers die sinds 2018 niet werkt.
+* Een kwantificering van de afweging tussen compilatietime-out en capaciteit, die volgens ons altijd naast elk gelijktijdigheidscijfer moet worden vermeld.
+
+## 2. Achtergrond
+
+### 2.1 Het compilatiepad
+
+Een compilatieverzoek in Overleaf loopt via `web` $\rightarrow$ `clsi` $\rightarrow$ een compilatiecontainer. In een deployment met sandboxed compiles (`SIBLING_CONTAINERS_ENABLED=true`) voert CLSI `latexmk` niet in het eigen proces uit; het vraagt de Docker-daemon van de host, bereikbaar via een met bind-mount gekoppelde socket, om een nieuwe container te starten vanuit een TeX Live-image, met de projectmap via bind-mount gekoppeld op `/compile`. Eén compilatie is dus één kortlevende container die één `latexmk`-proces uitvoert.
+
+Hieruit volgen drie consequenties, en alle drie bepalen ze de metingen in dit artikel. Ten eerste is de werkeenheid een single-threaded proces: XeLaTeX paralleliseert niet. Ten tweede is de resource-isolatie per compilatie precies wat de Docker-runner aanvraagt — we laten in §6.2 zien dat die in feite niets aanvraagt. Ten derde wordt de working set niet gedomineerd door het document maar door de TeX Live-boom, een alleen-lezen corpus van ongeveer 32 GiB waaruit elke gelijktijdige compilatie leest en die dus via de paginacache van de host wordt gedeeld. Dit delen is de oorsprong van de superlineaire geheugenschaling die we waarnemen.
+
+### 2.2 Sandboxed compiles inschakelen
+
+Overleaf Community Edition voert `latexmk` uit in de applicatiecontainer zelf. Ayakaleaf Pro kan, net als Overleaf Server Pro, elke compilatie in plaats daarvan uitvoeren in een _sibling_-container — een container die door de applicatie wordt gestart op de Docker-daemon van de _host_ in plaats van genest binnen de applicatiecontainer. Twee toolkitinstellingen schakelen dit in:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+De toolkit koppelt de Docker-socket van de host via een bind-mount in de applicatiecontainer en vertaalt deze instellingen naar de omgeving die CLSI leest: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` en `SANDBOXED_COMPILES_HOST_DIR`, waarbij de laatste het pad op de _host_ van de compilatiemap is. Dat pad is belangrijk: omdat de daemon die de compilatiecontainer start die van de host is, moet de bind-mount die hij krijgt resolvebaar zijn in de namespace van de host, niet in die van de applicatiecontainer. Het bestand `config/env.sh` van Server Pro dwingt in deze modus bovendien `TEXLIVE_IMAGE_USER=www-data` af, zodat bestanden die door de compilatiecontainer worden geschreven een consistente eigenaar hebben.
+
+De verificatie is direct: tijdens een compilatie toont de host een container met de naam `project-{projectId}-{userId}-{hash}` die `latexmk` uit de TeX Live-image uitvoert en met 0 eindigt. Dit is de eenheid waarvan we in het hele artikel de veelvoud meten, en waarvan we in §6.2 het volledig ontbreken van resourcelimieten rapporteren.
+
+**Waarom dit belangrijk is voor de studie.**
+
+Sibling-containers maken de meting zuiver — elke compilatie is een waarneembare, onafhankelijk geplande OS-entiteit — maar ze betekenen ook dat de gastkernel, en niet Overleaf, CPU en geheugen tussen compilaties verdeelt. Elke schaalwet in dit artikel is daarom een eigenschap van de Linux-scheduler toegepast op $N$ single-threaded processen, en daarom is ze zo regelmatig.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Figuur 1.** Eén compilatieverzoek, gevolgd door de microservices van de Community Edition. De splitsing bij de stappen en is van belang voor de capaciteit: documenttekst wordt in de request body gekopieerd, terwijl binaire assets per referentie worden doorgegeven en door `clsi` worden opgehaald. Geen van beide domineert — de compilatiekosten van een project worden bepaald door de TeX Live-boom van 32 GiB die elke gelijktijdige compilatie via de gedeelde paginacache leest.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Figuur 2.** Drie deploymenttopologieën en waar het compilatieplafond per instantie in elk ervan terechtkomt; gestapelde panelen geven replicatie aan. De constante van 65 compilaties bewaakt _één_ CLSI, dus de SaaS-vloot vermenigvuldigt die met instanties en zones (a), en de horizontale schaling die Server Pro en Ayakaleaf Pro ondersteunen vermenigvuldigt die met instanties (c) — ten koste van centrale MongoDB, Redis en S3-compatibele opslag, een load balancer met sessieaffiniteit via cookies (compilatie-uitvoer wordt naar de lokale schijf van de instantie geschreven, dus een compilatie en de daaropvolgende PDF-download moeten op dezelfde instantie terechtkomen) en een enkele `git-bridge`. De standaardconfiguratie van de toolkit (b), die we meten, heeft een vermenigvuldigingsfactor van één, waardoor een constante die is gedimensioneerd voor één lid van een vloot het plafond van de hele installatie wordt.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Figuur 3.** Shardselectie in `clsi-cache`. Een project wordt toegewezen via $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, d.w.z. de hashruimte wordt opgedeeld in evenveel gelijke sectoren als er shards zijn. Dit is _modulo_-hashing, geen ringgebaseerde consistent hashing: het uitbreiden van de vloot van drie naar vier shards herverdeelt de volledige ruimte en wijst in wezen elk project opnieuw toe (a, b). Dat is precies waarom de implementatie een expliciete online resharding-ramp nodig heeft, die binnen een tijdvenster een lineair groeiend deel van de projecten van `currentShards` naar `desiredShards` verplaatst, in plaats van de $K/n$-verplaatsing die een consistent-hashingring zou geven. Wanneer de circuit breaker van een shard is geactiveerd, wordt de salt $i$ verhoogd en de shard uit de kandidatenlijst verwijderd, zodat de lookup verder zoekt in plaats van te falen (c).
+
+### 2.3 De twee faalwijzen
+
+Elke configuratie die we hebben gemeten faalt op precies een van twee manieren, en het onderscheid is zichtbaar in de responsstatus in plaats van afgeleid:
+
+* **Geheugenuitputting** — de Overleaf-stack zelf reageert niet meer en het verzoek retourneert **HTTP 502**. Het beschikbare gastgeheugen op het falende niveau ligt doorgaans onder 500 MiB.
+* **Compilatietime-out** — CLSI beëindigt de compilatie bij de time-out per gebruiker en rapporteert de status `timedout`. Het beschikbare geheugen op het falende niveau bedraagt vaak enkele gigabytes.
+
+We classificeren elke configuratie aan de hand van dit patroon in plaats van via een heuristiek op resourceverhoudingen, waardoor de vraag "tegen welke muur liepen we aan" uit de gegevens zelf kan worden beantwoord.
+
+## 3. Methodologie
+
+### 3.1 Testopstelling en klokbeheersing
+
+Alle gasten draaien onder QEMU/KVM op één Intel Core i9-14900K-host met 62 GiB RAM en NVMe-opslag. De gast is Ubuntu 24.04 met Docker 29.7 en de Overleaf Toolkit, waarmee Ayakaleaf Pro v6.2.2 is gedeployed met sandboxed compiles op `texlive-full:2025.1`.
+
+Een gewone desktop-CPU is een slechte benadering van een server, tenzij de klok wordt beheerst. KVM biedt geen mechanisme om een virtuele klok in te stellen: een vCPU is een hostthread en draait op de frequentie waarop de hostcore draait. Daarom beperken we de host rechtstreeks: we schakelen turbo uit, zetten `scaling_max_freq` op elke core vast op 3,0 GHz en pinnen de vCPU's van de gast met `taskset` op fysieke P-cores. Dit onderscheid is belangrijk op een CPU met hybride cores: de E-cores van dit model hebben een basisklok van 2,4 GHz en _kunnen_ 3,0 GHz niet bereiken zodra turbo is uitgeschakeld, dus een run die daarop terechtkomt, meet ongemerkt een tragere machine. Onder volledige belasting verifiëren we precies 3000 MHz op alle zestien gepinde threads. Een guard-script controleert deze invariant vóór elke benchmark en weigert anders te starten; het ving tijdens de studie één stille reset van de governor op.
+
+### 3.2 Een tweede testopstelling: één grote runner
+
+De QEMU-matrix isoleert telkens één variabele, maar houdt op bij zestien gepinde threads. Om na te gaan of dezelfde wetmatigheden een orde van grootte hoger nog gelden, herhaalden we de gelijktijdigheidsreeks op één grote server: één AMD EPYC 7773X (Milan-X, 64 cores / 128 threads, 768 MiB L3) met 995 GiB RAM, met dezelfde Ayakaleaf Pro v6.2.2-image op dezelfde `texlive-full:2025.1`. Anders dan de QEMU-gasten is de klok van deze machine niet vastgezet: het is een server van productieklasse en we meten hem ook als zodanig.
+
+Twee operationele voorzorgsmaatregelen waren nodig en zijn het vermelden waard, omdat het experiment zonder deze maatregelen de testopstelling meet in plaats van de server. Ten eerste werd elke container beperkt tot een `systemd`-slice met `MemoryMax=940 GiB`, zodat een uit de hand gelopen meetreeks een cgroup uitput in plaats van de host. Ten tweede worden sandboxed compiles door de daemon van de host aangemaakt en vervuilt elk ervan zijn eigen copy-on-write-laag — gemeten op 116 MiB per container, ook al wordt de basisimage van 20,6 GiB gedeeld — dus werd de Docker-dataroot naar een apart NVMe-apparaat verplaatst. Een meetreeks bij $N=1024$ schrijft ongeveer 119 GiB aan scratchlagen, wat niet past op een standaard root-bestandssysteem.
+
+### 3.3 Workload
+
+Het document is een echte masterscriptie van 63 pagina's (SJTU-sjabloon), gecompileerd met XeLaTeX via `latexmk`, met TikZ-figuren, verwerking van de `biblatex`-bibliografie en ingesloten PDF-assets — dus een realistische in plaats van synthetische belasting. Eén compilatie op een onbelaste gast duurt in alle configuraties 8,6–9,8 s; dit gebruiken we als onbelaste basislijn $T_1$.
+
+### 3.4 Belastinggeneratie
+
+We maken 512 echte gebruikersaccounts aan en geven elk een eigen kopie van het project, zodat gelijktijdige compilaties precies zo concurreren als onafhankelijke gebruikers dat zouden doen, in plaats van een projectlock te delen. Verzoeken worden vanaf de host naar de doorgestuurde poort van de gast verzonden, zodat de belastinggeneratie geen CPU van de gast verbruikt.
+
+Gelijktijdigheid is _simultaan_, niet gespreid. Eerst wordt elke sessie opgezet — inloggen, CSRF-token, compilerselectie — en pas daarna slaapt elke thread tot een gemeenschappelijk tijdstip op de wandklok, eenmaal berekend en gedeeld, voordat hij zijn `POST /project/:id/compile` verstuurt. Dit onderscheid is geen muggenzifterij. Een gespreide oploop meet de doorvoer onder een stabiele wachtrij; een simultane burst meet wat er gebeurt wanneer een collegezaal vol studenten na dezelfde deadline-aankondiging op dezelfde knop drukt, en dat is het geval waar beheerders werkelijk bang voor zijn. De twee verschillen meer dan een constante factor, omdat de tweede de compilatiewachtrij sneller vult dan de daemon haar kan legen.
+
+Vier praktische obstakels moesten worden weggenomen voordat die burst getrouw kon worden afgeleverd. Elk ervan is het vastleggen waard, omdat elk het experiment ongemerkt degradeert tot een meting van de testopstelling in plaats van de server.
+
+#### 3.4.1 Twee rate limiters, niet één
+
+Overleaf beperkt het aantal inlogpogingen per bronadres — 20 pogingen per minuut — en al ons verkeer komt van één host. Door elke gesimuleerde gebruiker een eigen `X-Forwarded-For`-adres te geven, verdwijnt die limiet, maar loop je meteen tegen een tweede, grovere aan: een budget per subnet van ongeveer 200 per minuut. Gebruikers over een aaneengesloten blok verdelen faalt daarom bij het 201e account. In plaats daarvan leiden we het synthetische adres af van de gebruikersindex, zodat opeenvolgende gebruikers in verschillende `/24`'s terechtkomen,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+waardoor beide limiters ruim blijven voor de volledige populatie van 1024.
+
+#### 3.4.2 De geïnjecteerde header wordt standaard genegeerd
+
+Het instellen van de header is niet voldoende. Express honoreert `X-Forwarded-For` alleen voor peers die het moet vertrouwen, en `trustedProxyIps` van Overleaf staat standaard op `loopback`. Omdat de belastinggenerator de applicatie via de bridge van de container bereikt en niet via de loopback-interface, wordt de header geparst en vervolgens weggegooid, en vallen alle gesimuleerde gebruikers terug op één adres. Het symptoom is een golf van `HTTP 429` bij precies de twintigste login, wat gemakkelijk kan worden aangezien voor overbelasting van de server. Het gatewaynetwerk moet expliciet aan de vertrouwensketen worden toegevoegd; in de geclusterde deployment van §4.3 moeten ook de CIDR's van pods en services worden toegevoegd.
+
+#### 3.4.3 Een load balancer overschrijft de header die hij moest behouden
+
+Wanneer de instantie achter een proxy staat, _voegt_ de gebruikelijke `option forwardfor` het echte clientadres aan de keten toe; dat is het juiste gedrag voor productie en hier precies verkeerd: het synthetische adres wordt verdrongen door dat van de belastinggenerator zelf. De directive moet worden gekwalificeerd als `option forwardfor if-none`, zodat de proxy alleen een waarde toevoegt als de client er geen heeft meegestuurd.
+
+#### 3.4.4 De client raakt eerder door zijn file descriptors heen dan de server door zijn capaciteit
+
+Bij $N=1024$ houdt de generator meer dan duizend gelijktijdige sockets open, en de standaard soft limit van 1024 descriptors wordt bereikt tijdens het opzetten van de sessies in plaats van tijdens de meting. Het falen is onopvallend: drie sessies komen niet tot stand en de run rapporteert 1021 in plaats van 1024, terwijl een samplingthread die voor het tellen van containers een shell aanroept, sterft met `EMFILE` en de telemetrie ongemerkt afkapt. De soft limit moet op de generator worden verhoogd — de hard limit op onze host was al 1048576 — en de run moet worden herhaald. We rapporteren beide runs in §4.3: de gecorrigeerde voltooit 1024 van de 1024 met een mediaan die binnen 1,2 s van de afgekapte ligt; daarom behandelen we de eerste als bruikbaar maar niet als gezaghebbend.
+
+### 3.5 Meetprotocol
+
+Verscheidene methodologische keuzes bleken nodig voor de reproduceerbaarheid.
+
+#### 3.5.1 Opwarmen
+
+Op een vers opgestarte gast is de paginacache leeg en meten de eerste compilaties koude-start-I/O in plaats van capaciteit in stabiele toestand: dezelfde configuratie van 2 vCPU / 2 GiB levert koud 36,5 s en warm 9,8 s op, een factor 3,7. Elke configuratie voert daarom na het opstarten twee opwarmcompilaties uit die worden weggegooid.
+
+#### 3.5.2 Slagingscriterium
+
+Een gelijktijdigheidsniveau slaagt alleen als _elke_ compilatie slaagt en het niveau een herhaling doorstaat. Dit is strenger dan een drempel voor het slagingspercentage, en dat maakt uit: bij 4 vCPU / 16 GiB slaagde niveau 32 eenmaal met een mediaan van 80,2 s en kregen bij herhaling alle 32 compilaties een time-out, dus rapporteren we 31.
+
+#### 3.5.3 Zoeken
+
+Niveaus worden gevonden door exponentiële afbakening vanaf een door het model voorspelde startwaarde, gevolgd door exacte bisectie op gehele getallen. Omdat het criterium alles-of-niets is, ligt een niveau vast bij de eerste mislukking, dus breken we de resterende lopende verzoeken af zodra er één faalt — behalve bij kleine niveaus, waar de afgebroken compilaties een kleine gast zo zwaar belasten dat hij nooit herstelt.
+
+#### 3.5.4 Isolatie tussen niveaus
+
+Voordat het volgende niveau begint, worden compilatiecontainers leeggemaakt en wordt de webapplicatie gepold totdat ze weer antwoordt. Zonder dit registreert een niveau dat op een crash volgt een onterechte mislukking met nul sessies.
+
+#### 3.5.5 Hosthygiëne
+
+Niet-gerelateerde virtuele machines op de host werden uitgeschakeld: met 24 GiB hostgeheugen elders in gebruik rapporteerde dezelfde gastconfiguratie een load average van 11,7 in plaats van 3,2 bij identieke gelijktijdigheid. Geheugendruk op de host plant zich voort naar de gast en maakt de meting ongeldig.
+
+## 4. Resultaten
+
+### 4.1 De capaciteitsmatrix
+
+Tabel 1 en figuur 4 geven het gemeten plafond voor elke configuratie. Een rij van links naar rechts lezen levert de eerste verrassing op. Bij 4 GiB bereiken de gasten met 2, 4 en 8 vCPU's allemaal precies 9 — het aantal cores verviervoudigen verandert helemaal niets. Bij 16 GiB bereiken ze 54, 45 en 57: van 4 naar 16 cores gaan levert 6% op, en de gast met 8 cores is zelfs _slechter_ dan die met 4 cores (§5.2). Pas bij 48 GiB onderscheidt het aantal cores de configuraties duidelijk: 143, 268 en 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Figuur 4.** Gemeten capaciteit over de configuratiematrix. (a) Elke configuratie als staaf, gegroepeerd naar geheugen en gekleurd naar aantal cores; volle staven zijn geheugengebonden (de gast bezwijkt doordat het geheugen uitgeput raakt) en gearceerde staven zijn CPU-gebonden (compilaties krijgen een time-out terwijl er geheugen over is). Een groep van links naar rechts lezen laat zien hoe weinig het aantal cores onder 16 GiB oplevert; over groepen heen lezen toont het superlineaire rendement van geheugen. (b) Dezelfde punten tegen het gefitte model $N_{\max}=\min(0.69R^{1.60},\,26.4C)$; de gestippelde lijn is de geheugenmuur en de gestippelde horizontale lijnen zijn de CPU-plafonds per aantal cores. Een configuratie wordt begrensd door degene die ze het eerst tegenkomt.
+
+Een kolom van boven naar beneden lezen levert de tweede verrassing op: bij een vast aantal cores groeit de capaciteit superlineair met het geheugen, grofweg als $R^{1.6}$, om de reden van de paginacache die in §5.1 wordt uitgewerkt.
+
+| geheugen | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Tabel 1.** Maximaal aantal gelijktijdige compilaties dat succesvol wordt voltooid, gemeten bij een compilatietime-out van 300 s met opgeheven CLSI-gelijktijdigheidsplafond. **Vet** markeert een CPU-gebonden configuratie (compilaties krijgen een time-out terwijl er geheugen over is); de rest is geheugengebonden (de stack bezwijkt met HTTP 502). De rij voor 2 GiB bevat de correctie die in §5.2 wordt besproken.
+
+### 4.2 Gelijktijdigheid is time-sharing
+
+Figuur 5 doorloopt elk gelijktijdigheidsniveau op een vaste gast met 8 vCPU / 16 GiB. Twee regimes worden gescheiden door een scherpe knik bij precies één compilatie per core. Daaronder is de gemiddelde compilatietijd vlak — die gaat van 8,7 s bij $N=1$ naar 9,1 s bij $N=C=8$, een verandering van 5%. Daarboven groeit de tijd strikt evenredig met $N/C$: bij $N=16,24$ meten we 18,5 s en 27,1 s, d.w.z. een verhouding van $1:2.13:3.12$ tegenover een ideale $1:2:3$.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Figuur 5.** Compilatielatentie tegen gelijktijdigheid bij vaste hardware. De knik ligt bij $N=C$; daarna volgt de gemeten vertraging $N/C$ tot op 5–7% nauwkeurig. Alle vijftien niveaus slaagden volledig.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Figuur 6.** Compilatielatentie tegen gelijktijdigheid voor verschillende configuraties. Elk paneel houdt de hardware vast en varieert de aangeboden belasting; de verticale lijn markeert $N=C$. De curven zijn links daarvan vlak en rechts ervan lineair in $N/C$, wat kenmerkend is voor time-sharing en niet voor contentie: het werk wordt niet duurder, het wacht alleen op zijn beurt.
+
+Het fitten van $T(N)=T_1\max(1,N/C)^{b}$ over alle succesvolle metingen in de studie levert $b=0.914$ op ($R^2_{\log}=0.904$, $n=81$). Een exponent die niet van één te onderscheiden is, is de kwantitatieve vaststelling dat een compilatie een single-threaded, CPU-gebonden werkeenheid is en dat gelijktijdigheid niet helpt en niet schaadt, behalve dat de cores worden verdeeld. Het praktische gevolg is ongemakkelijk voor capaciteitsplanning: een configuratie kan een willekeurig aantal gebruikers opvangen zonder te _falen_, terwijl ze elk van hen evenredig langer laat wachten. Bij $N=56$ slagen op deze gast nog steeds alle compilaties, maar wacht elke gebruiker 64,8 s in plaats van 8,7 s.
+
+### 4.3 Verticale schaling tot 1024 gelijktijdige compilaties
+
+Tabel 2 en figuur 7 rapporteren de meetreeks op de grote runner. Elk niveau is een _koude_ compilatie: vóór elk niveau wissen we de compilatiemap en de CLSI-cache van elk deelnemend project via `DELETE /project/:id/output`, zodat geen enkel niveau profiteert van werk dat door het niveau eronder is gedaan. De basislijn voor één compilatie op deze machine is 28,8 s; dat is het koude cijfer en mag niet worden vergeleken met de basislijn in stabiele toestand van 8,6–9,8 s die eerder werd gebruikt. De koude basislijn op de QEMU-gasten is 28,3 s, dus per thread liggen de twee machines voor deze workload binnen twee procent van elkaar.
+
+| $N$ |   succes | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | piek ctrs |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tabel 2.** Gelijktijdigheidsreeks op één EPYC 7773X (64 cores / 128 threads, 995 GiB). Alle niveaus koud; basislijn 28,8 s. Piekcontainers is het maximale aantal sandboxes dat tegelijk actief is.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Figuur 7.** Verticale schaling op één grote runner. (a) Latentie tegen aangeboden gelijktijdigheid; het gearceerde gebied markeert het regime voorbij de knik. (b) Het aantal daadwerkelijk actieve sandboxes volgt nooit het aangevraagde aantal — het verzadigt rond de 200 — terwijl de compilatie-cgroup nooit meer dan een vijfde van zijn limiet gebruikt.
+
+#### 4.3.1 De machine faalt nooit
+
+Elk niveau wordt voor 100% voltooid, inclusief $N=1024$ — acht keer het aantal threads. We hebben het capaciteitsplafond van deze machine niet gevonden; ons geduld raakte eerder op dan haar reserve. Dit is de eerste configuratie in de studie waarin de bepalende beperking niet het geheugen is: bij $N=1024$ piekt de compilatie-cgroup op 184 GiB, een vijfde van de limiet van 940 GiB, terwijl de CPU op 100% benutting zit met een load average van 166.
+
+#### 4.3.2 De degradatie is sublineair omdat de toelating in snelheid is begrensd
+
+Naïeve time-sharing voorspelt dat $8\times$ zoveel threads $8\times$ zoveel latentie kost. De gemeten kosten zijn $9.7\times$ ten opzichte van één compilatie, maar slechts $3.8\times$ ten opzichte van $N=128$ — voor een achtvoudige toename van de aangeboden belasting. De reden is zichtbaar in figuur 7(b) en in de laatste kolom van tabel 2: hoewel 1024 verzoeken tegelijk worden verstuurd, komt het aantal daadwerkelijk actieve sandboxes nooit boven 205. De daemon kan containers niet zo snel aanmaken als de clients erom vragen, dus wachten verzoeken bij de toelating in plaats van binnen de CPU met elkaar te concurreren. Wachtrijvorming is wat hier de staart redt, en dat gebeurt per ongeluk.
+
+#### 4.3.3 De knik ligt bij 512, niet bij het faalpunt
+
+Tussen $N=256$ en $N=512$ stijgt de $p_{95}$-latentie met $2.9\times$ bij een verdubbeling van de belasting; elke eerdere verdubbeling kostte tussen $1.2\times$ en $1.4\times$. Een capaciteit uitgedrukt als "de grootste $N$ die niet faalt" zou 1024 rapporteren en zou voor een beheerder nutteloos zijn: op dat punt is de staartwachttijd bijna acht minuten.
+
+### 4.4 Compilatietijd is omgekeerd evenredig met de klok
+
+Omdat de workload CPU-gebonden is, zouden de kosten moeten schalen als $1/f$. We testen dit rechtstreeks door de hostklok over het volledige bereik van de machine te variëren, 1,0–5,5 GHz in tien stappen, op een verder ongewijzigde gast (figuur 8). De tijd voor één compilatie gaat van 26,5 s naar 4,8 s: een 5,5× hogere klok levert een 5,5× snellere compilatie op, zonder afnemende meeropbrengst waar dan ook in het bereik. Het product $T\!\cdot\!f$ is over alle tien klokfrequenties constant tot op 2%.
+
+Normaliseren naar het aandeel per core brengt alle dertig metingen — drie gelijktijdigheidsniveaus bij tien klokfrequenties — samen op één constante:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+met een restspreiding van 5,1% over een bereik waarin de klok zelf 5,5× varieert. Het ontbreken van enige kromming is op zichzelf het resultaat: als de workload door geheugenbandbreedte of I/O was begrensd, zou $T$ bij hoge klok afvlakken doordat de CPU de andere resource voorbijstreeft.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Figuur 8.** Kloksweep. (a) $T=k/f$ met de gefitte hyperbool. (b) Na deling door $\max(1,N/C)$ vallen alle punten samen op één constante, wat vergelijking (1) bevestigt.
+
+Vergelijking (1) heeft een direct gevolg voor de aanschaf dat eenvoudig te formuleren is en gemakkelijk verkeerd wordt begrepen: _de klok verbetert de ervaring van elke individuele gebruiker, het aantal cores laat er alleen meer toe_. Een machine met een 20% hogere klok compileert voor iedereen 20% sneller, zonder afnemende meeropbrengst; twee keer zoveel cores maken niemands compilatie ook maar iets sneller.
+
+## 5. Analyse
+
+### 5.1 Twee muren, afzonderlijk gefit
+
+Elke configuratie wordt geclassificeerd aan de hand van haar faalpatroon (§2.3), en de geheugenmuur en het CPU-plafond worden vervolgens alleen gefit op de configuraties die er daadwerkelijk tegenaan lopen:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+met $R$ in gibibytes en $C$ in vCPU's.
+
+De exponent van de geheugenmuur is consequent superlineair, $p>1$: de marginale geheugenkosten van één extra gelijktijdige compilatie _dalen_ naarmate het totale geheugen groeit, van ongeveer 312 MiB per compilatie op een gast met 3 GiB tot ongeveer 194 MiB op een gast met 32 GiB. Het mechanisme is de gedeelde paginacache over de TeX Live-boom, beschreven in §2.1: gelijktijdige compilaties lezen overlappende font- en macrobestanden, dus een grotere cache wordt over meer compilaties afgeschreven. Daarom onderschat de naïeve regel "één gigabyte per vijf gebruikers" grote machines en overschat hij kleine.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Figuur 9.** Dezelfde gegevens als twee oppervlakken boven het $(C,R)$-vlak. (a) Capaciteit: het gefitte oppervlak is een rug, geen vlak — het stijgt steil met het geheugen en is langs de core-as vrijwel vlak totdat het geheugen niet meer de beperking vormt; daarom is de rij van 48 GiB de enige waarin het aantal cores de configuraties onderscheidt. (b) Latentie tegen gelijktijdigheid voor elke configuratie, met de gefitte $T=12.6\,(N/C)^{0.91}$ gestreept weergegeven en de time-out van 180 s getekend als een vlak. Een configuratie faalt waar haar doorgetrokken curve dat vlak doorboort, wat zichtbaar maakt hoe direct de time-outinstelling de gerapporteerde capaciteit bepaalt.
+
+### 5.2 Waar meer cores het erger maken
+
+Vergelijking (2) is een minimum van twee termen en daarom monotoon in $C$, maar de metingen zijn dat niet. We zien twee inversies waarbij het toevoegen van cores de capaciteit _verlaagde_: bij 16 GiB (54 vs. 45) en bij 32 GiB (145 vs. 135). Beide treden op in het geheugengebonden regime, en het mechanisme is in beide gevallen hetzelfde: met meer cores vorderen gelijktijdige compilaties in lockstep en bereiken ze hun piekgeheugen op hetzelfde moment, terwijl de scheduler ze met minder cores afwisselt en de pieken gespreid zijn. Op een gast waarvan de geheugenmarge al krap is, is het spreiden precies wat hem in leven houdt. Een capaciteitsmodel dat op gemiddeld resourcegebruik is gebaseerd, kan dit niet uitdrukken; het is een eigenschap van het _samenvallen_ van pieken.
+
+Een derde schijnbare inversie, bij 2 GiB, laten we nu buiten beschouwing. De zoektocht registreert capaciteit 2 bij 2 vCPU maar 1 bij 4 en 8 vCPU, wat leest als hetzelfde effect. Herbeoordeling van de ruwe meetreeksen laat iets eenvoudigers zien: bij 2 GiB slaagde niveau $N=2$ bij de eerste poging voor alle drie de core-aantallen en faalde vervolgens bij twee van de drie in de bevestigingsrun. Het niveau is geen capaciteit maar een muntworp, en de vermelding voor 2 vCPU is de worp die toevallig goed uitviel. We rapporteren daarom de reproduceerbare waarde, 1, voor alle drie de core-aantallen en trekken geen conclusie uit het verschil. We leggen de correctie hier vast in plaats van de tabel stilzwijgend aan te passen, omdat de verworpen meting precies het soort is dat een interessante bewering zou hebben ondersteund.
+
+## 6. Bevindingen in de implementatie
+
+### 6.1 Een hardgecodeerd gelijktijdigheidsplafond
+
+Op voldoende grote gasten stopte de capaciteit bij precies 65 gelijktijdige compilaties, ongeacht de aangevraagde gelijktijdigheid: bij $N=66,80,96,128$ maten we $65$ successen en $1,15,31,63$ directe `unavailable`-responsen, terwijl het aantal containers vastzat op 65, er enkele gigabytes geheugen ongebruikt bleven en de mediane compilatietijd stabiel op 77 s lag — ver onder elke time-out.
+
+De oorzaak is een constante in CLSI:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+De vergelijking is niet strikt, dus het effectieve plafond is $64+1=65$, wat exact overeenkomt met de meting. De overtollige verzoeken krijgen **HTTP 503** — ze worden _geweigerd_, niet in de wachtrij geplaatst, dus vanuit de gebruiker gezien faalt de compileerknop gewoon. Anders dan elke andere instelbare parameter in hetzelfde bestand leest deze geen omgevingsvariabele; ze werd in augustus 2024 upstream geïntroduceerd en kan alleen worden gewijzigd door de image aan te passen. Met de verhoogde limiet rapporteerde dezelfde gast met 16 vCPU / 32 GiB die bij $N=80$ `success=65, unavailable=15` rapporteerde, in plaats daarvan `success=80`.
+
+### 6.2 Een niet-werkende geheugenlimiet voor containers
+
+Inspectie van een actieve compilatiecontainer toont dat er geen enkele resource-isolatie is:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Het ontbreken van een CPU-quotum is bewust zo ontworpen en verklaart waarom de time-sharingexponent van §4.2 zo zuiver is: niets verstoort de concurrentie tussen compilaties. Het ontbreken van een _geheugen_limiet is echter niet bewust zo ontworpen. De Docker-runner vraagt er wel degelijk een aan:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Dit is dubbel fout. De waarde is $1024^4=1 tebiB$ terwijl het commentaar $1024^3$ bedoelt; en het veld staat op het hoogste niveau van de create-opties in plaats van binnen `HostConfig`, waar de Docker API het verwacht, waardoor het wordt genegeerd — wat de waargenomen `Memory=0` bevestigt. Beide fouten zitten al in de commit die het bestand introduceerde (`9a519f0d3d`, maart 2018) en overleefden de conversie vanuit CoffeeScript, een herformattering van de hele repository en een migratie van CJS naar ESM, waarvan geen enkele de semantiek opnieuw bekeek. Opvallend is dat `MAX_OUTPUT = 1024 * 1024 // 1MB` in dezelfde commit wel correct is, wat wijst op een vergissing en niet op een misverstand.
+
+Het gevolg is zichtbaar in onze metingen met weinig geheugen. Omdat compilaties onbegrensd zijn, uit geheugenuitputting zich niet doordat Docker één overtredende container beëindigt; het legt de hele gast plat. Op de configuratie met 2 vCPU / 2 GiB zagen we dat de SSH-sessie voor monitoring 300 s lang blokkeerde, een load average van 68 op twee cores, en dat de gast zichzelf uiteindelijk herstartte. Een werkende limiet per container zou veel geleidelijker degraderen: de te grote compilatie zou falen en de service zou overleven.
+
+De enige limiet die wel effect heeft, is `RLIMIT_CPU`, ingesteld op $\text{timeout}+5$ seconden. Die begrenst de _CPU_-tijd, niet de wandkloktijd, en één compilatie verbruikt slechts ongeveer 9 s CPU, dus wordt deze bij geen enkele gelijktijdigheid bereikt; ze beschermt tegen pathologische invoer zoals een op hol geslagen macro. Ze is echter een nuttig orakel: het waarnemen van `Soft:305` bevestigt dat een time-outinstelling van 300 s daadwerkelijk tot in de container is doorgedrongen.
+
+### 6.3 De compilatietime-out is de dominante instelling
+
+Het veld per gebruiker `features.compileTimeout` staat standaard op 180 s. Voor elke CPU-gebonden configuratie is dit geen veiligheidsmarge maar een capaciteitsinstelling, omdat een machine die nog correct aan het rekenen is, als gefaald wordt beschouwd. Door deze te verhogen naar 300 s — één enkele MongoDB-update — verandert de gemeten capaciteit met maximaal een factor 4,2 (tabel 3). Het plafond is 600 s, afgedwongen door `RequestParser.MAX_TIMEOUT`; daarboven wordt de waarde stilzwijgend afgekapt.
+
+| Configuratie     | 180 s | 300 s |          Verhouding | Bepalende beperking   |
+| ---------------- | ----: | ----: | -------------: | --------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB vrij      |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB vrij      |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                   |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                   |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                   |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | raakt hierna de geheugenmuur |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | geheugen              |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | geheugen              |
+
+**Tabel 3.** Effect van de compilatietime-out op de gemeten capaciteit.
+
+De laatste twee rijen vormen de contra-intuïtieve helft van het resultaat en de reden waarom we elke configuratie onder één time-out opnieuw hebben gemeten. Voor _geheugen_gebonden configuraties _verlaagt_ een langere time-out de capaciteit, omdat elke compilatie haar resident set langer vasthoudt en er meer tegelijk overlappen. Een capaciteitscijfer is daarom zinloos zonder vermelding van de time-out waaronder het is gemeten, en de twee kunnen niet binnen één tabel worden gemengd.
+
+## 7. Gerelateerd werk
+
+### 7.1 Richtlijnen van de leverancier
+
+De eigen hardwaredocumentatie van Overleaf vermeldt de kwalitatieve feiten die we hier kwantificeren: dat LaTeX single-threaded is, dat de prestaties van één core daarom de compilatietijd bepalen, en dat "more cores will only help if you are trying to compile more documents than you have free CPU cores" \[1]. Vervolgens geeft ze de lineaire dimensioneringsregel — een basis van 2 cores/3 GiB plus één core en één gigabyte per vijf tot tien gelijktijdige gebruikers — die de aanleiding voor deze studie was. Onze bijdrage is om deze uitspraken om te zetten in gemeten wetmatigheden (vergelijkingen (1) en (2)) en te laten zien waar de lineaire regel tekortschiet: ze bevat geen term voor de gedeelde paginacache die de geheugenmuur superlineair maakt, en geen term voor de twee softwareparameters die het resultaat domineren.
+
+### 7.2 Capaciteitsstudies voor builds en CI
+
+Het meten van buildsystemen onder gelijktijdigheid is buiten de LaTeX-context goed ingeburgerd. LightSys rapporteert dat conventionele CI-systemen die in Docker-containers compileren in I/O degraderen naarmate de aankomstsnelheid van pull requests stijgt, met een knelpunt rond elf gelijktijdige verzoeken \[17]; TAOS-CI stelt vast dat compilatie de wandkloktijd van CI domineert, goed voor 60–67% van de totale pipelineduur bij grote projecten \[18]. Ons systeem verschilt in één opzicht dat doorslaggevend blijkt: een LaTeX-compilatie is interactief. Een CI-job die twee keer zo lang duurt, is een ongemak; een compilatie die twee keer zo lang duurt, wordt direct opgemerkt door een gebruiker die op een voorbeeldvenster wacht. Daarom behandelen we de time-out niet als faaldrempel maar als capaciteitsparameter.
+
+### 7.3 Overhead van containers
+
+Recent werk ontleedt de opstartlatentie van Docker-containers over opslaglagen \[19] en karakteriseert containerprestaties aan de edge \[20]. In onze situatie wordt het opstarten van een container per compilatie afgeschreven: het is een kleine constante ten opzichte van een compilatie van 9 s, en de onbelaste tijd $T_1$ die we fitten neemt die op. De containereigenschap die er wél toe doet, is het _ontbreken_ van resourcelimieten (§6.2), waardoor een geheugenoverschrijding per compilatie verandert in het falen van de hele host.
+
+### 7.4 LaTeX als onbetrouwbare invoer
+
+Sandboxed compilatie bestaat omdat TeX een programmeertaal is en documenten onbetrouwbare invoer zijn \[21, 22]. Die ontwerpkeuze maakt deze studie mogelijk — elke compilatie is een geïsoleerde container met waarneembaar resourcegedrag — en maakt ook de ontbrekende geheugenlimiet van belang, aangezien beheerders die het systeem deployen van isolatie uitgaan.
+
+### 7.5 De compiler als onderzoeksobject
+
+TeX zelf is als taal goed gedocumenteerd \[16], maar het gedrag ervan als _buildtarget_ krijgt pas sinds kort aandacht. Tan en Rigger \[8] compileren een groot corpus arXiv-bronnen met verschillende engines en distributieversies en stellen vast dat de keuze van engine niet uitwisselbaar is: slechts een fractie van een procent van de documenten levert onder XeTeX en pdfTeX byte-identieke uitvoer op. Dat resultaat raakt direct aan onze methodologie. Capaciteit is een eigenschap van een document _en_ een engine, dus een benchmark die niet beide vastlegt, is niet reproduceerbaar; daarom houden we overal één document, één engine en één distributie (`texlive-full:2025.1`) vast, en vermelden we de engine in elk figuuronderschrift. Het begrenst ook de algemeenheid van onze cijfers op een manier die het waard is om duidelijk te zeggen: ze karakteriseren XeLaTeX op dit document, niet TeX in het algemeen.
+
+Werk aan LaTeX-build_systemen_ wordt grotendeels door praktijkmensen gedreven. `l3build` van het LaTeX3-project \[13] standaardiseert regressietests en packaging, en onafhankelijke benchmarks vergelijken wrappertools — een overzicht van 26 buildsystemen stelt vast dat een voorgecompileerde preamble ongeveer 20% oplevert ten opzichte van een gewone run en 40% ten opzichte van `latexmk` \[14]. Deze optimaliseren de _individuele_ compilatie. Ze staan los van wat wij meten en zijn ermee te combineren: een preamble-cache verkort $T_1$, en elk capaciteitscijfer in dit artikel schaalt met $T_1$.
+
+### 7.6 Gelijktijdigheidsbeheer in de editor, niet in de compiler
+
+De collaboratieve helft van Overleaf rust op een gevestigde onderzoekslijn. Operational transformation is afkomstig van Ellis en Gibbs \[9] en werd praktisch bruikbaar gemaakt voor clients met hoge latentie door het Jupiter-systeem \[10], waarvan het ontwerp herkenbaar is in `document-updater`: een server die operaties ordent en een buffer per document waarmee clients synchroniseren. Conflict-free replicated data types \[11] lossen hetzelfde probleem op zonder centrale sequencer. Dit onderscheid is wat de topologie van §4.3 überhaupt laat werken: omdat de buffer met openstaande updates in gedeelde Redis staat en niet in het geheugen van een instantie, ziet een compilatie die naar een willekeurige replica wordt gerouteerd de laatste toetsaanslagen, en kan compilatieaffiniteit worden gekozen op basis van cachelokaliteit in plaats van correctheid.
+
+### 7.7 Capaciteitsmodellen
+
+De wet van Amdahl \[24] begrenst de versnelling door parallellisme en de wet van Little \[23] relateert bezetting aan aankomstsnelheid en bedieningstijd; beide worden hierboven gebruikt. De universal scalability law van Gunther \[12] breidt de eerste uit met een retrograde term voor coherentievertraging en voorspelt dat de doorvoer piekt en daarna daalt. We merken op dat ons systeem dat retrograde regime tot $N=1024$ _niet_ vertoont: de doorvoer verzadigt en de latentie groeit, maar niets stort in. De reden is structureel en geen geluk — compilaties delen geen toestand die coherent moet blijven, dus de term die de wet toevoegt is vrijwel nul, en het toelatingsplateau van §4.3 begrenst de contentie voordat die van belang kan worden.
+
+## 8. Aanbevelingen voor beheerders
+
+<Steps>
+<Step title="Pas de twee softwareparameters aan voordat je hardware koopt">
+Beide zijn gratis en beide zijn meer waard dan welke afzonderlijke hardware-upgrade die we hebben gemeten. Verhoog `features.compileTimeout` naar een waarde die je gebruikers daadwerkelijk accepteren — het maximum dat CLSI accepteert is 600 s — en als je verwacht meer dan 65 gelijktijdige compilaties te hebben, verhoog dan `compileConcurrencyLimit` in een afgeleide image of schaal horizontaal uit. Als je geen van beide doet, betaal je voor cores die de software weigert te gebruiken.
+</Step>
+
+<Step title="Dimensioneer één machine op haar knikpunt, niet op haar plafond">
+De meetreeks op de grote runner (§4.3) scheidt twee getallen die routinematig door elkaar worden gehaald. Het _plafond_ — de grootste gelijktijdigheid die nog elke PDF teruggeeft — ligt op een server met 64 cores op ten minste 1024, en we hebben het nooit bereikt. Het _knikpunt_ — het punt waarboven de staartlatentie niet meer geleidelijk groeit maar begint te verdubbelen — ligt bij 512, en het laatste comfortabele werkpunt daaronder is 256. Tussen $N=256$ en $N=512$ gaat de $p_{95}$-wachttijd van twee minuten naar bijna zes; tussen 512 en 1024 bereikt die acht. Een beheerder die op het plafond dimensioneert, levert een systeem op dat technisch werkt en dat niemand wil gebruiken.
+
+Voor deze machine en dit document is het aanbevolen werkpunt daarom **256 gelijktijdige compilaties**, wat $4\times$ het aantal fysieke cores en $2\times$ het aantal threads is, en waarbij $p_{95}$ rond 120 s blijft. We raden aan `compileConcurrencyLimit` op die waarde in te stellen in plaats van hoog te laten: 1024 compilaties tegelijk toelaten laat iedereen acht minuten wachten, terwijl 256 toelaten en de rest in de wachtrij zetten de meeste gebruikers binnen twee minuten bedient. Een wachtrij benadeelt de laatkomers; contentie benadeelt iedereen.
+</Step>
+
+<Step title="Beschouw dit als worstcasecijfers">
+Elk niveau in tabel 2 is een koude compilatie die gelijktijdig wordt gestart. Geen van beide omstandigheden geldt in productie: een warme compilatie van hetzelfde document duurt 8,6 s tegenover 28,3 s koud, een factor $3.3$, en echte gebruikers drukken niet in dezelfde seconde op de knop. Een populatie in stabiele toestand die elke twee minuten opnieuw compileert met een gangbare cache-hitrate, kan daarom aanzienlijk meer schrijvers bedienen dan het gelijktijdigheidscijfer alleen doet vermoeden — in de orde van duizend of meer actieve auteurs bij het werkpunt van 256. Het gelijktijdigheidscijfer is een grens voor de momentane burst, geen aantal plaatsen.
+</Step>
+
+<Step title="Bepaal eerst het latentiebudget en lees daarna de omvang af">
+Vergelijking (1) is direct om te keren. Voor een doelwachttijd $T$ bij klok $f$ op $C$ cores is de passende gelijktijdigheid $N \le C\,fT/k$ met $k\approx28 GHz·s$ voor dit document. Een budget van 60 s op 8 cores bij 3 GHz geeft $N\le51$; een budget van 120 s verdubbelt dat. Het budget samen met de capaciteit publiceren is de enige eerlijke manier om een van beide te vermelden.
+</Step>
+
+<Step title="Koop eerst geheugen, daarna cores, en controleer tegen welke muur je aanloopt">
+Onder 32 GiB maten we vrijwel geen voordeel van extra cores. De diagnose is eenvoudig: als storingen verschijnen als HTTP 502 terwijl de gast geheugen tekortkomt, voeg dan geheugen toe; als ze verschijnen als `timedout` terwijl er geheugen over is, voeg dan cores toe of verhoog de time-out. Beheerders kunnen dit aflezen aan hetzelfde faalpatroon dat wij gebruikten om configuraties te classificeren.
+</Step>
+
+<Step title="Kies klok voor de ervaring, cores voor de populatie">
+Omdat $T\propto 1/f$ zonder kromming geldt (2% over 1,0–5,5 GHz), maakt een snellere klok elke compilatie voor elke gebruiker sneller. Meer cores maken geen enkele afzonderlijke compilatie sneller; ze laten alleen meer gelijktijdige compilaties toe. Deployments waar de klacht "compilaties zijn traag" luidt, moeten klok kopen; deployments waar de klacht "compilaties falen rond de deadline" luidt, moeten geheugen en cores kopen.
+</Step>
+
+<Step title="Schaal voorbij het plafond horizontaal uit in plaats van verticaal op">
+Boven 65 gelijktijdige compilaties is horizontale schaling het ondersteunde pad (figuren 2c en 10, uitgewerkt in §9): meerdere applicatie-instanties achter een load balancer met sessieaffiniteit via cookies, die centrale MongoDB, Redis en S3-compatibele opslag delen, waarbij `git-bridge` een enkele instantie blijft. Dit vermenigvuldigt het plafond per instantie met het aantal instanties, en dat is precies hoe de SaaS-deployment haar eigen capaciteit bereikt.
+</Step>
+
+<Step title="Vertrouw niet op isolatie per compilatie">
+Totdat de geheugenlimiet van de Docker-runner is gecorrigeerd (§6.2), kan één pathologisch document de host uitputten in plaats van alleen zelf te worden beëindigd. Beheerders die die garantie nodig hebben, moeten haar zelf afdwingen in plaats van erop te wachten. Het mechanisme dat we op de grote host gebruikten, is een systemd-slice met een hard plafond, waarnaar de Docker-daemon vervolgens wordt verwezen, zodat elke container die hij aanmaakt daarbinnen wordt meegeteld:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Eén detail hierin kost een middag als je het mist. Een slice met de naam `docker-capped.slice` staat niet naast `docker.slice`; hij staat er _binnen_, omdat het koppelteken het hiërarchiescheidingsteken is en geen deel van de naam. Een plafond dat geen effect lijkt te hebben, is meestal één niveau verwijderd toegepast van waar de containers werkelijk leven. Verifieer dit door na een run de piek terug te lezen uit `memory.max_usage_in_bytes` in plaats van op het configuratiebestand te vertrouwen — op onze host kwam de compilatie-cgroup zelfs bij 1024 gelijktijdige compilaties nooit boven een vijfde van zijn plafond, wat op zichzelf het bewijs is dat de daemon, en niet het geheugen, de bepalende beperking was.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Figuur 10.** Referentietopologie voor een horizontaal geschaalde deployment, getekend op basis van de configuratie die we hebben geverifieerd. Applicatiereplica's zijn uitwisselbaar en bevatten niets duurzaams, dus ze kunnen vrij worden toegevoegd en verwijderd. Drie componenten zijn dat niet: Redis, waarvan de documentbuffer ervoor zorgt dat een compilatie die naar een willekeurige replica wordt gerouteerd de laatste toetsaanslagen ziet; de objectopslag, die bij meer dan één replica verplicht in plaats van optioneel wordt; en `git-bridge`, dat repository's op de lokale schijf bewaart zonder replicatiepad en als enkele instantie naast één aangewezen replica moet draaien.
+
+## 9. Een referentiedeployment over meerdere machines
+
+Alles hierboven meet één machine. Deze sectie beschrijft de gedistribueerde vorm gedetailleerd genoeg om haar te bouwen, en — omdat de vraag waar een beheerder werkelijk voor staat niet _hoe_ maar _of_ is — vermeldt eerst het punt waarop ze de moeite waard wordt.
+
+### 9.1 Wanneer de gedistribueerde vorm gerechtvaardigd is
+
+Eén machine is in elk relevant opzicht goedkoper in beheer: één faaldomein, geen gedeelde toestand die consistent moet blijven, geen routering die mis kan gaan. Onze gegevens leveren drie drempels voor wanneer je die situatie moet verlaten.
+
+#### 9.1.1 Onder 65 gelijktijdige compilaties: niet doen
+
+Het plafond per instantie is een softwareconstante, geen hardwareconstante (§6.1). Zolang de aangeboden belasting dat plafond niet nadert, voegt een tweede machine faalwijzen toe en levert ze niets op. De host met 64 cores bediende 256 gelijktijdige compilaties met volledig succes pas nadat `compileConcurrencyLimit` was verhoogd; een beheerder die die ene waarde nog niet heeft gewijzigd, wordt niet door hardware begrensd en hoeft geen hardware te kopen.
+
+#### 9.1.2 Tussen 65 en ongeveer 500: eerst verticaal opschalen
+
+Verticale schaling bleef over ons hele bereik lineair en kwam nooit in een retrograde regime terecht. Eén grote host bereikte 1024 gelijktijdige koude compilaties met 100% succes (§4.3); de knik in de latentie verscheen bij 512, niet eerder. Binnen die band is één grotere machine strikt eenvoudiger dan meerdere kleinere, en volgens §4.4 verbetert een snellere machine de ervaring van elke gebruiker in plaats van alleen meer gebruikers toe te laten.
+
+#### 9.1.3 Kies voor distributie vanwege beschikbaarheid, niet vanwege doorvoer
+
+De eerlijke reden om onder het plafond meer dan één applicatiereplica te draaien, is dat één machine één voeding, één kernel en één upgradevenster betekent. Dat is een legitieme reden en het is de reden die wij zouden geven; het is alleen geen capaciteitsargument, en het door elkaar halen van de twee leidt ertoe dat beheerders replica's kopen terwijl ze geheugen nodig hadden.
+
+### 9.2 Lagen en hun dimensionering
+
+Figuur 10 toont de topologie. Die heeft vier lagen, en ze schalen op verschillende grootheden — en dat is precies de reden om ze te scheiden.
+
+#### 9.2.1 Edge
+
+Eén load balancer, of twee voor beschikbaarheid. Hij termineert TLS en doet niets kostbaars; hij schaalt met het aantal verbindingen, niet met het aantal compilaties, en een kleine instantie volstaat voor de hier bestudeerde belastingen. Zijn configuratie, niet zijn omvang, is wat telt (§9.3).
+
+#### 9.2.2 Applicatiereplica's
+
+Deze dragen de compilatiebelasting en vormen de enige laag die met de gelijktijdigheid schaalt. Dimensioneer elke replica volgens de regels van §8 — geheugen vóór cores, daarna de klok — en stel het aantal replica's vervolgens zo in dat het de piekgelijktijdigheid gedeeld door het plafond per replica dekt. Replica's bevatten niets duurzaams: hun lokale schijf bevat compilatie-scratch en een uitvoercache, die allebei reconstrueerbaar zijn. Dit maakt het veilig om ze vrij toe te voegen en te verwijderen, en het is de moeite waard dit te verifiëren in plaats van aan te nemen, omdat één verkeerd geconfigureerd `filestore`-pad de laag ongemerkt in een stateful laag verandert.
+
+#### 9.2.3 Toestand
+
+Redis, MongoDB en een S3-compatibele objectopslag, op aparte hosts. Redis is de dragende component en de minst voor de hand liggende: het bevat de sessieopslag en de live documentbuffer, waardoor een compilatie die naar een willekeurige replica wordt gerouteerd toetsaanslagen ziet die op een andere replica zijn ingevoerd. Een beheerder die Redis als cache behandelt en het dimensioneert op eviction, krijgt compilaties van verouderde documenten die buitengewoon moeilijk te diagnosticeren zijn, omdat er niets faalt — de uitvoer is alleen fout. MongoDB schaalt met het aantal projecten en niet met de compilatiesnelheid. De objectopslag is optioneel bij één replica en verplicht daarboven.
+
+#### 9.2.4 De enkele instantie
+
+`git-bridge` bewaart repository's op de lokale schijf, onderhoudt een lokale index en heeft geen replicatiepad. Het moet als precies één instantie draaien, vastgezet naast één aangewezen replica, en het is de component die de deployment niet helemaal stateless maakt. Plan de host ervan dienovereenkomstig: de schijf ervan is degene waarvan een back-up nodig is.
+
+| **Laag**      | **Aantal**           | **Schaalt met**          |
+| ------------- | -------------------- | ------------------------ |
+| Load balancer | 1–2                  | gelijktijdige verbindingen |
+| Applicatie    | $\lceil N/C\rceil$ | piek aan gelijktijdige compilaties |
+| Redis         | 1 (+replica)         | actieve bewerkingssessies |
+| MongoDB       | 1 (+replica)         | opgeslagen projecten     |
+| Objectopslag  | 1 cluster            | totaal aantal projectbytes |
+| `git-bridge`  | precies 1            | repository's op schijf   |
+
+**Tabel 4.** Referentielagen. Alleen de applicatielaag schaalt met de gelijktijdigheid; de dimensionering ervan is het onderwerp van §8.
+
+### 9.3 Routering is het deel dat gemakkelijk misgaat
+
+Drie soorten verzoeken moeten drie verschillende bestemmingen bereiken, en de standaardconfiguratie met één regel voldoet aan hooguit twee daarvan.
+
+Compilatieverkeer onder `/project/` moet worden verdeeld via consistent hashing op de projectidentifier, zodat de compilatiecache van een project bij één replica blijft. We gebruiken HAProxy's `balance hash path,field(3,/)` met `hash-type consistent` en `hash-balance-factor 150`. De keuze is van belang bij het uitschalen: met cookie-affiniteit blijven bestaande sessies voor onbepaalde tijd vastzitten aan hun oorspronkelijke replica en krijgt een nieuw toegevoegde replica alleen nieuwe gebruikers, waardoor de machine waarvoor een beheerder net heeft betaald niets opvangt van de belasting die de aanleiding voor de aankoop was. Consistent hashing herverdeelde in onze configuratie bij het uitschalen 35% van de projecten, tegenover 0% bij cookies.
+
+Sessieverkeer is anders. Wanneer de WebSocket-upgrade mislukt en `socket.io` terugvalt op XHR-polling, moeten opeenvolgende polls van één sessie één replica bereiken, en het pad bevat geen projectidentifier om op te hashen. Dit verkeer heeft een aparte backend met cookie-affiniteit nodig. We hebben deze splitsing ontworpen maar niet gedeployed; we markeren het als een lacune in plaats van het te claimen.
+
+Ten slotte moet `/git/` de replica bereiken waarnaast `git-bridge` draait. Het wordt naar die replica gerouteerd en niet rechtstreeks naar `git-bridge`, omdat de bridge zijn callbacks authenticeert tegen de OAuth-endpoints van de applicatie en blob-URL's via de applicatie resolvet; het omzeilen van de replica breekt de authenticatie in plaats van iets te verbeteren.
+
+### 9.4 Inschalen vereist een drainbuffer
+
+Een replica verwijderen is niet symmetrisch met er een toevoegen: een lopende compilatie gaat verloren en de gebruiker ziet een fout die hij niet heeft veroorzaakt. De werkbare volgorde is eerst nieuw verkeer stoppen, wachten, en pas daarna beëindigen. We hebben dit geïmplementeerd als een pre-stop-hook die de pod gedurende een configureerbaar interval vasthoudt terwijl de balancer de backend als draining markeert — kort genoeg om in enkele minuten te testen, en in productie lang genoeg voor het natuurlijke einde van een sessie: uren in plaats van seconden. Het interval is de knop die bepaalt of elasticiteit onzichtbaar of tergend is.
+
+Nog een beperking ontdekten we door meting in plaats van door ontwerp: autoscaling op basis van CPU werkt niet voor deze workload. De eigen benutting van de applicatiepod bedroeg 22 m core tegenover een nodetotaal van 3997 m core, omdat het compilatiewerk plaatsvindt in sibling-containers die niet aan de pod worden toegerekend. Elk signaal dat wordt gebruikt om deze laag te schalen, moet het aantal actieve compilatiecontainers tellen, niet de CPU van de pod.
+
+## 10. Implicaties buiten Overleaf
+
+Niets in §4.2 of §4.3 is specifiek voor de code van Overleaf. De gemeten wetmatigheden volgen uit drie eigenschappen die elke gehoste LaTeX-service gemeen heeft: de werkeenheid is een single-threaded proces, ze is geïsoleerd in een container, en haar working set is een grote alleen-lezen boom die de paginacache moet vasthouden. Drie consequenties zijn direct overdraagbaar naar iedereen die zo'n service bouwt.
+
+### 10.1 Voorzie eerst in geheugen, daarna in cores
+
+Het sterkste resultaat van de matrix is negatief: onder 16 GiB is het aantal cores vrijwel irrelevant, en pas bij 48 GiB onderscheiden configuraties met 4, 8 en 16 vCPU's zich überhaupt (143, 268, 331). Een beheerder die de conventionele regel leest als "voeg een core toe per vijf gebruikers", koopt de verkeerde resource. Het mechanisme is de gedeelde paginacache over de distributieboom, en het is een eigenschap van de omvang van TeX Live en niet van een bepaalde front-end.
+
+### 10.2 De toelatingssnelheid is een resource, en wordt meestal vergeten
+
+Bij $N=1024$ hield onze server nooit meer dan 205 actieve sandboxes (figuur 7b), ook al kwam elk verzoek tegelijk binnen. Het aanmaken van containers, niet het compileren, was de beperkende factor — in lijn met meetstudies die de opstartkosten van containers toeschrijven aan runtime-overhead en niet aan de imagegrootte \[19, 20]. Een service die alleen CPU en geheugen dimensioneert, zal merken dat haar burstgedrag wordt bepaald door een grootheid die ze nooit heeft gemeten. De praktische vorm hiervan is de aanbeveling van §8: begrens de toelating bewust, want een wachtrij die je kiest is beter dan een wachtrij die je ontdekt.
+
+### 10.3 Een sandbox die langer leeft dan zijn compilatie maakt het model ongeldig
+
+Elk capaciteitscijfer hier gaat ervan uit dat de container wordt aangemaakt, één compilatie uitvoert en stopt — een levensduur van tientallen seconden en een bezettingsgraad van bijna één alleen zolang hij draait. Twee recente ontwerppatronen doorbreken die aanname, en ze doen dat op dezelfde manier.
+
+Het eerste is de persistente sandbox per gebruiker. Elke gebruiker een vaste privéomgeving toewijzen verandert een statistisch gemultiplexte pool in een verzameling reserveringen: een service die via time-sharing 256 gelijktijdige compilaties vanaf 64 cores kan bedienen, kan slechts 16 gebruikers bedienen als elk vier toegewezen cores krijgt — een orde van grootte minder voor dezelfde hardware. Onze gegevens kwantificeren de kosten van die keuze in plaats van ertegen te pleiten: reserveringen kopen voorspelbaarheid, en de wisselkoers bedraagt ongeveer $16\times$ bij het werkpunt dat we aanbevelen.
+
+Het tweede, en nieuwere, is de AI-agent die de sandbox met de compiler deelt. Op platforms voor agent-ondersteund schrijven kan dezelfde container die XeLaTeX uitvoert ook een langlopende codeeragent hosten, zodat hij continu bezet is in plaats van in bursts. Praktijkmensen melden precies het symptoom dat het model voor zulke deployments voorspelt — aanhoudende traagheid bij bescheiden gebruikersaantallen \[15]. De wisselwerking is het waard om nauwkeurig te beschrijven, omdat het niet simpelweg "meer belasting" is. Drie van onze bevindingen versterken elkaar. De bezetting is niet langer bursty, dus de time-sharingwet van §4.2 geldt voor de hele populatie tegelijk in plaats van voor het deel dat op dat moment compileert. De paginacache, die het superlineaire geheugenrendement van §4.1 oplevert, wordt nu gedeeld met de eigen working set van een agent en blijft niet meer warm voor TeX. En de ontbrekende geheugenlimiet voor containers uit §6.2 wordt veel gevaarlijker, omdat een container die nooit stopt zijn geheugen nooit teruggeeft.
+
+We hebben zo'n platform niet gemeten en doen geen uitspraak over een specifiek product. Wat we wel kunnen zeggen, is wat onze cijfers impliceren voor het ontwerp: een architectuur die elke gebruiker een langlevende sandbox met meerdere cores geeft, moet worden gedimensioneerd als reserveringssysteem en niet op basis van de hier gerapporteerde gelijktijdigheidscijfers, en de capaciteit die ze kan verwachten ligt dichter bij het aantal cores gedeeld door het aantal cores per gebruiker dan bij iets in tabel 1.
+
+## 11. Bedreigingen voor de validiteit
+
+### 11.1 Eén document
+
+Alle metingen gebruiken één XeLaTeX-document van 63 pagina's. Absolute capaciteiten zullen voor andere documenten verschillen; de schaalwetten, die verhoudingen zijn, zouden dat niet moeten doen. Een document met een aanzienlijk grotere resident set zou de geheugenmuur verschuiven zonder het superlineaire karakter ervan te veranderen.
+
+### 11.2 Gevirtualiseerde host
+
+Gasten draaien onder KVM op één fysieke machine, dus absolute getallen bevatten virtualisatie-overhead en de gasten delen een paginacache en NVMe-apparaat van de host. We hebben de grootste verstorende factor beperkt door niet-gerelateerde gasten uit te schakelen, nadat we hadden vastgesteld dat geheugendruk op de host de load averages in de gast bij identieke gelijktijdigheid met meer dan $3\times$ opdrijft.
+
+### 11.3 Gelijktijdige aankomst
+
+Elke compilatie wordt op één moment gestart, wat het slechtste geval is. Echte gebruikers komen binnen als een stochastisch proces, dus een deployment die op basis van onze cijfers is gedimensioneerd, heeft marge in plaats van een tekort — maar de piek aan het einde van een inleverdeadline ligt dichter bij ons model dan bij een Poisson-model.
+
+### 11.4 Randconfiguraties
+
+Bij 2 GiB ligt het systeem zo dicht bij instorting dat herhaalde runs van dezelfde configuratie één compilatie kunnen verschillen. We rapporteren de conservatieve waarde en trekken in dat regime geen conclusies uit verschillen van $\pm 1$.
+
+## 12. Beschikbaarheid
+
+Het geteste systeem, de deploymenttools en het upstreamproject waarvan het is afgeleid, zijn allemaal openbaar:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Deploymenttoolkit — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Documentatie — [https://ayakaleaf-pro.ayaka.space](/nl)
+* Upstream Overleaf — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* TeX Live-compilatie-images — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Elke bronlocatie die we citeren, wordt gegeven als pad relatief aan de repository met een regelnummer ten opzichte van Ayakaleaf Pro v6.2.2, en de twee upstream-commits die we dateren (`9a519f0d3d`, `5d472e9b38`) zijn bereikbaar in de geschiedenis van Overleaf.
+
+## 13. Bijdragen
+
+Musicminion ontwierp de studie, leverde en beheerde de testopstellingen, stuurde de onderzoekslijn en verifieerde elke hier gerapporteerde meting. Claude Opus 5 (Anthropic) bouwde en bediende de benchmarkopstelling, automatiseerde de deployments, voerde de broncode-archeologie uit, maakte de figuren en schreef de eerste versie van het manuscript. Beide auteurs hebben de definitieve tekst beoordeeld. Waar een run als besmet wordt gerapporteerd — de meetreeks met 1021 sessies uit §4.3 en het afwijkende niveau $N=256$ uit §4.1 — werd het defect tijdens de review gevonden en werd de run vóór publicatie herhaald in plaats van stilzwijgend weggelaten.
+
+Lezers moeten er rekening mee houden dat het auteurschapsbeleid van ACM, IEEE en de ICMJE het auteurschap momenteel voorbehoudt aan partijen die verantwoording voor een werk kunnen afleggen, en zou vereisen dat de bijdrage van de tweede auteur als vermelding wordt vastgelegd in plaats van als auteursnaam. We vermelden de taakverdeling hier expliciet, zodat het verslag onder beide conventies juist is.
+
+## 14. Conclusie
+
+Capaciteitsplanning voor zelf gehoste Overleaf is geen kwestie van het schalen van één resource. Drie bevindingen zouden de aanpak moeten veranderen.
+
+Ten eerste doet het aantal cores er onder 32 GiB gastgeheugen nauwelijks toe: bij 16 GiB verschillen de capaciteiten van gasten met 4, 8 en 16 vCPU's minder dan 8%. Het geheugen bepaalt, via de gedeelde paginacache over de TeX Live-boom, de limiet; cores beginnen pas mee te tellen zodra er ruim geheugen is.
+
+Ten tweede wegen twee softwareparameters zwaarder dan de hardware. Het opheffen van het hardgecodeerde plafond van 65 compilaties in CLSI en het verhogen van de standaard-compilatietime-out van 180 s brachten een gast met 8 vCPU / 48 GiB van 64 naar 268 gelijktijdige compilaties — een factor 4,2 zonder extra hardware. Geen van beide is te achterhalen uit de configuratiedocumentatie; één ervan is helemaal niet configureerbaar.
+
+Ten derde is de vraag "hoeveel gelijktijdige gebruikers ondersteunt deze machine" onvoldoende gespecificeerd. Gelijktijdigheid in dit systeem is zuivere time-sharing, en de capaciteit is wat de time-out toelaat. De eerlijke vorm van het antwoord vermeldt beide: _deze machine bedient_ $N$ _gelijktijdige compilaties als gebruikers_ $T$ _seconden willen wachten_, waarbij $N$ en $T$ samenhangen via vergelijking (1).
+
+We rapporteren ook een latent defect: de geheugenlimiet per container in de Docker-runner is sinds 2018 ineffectief, zowel qua grootte als qua plaatsing. Het praktische effect is dat geheugenuitputting op een kleine deployment de hele service platlegt in plaats van alleen de verantwoordelijke compilatie.
+
+## Referenties
+
+\[1] Overleaf. _Hardware requirements_, on-premises-documentatie. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, on-premises-documentatie. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, on-premises-documentatie. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Source repository_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Wenen, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Praktijkmeldingen over aanhoudende latentie op platforms voor agent-ondersteund schrijven die een persistente codeeragent samen met de LaTeX-compiler in een sandbox per gebruiker onderbrengen. We citeren dit als gerapporteerde operationele ervaring, niet als gecontroleerde meting; we hebben zo'n platform niet gebenchmarkt.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

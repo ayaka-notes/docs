@@ -1,0 +1,151 @@
+---
+title: Mikro hizmetler
+icon: microchip
+---
+
+Overleaf Server CE ve Overleaf Pro kurulumlarını dağıtmanın ve yönetmenin önerilen yolu Toolkit kullanmaktır.
+
+Toolkit, gerekli mikro hizmetlerin orkestrasyonunu soyutlayan bazı özel betikler aracılığıyla Overleaf kurulumunuzun oluşturulmasını basitleştirir. Paketle birlikte gelen başlatma betiğini çalıştırmanız, kalıcı depolama yollarınız gibi birkaç yapılandırma seçeneği sağlamanız yeterlidir; Toolkit, Overleaf Server CE veya Pro kurulumunuzu oluşturan mikro hizmetlerin hazırlanması ve birbirine bağlanmasıyla ilgilenir.
+
+Bu sayede kullanıcı deneyimini özelleştirmeye ve şirket içi kurulumunuzu oluşturan belirli özellikleri uygulamaya odaklanabilirsiniz. Toolkit tüm karmaşıklığı arka planda halleder ve Overleaf kurulumunuzun basitleştirilmiş bir şekilde dağıtılmasını sağlar.
+
+<Info>
+
+Tarihsel nedenlerle ana Overleaf konteynerinin adı `sharelatex`'tir ve `sharelatex/sharelatex` Docker imajını temel alır. Bunun nedeni, teknolojinin Overleaf ile birleştirilen ShareLaTeX kod tabanına dayanmasıdır. Daha fazla ayrıntı için [bu blog yazısına](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf) bakın. Gelecekte bir noktada bu ad, Overleaf adlandırma şemasına uyacak şekilde değiştirilecektir.
+
+</Info>
+
+#### Mimari
+
+Overleaf konteynerinin içinde yazılım, `runit` tarafından yönetilen bir dizi mikro hizmet olarak çalışır. Konteyner içindeki daha ilgi çekici dosyalardan bazıları şunlardır:
+
+* `/etc/service/`: mikro hizmetler için başlatma dosyaları.
+* `/var/log/overleaf/`: her mikro hizmetin günlükleri.
+* `/overleaf/services/`: çeşitli mikro hizmetlerin kodu.
+* `/var/lib/overleaf/`: kalıcı veriler için bağlama noktası (ana makinede `OVERLEAF_DATA_PATH` ile belirtilen dizine karşılık gelir).
+
+#### MongoDB ve Redis Konteynerleri
+
+Overleaf iki harici veritabanına bağlıdır: MongoDB ve Redis. Varsayılan olarak Toolkit, Overleaf konteynerine ek olarak bu veritabanlarının her biri için bir konteyner hazırlar; böylece toplamda üç Docker konteyneri olur.
+
+<Info>
+
+Mevcut bir MongoDB veya Redis örneğine bağlanmayı tercih ediyorsanız, bunu [overleaf.rc](/tr/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file) yapılandırma dosyasında uygun ayarları yaparak gerçekleştirebilirsiniz.
+
+</Info>
+
+#### Düzenleyici ve derleme süreci
+
+Bu bölüm, belgelerin işlenmesine ve derleme sürecine genel bir bakış sunar.
+
+<Info>
+
+Bu sayfa, derleme sürecini yalnızca Overleaf Pro'da mevcut olan Sandboxed Compiles ile açıklar. Server CE'de derleme süreci basit alt süreçler kullanır — bir **konteynere** atıfta bulunan öğeleri tek bir **derlemeyi alt süreçte çalıştır** öğesiyle değiştirin.
+
+</Info>
+
+Bileşenler / Aktörler:
+
+* `user` — Uygulamanın bir kullanıcısı
+* `editor` — Tarayıcıda çalışan istemci uygulaması
+* `clsi` — PDF derlemek için kullanılan mikro hizmet
+* `document-updater` — Belge güncellemelerini işlemek için kullanılan mikro hizmet
+* `filestore` — İkili dosyaları işleyen mikro hizmet
+* `real-time` — Web soketlerini işlemek için kullanılan mikro hizmet
+* `web` — API isteklerini işlemek için kullanılan (pek de mikro olmayan) hizmet
+
+**Redis önbelleğe alma**
+
+* **user**: düzenleyici sayfasını yükler
+* **editor**: web soketi açar
+* **editor**: web soketi üzerinden bir belgeyi açma isteği gönderir
+  * **real-time** -> **document-updater**: belge MongoDB'den Redis'e yüklenir
+* **editor**: web soketi üzerinden belge güncellemesi gönderir
+  * **real-time** -> **document-updater**: belge Redis'te güncellenir
+* **editor**: daha fazla derleme isteği gönderir
+  * Son aktarımdan (flush) bu yana 5 dakika geçtikten sonra (belge başına):
+    * **document-updater**: belgeyi Redis'ten MongoDB'ye aktarır
+* **editor**: daha fazla güncelleme gönderir
+  * her 100 güncellemede bir (belge başına):
+    * **document-updater**: belge geçmişini Redis'ten MongoDB'ye aktarır
+* **user**: düzenleyiciden ayrılır/tarayıcı sekmesini kapatır
+  * 5 dakika sonra
+    * **real-time**: başka ortak çalışan olup olmadığını kontrol eder, yoksa:
+      * **real-time** -> **document-updater**: belgeleri Redis'ten MongoDB'ye aktarır
+
+**MongoDB'den Redis'e okuma**
+
+* **document-updater** -> **web** -> **docstore**: MongoDB'den okuma
+
+**Redis'ten MongoDB'ye aktarma**
+
+* **document-updater** -> **web** -> **docstore**: MongoDB'ye yazma
+
+**Derleme — "full" senkronizasyon modu**
+
+* **editor**: senkronizasyon modu "full" olarak ayarlanmış bir derleme isteği gönderir
+* **web** -> **document-updater**: tüm belgeler Redis'ten MongoDB'ye aktarılır
+* **web** -> **docstore**: tüm belgeler MongoDB'den indirilir
+* **web** -> **clsi**: derleme isteği `clsi`'ye gönderilir; istek şunları içerir:
+  * senkronizasyon modu
+  * dosya ağacının bir hash'i -> "proje durumu"
+  * tüm belgeler içerikleriyle birlikte -> 7MB istek gövdesi sınırına tabidir
+  * ayrı olarak indirilecek ikili dosya URL'leri
+* **clsi**: diskteki durumu senkronizasyon modu ve "proje durumu" ile kontrol eder
+  * bu tam bir senkronizasyon olduğundan önceki disk durumu göz ardı edilebilir
+* **clsi**: derleme dizinini temizler
+* **clsi**: tüm belgeleri derleme dizinine yazar
+* **clsi**: tüm ikili dosyaları derleme dizinine yazar
+  * `clsi` dosyaları proje başına yerel bir önbellekten kopyalar
+  * önbellekte bulunamazsa:
+    * **clsi** -> **filestore**: dosyaları indirir
+* **clsi**: "proje durumunu" yazar
+* **clsi**: istenen yapılandırmaya sahip Docker konteynerinin var olduğundan emin olur
+  * konteyner seçeneklerini oluşturur, texlive sürümünü içerir
+  * seçeneklerin hash'ini alır
+  * konteyner adı: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: konteyneri başlatır ve stdout/stderr çıktısını belleğe aktarır -> sınır 2MB
+* **clsi**: durdurulan konteyneri yerinde bırakır -> 24 saat sonra temizlenir
+* **clsi**: stdout/stderr çıktısını diske yazar
+* **clsi**: çıktı dosyalarını benzersiz bir çıktı dizinine kopyalar
+  * build-id, 8 rastgele bayt ile ms hassasiyetinde bir zaman damgasından oluşur
+  * son 3 (anonim) / son 1 (oturum açmış kullanıcı) derleme klasörü dışındakilerin tümünü siler
+* **clsi**: derleme başarısız oldu/zaman aşımına uğradı
+  * derleme önbelleğini siler — kısmi dosyalar/bozuk önbellek içerebilir
+* **editor**: output.log ve output.pdf dosyalarını indirir
+
+**Derleme — "incremental" senkronizasyon modu**
+
+* **editor**: senkronizasyon modu "incremental" olarak ayarlanmış bir derleme isteği gönderir
+* **web** -> **document-updater**: Redis'ten belgeleri alır
+  * "proje durumu" hash'i de Redis'te saklanır
+  * **web**, dosya ağacının hash'ini `document-updater`'a gönderir ve `document-updater` uyuşmazlık durumunda artımlı derlemeyi tam derlemeye dönüştürebilir
+    * editor'ün "full" derleme istediği durumda gerçekleştirilen derleme sürecine bakın
+* **web** -> **clsi**: derleme isteği `clsi`'ye gönderilir; istek şunları içerir:
+  * senkronizasyon modu
+  * dosya ağacının bir hash'i -> "proje durumu"
+  * Redis'teki tüm belgeler içerikleriyle birlikte -> 7MB istek gövdesi sınırına tabidir
+  * ikili dosya yok
+* **clsi**: diskteki durumu senkronizasyon modu ve "proje durumu" ile kontrol eder
+  * bu artımlı bir senkronizasyon olduğundan "proje durumu" eşleşmelidir
+  * uyuşmazlık durumunda: 409 ile yanıt verir, web'in "full" senkronizasyonla yeniden denemesini sağlar
+    * editor'ün "full" derleme istediği durumda gerçekleştirilen derleme sürecine bakın
+* **clsi**: güncellenen belgeleri derleme dizinine yazar
+* **clsi**: istenen yapılandırmaya sahip Docker konteynerinin var olduğundan emin olur
+  * konteyner seçeneklerini oluşturur, texlive sürümünü içerir
+  * seçeneklerin hash'ini alır
+  * konteyner adı: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: konteyneri başlatır ve stdout/stderr çıktısını belleğe aktarır -> sınır 2MB
+* **clsi**: durdurulan konteyneri yerinde bırakır -> 24 saat sonra temizlenir
+* **clsi**: stdout/stderr çıktısını diske yazar
+* **clsi**: çıktı dosyalarını benzersiz bir çıktı dizinine kopyalar
+  * build-id, 8 rastgele bayt ile ms hassasiyetinde bir zaman damgasından oluşur
+  * son 3 (anonim) / son 1 (oturum açmış kullanıcı) derleme klasörü dışındakilerin tümünü siler
+* **clsi**: derleme başarısız oldu/zaman aşımına uğradı
+  * derleme önbelleğini siler — kısmi dosyalar/bozuk önbellek içerebilir
+* **editor**: output.log ve output.pdf dosyalarını indirir
+
+**Derleme — modlar arasında geçiş**
+
+* **editor**: bir derleme hatası gözlemler, sonraki derleme "full" derlemedir
+* **editor**: başarılı bir derleme gözlemler, sonraki derleme "incremental" derlemedir

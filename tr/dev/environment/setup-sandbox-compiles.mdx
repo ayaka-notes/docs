@@ -1,0 +1,123 @@
+---
+title: Sandbox Compiles Kurulumu
+icon: box-archive
+---
+
+Geliştirme için sandbox compile kurmak istiyorsanız, geliştirme ve üretim ortamları arasında küçük bir fark vardır. Dikkat etmeniz gereken 3 şey var:
+
+* Dosya İzinleri Sorunu
+* history-v1 ile filestore Arasında Volume Paylaşımı
+* Alt Dizinler Sorunu
+
+### Sandbox Compiles'ı Etkinleştirme
+
+Burada, Sandbox Compiles'ı Overleaf CE'de yaptığımız gibi etkinleştirmemiz yeterlidir. Ancak yalnızca kullanıcıya dikkat etmemiz gerekir. Burada onu root olarak ayarlıyoruz.
+
+Üretim ortamında, Overleaf konteyneri ile TeX derleme konteyneri arasında ortak kullanıcı olarak www-data kullanıyoruz. Ancak geliştirme ortamında konteynerdeki varsayılan kullanıcı node'dur ve bunu bağlayacak bir www-data kullanıcısı yoktur. Bu yüzden geçici çözüm olarak root kullanıyoruz.
+
+<Warning>
+
+Lütfen kendi oluşturduğunuz imajı kullanmayın, bir dizi hatayla karşılaşabilirsiniz.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Dosya İzinlerini Düzeltme
+
+LaTeX, kardeş konteynerlerde `TEXLIVE_IMAGE_USER` ortam değişkeninde belirtilen kullanıcı olarak çalışır. Yukarıdaki örnekte bu, uid değeri `0` olan `root` olarak ayarlanmıştır. root kullanıcısının `compiles` alt klasörlerine yazma izni olmadığı için bu, yukarıdaki izinlerle bir sorun yaratır.
+
+Hızlı bir çözüm, `compiles` için grup sahipliğini `root` grubuna vermek ve okuma-yazma izinleri tanımak, ayrıca yeni alt klasörlerin de bu sahipliği devralması için `setgid` ayarlamaktır:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Ayrıntılı dokümantasyon için `services/clsi/README.md` dosyasına bakabilirsiniz.
+
+### history-v1 ile filestore Arasında Volume Paylaşımı
+
+Varsayılan olarak filestore, Overleaf'te s3 ile diğer servisler arasında bir köprü görevi görür. Ancak Overleaf CE veya Server Pro'da tüm dosyalar varsayılan olarak yerel olarak depolanır. Bu nedenle Overleaf oldukça dolambaçlı bir yöntem getirmiştir.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Bu arada `data/history` de history servisi tarafından kullanılır. Bu şekilde farklı mikro servisler aynı veriyi paylaşabilir. Geliştirme ortamında filestore servisinize `history-v1-buckets` volume'unu eklemeniz gerekir. Aksi takdirde **clsi, filestore servisinden blob dosyalarını çekemez**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+Ayrıca `dev.env` ayarlarına BUCKET adını eklemeniz gerekir:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Alt Dizinleri Kullanma
+
+Filestore varsayılan olarak useSubdirectories değerini true olarak kullanır; ancak geliştirme ortamında history v1 **tüm verileri düzleştirir.** Bu da bazı çakışmalara yol açar. Bunu düzeltmek için aşağıdakileri eklemeniz gerekir:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+history v1'de tüm `project_blobs` dosyaları başlangıçta şu şekilde depolanır:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Alt dizin moduna geçmek için useSubdirectories değerini `true` olarak ayarlamanız gerekir. Artık blob içindeki orijinal `_` karakteri `/` ile değiştirilecektir.
