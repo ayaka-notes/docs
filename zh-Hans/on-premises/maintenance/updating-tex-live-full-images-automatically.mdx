@@ -1,0 +1,93 @@
+---
+title: 自动更新 TeX Live Full 镜像
+description: 使用 cron 刷新兼容 Overleaf 的沙盒编译器所使用的 TeX Live Docker 镜像。
+icon: arrows-rotate
+---
+
+通常，每次运行 `bin/up` 时，[using-the-toolkit](/zh-Hans/on-premises/installation/using-the-toolkit  "mention") 都会自动更新我们的 TeX Live full 镜像。为了避免手动更新，你可以使用以下脚本自动更新 TeX Live 沙盒镜像。将其添加为 cron 任务，并确保 cron 用户有权限运行 `docker`。运行 `crontab -e`，在末尾添加以下行。
+
+```cron title="crontab -e"
+0 * * * * /usr/bin/flock -n /tmp/pull-texlive.lock /usr/local/bin/pull-texlive.sh
+```
+
+`flock -n` 会在上一次运行仍持有锁时跳过本次运行，因此缓慢的拉取永远不会堆积。
+
+<Tabs>
+<Tab title="直接连接">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+IMAGE="ghcr.io/ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) ====="
+
+if timeout 50m docker pull "$IMAGE:$tag"; then
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+
+<Tab title="使用镜像站">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+MIRROR="ghcr.nju.edu.cn"
+CANONICAL="ghcr.io"
+REPO="ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) via $MIRROR ====="
+
+if timeout 50m docker pull "$MIRROR/$REPO:$tag"; then
+  # Retag to the canonical name the compiler is configured with. This only
+  # adds a second name for the same layers; nothing is copied.
+  docker tag "$MIRROR/$REPO:$tag" "$CANONICAL/$REPO:$tag"
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+</Tabs>
+
+**为什么按小时轮换而不是一次性拉取全部镜像**：标签由时钟推导而来（自纪元以来的小时数对标签数量取模），因此该任务是无状态的——无需记录"上次进行到哪里"，在重启或错过某个小时后，周期会自行重新对齐。每次运行只处理一个标签；当镜像仓库的摘要没有变化时，拉取只是一次清单检查（`Image is up to date`），几秒钟内即可完成。真正的更新每小时最多下载一个镜像，并受 `timeout 50m` 限制，而 `docker image prune -f` 会清理因标签变动而成为孤立的镜像层。
+
+检查同步是否正常：
+
+```bash
+tail -20 /var/log/pull-texlive.log     # each run ends with "OK <tag>" or "FAIL <tag>"
+grep -c '^FAIL' /var/log/pull-texlive.log
+```
+
+当发布新的 TeX Live 版本时，将其标签追加到 `TAGS` 数组中即可——轮换周期会自动适应。主机关机期间的小时会被跳过而不会排队；受影响的标签只需在下一轮时刷新即可。
