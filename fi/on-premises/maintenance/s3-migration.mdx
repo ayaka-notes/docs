@@ -1,0 +1,179 @@
+---
+title: S3-siirto
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+## S3-siirto
+
+<Info>
+
+Nämä ohjeet koskevat versioita v5.x ja uudempia. Jos noudatat tätä opasta aiemmassa versiossa, käytä polkujen nimissä `sharelatex`-nimeä `overleaf`-nimen sijaan ja ympäristömuuttujissa `SHARELATEX_`-etuliitettä `OVERLEAF_`-etuliitteen sijaan.
+
+</Info>
+
+<Check>
+
+**Kuulisimme mielellämme kokemuksistasi!** Jos haluat kertoa meille, kuinka monta tiedostoa siirsit, mikä niiden kokonaismäärä oli ja kuinka kauan siirto kesti, lähetä sähköpostia osoitteeseen [`ayaka-notes@outlook.com`](mailto:support@overleaf.com) .
+
+</Check>
+
+Tämä opas käy läpi siirtymisen levytallennuksesta S3-yhteensopivaan objektitallennukseen. Se viittaa [S3-määritystä](/fi/on-premises/configuration/overleaf-toolkit/s3) käsittelevän johdantodokumentin osioihin.
+
+### Vaatimukset
+
+* S3-yhteensopiva objektitallennus, johon yhdistetään; vaihtoehdot löydät kohdasta [#s3-setup](/fi/on-premises/configuration/overleaf-toolkit/s3#s3-setup  "mention")
+* Vapaata levytilaa olemassa olevien tietojen siirtämiseen, suunnilleen nykyisen levyllä olevan koon verran
+* Huoltoikkuna varsinaista siirtoa varten
+* Täydellinen varmuuskopio määritykset mukaan lukien, jotta siitä voidaan tarvittaessa palauttaa
+
+### Siirtoon tarvittavan levytilan arviointi
+
+Nykyisen levynkäytön voi laskea `du`-komennolla:
+
+```shell
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/user_files
+
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/template_files
+```
+
+Jos nykyisellä palvelimella ei ole riittävästi levytilaa, kokeile liittää palvelimeen toinen levy.
+
+<Info>
+
+Historiahakemistoilla on jo oikea rakenne. Voit ladata ne suoraan liitetystä (bind-mount) lähdekansiosta, mikä ei vaadi lainkaan lisälevytilaa.
+
+</Info>
+
+### Siirron vaiheet
+
+#### Vaihe 0: sammuta instanssi
+
+Meidän on varmistettava, että kaikki käyttäjä- ja mallitiedostot siirretään. Instanssi kannattaa sammuttaa, jotta uusia ladattuja tiedostoja ei jää siirtämättä.
+
+Sammutusmenettely on kuvattu johdonmukaisen varmuuskopion tekemistä käsittelevässä oppaassamme.
+
+#### Vaihe 1: kirjoita hakemistorakenne uudelleen
+
+Projektitiedostojen hakemistorakenne on kirjoitettava uudelleen niiden lataamiseksi S3:een. Filestoren paikallisen tallennuksen hakemistorakenne on `<project-id>_<file-id>` ja S3:n hakemistorakenne on `<project-id>/<file-id>`.
+
+Seuraavassa hakemistoa `/srv/overleaf-s3-migration` käytetään tiedostojen tallentamiseen uudessa hakemistorakenteessa.
+
+Rakenteen voi kirjoittaa uudelleen `tar`-komennolla:
+
+```shell
+mkdir -p /srv/overleaf-s3-migration/user_files \
+         /srv/overleaf-s3-migration/template_files
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/user_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/user_files \
+  --transform=sx_x/x
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/template_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/template_files \
+  --transform=sx_x/xg
+```
+
+#### Vaihe 2: lataa tiedostot
+
+Mieltymyksesi mukaan voit ladata tiedostot S3-yhteensopivaan objektitallennukseesi joko minio mc -S3-asiakasohjelmalla tai aws cli -työkalulla.
+
+**aws cli**
+
+<Info>
+
+* Korvaa tässä `overleaf-user-files`, `overleaf-template-files`, `overleaf-project-blobs` ja `overleaf-chunks` omien S3-säiliöidesi nimillä.
+* Korvaa myös `/srv/overleaf-bind-mount` `/var/lib/overleaf`-liitoksen paikallisella polulla. Oletuksena se on `~/overleaf_data` docker-compose.yml-käyttöönotossa ja `<toolkit-checkout>/data/overleaf` Toolkitia käytettäessä.
+
+</Info>
+
+```shell wrap
+aws s3 sync /srv/overleaf-s3-migration/user_files s3://overleaf-user-files
+aws s3 sync /srv/overleaf-s3-migration/template_files s3://overleaf-template-files
+
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3://overleaf-project-blobs
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-chunks s3://overleaf-chunks
+```
+
+**minio mc**
+
+Käytämme tässä palvelinaliasta "s3"; olet ehkä valinnut toisen nimen.
+
+```shell wrap
+mc mirror /srv/overleaf-s3-migration/user_files s3/overleaf-user-files
+mc mirror /srv/overleaf-s3-migration/template_files s3/overleaf-template-files
+
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3/overleaf-project-blobs
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-chunks s3/overleaf-chunks
+```
+
+#### Vaihe 3: käynnistä instanssi S3:een osoittavana
+
+Lisää kaikki S3:een liittyvät muuttujat määritykseesi [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3)-määritysoppaan osiossa [Muuttujien yleiskatsaus](/fi/on-premises/configuration/overleaf-toolkit/s3#overview-of-variables) kuvatulla tavalla.
+
+Docker Compose -käyttöönotoissa voit myös poistaa datahakemiston liitoksen volumes-osiosta.
+
+<Check>
+
+Pidä [väliaikaisille tiedostoille tarkoitetun työlevyn liitos](/fi/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem) paikallaan.
+
+</Check>
+
+Voit nyt käynnistää instanssin ja tarkistaa siirron:
+
+* binääritiedostojen esikatselu editorissa toimii
+* kuvia sisältävän PDF:n kääntäminen toimii
+* uusien tiedostojen lataaminen toimii
+
+### Peruuttaminen
+
+Voit peruuttaa siirron hallitusti suorittamalla vaiheet käänteisesti:
+
+1. Sammuta instanssi
+2. Peilaa tiedostot takaisin vaihtamalla lähteen ja kohteen järjestys
+3. Kirjoita uudet tiedostot takaisin paikalliseen hakemistoon käänteisellä `transform`-muunnoksella
+4. Käynnistä instanssi uudelleen vanhalla määrityksellä
+
+```shell wrap
+# When using aws cli
+aws s3 sync s3://overleaf-user-files /srv/overleaf-s3-migration/user_files
+aws s3 sync s3://overleaf-template-files /srv/overleaf-s3-migration/template_files
+aws s3 sync s3://overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+aws s3 sync s3://overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+
+# When using minio mc
+mc mirror s3/overleaf-user-files /srv/overleaf-s3-migration/user_files
+mc mirror s3/overleaf-template-files /srv/overleaf-s3-migration/template_files
+mc mirror s3/overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+mc mirror s3/overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+```
+
+```shell
+# Write files into local Server CE/Server Pro
+tar --create --directory /srv/overleaf-s3-migration/user_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/user_files \
+      --transform=sx./xx --transform=sx/x_x \
+      --wildcards '*/*/*'
+
+tar --create --directory /srv/overleaf-s3-migration/template_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/template_files \
+      --transform=sx./xx --transform=sx/x_xg \
+      --wildcards '*/*/*/*/pdf-converted-cache/*' \
+      --wildcards '*/*/*/*/pdf' \
+      --wildcards '*/*/*/*/zip'
+```
+
+<Info>
+
+Ensimmäinen muunnos poistaa ylimmän tason kansion. Toinen muunnos muuttaa hakemistorakenteen litteäksi. Jokerimerkit varmistavat, että vain tiedostot puretaan, eivät niiden yläkansioita (projektikansioita).
+
+</Info>

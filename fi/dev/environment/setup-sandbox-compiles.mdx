@@ -1,0 +1,123 @@
+---
+title: Sandbox Compiles -toiminnon määrittäminen
+icon: box-archive
+---
+
+Kehitys- ja tuotantoympäristön välillä on pieniä eroja, jos haluat määrittää Sandbox Compiles -toiminnon kehityskäyttöön. Sinun on huomioitava kolme asiaa:
+
+* Tiedosto-oikeusongelma
+* Volyymin jakaminen history-v1:n ja filestoren välillä
+* Alihakemisto-ongelma
+
+### Sandbox Compiles -toiminnon käyttöönotto
+
+Tässä meidän tarvitsee vain ottaa Sandbox Compiles käyttöön samalla tavalla kuin Overleaf CE:ssä. Ainoastaan käyttäjä on huomioitava: asetamme sen tässä arvoon root.
+
+Tuotantoympäristössä käytämme www-data-käyttäjää jaettuna käyttäjänä Overleaf-kontin ja TeX-käännöskontin välillä. Kehitysympäristössä kontin oletuskäyttäjä on kuitenkin node, eikä www-data-käyttäjää ole, johon tämän voisi kytkeä. Siksi käytämme kiertotienä root-käyttäjää.
+
+<Warning>
+
+Älä käytä itse rakentamaasi imagea, sillä saatat kohdata useita virheitä.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Tiedosto-oikeuksien korjaaminen
+
+LaTeX ajetaan rinnakkaiskonteissa käyttäjänä, joka on määritetty `TEXLIVE_IMAGE_USER`-ympäristömuuttujassa. Yllä olevassa esimerkissä sen arvo on `root`, jonka uid on `0`. Tämä aiheuttaa ongelman yllä mainittujen oikeuksien kanssa, koska root-käyttäjällä ei ole oikeutta kirjoittaa `compiles`-hakemiston alikansioihin.
+
+Nopea korjaus on antaa `root`-ryhmälle omistajuus sekä luku- ja kirjoitusoikeudet `compiles`-hakemistoon ja asettaa `setgid`, jotta myös uudet alikansiot perivät tämän omistajuuden:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Tarkemmat tiedot löydät tiedostosta `services/clsi/README.md`.
+
+### Volyymin jakaminen history-v1:n ja filestoren välillä
+
+Oletusarvoisesti filestore toimii siltana S3:n ja Overleafin muiden palveluiden välillä. Overleaf CE:ssä ja Server Prossa kaikki tiedostot kuitenkin tallennetaan oletusarvoisesti paikallisesti. Siksi Overleaf otti käyttöön hyvin kekseliään menetelmän.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Samaan aikaan history-palvelu käyttää myös `data/history`-hakemistoa. Näin eri mikropalvelut voivat jakaa samat tiedot. Sinun on lisättävä tämä `history-v1-buckets`-volyymi kehitysympäristön filestore-palveluun. Muuten **clsi ei pysty noutamaan blob-tiedostoja filestore-palvelusta**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+Lisäksi sinun on lisättävä BUCKET-nimet `dev.env`-asetuksiin:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Alihakemistojen käyttäminen
+
+Filestore käyttää oletusarvoisesti asetusta useSubdirectories arvolla true, mutta kehitysympäristössä history v1 **litistää kaikki tiedot.** Tämä aiheuttaa ristiriitoja. Korjataksesi tämän sinun on lisättävä seuraava:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+History v1:ssä kaikki `project_blobs`-tiedostot tallennetaan alun perin näin:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Sinun on asetettava useSubdirectories arvoon `true`, jotta käyttöön tulee alihakemistotila. Tällöin blobin alkuperäinen `_` korvataan merkillä `/`.

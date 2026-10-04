@@ -1,0 +1,130 @@
+---
+title: Pandoc-tuonti ja -vienti
+icon: file-lines
+---
+
+### Pandoc-tuonti / -vienti
+
+Overleaf voi muuntaa asiakirjoja LaTeX-muotoon ja LaTeX-muodosta [Pandocin](https://pandoc.org/) avulla. Muunnos ajetaan `clsi`-palvelun hallinnoimassa **hiekkalaatikoidussa Docker-kontissa**, joten ominaisuus on oletuksena pois päältä, ja se on otettava käyttöön muutamalla ympäristömuuttujalla.
+
+#### Mitä se tekee
+
+| Suunta     | Mistä → Mihin            | Muodot                     | Missä                                                                                           |
+| ---------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Tuonti** | asiakirja → LaTeX-projekti | `docx`, `markdown`       | _New Project → Import_ (lataa `.docx`- / `.md`-tiedoston ja muuntaa sen muokattavaksi `.tex`-projektiksi) |
+| **Vienti** | LaTeX-projekti → asiakirja | `docx`, `markdown`, `html` | _Menu → Download / Export_ (renderöi projektin Pandocin kautta)                              |
+
+***
+
+### Ympäristömuuttujat
+
+Merkitystä on **kahdella** muuttujalla, ja yksi samannäköinen muuttuja **ei** vaikuta.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — pääkytkin
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* Tyyppi: totuusarvo (`true` ottaa sen käyttöön; mikä tahansa muu arvo poistaa sen käytöstä).
+* **On asetettava SEKÄ `web`- ETTÄ `clsi`-palveluun.** Ne ovat erillisiä prosesseja, joilla on erilliset määritykset:
+  * `web` lukee sen asetukseen `enablePandocConversions` (`services/web/config/settings.defaults.js`). Se ohjaa tuontireittejä, vientireittejä sekä `ol-ExposedSettings.enablePandocConversions`-lippua, joka kertoo käyttöliittymälle, näytetäänkö tuonti- ja vientitoiminnot.
+  * `clsi` lukee sen asetukseen `enablePandocConversions` (`services/clsi/config/settings.defaults.cjs`). Se ohjaa päätepisteitä, jotka ajavat Pandocia.
+* Jos se on käytössä `web`-palvelussa mutta ei `clsi`-palvelussa (tai päinvastoin), käyttöliittymä näkyy, mutta muunnos epäonnistuu – pidä asetukset yhdenmukaisina.
+
+2\. `PANDOC_IMAGE` — kontti-image, jonka clsi ajaa muunnosta varten
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### Edellytykset
+
+Koska muunnokset ajetaan `clsi`-palvelun käynnistäminä Docker-kontteina:
+
+1. **`clsi`-palvelun on toimittava hiekkalaatikkotilassa ja sillä on oltava pääsy Dockeriin.** Kehityspinossa `clsi`-palvelulla on jo `SANDBOXED_COMPILES=true` ja isäntäkoneen Docker-socket (`/var/run/docker.sock`) liitettynä.
+2. **`PANDOC_IMAGE`-imagen on oltava saatavilla** kyseisellä Docker-isännällä (noudettuna tai paikallisesti rakennettuna) ennen ensimmäistä muunnosta.
+
+***
+
+### Pika-asennus
+
+Kehityspino (`develop/dev.env`) sisältää valmiiksi:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+Koska virallinen image on yksityinen, rakenna mukana toimitettu image **kerran** ennen ominaisuuden käyttöä:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Käynnistä sitten pino (uudelleen), jotta `clsi` ja `web` ottavat muuttujat käyttöön.
+
+***
+
+### Pandoc-imagen rakentaminen
+
+Tavallinen Pandoc-image toimii, koska clsi kutsuu Pandocia yleisellä tavalla (ilman mukautettuja malleja tai suodattimia). Se tarvitsee vain kolme ajonaikaista perusedellytystä, jotka kaikki hoidetaan tiedostossa `develop/pandoc/Dockerfile`:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+Rakenna ja tagaa image niin, että tagi vastaa `PANDOC_IMAGE`-muuttujaa:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Tuotannossa kiinnitä `pandoc/core` tiettyyn versioon `latest`-tagin sijaan toistettavien buildien varmistamiseksi, ja aseta `PANDOC_IMAGE` osoittamaan omaan rekisteriisi.
+
+***
+
+### Vianmääritys
+
+| Oire                                                | Todennäköinen syy                                                                             |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Tuonti- ja vientipainikkeet eivät näy               | `ENABLE_PANDOC_CONVERSIONS` ei ole `true` **web**-palvelussa                                  |
+| Käyttöliittymä näkyy, mutta muunnos epäonnistuu palvelinvirheeseen | `ENABLE_PANDOC_CONVERSIONS` ei ole asetettu **clsi**-palveluun, tai `PANDOC_IMAGE` puuttuu Docker-isännältä |
+| `clsi`-virhe imagea noudettaessa (401)              | `PANDOC_IMAGE` osoittaa yhä yksityiseen oletusimageen; rakenna oma image ja osoita siihen     |
+| Kontti ajaa `pandoc pandoc …` / väärät argumentit   | Imagessa on `pandoc`-`ENTRYPOINT`; käytä `ENTRYPOINT []`                                      |
+| Tuonnin tulos on tyhjä / zip-vaihe epäonnistuu      | `zip` ei ole asennettuna imageen                                                              |
+| Oikeusvirheitä muunnetuissa tiedostoissa            | Imagessa ei ole `tex`-käyttäjää UID:llä 1000                                                  |

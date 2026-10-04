@@ -1,0 +1,179 @@
+---
+title: Migrace na S3
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+## Migrace na S3
+
+<Info>
+
+Tyto pokyny platí pro verzi v5.x a novější. Pokud tento návod používáte pro starší verzi, použijte v názvech cest `sharelatex` místo `overleaf` a u proměnných prostředí předponu `SHARELATEX_` místo `OVERLEAF_`.
+
+</Info>
+
+<Check>
+
+**Rádi od vás uslyšíme!** Pokud se s námi chcete podělit o to, kolik souborů jste migrovali, jaký byl jejich celkový objem a jak dlouho migrace trvala, napište na [`ayaka-notes@outlook.com`](mailto:support@overleaf.com) .
+
+</Check>
+
+Tento návod vás provede migrací z diskového úložiště na objektové úložiště kompatibilní s S3. Odkazuje na části úvodního dokumentu [Nastavení S3](/cs/on-premises/configuration/overleaf-toolkit/s3).
+
+### Požadavky
+
+* Objektové úložiště kompatibilní s S3, se kterým lze komunikovat; možnosti viz [#s3-setup](/cs/on-premises/configuration/overleaf-toolkit/s3#s3-setup  "mention")
+* Volné místo na disku pro migraci stávajících dat, přibližně ve velikosti aktuálních dat na disku
+* Okno údržby pro samotnou migraci
+* Úplnou zálohu včetně konfigurace, aby z ní bylo možné obnovit
+
+### Odhad potřebného místa na disku pro migraci
+
+Pro výpočet aktuálního využití disku můžeme použít `du`:
+
+```shell
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/user_files
+
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/template_files
+```
+
+Pokud na aktuálním serveru nemáte k dispozici dostatek místa na disku, zkuste k serveru připojit další disk.
+
+<Info>
+
+Adresáře historie již mají správné rozložení. Můžete je nahrát přímo ze zdrojové složky připojené přes bind-mount, což nevyžaduje žádné další místo na disku.
+
+</Info>
+
+### Postup migrace
+
+#### Krok 0: vypnutí instance
+
+Musíme zajistit, aby byly migrovány všechny uživatelské soubory i soubory šablon. Nejlepší je instanci vypnout, aby se nepřehlédly nově nahrané soubory.
+
+Postup vypnutí najdete v našem návodu k provedení konzistentní zálohy.
+
+#### Krok 1: přepsání rozložení adresářů
+
+Pro nahrání do S3 musíme přepsat rozložení adresářů souborů projektů. Rozložení adresářů pro lokální úložiště ve filestore je `<project-id>_<file-id>` a rozložení adresářů v S3 je `<project-id>/<file-id>`.
+
+V následujícím textu se pro ukládání souborů v novém rozložení adresářů používá `/srv/overleaf-s3-migration`.
+
+K přepsání rozložení můžeme využít `tar`:
+
+```shell
+mkdir -p /srv/overleaf-s3-migration/user_files \
+         /srv/overleaf-s3-migration/template_files
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/user_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/user_files \
+  --transform=sx_x/x
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/template_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/template_files \
+  --transform=sx_x/xg
+```
+
+#### Krok 2: nahrání souborů
+
+Podle svých preferencí můžete k nahrání souborů do objektového úložiště kompatibilního s S3 použít S3 klienta minio mc nebo aws cli.
+
+**aws cli**
+
+<Info>
+
+* Zde byste měli nahradit `overleaf-user-files`, `overleaf-template-files`, `overleaf-project-blobs` a `overleaf-chunks` názvy svých S3 bucketů.
+* Nahraďte také `/srv/overleaf-bind-mount` lokální cestou bind-mountu `/var/lib/overleaf`. Ve výchozím nastavení je to `~/overleaf_data` v nasazení přes docker-compose.yml a `<toolkit-checkout>/data/overleaf` při použití Toolkitu.
+
+</Info>
+
+```shell wrap
+aws s3 sync /srv/overleaf-s3-migration/user_files s3://overleaf-user-files
+aws s3 sync /srv/overleaf-s3-migration/template_files s3://overleaf-template-files
+
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3://overleaf-project-blobs
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-chunks s3://overleaf-chunks
+```
+
+**minio mc**
+
+Zde používáme alias serveru „s3“; vy jste mohli zvolit jiný název.
+
+```shell wrap
+mc mirror /srv/overleaf-s3-migration/user_files s3/overleaf-user-files
+mc mirror /srv/overleaf-s3-migration/template_files s3/overleaf-template-files
+
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3/overleaf-project-blobs
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-chunks s3/overleaf-chunks
+```
+
+#### Krok 3: spuštění instance s nasměrováním na S3
+
+Přidejte do své konfigurace všechny proměnné související s S3, jak je podrobně popsáno v části [Přehled proměnných](/cs/on-premises/configuration/overleaf-toolkit/s3#overview-of-variables) v návodu k nastavení [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3).
+
+U nasazení přes Docker Compose můžete také ze sekce volumes odstranit bind-mount pro datový adresář.
+
+<Check>
+
+Ponechte prosím na místě [bind-mount pomocného disku pro dočasné soubory](/cs/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem).
+
+</Check>
+
+Nyní můžete instanci spustit a migraci ověřit:
+
+* v editoru lze zobrazit náhled binárních souborů
+* lze zkompilovat PDF s obrázky
+* lze nahrávat nové soubory
+
+### Vrácení zpět
+
+Migraci můžete elegantně vrátit zpět provedením kroků v opačném pořadí:
+
+1. Vypněte instanci
+2. Zrcadlete soubory zpět prohozením zdroje a cíle
+3. Zapište nové soubory zpět do lokálního adresáře pomocí inverzní transformace `transform`
+4. Restartujte instanci se starou konfigurací
+
+```shell wrap
+# When using aws cli
+aws s3 sync s3://overleaf-user-files /srv/overleaf-s3-migration/user_files
+aws s3 sync s3://overleaf-template-files /srv/overleaf-s3-migration/template_files
+aws s3 sync s3://overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+aws s3 sync s3://overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+
+# When using minio mc
+mc mirror s3/overleaf-user-files /srv/overleaf-s3-migration/user_files
+mc mirror s3/overleaf-template-files /srv/overleaf-s3-migration/template_files
+mc mirror s3/overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+mc mirror s3/overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+```
+
+```shell
+# Write files into local Server CE/Server Pro
+tar --create --directory /srv/overleaf-s3-migration/user_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/user_files \
+      --transform=sx./xx --transform=sx/x_x \
+      --wildcards '*/*/*'
+
+tar --create --directory /srv/overleaf-s3-migration/template_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/template_files \
+      --transform=sx./xx --transform=sx/x_xg \
+      --wildcards '*/*/*/*/pdf-converted-cache/*' \
+      --wildcards '*/*/*/*/pdf' \
+      --wildcards '*/*/*/*/zip'
+```
+
+<Info>
+
+První transformace odstraní složku nejvyšší úrovně. Druhá transformace změní rozložení adresářů na ploché. Zástupné znaky (wildcards) zajistí, že se extrahují pouze soubory, nikoli jejich nadřazené složky (projektů).
+
+</Info>

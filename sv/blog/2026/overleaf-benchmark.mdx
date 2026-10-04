@@ -1,0 +1,635 @@
+---
+title: 'Overleaf Benchmark: en djupgående undersökning av samtidig LaTeX-kompilering i Overleaf (SaaS och egenhostat)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Sammanfattning
+
+Egenhostade Overleaf-driftsättningar dimensioneras vanligen efter en enda tumregel: en CPU-kärna och en gigabyte minne per fem till tio samtidiga användare. Vi visar att denna regel inte bara är oprecis utan strukturellt felaktig, eftersom den antar att en enda resursdimension styr kapaciteten när det i själva verket är två oberoende väggar som gör det, och eftersom två mjukvaruparametrar — ingen av dem hårdvara — dominerar resultatet med faktorer på upp till fyra.
+
+Vi mäter en standardinstallation av Ayakaleaf Pro v6.2.2 med sandlådekompilering (TeX Live 2025) över 21 CPU-/minneskonfigurationer i QEMU/KVM-gäster vars värdkärnor är klocklåsta till 3,0 GHz. Arbetslasten är en verklig XeLaTeX-avhandling på 63 sidor som kompileras samtidigt av upp till flera hundra distinkta användarkonton. Vi finner att under 32 GiB gästminne är antalet kärnor nästan irrelevant — vid 16 GiB skiljer sig den uppmätta kapaciteten för gäster med 4, 8 och 16 vCPU:er med mindre än 8 % — och att kapaciteten i stället styrs av en superlinjär minnesvägg som uppstår ur den delade sidcachen över TeX Live-trädet.
+
+För att undersöka om dessa lagar håller vid en skaländring på en storleksordning upprepar vi svepet på en enda server med 64 kärnor och 995 GiB. Den klarar 1024 samtidiga kalla kompileringar med 100 % framgång — åtta gånger dess antal trådar — och vi når aldrig dess tak. Det användbara talet är inte taket utan knäet under det: svanslatensen växer med 20–40 % per fördubbling upp till $N=256$, och sedan med 190 % vid $N=512$. En kapacitet angiven som "den högsta samtidighet som inte misslyckas" skulle därför överskatta den användbara driftpunkten med en faktor fyra. På den maskinen är minnet aldrig den begränsande resursen; gränsen är CPU tillsammans med den takt i vilken containerdaemonen kan släppa in nya sandlådor, vilken mättas nära 200 oavsett hur många kompileringar som begärs.
+
+Vi identifierar vidare två effekter på implementationsnivå som är osynliga för kapacitetsplanering. För det första tillämpar CLSI ett hårdkodat tak på 65 samtidiga kompileringar som inte exponeras via någon miljövariabel; utöver det får användarna omedelbart HTTP 503 i stället för att ställas i kö. För det andra har minnesgränsen per container i Docker-körmiljön varit verkningslös sedan den infördes 2018, både till storlek och placering, så att en minnesbristhändelse slår ut hela värden i stället för en enskild kompilering. Att lyfta samtidighetstaket och höja standardtidsgränsen för kompilering från 180 s till 300 s ökar den uppmätta kapaciteten för en gäst med 8 vCPU / 48 GiB från 64 till 268 samtidiga kompileringar — en faktor 4,2 utan någon hårdvarukostnad.
+
+Slutligen visar vi att samtidighet i detta system inte köper något annat än tidsdelning, och att arbetslasten enbart begränsas av klockfrekvensen. En anpassad degraderingslag $T(N)=T_1\max(1,N/C)^{b}$ ger $b=0.914$, nära perfekt proportionell nedsaktning, och ett klocksvep över maskinens hela intervall 1,0–5,5 GHz samlar trettio mätningar på $T=(k/f)\max(1,N/C)$ med $k=27.9 GHz·s$ och en restspridning på 5,1 %. En 5,5× högre klocka ger 5,5× snabbare körning utan avtagande avkastning, och det är i den meningen som klocka och kärnor köper olika saker: klockan gör varje användares kompilering snabbare, kärnorna släpper bara in fler användare.
+
+## 1. Inledning
+
+Overleaf är den dominerande samarbetsinriktade LaTeX-redigeraren, och dess lokalt driftsatta distribution används brett av universitet och forskargrupper som inte kan skicka opublicerade manuskript till ett tredjepartsmoln. Att dimensionera en sådan driftsättning är en återkommande praktisk fråga: givet en fast hårdvarubudget, hur många personer kan faktiskt trycka på "Recompile" samtidigt?
+
+Den officiella vägledningen är en linjär regel — ungefär en kärna och en gigabyte per fem till tio samtidiga användare — som förutsätter att kapaciteten skalar jämnt och gemensamt i båda resurserna. Våra mätningar motsäger detta på tre sätt.
+
+### 1.1 Kapaciteten styrs av två oberoende väggar, inte en
+
+En konfiguration misslyckas antingen för att minnet tar slut, varvid Overleaf-stacken själv dör och returnerar HTTP 502, eller för att kompileringar överskrider tidsgränsen på serversidan, varvid CLSI rapporterar `timedout` medan gigabyte av minne står oanvända. Dessa två regimer har helt olika skalningsbeteende och olika botemedel. Att lägga till kärnor i en minnesbunden konfiguration är inte bara ineffektivt, det är ibland kontraproduktivt: vi mäter konfigurationer där ett ökat antal kärnor _minskar_ kapaciteten, eftersom fler kärnor får samtidiga kompileringar att avancera i takt så att deras toppar i minnesbehov sammanfaller i stället för att varvas.
+
+### 1.2 Mjukvaruparametrar dominerar över hårdvara
+
+Tidsgränsen för kompilering är ett fält per användare i MongoDB vars standardvärde på 180 s i det tysta begränsar CPU-bundna konfigurationer. Att höja den till 300 s multiplicerar den uppmätta kapaciteten med upp till 4,2 på oförändrad hårdvara. Oberoende av detta vägrar CLSI mer än 65 samtidiga kompileringar på grund av en hårdkodad konstant. Varje kapacitetsstudie — och varje driftsättning — som inte tar hänsyn till båda mäter mjukvaran, inte maskinen.
+
+### 1.3 Samtidighet är tidsdelning, inte parallellism
+
+Eftersom en LaTeX-kompilering är entrådad gör det inte att systemet blir klart tidigare att betjäna $N$ samtidiga användare på $C$ kärnor; det gör att varje användare får vänta proportionellt längre. Frågan "hur många samtidiga användare stöds" är därför illa ställd tills man har bestämt hur länge en användare är villig att vänta. Vi gör detta beroende explicit och kvantifierar det.
+
+### 1.4 Bidrag
+
+* En kapacitetsmatris över 21 CPU-/minneskonfigurationer, uppmätt under klocklåsta, upprepningsverifierade förhållanden, där den begränsande faktorn identifieras per konfiguration utifrån dess felsignatur.
+* Två anpassade modeller: en kapacitetsmodell som skiljer en superlinjär minnesvägg från ett CPU-tak, och en latensmodell som påvisar rent tidsdelningsbeteende.
+* Identifiering och experimentell bekräftelse av två implementationsproblem i det driftsatta systemet, däribland en minnesgräns för containrar som har varit verkningslös sedan 2018.
+* En kvantifiering av avvägningen mellan tidsgräns för kompilering och kapacitet, som vi menar måste anges tillsammans med varje samtidighetssiffra.
+
+## 2. Bakgrund
+
+### 2.1 Kompileringsvägen
+
+En kompileringsbegäran i Overleaf går `web` $\rightarrow$ `clsi` $\rightarrow$ en kompileringscontainer. I en driftsättning med sandlådekompilering (`SIBLING_CONTAINERS_ENABLED=true`) kör CLSI inte `latexmk` i den egna processen; i stället ber den värdens Docker-daemon, som nås via en bind-monterad socket, att starta en ny container från en TeX Live-avbildning med projektkatalogen bind-monterad på `/compile`. En kompilering är därför en kortlivad container som kör en `latexmk`-process.
+
+Tre konsekvenser följer, och alla tre formar mätningarna i denna artikel. För det första är arbetsenheten en entrådad process: XeLaTeX parallelliserar inte. För det andra är resursisoleringen per kompilering vad Docker-körmiljön än begär — vi visar i §6.2 att den i praktiken inte begär något alls. För det tredje domineras arbetsmängden inte av dokumentet utan av TeX Live-trädet, en skrivskyddad korpus på ungefär 32 GiB som varje samtidig kompilering läser från och därför delar via värdens sidcache. Denna delning är ursprunget till den superlinjära minnesskalning vi observerar.
+
+### 2.2 Aktivera sandlådekompilering
+
+Overleaf Community Edition kör `latexmk` inuti själva applikationscontainern. Ayakaleaf Pro kan, liksom Overleaf Server Pro, i stället köra varje kompilering i en _syskoncontainer_ — en container som startas av applikationen på _värdens_ Docker-daemon i stället för att nästlas inuti applikationscontainern. Två Toolkit-inställningar aktiverar detta:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit bind-monterar värdens Docker-socket i applikationscontainern och översätter dessa till den miljö som CLSI läser: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` och `SANDBOXED_COMPILES_HOST_DIR`, där den sistnämnda är _värdens_ sökväg till kompileringskatalogen. Den sökvägen spelar roll: eftersom daemonen som startar kompileringscontainern är värdens måste bind-monteringen den får kunna lösas upp i värdens namnrymd, inte i applikationscontainerns. Server Pros `config/env.sh` tvingar dessutom `TEXLIVE_IMAGE_USER=www-data` i detta läge så att filer som skrivs av kompileringscontainern får konsekvent ägarskap.
+
+Verifieringen är direkt: under en kompilering visar värden en container med namnet `project-{projectId}-{userId}-{hash}` som kör `latexmk` från TeX Live-avbildningen och avslutas med 0. Detta är den enhet vars mångfald vi mäter genom hela artikeln, och vars totala avsaknad av resursgränser vi redovisar i §6.2.
+
+**Varför detta är viktigt för studien.**
+
+Syskoncontainrar gör mätningen ren — varje kompilering är en observerbar, oberoende schemalagd OS-entitet — men de innebär också att gästens kärna, inte Overleaf, fördelar CPU och minne mellan kompileringar. Varje skalningslag i denna artikel är därför en egenskap hos Linux-schemaläggaren tillämpad på $N$ entrådade processer, vilket är förklaringen till att den är så regelbunden.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Figur 1.** En kompileringsbegäran, spårad genom mikrotjänsterna i Community Edition. Uppdelningen vid stegen och är viktig för kapaciteten: dokumenttexten kopieras in i begärans kropp, medan binära resurser skickas som referenser och hämtas av `clsi`. Ingen av dem dominerar — ett projekts kompileringskostnad bestäms av det 32 GiB stora TeX Live-trädet som varje samtidig kompilering läser via den delade sidcachen.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Figur 2.** Tre driftsättningstopologier och var kompileringstaket per instans hamnar i var och en; staplade paneler anger replikering. Konstanten på 65 kompileringar skyddar _en_ CLSI, så SaaS-flottan multiplicerar den med instanser och zoner (a), och den horisontella skalning som stöds av Server Pro och Ayakaleaf Pro multiplicerar den med instanser (c) — till priset av central MongoDB, Redis och S3-kompatibel lagring, en lastbalanserare med cookiebaserad sessionsaffinitet (kompileringsutdata skrivs till instansens lokala disk, så en kompilering och den efterföljande PDF-nedladdningen måste hamna på samma instans) och en ensam `git-bridge`. Toolkits standardläge (b), som är det vi mäter, har multiplikatorn ett, så en konstant dimensionerad för en medlem av en flotta blir taket för hela installationen.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Figur 3.** Val av shard i `clsi-cache`. Ett projekt mappas med $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, dvs. hashrymden delas in i lika många lika stora sektorer som det finns shards. Detta är _modulo_-hashning, inte ringbaserad konsistent hashning: att utöka flottan från tre shards till fyra delar om hela rymden och mappar om i princip varje projekt (a, b). Det är precis därför implementationen behöver en explicit ramp för omsharding online, som flyttar en linjärt växande andel projekt från `currentShards` till `desiredShards` under ett tidsfönster, i stället för den $K/n$-förflyttning en konsistent hashring skulle ge. När en shards kretsbrytare har löst ut ökas saltet $i$ och sharden tas bort från kandidatlistan, så att uppslaget fortsätter att söka i stället för att misslyckas (c).
+
+### 2.3 De två fellägena
+
+Varje konfiguration vi mätte misslyckas på exakt ett av två sätt, och skillnaden syns i svarsstatusen snarare än att den behöver härledas:
+
+* **Minnesbrist** — Overleaf-stacken själv slutar svara och begäran returnerar **HTTP 502**. Tillgängligt gästminne på den nivå där felet inträffar är typiskt under 500 MiB.
+* **Tidsgräns för kompilering** — CLSI avbryter kompileringen vid tidsgränsen per användare och rapporterar status `timedout`. Tillgängligt minne på den nivå där felet inträffar är ofta flera gigabyte.
+
+Vi klassificerar varje konfiguration utifrån denna signatur snarare än utifrån en heuristik på resurskvoter, vilket gör att frågan "vilken vägg slog vi i" kan besvaras utifrån själva datan.
+
+## 3. Metod
+
+### 3.1 Testmiljö och klockkontroll
+
+Alla gäster körs under QEMU/KVM på en enda värd med Intel Core i9-14900K, 62 GiB RAM och NVMe-lagring. Gästen kör Ubuntu 24.04 med Docker 29.7 och Overleaf Toolkit, som driftsätter Ayakaleaf Pro v6.2.2 med sandlådekompilering mot `texlive-full:2025.1`.
+
+En vanlig stationär CPU är en dålig ersättning för en server om inte dess klocka kontrolleras. KVM erbjuder ingen mekanism för att ställa in en virtuell klocka: en vCPU är en värdtråd och körs med den frekvens som värdkärnan har. Vi begränsar därför värden direkt genom att inaktivera turbo och låsa `scaling_max_freq` till 3,0 GHz på varje kärna, och vi knyter gästens vCPU:er till fysiska P-kärnor med `taskset`. Skillnaden spelar roll på en CPU med hybridkärnor: E-kärnorna i denna modell har en basfrekvens på 2,4 GHz och _kan inte_ nå 3,0 GHz när turbo är inaktiverat, så en körning som hamnar på dem mäter i tysthet en långsammare maskin. Under full last verifierar vi exakt 3000 MHz på alla sexton fastlåsta trådar. Ett vaktskript kontrollerar denna invariant före varje benchmark och vägrar annars att starta; det fångade en tyst återställning av frekvensregulatorn under studien.
+
+### 3.2 En andra testmiljö: en stor körmaskin
+
+QEMU-matrisen isolerar en variabel i taget, men den slår i taket vid sexton fastlåsta trådar. För att undersöka om samma lagar fortfarande gäller en storleksordning högre upprepade vi samtidighetssvepet på en enda stor server: en AMD EPYC 7773X (Milan-X, 64 kärnor / 128 trådar, 768 MiB L3) med 995 GiB RAM, som kör samma Ayakaleaf Pro v6.2.2-avbildning mot samma `texlive-full:2025.1`. Till skillnad från QEMU-gästerna är denna maskin inte klocklåst: det är en server i produktionsklass och vi mäter den som en sådan.
+
+Två driftsmässiga försiktighetsåtgärder var nödvändiga och förtjänar att nämnas, eftersom experimentet utan dem mäter testriggen snarare än servern. För det första begränsades varje container till en `systemd`-slice med `MemoryMax=940 GiB`, så att ett skenande svep uttömmer en cgroup snarare än värden. För det andra skapas sandlådekompileringar av värdens daemon och var och en smutsar ned sitt eget copy-on-write-lager — uppmätt till 116 MiB per container trots att den 20,6 GiB stora basavbildningen delas — så Dockers datarot flyttades till en dedikerad NVMe-enhet. Ett svep vid $N=1024$ skriver ungefär 119 GiB tillfälliga lager, vilket inte får plats på ett vanligt rotfilsystem.
+
+### 3.3 Arbetslast
+
+Dokumentet är en verklig masteruppsats på 63 sidor (SJTU-mall) som kompileras med XeLaTeX via `latexmk` och innehåller TikZ-figurer, bibliografibearbetning med `biblatex` och inbäddade PDF-resurser — alltså en realistisk snarare än syntetisk last. En enskild kompilering på en obelastad gäst tar 8,6–9,8 s i alla konfigurationer, vilket vi använder som friflygningsbaslinjen $T_1$.
+
+### 3.4 Lastgenerering
+
+Vi skapar 512 verkliga användarkonton och ger var och en sin egen kopia av projektet, så att samtidiga kompileringar konkurrerar exakt som oberoende användare skulle göra i stället för att dela ett projektlås. Förfrågningar skickas från värden mot gästens vidarebefordrade port, så att lastgenereringen inte förbrukar någon gäst-CPU.
+
+Samtidigheten är _simultan_, inte förskjuten. Varje session upprättas först — inloggning, CSRF-token, val av kompilator — och först därefter sover varje tråd fram till ett gemensamt väggklockeögonblick, som beräknas en gång och delas, innan den skickar sin `POST /project/:id/compile`. Skillnaden är inte pedantisk. En förskjuten ramp mäter genomströmning under en stabil kö; en simultan skur mäter vad som händer när en hel föreläsningssal med studenter trycker på samma knapp efter samma deadlinebesked, vilket är det fall som driftansvariga faktiskt fruktar. De två skiljer sig åt med mer än en konstant faktor, eftersom den andra fyller kompileringskön snabbare än daemonen hinner tömma den.
+
+Fyra praktiska hinder måste undanröjas innan den skuren kunde levereras på ett tillförlitligt sätt. Vart och ett förtjänar att dokumenteras, eftersom vart och ett i tysthet degraderar experimentet till en mätning av testriggen snarare än av servern.
+
+#### 3.4.1 Två hastighetsbegränsare, inte en
+
+Overleaf stryper inloggningar per källadress — 20 försök per minut — och all vår trafik kommer från en enda värd. Att tilldela varje simulerad användare en distinkt `X-Forwarded-For`-adress tar bort den gränsen men stöter omedelbart på en andra, grövre: en budget per subnät på ungefär 200 per minut. Att sprida användarna över ett sammanhängande block misslyckas därför vid det 201:a kontot. Vi härleder i stället den syntetiska adressen från användarindexet så att på varandra följande användare hamnar i olika `/24`-nät,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+vilket håller båda begränsarna obelastade för hela populationen på 1024.
+
+#### 3.4.2 Den injicerade headern kastas som standard
+
+Det räcker inte att sätta headern. Express respekterar endast `X-Forwarded-For` för motparter som den har blivit tillsagd att lita på, och Overleafs `trustedProxyIps` har standardvärdet `loopback`. Eftersom lastgeneratorn når applikationen via containerns brygga snarare än via loopback-gränssnittet tolkas headern och kastas sedan bort, och varje simulerad användare faller tillbaka på en och samma adress. Symptomet är en våg av `HTTP 429` vid exakt den tjugonde inloggningen, vilket lätt misstolkas som serveröverbelastning. Gateway-nätverket måste uttryckligen läggas till i förtroendekedjan; i den klustrade driftsättningen i §4.3 måste även pod- och tjänste-CIDR:erna läggas till.
+
+#### 3.4.3 En lastbalanserare skriver över den header den ombads bevara
+
+När instansen ligger bakom en proxy _lägger_ den konventionella `option forwardfor` _till_ den verkliga klientadressen i kedjan, vilket är rätt beteende i produktion och precis fel här: den syntetiska adressen trängs undan av lastgeneratorns egen. Direktivet måste kvalificeras som `option forwardfor if-none`, så att proxyn bara lägger till ett värde när klienten inte angav något.
+
+#### 3.4.4 Klienten får slut på filbeskrivare innan servern får slut på kapacitet
+
+Vid $N=1024$ håller generatorn mer än tusen samtidiga socketar, och standardvärdet för den mjuka gränsen på 1024 beskrivare nås under sessionsupprättandet snarare än under mätningen. Felet är tyst: tre sessioner misslyckas att upprättas och körningen rapporterar 1021 i stället för 1024, medan en samplingstråd som anropar skalet för att räkna containrar dör med `EMFILE` och i tysthet trunkerar telemetrin. Den mjuka gränsen måste höjas på generatorn — den hårda gränsen på vår värd var redan 1048576 — och körningen upprepas. Vi redovisar båda körningarna i §4.3: den korrigerade slutför 1024 av 1024 med en median inom 1,2 s från den trunkerade, vilket är skälet till att vi betraktar den första som användbar men inte auktoritativ.
+
+### 3.5 Mätprotokoll
+
+Flera metodologiska val visade sig nödvändiga för reproducerbarheten.
+
+#### 3.5.1 Uppvärmning
+
+På en nystartad gäst är sidcachen tom och de första kompileringarna mäter kallstarts-I/O snarare än kapacitet i stationärt tillstånd: samma konfiguration med 2 vCPU / 2 GiB ger 36,5 s kall och 9,8 s varm, en faktor 3,7. Varje konfiguration utför därför två kasserade uppvärmningar med en enskild kompilering efter uppstart.
+
+#### 3.5.2 Godkännandekriterium
+
+En samtidighetsnivå godkänns endast om _varje_ kompilering lyckas och nivån klarar en upprepning. Detta är striktare än en tröskel för andel lyckade och det spelar roll: vid 4 vCPU / 16 GiB godkändes nivån 32 en gång med en median på 80,2 s och fick sedan tidsgränsöverskridande på alla 32 kompileringar när den upprepades, så vi redovisar 31.
+
+#### 3.5.3 Sökning
+
+Nivåerna lokaliseras genom exponentiell inringning från ett modellförutsagt startvärde följt av exakt heltalsbisektion. Eftersom kriteriet är allt-eller-inget avgörs en nivå av sitt första misslyckande, så vi överger de återstående pågående förfrågningarna så snart en misslyckas — utom på låga nivåer, där de övergivna kompileringarna belastar en liten gäst så hårt att den aldrig återhämtar sig.
+
+#### 3.5.4 Isolering mellan nivåer
+
+Kompileringscontainrar töms, och webbapplikationen pollas tills den svarar igen, innan nästa nivå startar. Utan detta registrerar en nivå som följer på en krasch ett falskt misslyckande med noll sessioner.
+
+#### 3.5.5 Värdhygien
+
+Orelaterade virtuella maskiner på värden stängdes av: med 24 GiB värdminne allokerat på annat håll rapporterade samma gästkonfiguration ett lastmedelvärde på 11,7 i stället för 3,2 vid identisk samtidighet. Minnestryck på värden fortplantar sig in i gästen och ogiltigförklarar mätningen.
+
+## 4. Resultat
+
+### 4.1 Kapacitetsmatrisen
+
+Tabell 1 och figur 4 visar det uppmätta taket för varje konfiguration. Att läsa den längs en rad ger den första överraskningen. Vid 4 GiB når gästerna med 2, 4 och 8 vCPU alla exakt 9 — att fyrdubbla kärnorna ändrar ingenting alls. Vid 16 GiB når de 54, 45 och 57: att gå från 4 till 16 kärnor ger 6 %, och gästen med 8 kärnor är faktiskt _sämre_ än den med 4 (§5.2). Först vid 48 GiB skiljer antalet kärnor konfigurationerna åt på ett avgörande sätt: 143, 268 och 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Figur 4.** Uppmätt kapacitet över konfigurationsmatrisen. (a) Varje konfiguration som en stapel, grupperad efter minne och färgad efter antal kärnor; heldragna staplar är minnesbundna (gästen dör med slut på minne) och skrafferade staplar är CPU-bundna (kompileringar överskrider tidsgränsen med minne till övers). Att läsa en grupp från vänster till höger visar hur lite antalet kärnor ger under 16 GiB; att läsa mellan grupperna visar den superlinjära avkastningen på minne. (b) Samma punkter mot den anpassade modellen $N_{\max}=\min(0.69R^{1.60},\,26.4C)$; den streckade linjen är minnesväggen och de prickade horisontella linjerna är CPU-taken per antal kärnor. En konfiguration begränsas av den av de två som den möter först.
+
+Att läsa nedför en kolumn ger den andra: vid ett fast antal kärnor växer kapaciteten superlinjärt med minnet, ungefär som $R^{1.6}$, av det sidcacheskäl som utvecklas i §5.1.
+
+| minne  | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Tabell 1.** Högsta antal samtidiga kompileringar som slutförs framgångsrikt, uppmätt vid en tidsgräns för kompilering på 300 s med CLSI:s samtidighetstak lyft. **Fetstil** markerar en CPU-bunden konfiguration (kompileringar överskrider tidsgränsen med minne till övers); resten är minnesbundna (stacken dör med HTTP 502). Raden för 2 GiB innehåller den korrigering som diskuteras i §5.2.
+
+### 4.2 Samtidighet är tidsdelning
+
+Figur 5 sveper över varje samtidighetsnivå på en fast gäst med 8 vCPU / 16 GiB. Två regimer skiljs åt av ett skarpt knä vid exakt en kompilering per kärna. Under det är den genomsnittliga kompileringstiden plan — den går från 8,7 s vid $N=1$ till 9,1 s vid $N=C=8$, en förändring på 5 %. Över det växer tiden strikt proportionellt mot $N/C$: vid $N=16,24$ mäter vi 18,5 s och 27,1 s, dvs. ett förhållande på $1:2.13:3.12$ mot ett ideal på $1:2:3$.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Figur 5.** Kompileringslatens mot samtidighet vid fast hårdvara. Knäet ligger vid $N=C$; bortom det följer den uppmätta nedsaktningen $N/C$ inom 5–7 %. Alla femton nivåer lyckades fullständigt.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Figur 6.** Kompileringslatens mot samtidighet för flera konfigurationer. Varje panel håller hårdvaran fast och sveper över den erbjudna lasten; den vertikala linjen markerar $N=C$. Kurvorna är plana till vänster om den och linjära i $N/C$ till höger, vilket är signaturen för tidsdelning snarare än för resurskonflikt: arbetet blir inte dyrare, det väntar bara på sin tur.
+
+Anpassning av $T(N)=T_1\max(1,N/C)^{b}$ över alla lyckade mätningar i studien ger $b=0.914$ ($R^2_{\log}=0.904$, $n=81$). En exponent som inte går att skilja från ett är det kvantitativa uttrycket för att en kompilering är en entrådad, CPU-bunden arbetsenhet och att samtidighet varken hjälper eller stjälper utöver att dela upp kärnorna. Den praktiska följden är obekväm för kapacitetsplanering: en konfiguration kan ta emot ett godtyckligt antal användare utan att _misslyckas_ samtidigt som varenda en av dem får vänta proportionellt längre. Vid $N=56$ på denna gäst lyckas fortfarande alla kompileringar, men varje användare väntar 64,8 s i stället för 8,7 s.
+
+### 4.3 Vertikal skalning till 1024 samtidiga kompileringar
+
+Tabell 2 och figur 7 redovisar svepet på den stora körmaskinen. Varje nivå är en _kall_ kompilering: före varje nivå rensar vi kompileringskatalogen och CLSI-cachen för varje deltagande projekt via `DELETE /project/:id/output`, så att ingen nivå drar nytta av arbete som gjorts av nivån under. Baslinjen för en enskild kompilering på denna maskin är 28,8 s, vilket är det kalla värdet och inte ska jämföras med baslinjen på 8,6–9,8 s i stationärt tillstånd som användes tidigare; den kalla baslinjen på QEMU-gästerna är 28,3 s, så per tråd ligger de två maskinerna inom två procent från varandra för denna arbetslast.
+
+| $N$ |   lyckade | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | max ctrs |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tabell 2.** Samtidighetssvep på en EPYC 7773X (64 kärnor / 128 trådar, 995 GiB). Alla nivåer kalla; baslinje 28,8 s. Max antal containrar är det högsta antalet sandlådor som lever samtidigt.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Figur 7.** Vertikal skalning på en stor körmaskin. (a) Latens mot erbjuden samtidighet; det skuggade området markerar regimen efter knäet. (b) Antalet sandlådor som faktiskt lever följer aldrig det begärda antalet — det mättas nära 200 — medan kompilerings-cgroupen aldrig använder mer än en femtedel av sitt tak.
+
+#### 4.3.1 Maskinen misslyckas aldrig
+
+Varje nivå slutförs till 100 %, inklusive $N=1024$ — åtta gånger antalet trådar. Vi hittade inte denna maskins kapacitetstak; vårt tålamod tog slut innan dess marginal gjorde det. Detta är den första konfigurationen i studien där den begränsande faktorn inte är minnet: vid $N=1024$ når kompilerings-cgroupen en topp på 184 GiB, en femtedel av sitt tak på 940 GiB, medan CPU:n ligger på 100 % utnyttjande med ett lastmedelvärde på 166.
+
+#### 4.3.2 Degraderingen är sublinjär eftersom insläppet är hastighetsbegränsat
+
+Naiv tidsdelning förutsäger att $8\times$ så många trådar kostar $8\times$ latensen. Den uppmätta kostnaden är $9.7\times$ relativt en enskild kompilering, men bara $3.8\times$ relativt $N=128$ — för en åttafaldig ökning av erbjuden last. Skälet syns i figur 7(b) och i sista kolumnen i tabell 2: trots att 1024 förfrågningar skickas samtidigt överstiger antalet sandlådor som faktiskt lever aldrig 205. Daemonen kan inte skapa containrar så snabbt som klienterna begär, så förfrågningarna köas vid insläppet i stället för att konkurrera inne i CPU:n. Det är köandet som räddar svansen här, och det gör det av en slump.
+
+#### 4.3.3 Knäet ligger vid 512, inte vid felpunkten
+
+Mellan $N=256$ och $N=512$ ökar $p_{95}$-latensen med $2.9\times$ för en fördubbling av lasten; varje tidigare fördubbling kostade mellan $1.2\times$ och $1.4\times$. En kapacitet angiven som "det högsta $N$ som inte misslyckas" skulle rapportera 1024 och vara oanvändbar för en driftansvarig: vid den punkten är väntetiden i svansen nästan åtta minuter.
+
+### 4.4 Kompileringstiden är omvänt proportionell mot klockfrekvensen
+
+Eftersom arbetslasten är CPU-bunden bör dess kostnad skala som $1/f$. Vi testar detta direkt genom att svepa värdens klocka över maskinens hela intervall, 1,0–5,5 GHz i tio steg, på en i övrigt oförändrad gäst (figur 8). Tiden för en enskild kompilering går från 26,5 s till 4,8 s: en 5,5× högre klocka ger 5,5× snabbare körning utan avtagande avkastning någonstans i intervallet. Produkten $T\!\cdot\!f$ är konstant inom 2 % över alla tio klockfrekvenser.
+
+Normalisering med kärnandelen samlar alla trettio mätningar — tre samtidighetsnivåer vid tio klockfrekvenser — på en enda konstant:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+med en restspridning på 5,1 % över ett intervall där klockan själv varierar med 5,5×. Avsaknaden av krökning är i sig resultatet: om arbetslasten hade varit bunden av minnesbandbredd eller I/O hade $T$ planat ut vid hög klocka när CPU:n sprang ifrån den andra resursen.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Figur 8.** Klocksvep. (a) $T=k/f$ med den anpassade hyperbeln. (b) Efter division med $\max(1,N/C)$ samlas alla punkter på en konstant, vilket bekräftar ekvation (1).
+
+Ekvation (1) har en direkt konsekvens för upphandling som är lätt att formulera och lätt att få fel: _klockan förbättrar upplevelsen för varje enskild användare, antalet kärnor släpper bara in fler av dem_. En maskin med 20 % högre klocka kompilerar 20 % snabbare för alla, utan avtagande avkastning; dubbelt så många kärnor gör ingens kompilering snabbare alls.
+
+## 5. Analys
+
+### 5.1 Två väggar, anpassade var för sig
+
+Varje konfiguration klassificeras efter sin felsignatur (§2.3), och minnesväggen och CPU-taket anpassas sedan endast på de konfigurationer som faktiskt når dem:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+med $R$ i gibibyte och $C$ i vCPU:er.
+
+Minnesväggens exponent är genomgående superlinjär, $p>1$: den marginella minneskostnaden för ytterligare en samtidig kompilering _sjunker_ när det totala minnet växer, från ungefär 312 MiB per kompilering på en gäst med 3 GiB till omkring 194 MiB på en med 32 GiB. Mekanismen är den delade sidcachen över TeX Live-trädet som beskrivs i §2.1: samtidiga kompileringar läser överlappande typsnitts- och makrofiler, så en större cache fördelas över fler av dem. Det är därför den naiva regeln "en gigabyte per fem användare" underskattar stora maskiner och överskattar små.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Figur 9.** Samma data som två ytor över $(C,R)$-planet. (a) Kapacitet: den anpassade ytan är en ås, inte ett plan — den stiger brant med minnet och är nästan plan längs kärnaxeln tills minnet slutar vara begränsande, vilket är skälet till att raden för 48 GiB är den enda där antalet kärnor skiljer konfigurationerna åt. (b) Latens mot samtidighet för varje konfiguration, med den anpassade $T=12.6\,(N/C)^{0.91}$ streckad och tidsgränsen på 180 s ritad som ett plan. En konfiguration misslyckas där dess heldragna kurva genomborrar planet, vilket synliggör hur direkt tidsgränsinställningen avgör den rapporterade kapaciteten.
+
+### 5.2 Där fler kärnor gör saken värre
+
+Ekvation (2) är ett minimum av två termer och därför monoton i $C$, men mätningarna är det inte. Vi observerar två inversioner där fler kärnor _minskade_ kapaciteten: vid 16 GiB (54 mot 45) och vid 32 GiB (145 mot 135). Båda inträffar i den minnesbundna regimen, och mekanismen är densamma i båda: med fler kärnor avancerar samtidiga kompileringar i takt och når sin högsta residenta storlek i samma ögonblick, medan schemaläggaren med färre kärnor varvar dem och topparna förskjuts. På en gäst vars minnesmarginal redan är knapp är det förskjutningen som håller den vid liv. En kapacitetsmodell byggd på genomsnittlig resursanvändning kan inte uttrycka detta; det är en egenskap hos topparnas _sammanfall_.
+
+En tredje skenbar inversion, vid 2 GiB, bortser vi nu från. Sökningen registrerar kapaciteten 2 vid 2 vCPU men 1 vid 4 och 8 vCPU, vilket ser ut som samma effekt. En ny granskning av de råa svepen visar något enklare: vid 2 GiB lyckades nivån $N=2$ vid första försöket för alla tre antal kärnor och misslyckades sedan i bekräftelsekörningen för två av de tre. Nivån är ingen kapacitet utan ett myntkast, och posten för 2 vCPU är det kast som råkade landa rätt. Vi redovisar därför det reproducerbara värdet, 1, för alla tre antal kärnor och drar ingen slutsats av skillnaden. Vi dokumenterar korrigeringen här i stället för att i tysthet ändra tabellen, eftersom den kasserade avläsningen är just den sortens som hade kunnat stödja ett intressant påstående.
+
+## 6. Fynd i implementationen
+
+### 6.1 Ett hårdkodat samtidighetstak
+
+På tillräckligt stora gäster stannade kapaciteten vid exakt 65 samtidiga kompileringar oavsett begärd samtidighet: vid $N=66,80,96,128$ mätte vi $65$ lyckade och $1,15,31,63$ omedelbara `unavailable`-svar, med antalet containrar låst vid 65, flera gigabyte minne oanvänt och en mediankompileringstid stadigt på 77 s — långt under någon tidsgräns.
+
+Orsaken är en konstant i CLSI:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+Jämförelsen är icke-strikt, så det effektiva taket är $64+1=65$, vilket stämmer exakt med mätningen. De överskjutande förfrågningarna får **HTTP 503** — de _avvisas_, de köas inte, så från användarens sida misslyckas kompileringsknappen helt enkelt. Till skillnad från alla andra justerbara inställningar i samma fil läser denna ingen miljövariabel; den infördes uppströms i augusti 2024 och kan bara ändras genom att modifiera avbildningen. Med gränsen höjd rapporterade samma gäst med 16 vCPU / 32 GiB, som rapporterade `success=65, unavailable=15` vid $N=80$, i stället `success=80`.
+
+### 6.2 En verkningslös minnesgräns för containrar
+
+En inspektion av en aktiv kompileringscontainer visar ingen resursisolering över huvud taget:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Avsaknaden av CPU-kvot är avsiktlig och förklarar varför tidsdelningsexponenten i §4.2 är så ren: ingenting snedvrider konkurrensen mellan kompileringar. Avsaknaden av en _minnesgräns_ är dock inte avsiktlig. Docker-körmiljön begär faktiskt en:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Detta är fel på två sätt. Värdet är $1024^4=1 tebiB$ där kommentaren avser $1024^3$; och fältet är placerat på toppnivån i skapandealternativen i stället för inuti `HostConfig`, där Docker-API:t förväntar sig det, så det kastas bort — vilket det observerade `Memory=0` bekräftar. Båda felen finns i den commit som införde filen (`9a519f0d3d`, mars 2018) och överlevde konverteringen från CoffeeScript, en omformatering av hela repositoriet och en migrering från CJS till ESM, varav ingen granskade semantiken. Noterbart är att `MAX_OUTPUT = 1024 * 1024 // 1MB` i samma commit är korrekt, vilket tyder på ett slarvfel snarare än ett missförstånd.
+
+Konsekvensen syns i våra mätningar med lite minne. Eftersom kompileringarna är obegränsade yttrar sig minnesbrist inte som att Docker avslutar en felande container; den slår ut hela gästen. På konfigurationen med 2 vCPU / 2 GiB observerade vi att övervakningssessionen via SSH blockerades i 300 s, ett lastmedelvärde på 68 på två kärnor, och att gästen till slut startade om sig själv. En fungerande gräns per container skulle degradera betydligt mer kontrollerat: den alltför stora kompileringen skulle misslyckas och tjänsten skulle överleva.
+
+Den enda gräns som faktiskt får effekt är `RLIMIT_CPU`, satt till $\text{timeout}+5$ sekunder. Den begränsar _CPU_-tid, inte väggklocktid, och en enskild kompilering förbrukar bara omkring 9 s CPU, så den slår aldrig till vid någon samtidighet; den skyddar mot patologisk indata som ett skenande makro. Den är dock ett användbart orakel: att observera `Soft:305` bekräftar att en tidsgränsinställning på 300 s faktiskt har fortplantats till containern.
+
+### 6.3 Tidsgränsen för kompilering är den dominerande inställningen
+
+Fältet per användare `features.compileTimeout` har standardvärdet 180 s. För varje CPU-bunden konfiguration är detta ingen säkerhetsmarginal utan en kapacitetsinställning, eftersom en maskin som fortfarande räknar korrekt förklaras ha misslyckats. Att höja den till 300 s — en enda MongoDB-uppdatering — ändrar den uppmätta kapaciteten med upp till en faktor 4,2 (tabell 3). Taket är 600 s, som upprätthålls av `RequestParser.MAX_TIMEOUT`; värden över detta trunkeras i tysthet.
+
+| Konfiguration    | 180 s | 300 s |          Kvot | Begränsande faktor    |
+| ---------------- | ----: | ----: | -------------: | --------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB ledigt    |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB ledigt    |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                   |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                   |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                   |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | når minnesväggen härnäst |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | minne                 |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | minne                 |
+
+**Tabell 3.** Effekten av tidsgränsen för kompilering på uppmätt kapacitet.
+
+De två sista raderna är den kontraintuitiva halvan av resultatet och skälet till att vi mätte om varje konfiguration under en och samma tidsgräns. För _minnesbundna_ konfigurationer _minskar_ en längre tidsgräns kapaciteten, eftersom varje kompilering håller sin residenta mängd längre och fler av dem överlappar. En kapacitetssiffra är därför meningslös utan att ange den tidsgräns den mättes under, och de två kan inte blandas i en och samma tabell.
+
+## 7. Relaterat arbete
+
+### 7.1 Leverantörens vägledning
+
+Overleafs egen hårdvarudokumentation anger de kvalitativa fakta som vi kvantifierar här: att LaTeX är entrådat, att prestanda per kärna därför styr kompileringstiden och att "fler kärnor hjälper bara om du försöker kompilera fler dokument än du har lediga CPU-kärnor" \[1]. Den ger sedan den linjära dimensioneringsregeln — en bas på 2 kärnor/3 GiB plus en kärna och en gigabyte per fem till tio samtidiga användare — som motiverade denna studie. Vårt bidrag är att omvandla dessa påståenden till uppmätta lagar (ekvationerna (1) och (2)) och att visa var den linjära regeln brister: den har ingen term för den delade sidcache som gör minnesväggen superlinjär, och ingen term för de två mjukvaruparametrar som dominerar resultatet.
+
+### 7.2 Kapacitetsstudier av byggen och CI
+
+Mätning av byggsystem under samtidighet är väletablerad utanför LaTeX-sammanhanget. LightSys rapporterar att konventionella CI-system som kompilerar i Docker-containrar degraderas i I/O när ankomsttakten för pull requests ökar, med en flaskhals som uppträder kring elva samtidiga förfrågningar \[17]; TAOS-CI observerar att kompilering dominerar CI:s väggklocktid och står för 60–67 % av den totala pipelinetiden i stora projekt \[18]. Vårt system skiljer sig i ett avseende som visar sig vara avgörande: en LaTeX-kompilering är interaktiv. Ett CI-jobb som tar dubbelt så lång tid är en olägenhet; en kompilering som tar dubbelt så lång tid upplevs direkt av en användare som väntar på en förhandsgranskningsruta, vilket är skälet till att vi betraktar tidsgränsen inte som en feltröskel utan som en kapacitetsparameter.
+
+### 7.3 Containeroverhead
+
+Nyare arbeten bryter ned startlatensen för Docker-containrar över lagringsnivåer \[19] och karakteriserar containerprestanda vid nätverkets kant \[20]. I vår miljö amorteras containerstarten per kompilering: den är en liten konstant i förhållande till en kompilering på 9 s, och friflygningstiden $T_1$ som vi anpassar absorberar den. Den containeregenskap som faktiskt spelar roll är _avsaknaden_ av resursgränser (§6.2), som förvandlar ett minnesöverskridande i en kompilering till ett fel för hela värden.
+
+### 7.4 LaTeX som opålitlig indata
+
+Sandlådekompilering finns eftersom TeX är ett programmeringsspråk och dokument är opålitlig indata \[21, 22]. Det designvalet är det som gör denna studie möjlig — varje kompilering är en isolerad container med observerbart resursbeteende — och också det som gör den saknade minnesgränsen betydelsefull, eftersom isolering förutsätts av de driftansvariga som använder den.
+
+### 7.5 Kompilatorn som studieobjekt
+
+TeX i sig är väldokumenterat som språk \[16], men dess beteende som _byggmål_ har uppmärksammats först på senare tid. Tan och Rigger \[8] kompilerar en stor korpus av arXiv-källor med olika motorer och distributionsversioner och finner att valet av motor inte är utbytbart: endast en bråkdel av en procent av dokumenten ger byte-identisk utdata under XeTeX och pdfTeX. Det resultatet har direkt betydelse för vår metod. Kapacitet är en egenskap hos ett dokument _och_ en motor, så ett benchmark som inte fixerar båda är inte reproducerbart; vi fixerar därför ett dokument, en motor och en distribution (`texlive-full:2025.1`) genomgående, och vi anger motorn i varje figurtext. Det begränsar också hur generella våra siffror är på ett sätt som förtjänar att sägas rakt ut: de karakteriserar XeLaTeX på detta dokument, inte TeX i allmänhet.
+
+Arbete kring LaTeX-_byggsystem_ drivs till stor del av praktiker. LaTeX3-projektets `l3build` \[13] standardiserar regressionstestning och paketering, och oberoende benchmarks jämför omslagsverktyg — en undersökning av 26 byggsystem finner att en förkompilerad preambel ger ungefär 20 % jämfört med en vanlig körning och 40 % jämfört med `latexmk` \[14]. Dessa optimerar den _enskilda_ kompileringen. De är ortogonala mot, och kan kombineras med, det vi mäter: en preambelcache förkortar $T_1$, och varje kapacitetssiffra i denna artikel skalar med $T_1$.
+
+### 7.6 Samtidighetskontroll i redigeraren, inte i kompilatorn
+
+Samarbetsdelen av Overleaf vilar på en väletablerad forskningslinje. Operationell transformation härstammar från Ellis och Gibbs \[9] och gjordes praktiskt användbar för klienter med hög latens av Jupiter-systemet \[10], vars design känns igen i `document-updater`: en server som ordnar operationer och en buffert per dokument som klienterna synkroniserar mot. Konfliktfria replikerade datatyper \[11] löser samma problem utan en central sekvenserare. Denna skillnad är det som överhuvudtaget får topologin i §4.3 att fungera: eftersom bufferten för väntande uppdateringar ligger i delad Redis snarare än i en instans minne ser en kompilering som dirigeras till vilken replik som helst de senaste tangenttryckningarna, och kompileringsaffinitet kan väljas för cachelokalitet snarare än för korrekthet.
+
+### 7.7 Kapacitetsmodeller
+
+Amdahls lag \[24] begränsar uppsnabbningen från parallellism och Littles lag \[23] relaterar beläggning till ankomsttakt och betjäningstid; båda används ovan. Gunthers universella skalbarhetslag \[12] utökar den första med en retrograd term för koherensfördröjning, och förutsäger att genomströmningen når en topp och sedan sjunker. Vi noterar att vårt system _inte_ uppvisar den retrograda regimen upp till $N=1024$: genomströmningen mättas och latensen växer, men ingenting kollapsar. Skälet är strukturellt snarare än tur — kompileringar delar inget tillstånd som måste hållas koherent, så den term lagen lägger till är nära noll, och insläppsplatån i §4.3 begränsar konkurrensen innan den hinner spela roll.
+
+## 8. Rekommendationer för driftansvariga
+
+<Steps>
+<Step title="Åtgärda de två mjukvaruparametrarna innan du köper hårdvara">
+Båda är gratis och båda är värda mer än någon enskild hårdvaruuppgradering vi mätte. Höj `features.compileTimeout` till ett värde som dina användare faktiskt tolererar — det maximala värde CLSI accepterar är 600 s — och om du räknar med att överskrida 65 samtidiga kompileringar, lyft antingen `compileConcurrencyLimit` i en härledd avbildning eller skala ut. Att göra ingetdera innebär att betala för kärnor som mjukvaran vägrar att använda.
+</Step>
+
+<Step title="Dimensionera en maskin efter dess knä, inte efter dess tak">
+Svepet på den stora körmaskinen (§4.3) skiljer två tal som rutinmässigt blandas ihop. _Taket_ — den högsta samtidighet som fortfarande returnerar varje PDF — är minst 1024 på en server med 64 kärnor, och vi nådde det aldrig. _Knäet_ — den punkt bortom vilken svanslatensen slutar växa måttligt och börjar fördubblas — ligger vid 512, och den sista bekväma driftpunkten under det är 256. Mellan $N=256$ och $N=512$ går $p_{95}$-väntetiden från två minuter till nästan sex; mellan 512 och 1024 når den åtta. En driftansvarig som dimensionerar efter taket levererar ett system som tekniskt fungerar men som ingen vill använda.
+
+För denna maskin och detta dokument är den rekommenderade driftpunkten därför **256 samtidiga kompileringar**, vilket är $4\times$ antalet fysiska kärnor och $2\times$ antalet trådar, och som håller $p_{95}$ nära 120 s. Vi föreslår att `compileConcurrencyLimit` sätts till det värdet i stället för att lämnas högt: att släppa in 1024 kompileringar på en gång får alla att vänta i åtta minuter, medan att släppa in 256 och köa resten betjänar de flesta användare på två. Köande försämrar för de som kommer sent; resurskonflikt försämrar för alla.
+</Step>
+
+<Step title="Behandla dessa som värsta-fall-siffror">
+Varje nivå i tabell 2 är en kall kompilering som startas samtidigt. Inget av villkoren gäller i produktion: en varm kompilering av samma dokument tar 8,6 s mot 28,3 s kall, en faktor $3.3$, och verkliga användare trycker inte på knappen i samma sekund. En population i stationärt tillstånd som kompilerar om varannan minut med en typisk cacheträffgrad kommer därför att klara betydligt fler skribenter än samtidighetssiffran ensam antyder — i storleksordningen tusen eller fler aktiva författare vid driftpunkten 256. Samtidighetssiffran är en gräns för den momentana skuren, inte ett antal platser.
+</Step>
+
+<Step title="Bestäm latensbudgeten först och läs sedan av storleken">
+Ekvation (1) kan inverteras direkt. För en målväntetid $T$ vid klockfrekvensen $f$ på $C$ kärnor är den samtidighet som ryms $N \le C\,fT/k$ med $k\approx28 GHz·s$ för detta dokument. En budget på 60 s på 8 kärnor vid 3 GHz ger $N\le51$; en budget på 120 s fördubblar den. Att publicera budgeten tillsammans med kapaciteten är det enda ärliga sättet att ange någon av dem.
+</Step>
+
+<Step title="Köp minne först, sedan kärnor, och kontrollera vilken vägg du står vid">
+Under 32 GiB mätte vi nästan ingen nytta av ytterligare kärnor. Diagnosen är billig: om felen visar sig som HTTP 502 med gästen kort om minne, lägg till minne; om de visar sig som `timedout` med minne till övers, lägg till kärnor eller höj tidsgränsen. Driftansvariga kan läsa av detta från samma felsignatur som vi använde för att klassificera konfigurationerna.
+</Step>
+
+<Step title="Prioritera klocka för upplevelsen, kärnor för antalet användare">
+Eftersom $T\propto 1/f$ gäller utan krökning (2 % över 1,0–5,5 GHz) gör en snabbare klocka varje kompilering snabbare för varje användare. Fler kärnor gör ingen enskild kompilering snabbare; de släpper bara in fler samtidiga. Driftsättningar vars klagomål är "kompileringarna är långsamma" bör köpa klockfrekvens; driftsättningar vars klagomål är "kompileringarna misslyckas vid deadline" bör köpa minne och kärnor.
+</Step>
+
+<Step title="Skala ut i stället för upp bortom taket">
+Bortom 65 samtidiga kompileringar är den stödda vägen horisontell skalning (figurerna 2c och 10, utvecklat i §9): flera applikationsinstanser bakom en lastbalanserare med cookiebaserad sessionsaffinitet, som delar central MongoDB, Redis och S3-kompatibel lagring, med `git-bridge` kvar som en ensam instans. Detta multiplicerar taket per instans med antalet instanser, vilket är exakt hur SaaS-driftsättningen når sin egen kapacitet.
+</Step>
+
+<Step title="Förlita dig inte på isolering per kompilering">
+Tills Docker-körmiljöns minnesgräns har rättats (§6.2) kan ett enda patologiskt dokument uttömma värden i stället för att avslutas på egen hand. Driftansvariga som behöver den garantin bör införa den själva i stället för att vänta på den. Mekanismen vi använde på den stora värden är en systemd-slice med ett hårt tak, som Docker-daemonen sedan pekas mot så att varje container den skapar räknas inuti den:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+En detalj här kostar en eftermiddag om den missas. En slice med namnet `docker-capped.slice` ligger inte bredvid `docker.slice`; den ligger _inuti_ den, eftersom bindestrecket är hierarkiavgränsaren snarare än en del av namnet. Ett tak som inte verkar ha någon effekt har vanligen tillämpats en nivå bort från där containrarna faktiskt bor. Verifiera genom att läsa tillbaka toppvärdet från `memory.max_usage_in_bytes` efter en körning i stället för att lita på konfigurationsfilen — på vår värd översteg kompilerings-cgroupen aldrig en femtedel av sitt tak ens vid 1024 samtidiga kompileringar, vilket i sig är beviset på att det var daemonen snarare än minnet som var den begränsande faktorn.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Figur 10.** Referenstopologi för en horisontellt skalad driftsättning, ritad utifrån den konfiguration vi verifierade. Applikationsrepliker är utbytbara och håller inget beständigt, så de kan läggas till och tas bort fritt. Tre komponenter är det inte: Redis, vars dokumentbuffert är det som låter en kompilering som dirigeras till vilken replik som helst se de senaste tangenttryckningarna; objektlagringen, som blir obligatorisk snarare än valfri vid mer än en replik; och `git-bridge`, som lagrar repositorier på lokal disk utan replikeringsväg och måste köras som en ensam instans bredvid en utsedd replik.
+
+## 9. En referensdriftsättning med flera maskiner
+
+Allt ovan mäter en maskin. Detta avsnitt beskriver den distribuerade formen tillräckligt detaljerat för att den ska kunna byggas, och — eftersom den fråga en driftansvarig faktiskt står inför inte är _hur_ utan _om_ — anger först den punkt där den blir värd besväret.
+
+### 9.1 När den distribuerade formen är motiverad
+
+En enda maskin är billigare att driva i varje avseende som spelar roll: en feldomän, inget delat tillstånd att hålla konsistent, ingen dirigering att göra fel. Våra data ger tre trösklar för när man bör lämna den.
+
+#### 9.1.1 Under 65 samtidiga kompileringar: gör det inte
+
+Taket per instans är en mjukvarukonstant, inte en hårdvarukonstant (§6.1). Tills den erbjudna lasten närmar sig det tillför en andra maskin fellägen och ger ingenting. Värden med 64 kärnor betjänade 256 samtidiga kompileringar med full framgång först efter att `compileConcurrencyLimit` hade lyfts; en driftansvarig som ännu inte har ändrat det enda värdet är inte hårdvarubegränsad och bör inte handla hårdvara.
+
+#### 9.1.2 Mellan 65 och ungefär 500: skala upp först
+
+Vertikal skalning förblev linjär över hela vårt intervall och gick aldrig in i en retrograd regim. En stor värd nådde 1024 samtidiga kalla kompileringar med 100 % framgång (§4.3); knäet i latens uppträdde vid 512, inte tidigare. Inom det bandet är en större maskin strikt enklare än flera mindre och, enligt §4.4, förbättrar en snabbare maskin varje användares upplevelse snarare än att bara släppa in fler av dem.
+
+#### 9.1.3 Gå distribuerat för tillgänglighet, inte genomströmning
+
+Det ärliga skälet att köra mer än en applikationsreplik under taket är att en maskin är ett nätaggregat, en kärna, ett uppgraderingsfönster. Det är ett legitimt skäl och det är det vi skulle ange; det är helt enkelt inte ett kapacitetsargument, och att blanda ihop de två leder driftansvariga till att köpa repliker när de behövde minne.
+
+### 9.2 Nivåer och deras dimensionering
+
+Figur 10 visar topologin. Den har fyra nivåer, och de skalar efter olika storheter — vilket är hela poängen med att separera dem.
+
+#### 9.2.1 Kant
+
+En lastbalanserare, eller två för tillgänglighet. Den terminerar TLS och gör inget kostsamt; den skalar med antalet anslutningar, inte antalet kompileringar, och en liten instans räcker för de laster som studeras här. Det är dess konfiguration, inte dess storlek, som spelar roll (§9.3).
+
+#### 9.2.2 Applikationsrepliker
+
+Dessa bär kompileringslasten och är den enda nivå som skalar med samtidigheten. Dimensionera var och en enligt reglerna i §8 — minne före kärnor, sedan klocka — och sätt sedan antalet repliker så att det täcker toppsamtidigheten delat med taket per replik. Replikerna håller inget beständigt: deras lokala disk innehåller tillfälliga kompileringsfiler och en utdatacache, som båda kan återskapas. Det är det som gör dem säkra att lägga till och ta bort fritt, och det är värt att verifiera snarare än att anta, eftersom en enda felkonfigurerad `filestore`-sökväg i tysthet förvandlar nivån till en tillståndsbärande.
+
+#### 9.2.3 Tillstånd
+
+Redis, MongoDB och en S3-kompatibel objektlagring, på separata värdar. Redis är den bärande och den minst uppenbara: den håller sessionslagret och den aktiva dokumentbufferten, vilket är det som gör att en kompilering som dirigeras till vilken replik som helst ser tangenttryckningar som skrivits mot en annan replik. En driftansvarig som behandlar Redis som en cache och dimensionerar den för utkastning kommer att producera kompileringar av inaktuella dokument som är extremt svåra att diagnostisera, eftersom ingenting misslyckas — utdatan är bara fel. MongoDB skalar med antalet projekt snarare än kompileringstakten. Objektlagringen är valfri vid en replik och obligatorisk därutöver.
+
+#### 9.2.4 Den ensamma instansen
+
+`git-bridge` lagrar repositorier på lokal disk, underhåller ett lokalt index och har ingen replikeringsväg. Den måste köras som exakt en instans, fastlåst bredvid en utsedd replik, och det är den komponent som gör att driftsättningen inte är helt tillståndslös. Planera dess värd därefter: dess disk är den som behöver säkerhetskopieras.
+
+| **Nivå**      | **Antal**            | **Skalar med**           |
+| ------------- | -------------------- | ------------------------ |
+| Lastbalanserare | 1–2                | samtidiga anslutningar   |
+| Applikation   | $\lceil N/C\rceil$ | samtidiga kompileringar vid topp |
+| Redis         | 1 (+replik)          | aktiva redigeringssessioner |
+| MongoDB       | 1 (+replik)          | lagrade projekt          |
+| Objektlagring | 1 kluster            | totalt antal projektbyte |
+| `git-bridge`  | exakt 1              | repositorier på disk     |
+
+**Tabell 4.** Referensnivåer. Endast applikationsnivån skalar med samtidigheten; dimensioneringen av den är ämnet för §8.
+
+### 9.3 Dirigeringen är den del som är lätt att göra fel
+
+Tre klasser av förfrågningar måste nå tre olika platser, och standardkonfigurationen med en enda regel uppfyller högst två av dem.
+
+Kompileringstrafik under `/project/` bör fördelas med konsistent hashning på projektidentifieraren, så att ett projekts kompileringscache stannar hos en replik. Vi använder HAProxys `balance hash path,field(3,/)` med `hash-type consistent` och `hash-balance-factor 150`. Valet spelar roll vid utskalning: med cookieaffinitet förblir befintliga sessioner fastlåsta vid sin ursprungliga replik på obestämd tid och en nytillagd replik får bara nya användare, så maskinen som en driftansvarig just har betalat för tar inte emot något av den last som motiverade inköpet. Konsistent hashning omfördelade 35 % av projekten vid utskalning i vår konfiguration, mot 0 % för cookies.
+
+Sessionstrafik är annorlunda. När WebSocket-uppgraderingen misslyckas och `socket.io` faller tillbaka till XHR-polling måste på varandra följande pollningar i en session nå en och samma replik, och det finns ingen projektidentifierare i sökvägen att hasha. Denna trafik behöver en separat backend med cookieaffinitet. Vi designade denna uppdelning men driftsatte den inte; vi flaggar den som en lucka snarare än att påstå att den finns.
+
+Slutligen måste `/git/` nå den replik bredvid vilken `git-bridge` körs. Den dirigeras till den repliken snarare än direkt till `git-bridge` eftersom bryggan autentiserar sina återanrop mot applikationens OAuth-slutpunkter och löser upp blob-URL:er via den; att gå förbi repliken förstör autentiseringen i stället för att förbättra något.
+
+### 9.4 Inskalning kräver en dräneringsbuffert
+
+Att ta bort en replik är inte symmetriskt med att lägga till en: en pågående kompilering går förlorad, och användaren ser ett fel som hen inte orsakat. Den fungerande sekvensen är att först stoppa ny trafik, vänta och först därefter avsluta. Vi implementerade detta som en pre-stop-hook som håller kvar podden under ett konfigurerbart intervall medan balanseraren markerar backenden som dränerande — tillräckligt kort för att testas på minuter, och i produktion tillräckligt långt för att en session ska hinna avslutas naturligt, timmar snarare än sekunder. Intervallet är den inställning som avgör om elasticiteten är osynlig eller outhärdlig.
+
+Ytterligare en begränsning hittade vi genom mätning snarare än design: autoskalning på CPU fungerar inte för denna arbetslast. Applikationspoddens eget utnyttjande låg på 22 m core mot nodens totala 3997 m core, eftersom kompileringsarbetet sker i syskoncontainrar som podden inte räknar in. Varje signal som används för att skala denna nivå måste räkna körande kompileringscontainrar, inte poddens CPU.
+
+## 10. Konsekvenser bortom Overleaf
+
+Ingenting i §4.2 eller §4.3 är specifikt för Overleafs kod. De uppmätta lagarna följer av tre egenskaper som varje hostad LaTeX-tjänst delar: arbetsenheten är en entrådad process, den isoleras i en container, och dess arbetsmängd är ett stort skrivskyddat träd som sidcachen måste rymma. Tre konsekvenser överförs direkt till alla som bygger en sådan tjänst.
+
+### 10.1 Tilldela minne, sedan kärnor
+
+Matrisens starkaste resultat är negativt: under 16 GiB är antalet kärnor nästan irrelevant, och först vid 48 GiB skiljer sig konfigurationerna med 4, 8 och 16 vCPU över huvud taget åt (143, 268, 331). En driftansvarig som läser den konventionella regeln som "lägg till en kärna per fem användare" köper fel resurs. Mekanismen är den delade sidcachen över distributionsträdet, och den är en egenskap hos TeX Lives storlek snarare än hos något särskilt gränssnitt.
+
+### 10.2 Insläppstakten är en resurs, och den glöms oftast bort
+
+Vid $N=1024$ höll vår server aldrig mer än 205 aktiva sandlådor (figur 7b) trots att varje förfrågan anlände samtidigt. Det var skapandet av containrar, inte kompileringen, som var begränsningen — i linje med mätstudier som tillskriver kostnaden för containerstart till körmiljöns overhead snarare än till avbildningens storlek \[19, 20]. En tjänst som bara dimensionerar CPU och minne kommer att finna att dess beteende vid skurar styrs av en storhet som den aldrig mätte. Den praktiska formen av detta är rekommendationen i §8: begränsa insläppet medvetet, eftersom en kö du väljer är bättre än en kö du upptäcker.
+
+### 10.3 En sandlåda som överlever sin kompilering ogiltigförklarar modellen
+
+Varje kapacitetssiffra här förutsätter att containern skapas, gör en kompilering och avslutas — en livslängd på tiotals sekunder och en arbetscykel nära ett endast medan den körs. Två nyare designmönster bryter mot det antagandet, och de bryter mot det på samma sätt.
+
+Det första är den beständiga sandlådan per användare. Att tilldela varje användare en fast privat miljö förvandlar en statistiskt multiplexad pool till en uppsättning reservationer: en tjänst som kunde betjäna 256 samtidiga kompileringar från 64 kärnor genom tidsdelning kan bara betjäna 16 användare om var och en får fyra dedikerade kärnor, en storleksordning färre för samma hårdvara. Våra data kvantifierar kostnaden för det valet snarare än argumenterar emot det — reservationer köper förutsägbarhet, och växelkursen är ungefär $16\times$ vid den driftpunkt vi rekommenderar.
+
+Det andra, och nyare, är AI-agenten som delar sandlådan med kompilatorn. På agentstödda skrivplattformar kan samma container som kör XeLaTeX även vara värd för en långlivad kodagent, så att den är upptagen kontinuerligt snarare än i skurar. Praktiker rapporterar exakt det symptom som modellen förutsäger för sådana driftsättningar — ihållande tröghet vid måttliga användarantal \[15]. Interaktionen förtjänar att beskrivas precist, eftersom det inte bara handlar om "mer last". Tre av våra fynd förstärker varandra. Beläggningen slutar vara skurartad, så tidsdelningslagen i §4.2 gäller för hela populationen på en gång i stället för den andel som för tillfället kompilerar. Sidcachen, som är det som ger den superlinjära minnesavkastningen i §4.1, delas nu med agentens egen arbetsmängd och slutar vara varm för TeX. Och den saknade minnesgränsen för containrar i §6.2 blir betydligt farligare, eftersom en container som aldrig avslutas aldrig lämnar tillbaka sitt minne.
+
+Vi mätte inte en sådan plattform och gör inga påståenden om någon specifik produkt. Vad vi kan säga är vad våra siffror innebär för designen: en arkitektur som ger varje användare en långlivad sandlåda med flera kärnor bör dimensioneras som ett reservationssystem, inte utifrån de samtidighetssiffror som redovisas här, och den kapacitet den kan förvänta sig ligger närmare dess antal kärnor delat med kärnor per användare än något i tabell 1.
+
+## 11. Hot mot validiteten
+
+### 11.1 Ett enda dokument
+
+Alla mätningar använder ett XeLaTeX-dokument på 63 sidor. Absoluta kapaciteter kommer att skilja sig för andra dokument; skalningslagarna, som är kvoter, bör inte göra det. Ett dokument med en avsevärt större resident mängd skulle flytta minnesväggen utan att ändra dess superlinjära karaktär.
+
+### 11.2 Virtualiserad värd
+
+Gästerna körs under KVM på en fysisk maskin, så absoluta tal inkluderar virtualiseringsoverhead och gästerna delar värdens sidcache och NVMe-enhet. Vi minskade den största störfaktorn genom att stänga av orelaterade gäster efter att ha observerat att minnestryck på värden blåser upp lastmedelvärdena i gästen med mer än $3\times$ vid identisk samtidighet.
+
+### 11.3 Samtidig ankomst
+
+Varje kompilering skickas i ett och samma ögonblick, vilket är det värsta fallet. Verkliga användare anländer som en stokastisk process, så en driftsättning som dimensioneras efter våra siffror har marginal snarare än underskott — men toppen i slutet av en inlämningsdeadline ligger närmare vår modell än en Poisson-modell.
+
+### 11.4 Gränskonfigurationer
+
+Vid 2 GiB är systemet så nära kollaps att upprepade körningar av samma konfiguration kan skilja sig med en kompilering. Vi redovisar det konservativa värdet och drar inga slutsatser av skillnader på $\pm 1$ i den regimen.
+
+## 12. Tillgänglighet
+
+Systemet som testas, driftsättningsverktygen och det uppströmsprojekt som det härstammar från är alla offentliga:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Driftsättningsverktyg (Toolkit) — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Dokumentation — [https://ayakaleaf-pro.ayaka.space](/sv)
+* Overleaf uppströms — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* TeX Live-kompileringsavbildningar — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Varje källkodsplats vi hänvisar till anges som en sökväg relativt repositoriet med ett radnummer mot Ayakaleaf Pro v6.2.2, och de två uppströmscommits vi daterar (`9a519f0d3d`, `5d472e9b38`) går att nå i Overleafs historik.
+
+## 13. Bidrag
+
+Musicminion utformade studien, tillhandahöll och drev testmiljöerna, styrde undersökningens inriktning och verifierade varje mätning som redovisas här. Claude Opus 5 (Anthropic) byggde och körde benchmarkriggen, automatiserade driftsättningarna, utförde källkodsarkeologin, tog fram figurerna och skrev utkastet till manuskriptet. Båda författarna granskade den slutliga texten. Där en körning redovisas som kontaminerad — svepet med 1021 sessioner i §4.3 och den avvikande nivån $N=256$ i §4.1 — hittades defekten under granskningen och körningen upprepades före publicering i stället för att i tysthet strykas.
+
+Läsare bör notera att författarskapspolicyerna hos ACM, IEEE och ICMJE för närvarande förbehåller författarskap för parter som kan ta ansvar för ett verk, och skulle kräva att den andra författarens bidrag redovisas som en upplysning snarare än som en författarrad. Vi anger arbetsfördelningen uttryckligen här så att redovisningen är korrekt enligt båda konventionerna.
+
+## 14. Slutsats
+
+Kapacitetsplanering för egenhostad Overleaf handlar inte om att skala en resurs. Tre fynd bör ändra hur den görs.
+
+För det första spelar antalet kärnor knappt någon roll under 32 GiB gästminne: vid 16 GiB skiljer sig kapaciteten för gäster med 4, 8 och 16 vCPU med mindre än 8 %. Minnet, via den delade sidcachen över TeX Live-trädet, sätter gränsen; kärnorna börjar spela roll först när minnet är generöst tilltaget.
+
+För det andra väger två mjukvaruparametrar tyngre än hårdvaran. Att lyfta CLSI:s hårdkodade tak på 65 kompileringar och höja standardtidsgränsen för kompilering på 180 s tog en gäst med 8 vCPU / 48 GiB från 64 till 268 samtidiga kompileringar — en faktor 4,2 utan någon ytterligare hårdvara. Ingen av dem går att upptäcka i konfigurationsdokumentationen; den ena går inte att konfigurera alls.
+
+För det tredje är frågan "hur många samtidiga användare stöder den här maskinen" underspecificerad. Samtidighet i detta system är ren tidsdelning, och kapaciteten är vad tidsgränsen än släpper igenom. Den ärliga formen av svaret anger båda: _den här maskinen betjänar_ $N$ _samtidiga kompileringar om användarna är villiga att vänta_ $T$ _sekunder_, där $N$ och $T$ hänger samman enligt ekvation (1).
+
+Vi redovisar även en latent defekt: minnesgränsen per container i Docker-körmiljön har varit verkningslös sedan 2018, både till storlek och placering. Dess praktiska effekt är att minnesbrist i en liten driftsättning slår ut hela tjänsten i stället för den enda kompilering som är ansvarig.
+
+## Referenser
+
+\[1] Overleaf. _Hardware requirements_, dokumentation för On-premises. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, dokumentation för On-premises. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, dokumentation för On-premises. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Källkodsrepositorium_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Rapporter från praktiker om ihållande latens på agentstödda skrivplattformar som samlokaliserar en beständig kodagent med LaTeX-kompilatorn i en sandlåda per användare. Vi hänvisar till detta som rapporterad driftserfarenhet, inte som en kontrollerad mätning; vi har inte gjort benchmarks på en sådan plattform.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

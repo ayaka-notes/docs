@@ -1,0 +1,93 @@
+---
+title: Automatyczna aktualizacja obrazów TeX Live Full
+description: Użyj crona do odświeżania obrazów Dockera TeX Live używanych przez kompatybilny z Overleaf kompilator w trybie sandbox.
+icon: arrows-rotate
+---
+
+Zasadniczo przy każdym uruchomieniu `bin/up` [using-the-toolkit](/pl/on-premises/installation/using-the-toolkit  "mention") automatycznie aktualizuje nasz pełny obraz TeX Live. Aby uniknąć ręcznych aktualizacji, możesz zautomatyzować aktualizację obrazu TeX Live Sandbox za pomocą poniższego skryptu. Dodaj go jako zadanie cron, upewniając się, że użytkownik crona ma uprawnienia do uruchamiania `docker`. Uruchom `crontab -e` i dodaj na końcu następujący wiersz.
+
+```cron title="crontab -e"
+0 * * * * /usr/bin/flock -n /tmp/pull-texlive.lock /usr/local/bin/pull-texlive.sh
+```
+
+`flock -n` pomija uruchomienie, gdy poprzednie nadal utrzymuje blokadę, dzięki czemu wolne pobieranie nigdy nie powoduje nawarstwiania się zadań.
+
+<Tabs>
+<Tab title="Połączenie bezpośrednie">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+IMAGE="ghcr.io/ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) ====="
+
+if timeout 50m docker pull "$IMAGE:$tag"; then
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+
+<Tab title="Korzystanie z serwera lustrzanego">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+MIRROR="ghcr.nju.edu.cn"
+CANONICAL="ghcr.io"
+REPO="ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) via $MIRROR ====="
+
+if timeout 50m docker pull "$MIRROR/$REPO:$tag"; then
+  # Retag to the canonical name the compiler is configured with. This only
+  # adds a second name for the same layers; nothing is copied.
+  docker tag "$MIRROR/$REPO:$tag" "$CANONICAL/$REPO:$tag"
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+</Tabs>
+
+**Dlaczego rotacja godzinowa zamiast pobierania wszystkiego naraz**: tag jest wyznaczany na podstawie zegara (liczba godzin od epoki modulo liczba tagów), więc zadanie jest bezstanowe — nic nie zapisuje, "gdzie skończyliśmy", a cykl sam się wyrównuje po ponownym uruchomieniu lub pominiętej godzinie. Każde uruchomienie dotyczy jednego tagu; gdy skrót (digest) w rejestrze się nie zmienił, pobieranie sprowadza się do sprawdzenia manifestu (`Image is up to date`) i kończy się w kilka sekund. Rzeczywista aktualizacja pobiera co najwyżej jeden obraz na godzinę, z limitem `timeout 50m`, a `docker image prune -f` usuwa warstwy osierocone po przeniesieniu tagu.
+
+Aby sprawdzić, czy synchronizacja działa prawidłowo:
+
+```bash
+tail -20 /var/log/pull-texlive.log     # each run ends with "OK <tag>" or "FAIL <tag>"
+grep -c '^FAIL' /var/log/pull-texlive.log
+```
+
+Po opublikowaniu nowego wydania TeX Live dopisz jego tag do tablicy `TAGS` — długość rotacji dostosuje się automatycznie. Godziny, w których host jest wyłączony, są pomijane, a nie kolejkowane; dotknięte tym tagi zostaną po prostu odświeżone przy następnej kolejce.

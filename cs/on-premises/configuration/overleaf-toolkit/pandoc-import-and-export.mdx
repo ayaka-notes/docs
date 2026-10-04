@@ -1,0 +1,130 @@
+---
+title: Import a export přes Pandoc
+icon: file-lines
+---
+
+### Import / export přes Pandoc
+
+Overleaf umí převádět dokumenty do LaTeXu a z LaTeXu pomocí [Pandocu](https://pandoc.org/). Převod běží uvnitř **Docker kontejneru v sandboxu** spravovaného službou `clsi`, takže funkce je ve výchozím stavu vypnutá a je nutné ji zapnout pomocí několika proměnných prostředí.
+
+#### Co dělá
+
+| Směr  | Z → Do                | Formáty                    | Kde                                                                                           |
+| ---------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Import** | dokument → projekt LaTeX | `docx`, `markdown`         | _New Project → Import_ (nahraje `.docx` / `.md` a převede ho na upravitelný projekt `.tex`) |
+| **Export** | projekt LaTeX → dokument | `docx`, `markdown`, `html` | _Menu → Download / Export_ (vykreslí projekt pomocí Pandocu)                                 |
+
+***
+
+### Proměnné prostředí
+
+Důležité jsou **dvě** proměnné a jedna podobně vypadající, která důležitá **není**.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — hlavní přepínač
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* Typ: boolean (`true` funkci zapíná; cokoli jiného ji vypíná).
+* **Musí být nastavena u OBOU služeb, `web` i `clsi`.** Jde o samostatné procesy se samostatnou konfigurací:
+  * `web` ji načítá do `enablePandocConversions` (`services/web/config/settings.defaults.js`). Řídí přístup k importním a exportním routám a příznak `ol-ExposedSettings.enablePandocConversions`, který frontendu říká, zda má zobrazit rozhraní pro import/export.
+  * `clsi` ji načítá do `enablePandocConversions` (`services/clsi/config/settings.defaults.cjs`). Řídí přístup k endpointům, které spouštějí Pandoc.
+* Pokud je povolena u `web`, ale ne u `clsi` (nebo naopak), rozhraní se zobrazí, ale převod selže — udržujte je v souladu.
+
+2\. `PANDOC_IMAGE` — image kontejneru, který clsi spouští pro převod
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### Předpoklady
+
+Protože převody běží jako Docker kontejnery spouštěné službou `clsi`:
+
+1. **`clsi` musí běžet v režimu sandboxu s přístupem k Dockeru.** Ve vývojovém stacku má `clsi` již nastaveno `SANDBOXED_COMPILES=true` a připojený socket Dockeru hostitele (`/var/run/docker.sock`).
+2. **`PANDOC_IMAGE` musí být k dispozici** na daném Docker hostiteli (stažený nebo sestavený lokálně) ještě před prvním převodem.
+
+***
+
+### Rychlé nastavení
+
+Vývojový stack (`develop/dev.env`) již obsahuje:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+Protože oficiální image je soukromý, sestavte před použitím funkce **jednou** přibalený image:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Poté stack (znovu) spusťte, aby `clsi` a `web` načetly proměnné.
+
+***
+
+### Sestavení image Pandocu
+
+Standardní image Pandocu funguje, protože clsi volá Pandoc obecně (bez vlastních šablon či filtrů). Potřebuje jen tři nezbytné věci pro běh, o které se stará `develop/pandoc/Dockerfile`:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+Sestavte ho a otagujte tak, aby tag odpovídal `PANDOC_IMAGE`:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+V produkci připněte `pandoc/core` ke konkrétní verzi místo `latest`, aby byla sestavení reprodukovatelná, a nastavte `PANDOC_IMAGE` na cestu ve vašem registru.
+
+***
+
+### Řešení problémů
+
+| Příznak                                             | Pravděpodobná příčina                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Tlačítka Import/Export se nezobrazují                  | `ENABLE_PANDOC_CONVERSIONS` není `true` u **web**                                             |
+| Rozhraní se zobrazí, ale převod selže s chybou serveru | `ENABLE_PANDOC_CONVERSIONS` není nastavena u **clsi**, nebo `PANDOC_IMAGE` chybí na Docker hostiteli |
+| `clsi` hlásí chybu při stahování image (401)                | `PANDOC_IMAGE` stále ukazuje na soukromý výchozí image; sestavte vlastní image a odkažte na něj             |
+| Kontejner spouští `pandoc pandoc …` / nesprávné argumenty       | Image má `ENTRYPOINT` `pandoc`; použijte `ENTRYPOINT []`                                        |
+| Výstup importu je prázdný / krok zip selže             | V image není nainstalován `zip`                                                           |
+| Chyby oprávnění u převedených souborů                | Image nemá uživatele `tex` s UID 1000                                                           |

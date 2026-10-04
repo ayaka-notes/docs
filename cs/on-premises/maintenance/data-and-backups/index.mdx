@@ -1,0 +1,194 @@
+---
+title: Data a zálohy
+icon: database
+---
+
+Při vývoji Overleafu někdy potřebujeme změnit schéma dat v databázi; k automatizaci tohoto procesu slouží migrační skripty. Ty jsou nejprve spuštěny na [overleaf.com](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit), což je největší instance Overleafu na světě, takže většina eventualit již nastala, za vaše data však neposkytujeme žádné záruky. Před upgradem instance si prosím **vždy** vytvořte **konzistentní** zálohu svých dat.
+
+<Info>
+
+Při upgradu na nový Docker image se automaticky spustí všechny migrace, které dosud spuštěny **nebyly**. To může v závislosti na velikosti vašich dat chvíli trvat; průběh zjistíte sledováním logů. Další informace najdete v naší dokumentaci [Logging](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging).
+
+</Info>
+
+### Ukládání dat
+
+Overleaf Community Edition a Server Pro ukládají svá data na třech oddělených místech:
+
+* **Databáze MongoDB:** Zde jsou uložena data uživatelů a projektů.
+* **Redis:** slouží jako vysoce výkonná mezipaměť pro rozpracovaná data, především informace související s úpravami projektů a spoluprací.
+* **Souborový systém Overleafu:** ukládá needitovatelné soubory projektů (včetně obrázků) a slouží také jako dočasná disková mezipaměť během kompilace projektů.
+
+<Info>
+
+Může jít o `~/sharelatex_data` nebo `~/overleaf_data`, podle toho, kdy byla vaše instance nastavena.
+
+</Info>
+
+<Check>
+
+Pro soubory projektů a data úplné historie projektů podporujeme také úložné backendy kompatibilní s S3.
+
+</Check>
+
+Další informace o rozložení složek na disku najdete v části Podrobný popis složek.
+
+### Provedení konzistentní zálohy
+
+Při vytváření konzistentní zálohy je nutné zahrnout tři úložiště:
+
+* MongoDB
+* Redis
+* Data souborového systému Overleafu
+
+Pro vytvoření konzistentní zálohy je **nezbytné** zabránit uživatelům ve vytváření nových dat, dokud proces zálohování probíhá. Doporučujeme proto naplánovat okno údržby, během kterého uživatelé nebudou mít přístup k instanci ani nebudou moci upravovat své projekty.
+
+Před zahájením zálohování musíte instanci odstavit. Od Server Pro `3.5.0` proces vypnutí automaticky uzavře web a odpojí uživatele.
+
+Pro vypnutí instance spusťte `bin/docker-compose stop sharelatex`, pokud používáte nasazení přes Toolkit, nebo `docker compose stop sharelatex`, pokud používáte Docker Compose.
+
+Jakmile je kontejner `sharelatex` zastaven, můžete zahájit zálohování.
+
+Po **úspěšném** dokončení zálohování musíte kontejner `sharelatex` znovu spustit. Spusťte k tomu `bin/docker-compose start sharelatex`, pokud používáte nasazení přes Toolkit, nebo `docker compose start sharelatex`, pokud používáte Docker Compose.
+
+<Danger>
+
+* Zálohy by měly být uloženy na jiném serveru, než na kterém běží vaše instance Overleafu, ideálně na úplně jiném místě.
+* Replikace databází na více instancí MongoDB může poskytnout určitou redundanci, ale nechrání před poškozením dat.
+* Testování záloh je nejlepší způsob, jak zajistit, že jsou úplné a funkční.
+
+</Danger>
+
+### MongoDB
+
+MongoDB obsahuje nástroj příkazové řádky [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/), pomocí kterého lze vytvořit zálohu dat uživatelů a projektů uložených v databázi.
+
+### Data souborového systému Overleafu
+
+U nasazení přes Toolkit je cesta, kde jsou uloženy needitovatelné soubory, určena v `config/overleaf.rc` proměnnou prostředí `OVERLEAF_DATA_PATH`, podle toho, kdy byla vaše instance vytvořena, však může jít o `data/sharelatex`.
+
+Pro vytvoření úplné zálohy je nutné tento adresář rekurzivně zkopírovat pomocí nástroje, jako je **rsync**.
+
+### Redis
+
+Redis ukládá uživatelské relace a čekající aktualizace dokumentů, než jsou zapsány do MongoDB.
+
+Doporučenou konfigurací perzistence Redisu je perzistence Append Only File (AOF).
+
+Uživatelé Toolkitu mají u **nových** instalací perzistenci AOF ve výchozím stavu povolenou; stávající uživatelé najdou další informace o povolení AOF [zde](/cs/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence).
+
+Pokud se rozhodnete nadále používat snímky RDB spolu s perzistencí AOF, můžete soubor RDB zkopírovat jako zálohu na bezpečné místo.
+
+### Migrace dat mezi servery
+
+V ideálním případě zatím v nové instanci nemáte žádná cenná data. Postup pro slučování dat instancí nemáme.
+
+Za předpokladu, že nová instance zatím neobsahuje žádná data, můžete postupovat podle následujících kroků. Zjednodušeně: vytvoříme tar archiv svazků `mongo`, `redis` a `overleaf`, zkopírujeme ho na nový server a tam ho opět rozbalíme.
+
+#### Toolkit
+
+```bash
+# Gracefully shutdown the old instance
+old-server$ bin/stop
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar config/ data/
+
+# Copy the backup-old-server.tar file from the old-server to the
+# new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ bin/stop
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv config/ data/ backup-new-server/
+
+# Populate config/data dir again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ bin/up
+```
+
+#### Docker Compose
+
+```bash wrap
+# Gracefully shutdown the old instance
+old-server$ docker stop sharelatex
+old-server$ docker stop mongo redis
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar ~/OVERLEAF_data ~/mongo_data ~/redis_data
+
+# Copy the backup-old-server.tar file from the old-server to
+# the new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ docker stop sharelatex
+new-server$ docker stop mongo redis
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv ~/OVERLEAF_data ~/mongo_data ~/redis_data backup-new-server/
+
+# Populate data dirs again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ docker start mongo redis
+new-server$ docker start sharelatex
+```
+
+V závislosti na vašem souboru **docker-compose.yml** může být nutné upravit cesty ke svazkům `mongo`, `redis` a `overleaf`.
+
+<Info>
+
+Při spuštění pod uživatelem root (nebo se sudo) zachová tar vlastníka/skupinu a oprávnění souborů, což je při obnově zálohy zásadní.
+
+</Info>
+
+### Podrobný popis složek
+
+<Info>
+
+Následující složky mají doplňující značky:
+
+* (b) zahrnout do záloh, nejlépe při zastavené instanci kvůli konzistenci
+* (d) lze smazat
+* (e) dočasné soubory, lze smazat při zastavené instanci
+
+</Info>
+
+1. `~/mongo_data` (b)
+   * datový adresář mongodb
+2. `~/redis_data` (b)
+   * datový adresář databáze redis
+3. `~/overleaf_data`
+   1. bin
+      1. synctex (d)
+         * v nejnovějším vydání se nepoužívá, dříve se používala vlastní binárka synctex (synctex slouží k mapování zdroje mezi soubory .tex a PDF)
+   2. data
+      1. cache (e)
+         * mezipaměť binárních souborů pro kompilace
+      2. compiles (e)
+         * zde probíhá kompilace LaTeXu
+      3. db.sqlite (d)
+         * v nejnovějším vydání se nepoužívá, dříve ukládal údaje mezipaměti clsi (nyní buď přesunuto do jednoduchých map v paměti, nebo se prochází disk)
+      4. db.sqlite-wal (d)
+         * v nejnovějším vydání se nepoužívá, viz db.sqlite
+      5. output (e)
+         * úložiště výstupu kompilace LaTeXu pro poskytování klientovi
+      6. template\_files (b)
+         * obrázkové náhledy systému šablon (pouze Server Pro)
+      7. user\_files (b)
+         * binární soubory projektů
+      8. history (b)
+         * soubory úplné historie projektů
+   3. tmp
+      1. dumpFolder (e)
+         * dočasné soubory ze zpracování souborů zip
+      2. uploads (e)
+         * vyrovnávací paměť pro nahrávání souborů (nahrání binárního souboru / nového projektu ze zip)
+      3. projectHistories (e)
+         * dočasné soubory pro migrace úplné historie projektů

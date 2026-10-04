@@ -1,0 +1,151 @@
+---
+title: Mikropalvelut
+icon: microchip
+---
+
+Suositeltu tapa ottaa käyttöön ja hallita Overleaf Server CE- ja Overleaf Pro -instansseja on Toolkitin käyttäminen.
+
+Toolkit yksinkertaistaa Overleaf-instanssisi luomista mukautetuilla skripteillä, jotka piilottavat tarvittavien mikropalveluiden orkestroinnin. Suorita vain mukana tuleva alustusskripti ja anna muutama konfiguraatioasetus, kuten pysyvän tallennustilan polut, niin Toolkit huolehtii Overleaf Server CE- tai Pro -instanssisi muodostavien mikropalveluiden luomisesta ja yhdistämisestä.
+
+Näin voit keskittyä käyttökokemuksen mukauttamiseen ja paikallisen instanssisi erityisominaisuuksien toteuttamiseen. Toolkit hoitaa kaiken monimutkaisuuden taustalla ja mahdollistaa Overleaf-instanssisi yksinkertaistetun käyttöönoton.
+
+<Info>
+
+Historiallisista syistä Overleafin pääkontin nimi on `sharelatex`, ja se perustuu `sharelatex/sharelatex`-Docker-imageen. Tämä johtuu siitä, että teknologia perustuu ShareLaTeX-koodipohjaan, joka yhdistettiin Overleafiin. Lisätietoja on [tässä blogikirjoituksessa](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf). Jossain vaiheessa tulevaisuudessa se nimetään uudelleen Overleafin nimeämiskäytännön mukaiseksi.
+
+</Info>
+
+#### Arkkitehtuuri
+
+Overleaf-kontin sisällä ohjelmisto toimii joukkona mikropalveluita, joita hallitsee `runit`. Joitakin kontin kiinnostavimmista tiedostoista ovat:
+
+* `/etc/service/`: mikropalveluiden alustustiedostot.
+* `/var/log/overleaf/`: kunkin mikropalvelun lokit.
+* `/overleaf/services/`: eri mikropalveluiden koodi.
+* `/var/lib/overleaf/`: pysyvän datan liitoskohta (vastaa isäntäkoneella muuttujan `OVERLEAF_DATA_PATH` osoittamaa hakemistoa).
+
+#### MongoDB- ja Redis-kontit
+
+Overleaf on riippuvainen kahdesta ulkoisesta tietokannasta: MongoDB:stä ja Redisistä. Oletuksena Toolkit luo kummallekin tietokannalle oman kontin Overleaf-kontin lisäksi, eli yhteensä kolme Docker-konttia.
+
+<Info>
+
+Jos haluat mieluummin yhdistää olemassa olevaan MongoDB- tai Redis-instanssiin, voit tehdä sen asettamalla asianmukaiset asetukset konfiguraatiotiedostoon [overleaf.rc](/fi/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Editori ja käännösprosessi
+
+Tämä osio tarjoaa yleiskatsauksen dokumenttien käsittelyyn ja käännösprosessiin.
+
+<Info>
+
+Tällä sivulla kuvataan käännösprosessi hiekkalaatikoitujen käännösten (Sandboxed Compiles) kanssa, jotka ovat saatavilla vain Overleaf Prossa. Server CE:ssä käännösprosessi käyttää yksinkertaisia aliprosesseja — korvaa **konttiin** viittaavat kohdat yhdellä kohdalla **suorita käännös aliprosessissa**.
+
+</Info>
+
+Komponentit / toimijat:
+
+* `user` — Sovelluksen käyttäjä
+* `editor` — Selaimessa toimiva asiakassovellus
+* `clsi` — PDF-tiedostojen kääntämiseen käytettävä mikropalvelu
+* `document-updater` — Dokumenttipäivitysten käsittelyyn käytettävä mikropalvelu
+* `filestore` — Binääritiedostoja käsittelevä mikropalvelu
+* `real-time` — WebSocket-yhteyksien käsittelyyn käytettävä mikropalvelu
+* `web` — API-pyyntöjen käsittelyyn käytettävä (ei niin) mikropalvelu
+
+**Redis-välimuisti**
+
+* **user**: lataa editorisivun
+* **editor**: avaa WebSocket-yhteyden
+* **editor**: lähettää WebSocketin kautta pyynnön dokumentin avaamiseksi
+  * **real-time** -> **document-updater**: dokumentti ladataan MongoDB:stä Redisiin
+* **editor**: lähettää dokumenttipäivityksen WebSocketin kautta
+  * **real-time** -> **document-updater**: dokumentti päivitetään Redisissä
+* **editor**: lähettää lisää käännöspyyntöjä
+  * Kun edellisestä tallennuksesta on kulunut 5 minuuttia (dokumenttikohtaisesti):
+    * **document-updater**: tallentaa dokumentin Redisistä MongoDB:hen
+* **editor**: lähettää lisää päivityksiä
+  * 100 päivityksen välein (dokumenttikohtaisesti):
+    * **document-updater**: tallentaa dokumentin historian Redisistä MongoDB:hen
+* **user**: poistuu editorista / sulkee selaimen välilehden
+  * 5 minuuttia myöhemmin
+    * **real-time**: tarkistaa, onko muita yhteistyökumppaneita; jos ei ole:
+      * **real-time** -> **document-updater**: tallentaa dokumentit Redisistä MongoDB:hen
+
+**Lukeminen MongoDB:stä Redisiin**
+
+* **document-updater** -> **web** -> **docstore**: luku MongoDB:stä
+
+**Tallentaminen Redisistä MongoDB:hen**
+
+* **document-updater** -> **web** -> **docstore**: kirjoitus MongoDB:hen
+
+**Käännös — "full"-synkronointitila**
+
+* **editor**: lähettää käännöspyynnön, jonka synkronointitilaksi on asetettu "full"
+* **web** -> **document-updater**: kaikki dokumentit tallennetaan Redisistä MongoDB:hen
+* **web** -> **docstore**: kaikki dokumentit ladataan MongoDB:stä
+* **web** -> **clsi**: käännöspyyntö lähetetään `clsi`:lle, ja se sisältää:
+  * synkronointitilan
+  * tiedostopuun tiivisteen -> "projektin tila"
+  * kaikki dokumentit sisältöineen -> pyynnön rungon 7 Mt:n raja
+  * binääritiedostojen URL-osoitteet erillistä latausta varten
+* **clsi**: tarkistaa levyllä olevan tilan synkronointitilan ja "projektin tilan" perusteella
+  * tämä on täysi synkronointi, joten aiempi levyllä oleva tila voidaan ohittaa
+* **clsi**: siivoaa käännöshakemiston
+* **clsi**: kirjoittaa kaikki dokumentit käännöshakemistoon
+* **clsi**: kirjoittaa kaikki binääritiedostot käännöshakemistoon
+  * `clsi` kopioi tiedostot projektikohtaisesta paikallisesta välimuistista
+  * jos tiedostoa ei löydy välimuistista:
+    * **clsi** -> **filestore**: lataa tiedostot
+* **clsi**: kirjoittaa "projektin tilan"
+* **clsi**: varmistaa, että Docker-kontti on olemassa halutulla konfiguraatiolla
+  * muodostaa kontin asetukset, mukaan lukien texlive-versio
+  * laskee asetuksista tiivisteen
+  * kontin nimi: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: käynnistää kontin ja ohjaa stdout/stderr-tulosteen muistiin -> raja 2 Mt
+* **clsi**: jättää pysäytetyn kontin jäljelle -> siivotaan 24 tunnin kuluttua
+* **clsi**: kirjoittaa stdout/stderr-tulosteen levylle
+* **clsi**: kopioi tulostiedostot yksilölliseen tuloshakemistoon
+  * build-id koostuu 8 satunnaisesta tavusta sekä millisekunnin tarkkuudella olevasta aikaleimasta
+  * poistaa kaikki paitsi 3 viimeisintä (anonyymi) / 1 viimeisimmän (kirjautunut käyttäjä) build-kansiota
+* **clsi**: käännös epäonnistui / aikakatkaistiin
+  * poistaa käännösvälimuistin — siinä voi olla osittaisia tiedostoja tai vioittunutta välimuistia
+* **editor**: lataa tiedostot output.log ja output.pdf
+
+**Käännös — "incremental"-synkronointitila**
+
+* **editor**: lähettää käännöspyynnön, jonka synkronointitilaksi on asetettu "incremental"
+* **web** -> **document-updater**: hakee kaikki dokumentit Redisistä
+  * "projektin tila" -tiiviste tallennetaan myös Redisiin
+  * **web** lähettää tiedostopuun tiivisteen `document-updater`ille, ja `document-updater` voi muuttaa inkrementaalisen käännöksen täydeksi käännökseksi, jos tiivisteet eivät täsmää
+    * katso käännösprosessi, joka suoritetaan, kun editori pyytää "full"-käännöstä
+* **web** -> **clsi**: käännöspyyntö lähetetään `clsi`:lle, ja se sisältää:
+  * synkronointitilan
+  * tiedostopuun tiivisteen -> "projektin tila"
+  * kaikki Redisistä haetut dokumentit sisältöineen -> pyynnön rungon 7 Mt:n raja
+  * ei binääritiedostoja
+* **clsi**: tarkistaa levyllä olevan tilan synkronointitilan ja "projektin tilan" perusteella
+  * tämä on inkrementaalinen synkronointi, joten "projektin tilan" on täsmättävä
+  * jos ne eivät täsmää: vastaa koodilla 409 ja anna webin yrittää uudelleen "full"-synkronoinnilla
+    * katso käännösprosessi, joka suoritetaan, kun editori pyytää "full"-käännöstä
+* **clsi**: kirjoittaa päivitetyt dokumentit käännöshakemistoon
+* **clsi**: varmistaa, että Docker-kontti on olemassa halutulla konfiguraatiolla
+  * muodostaa kontin asetukset, mukaan lukien texlive-versio
+  * laskee asetuksista tiivisteen
+  * kontin nimi: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: käynnistää kontin ja ohjaa stdout/stderr-tulosteen muistiin -> raja 2 Mt
+* **clsi**: jättää pysäytetyn kontin jäljelle -> siivotaan 24 tunnin kuluttua
+* **clsi**: kirjoittaa stdout/stderr-tulosteen levylle
+* **clsi**: kopioi tulostiedostot yksilölliseen tuloshakemistoon
+  * build-id koostuu 8 satunnaisesta tavusta sekä millisekunnin tarkkuudella olevasta aikaleimasta
+  * poistaa kaikki paitsi 3 viimeisintä (anonyymi) / 1 viimeisimmän (kirjautunut käyttäjä) build-kansiota
+* **clsi**: käännös epäonnistui / aikakatkaistiin
+  * poistaa käännösvälimuistin — siinä voi olla osittaisia tiedostoja tai vioittunutta välimuistia
+* **editor**: lataa tiedostot output.log ja output.pdf
+
+**Käännös — tilojen välillä vaihtaminen**
+
+* **editor**: havaitsee käännöksen epäonnistuvan, seuraava käännös on "full"-käännös
+* **editor**: havaitsee käännöksen onnistuvan, seuraava käännös on "incremental"-käännös

@@ -1,0 +1,288 @@
+---
+title: (v5.5.7-siirto) Binääritiedostojen siirto
+icon: arrows-rotate
+---
+
+## Binääritiedostojen siirto
+
+Server Pron ja Community Editionin tuleva pääversio `6.0` puolittaa binääritiedostojen tallennustilan käytön. Versioon `5.5.7` sisältyy online-siirto, joka mahdollistaa mahdollisimman lyhyen käyttökatkon päivityksen yhteydessä.
+
+Server Pron versiosta `4.x` lähtien binääritiedostot on tallennettu kahteen kertaan: aktiivisten tiedostojen tallennustilaan "filestoressa" sekä projektien täyteen historiajärjestelmään. Jatkossa kustakin tiedostosta tallennetaan vain yksi kopio projektien täyteen historiajärjestelmään.
+
+Siirto yhdistettyyn tallennusjärjestelmään koostuu kahdesta osasta: uudesta lipusta, jolla ohjataan siirron vaihetta, sekä skriptistä, joka käsittelee kaikki aktiiviset ja pehmeästi poistetut projektit.
+
+Vaiheet:
+
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=0` (oletus): tiedostot luetaan filestoresta ja kirjoitetaan sinne. Tiedostot kirjoitetaan historiaan asynkronisesti.
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1` : tiedostot luetaan historiasta, ja varavaihtoehtona käytetään filestorea, ja ne kirjoitetaan sekä filestoreen että historiaan. Paluu tasolle `OVERLEAF_FILESTORE_MIGRATION_LEVEL=0` on mahdollinen.
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=2`: tiedostot luetaan ja kirjoitetaan vain historiaan. Paluu tasolle `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1` ei ole mahdollinen, ellei siirtoa tehty "offline-tilassa".
+
+Kun tiedot tallennetaan [S3:een](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3) ja filestorelle (`OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID`) ja historialle (`OVERLEAF_HISTORY_S3_ACCESS_KEY_ID`) käytetään erillisiä palvelutilejä: anna filestore-käyttäjälle lukuoikeus historian blob-bucketiin `OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET` . Jatkossa filestore-palvelu palvelee kääntäjäpalvelun lukupyyntöjä.
+
+<Warning>
+
+On erittäin suositeltavaa suorittaa binääritiedostojen siirto ensin muussa kuin tuotantoympäristössä / testiympäristössä.
+
+</Warning>
+
+<Check>
+
+Tavallinen Server Pro -lisenssi sallii sovelluksen ajamisen sekä tuotantoympäristössä että yhdessä muussa kuin tuotantoympäristössä / testiympäristössä; on erittäin suositeltavaa varata testausta varten muu kuin tuotantoympäristö.
+
+</Check>
+
+<Info>
+
+Jos päivität Server Pron/CE:n versioon `6.0` ja päätät myöhemmin palata aiempaan versioon, sinun tulee palauttaa järjestelmä täydestä varmuuskopiosta.
+
+</Info>
+
+### Siirtomenettely
+
+<Steps>
+<Step title="Luo varmuuskopio">
+Luo instanssistasi täysi [varmuuskopio](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup), joka sisältää yhtenäisen tilannevedoksen **mongo**-, **redis**- ja **sharelatex**-hakemistoista.
+</Step>
+
+<Step title="Päivitä">
+**Toolkit:** Päivitä **toolkit** uusimpaan versioon `$ bin/upgrade` -skriptillä. Kun sinulta kysytään, **älä** vahvista kehotetta **Upgrade** image? – muokkaa sen sijaan manuaalisesti **config/version**-tiedostoa ja aseta arvoksi `5.5.7`.
+
+**Vanha docker-compose.yml:** Päivitä `sharelatex`-palvelun versioksi `5.5.7`.
+</Step>
+
+<Step title="Arvioi siirron koskettamien projektien määrä">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --report"
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --report"
+```
+
+Esimerkkituloste:
+
+```text
+Current status:
+- Total number of projects: 10
+- Total number of deleted projects: 5
+Sampling 1000 projects to estimate progress...
+Sampled stats for projects:
+- Sampled projects: 9 (90% of all projects)
+- Sampled projects with all hashes present: 5
+- Percentage of projects that need back-filling hashes: 44% (estimated)
+- Sampled projects have 11 files that need to be checked against the full project history system.
+- Sampled projects have 3 files that need to be uploaded to the full project history system (estimating 27% of all files).
+Sampled stats for deleted projects:
+- Sampled deleted projects: 4 (80% of all deleted projects)
+- Sampled deleted projects with all hashes present: 3
+- Percentage of deleted projects that need back-filling hashes: 25% (estimated)
+- Sampled deleted projects have 2 files that need to be checked against the full project history system.
+- Sampled deleted projects have 1 files that need to be uploaded to the full project history system (estimating 50% of all files).
+```
+</Step>
+
+<Step title="Tyhjennä projektihistorian jonot">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /overleaf/bin/flush-history-queues
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /overleaf/bin/flush-history-queues
+```
+
+Toista tyhjennys, kunnes kaikki projektit on tyhjennetty (`"project_ids":0`).
+
+```text
+found projects {"project_ids":0,"limit":100000,"ts":"2025-09-01T10:35:33.353Z"}
+total {"succeededProjects":0,"failedProjects":0}
+```
+
+<Danger>
+
+Jos "failedProjects" ei ole nolla, ota yhteyttä tukeen äläkä jatka binääritiedostojen siirtoa.
+
+</Danger>
+</Step>
+
+<Step title="Siirry siirron vaiheeseen 1">
+Toolkit: Aseta `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1` tiedostossa `config/variables.env`.
+
+Vanha docker-compose.yml: Aseta `OVERLEAF_FILESTORE_MIGRATION_LEVEL: '1'` `sharelatex`-palvelun `environment`-osioon.
+</Step>
+
+<Step title="Ota määritysmuutos käyttöön ja käynnistä instanssi">
+Toolkit: `bin/up -d`
+
+Vanha docker-compose.yml: `docker compose up -d`
+</Step>
+
+<Step title="Tarkista pääsy binääritiedostoihin">
+Avaa projekti Overleaf-editorissa selaimessa ja valitse binääritiedosto, esimerkiksi kuva.
+</Step>
+
+<Step title="Aja siirtoskripti">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --all"
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --all"
+```
+
+<Danger>
+
+Jos [tallennat lokitiedostoja pysyvästi](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging#persisting-logs) **sharelatex**-kontin ulkopuolelle, varmista, että lokihakemiston omistajaksi on asetettu `www-data`-käyttäjä (uid=33), jotta tuotettu lokitiedosto voidaan kirjoittaa.
+
+</Danger>
+
+Tulosteen pitäisi näyttää tältä:
+
+```bash
+Set UV_THREADPOOL_SIZE=16
+{"name":"default","hostname":"c25e9faaeb53","pid":971,"level":30,"backend":"fs","msg":"Loading backend","time":"2025-07-25T15:00:58.166Z","v":0}
+Writing logs into /var/log/overleaf/file-migration-2025-07-25T15_00_58_199Z.log
+Starting project file backup...
+Loaded global blobs: 0
+Processing non-deleted projects...
+Processed 1 projects, elapsed time 0s
+Done updating live projects
+Processing deleted projects...
+The collection deletedProjects appears to be empty.
+
+Done updating deleted projects
+Done.
+
+```
+
+Jos siirto onnistuu, saat poistumiskoodin `0`, ja viimeiset rivit osoittavat, ettei virheitä ollut:
+
+```bash
+Done.
+```
+
+Lokitiedosto näyttää tältä (käytä skriptin tulostamaa polkua):
+
+```bash wrap
+$ docker cp sharelatex:/var/log/overleaf/file-migration-2025-07-25T15_00_58_199Z.log .
+$ cat file-migration-2025-07-25T15_00_58_199Z.log
+{"name":"file-migration","hostname":"c25e9faaeb53","pid":971,"level":30,"end":"68839a8f577b9f009d947b27 (2025-07-25T14:54:07.000Z)","msg":"actually completed batch","time":"2025-07-25T15:00:58.379Z","v":0}
+{"name":"file-migration","hostname":"c25e9faaeb53","pid":971,"level":30,"time":"2025-07-25T15:00:58.383Z","LOGGING_IDENTIFIER":"4effa2000000000000000000","projects":1,"blobs":6,"filesWithHash":5,"filesWithoutHash":2,"filesDuplicated":0,"filesRetries":0,"filesFailed":0,"fileTreeUpdated":0,"badFileTrees":0,"globalBlobsCount":0,"globalBlobsEgress":0,"projectDeleted":0,"projectHardDeleted":0,"fileHardDeleted":0,"mongoUpdates":1,"readFromGCSCount":7,"readFromGCSIngress":28532,"writeToGCSCount":5,"writeToGCSEgress":300,"readFromGCSThroughputMiBPerSecond":0.14925639825786063,"eventLoop":{"idle":48.277844,"active":381.53244699971054,"utilization":0.8876763888372498},"diff":{"eventLoop":{"idle":48.223536,"active":134.04030200059555,"utilization":0.7354190687027976},"projects":1,"blobs":6,"filesWithHash":5,"filesWithoutHash":2,"filesDuplicated":0,"filesRetries":0,"filesFailed":0,"fileTreeUpdated":0,"badFileTrees":0,"globalBlobsCount":0,"globalBlobsEgress":0,"projectDeleted":0,"projectHardDeleted":0,"fileHardDeleted":0,"mongoUpdates":1,"readFromGCSCount":7,"readFromGCSIngress":28532,"writeToGCSCount":5,"writeToGCSEgress":300,"readFromGCSThroughputMiBPerSecond":0.14925639825786063},"deferredBatches":[],"msg":"file-migration stats","v":0}
+```
+</Step>
+
+<Step title="Pysäytä instanssi">
+Toolkit: `bin/stop sharelatex`
+
+Vanha docker-compose.yml: `docker compose stop sharelatex`
+</Step>
+
+<Step title="Estä sovelluksen pääsy vanhoihin tiedostoihin">
+Voit nyt siirtää vanhat tiedostot toissijaiseen tallennustilaan. Suosittelemme säilyttämään tiedostot jonkin aikaa siltä varalta, että ongelmia ilmenee myöhemmin.
+
+```bash wrap
+# Toolkit users:
+$ bin/docker-compose run --rm --entrypoint mv sharelatex --no-clobber --verbose /var/lib/overleaf/data/user_files /var/lib/overleaf/data/old_user_files
+
+# Legacy docker-compose.yml users:
+# We are assuming that you are using the default bind-mount in /var/lib/overleaf
+$ docker compose run --rm --entrypoint mv sharelatex --no-clobber --verbose /var/lib/overleaf/data/user_files /var/lib/overleaf/data/old_user_files
+# In case you are using selective bind-mounts, you can simply remove the bind-mount for /var/lib/overleaf/data/user_files inside the container.
+```
+</Step>
+
+<Step title="Siirry siirron vaiheeseen 2">
+Toolkit: Aseta `OVERLEAF_FILESTORE_MIGRATION_LEVEL=2` tiedostossa `config/variables.env`.
+
+Vanha docker-compose.yml: Aseta `OVERLEAF_FILESTORE_MIGRATION_LEVEL: '2'` `sharelatex`-palvelun `environment`-osioon.
+</Step>
+
+<Step title="Ota määritysmuutos käyttöön ja käynnistä instanssi">
+Toolkit: `bin/up -d`
+
+Vanha docker-compose.yml: `docker compose up -d`
+</Step>
+
+<Step title="Tarkista pääsy binääritiedostoihin">
+Avaa projekti Overleaf-editorissa selaimessa ja valitse binääritiedosto, esimerkiksi kuva.
+</Step>
+</Steps>
+
+#### Offline-siirto
+
+Jos haluat estää käyttäjiä kirjautumasta sisään binääritiedostojen siirtoskriptin ollessa käynnissä, noudata seuraavia ohjeita:
+
+* Kirjaudu Overleaf-instanssiisi ylläpitäjän tilillä
+* Napsauta **Admin**-painiketta ja valitse **Manage Site**
+* Napsauta **Open/Close Editor** -välilehteä
+* Napsauta **Close Editor** -painiketta
+* Napsauta **Disconnect all users** -painiketta
+
+Kun tämä on tehty, sisäänkirjautuneet käyttäjät ohjataan huoltosivulle, ja kirjautumissivulle saapuvat uudet käyttäjät näkevät huoltosivun **eivätkä** voi kirjautua sisään.
+
+Nämä vaiheet on toistettava, kun instanssi käynnistetään uudelleen. Avataksesi sivuston uudelleen käynnistä instanssi yksinkertaisesti uudelleen.
+
+#### Online-siirto
+
+Siirtoskriptit on mahdollista ajaa sovelluksen ollessa edelleen käynnissä. Huomioon on otettava muutama seikka:
+
+* Siirtoprosessi kuormittaa I/O:ta voimakkaasti, joten resurssien käyttöä kannattaa seurata skriptin ollessa käynnissä.
+* Suurella käsittelyn rinnakkaisuudella `filestore`-palvelun tapahtumasilmukka voi joutua osittain estetyksi, mikä heikentäisi käyttökokemusta. Suosittelemme aloittamaan oletusarvoilla `--concurrency=10` ja `--concurrent-batches=1` .
+* Voit pysäyttää skriptin milloin tahansa. Kun käynnistät sen uudelleen, se validoi aiemmat projektit ja ohittaa jo käsitellyt tiedostot. Tästä on hyötyä, jos haluat ajaa siirron hiljaisempina aikoina (esim. yöllä).
+
+Suosittelemme sulkemaan sivuston ja ajamaan siirron offline-tilassa huoltoikkunan aikana, jos projekteja on alle 1000 (katso siirtoskriptin tuloste `--report`-valinnalla ajettaessa). Jos projekteja on paljon, voit ajaa skriptin ja seurata sen edistymistä ja päättää sitten tilanteesi perusteella, jatkatko sen ajamista online- vai offline-tilassa.
+
+#### Vanhojen binääritiedostotietojen siivoaminen
+
+Kun siirto on valmis ja olet varmistanut, että projektit pääsevät edelleen käsiksi kaikkiin tiedostoihinsa, voit poistaa vanhan tiedostotallennustilan hakemistosta `/var/lib/overleaf/data/user_files`. Suosittelemme vahvasti säilyttämään nämä tiedostot jonkin aikaa – voit estää sovelluksen pääsyn niihin nimeämällä kansion ensin uudelleen.
+
+### Vianmääritys
+
+Lisäämme vianmääritysohjeita tähän. Huomaa, että vaikka tarjoamme tukea yleensä vain Server Pron asiakkaille, tämän siirron luonteen vuoksi pyrimme parhaamme mukaan tukemaan myös CE-asiakkaita, jotka kohtaavat nimenomaan binääritiedostojen siirtoon liittyviä ongelmia.
+
+Jos binääritiedostojen siirtoskripti epäonnistuu (eli päättyy virheeseen tai tulostaa epäonnistuneiden projektien määräksi muun kuin nollan), lähetä seuraavat tiedot tukitiimillemme sähköpostitse osoitteeseen [support+filestoremigration@overleaf.com](mailto:support+filestoremigration@overleaf.com?subject=Binary%20file%20migration%20problem&body=Instance%20Type%3A%20CE%20or%20Server%20Pro%20%28delete%20as%20appropriate%29%0A%0AInstallation%20Type%3A%20Overleaf%20toolkit%20or%20docker-compose.yml%20or%20other%20%28delete%20as%20appropriate%29%0A%0AScript%20output%3A%0A%0Abin%2Fdoctor%20output%20%28if%20using%20toolkit%29%3A%0A) ja kerro:
+
+Aihe: Binary file migration problem
+
+Viesti:
+
+* Instanssin tyyppi: CE tai Server Pro (poista tarpeeton)
+* Asennustyyppi: Overleaf toolkit, `docker-compose.yml` tai muu (poista tarpeeton)
+* Versio: 5.5.x (toolkit: `$ cat config/version`)
+* Siirtoskriptin tuloste (jonka pitäisi löytyä kontista hakemistosta `/var/log/overleaf`)
+* Raportti: (aja siirtoskripti `--report`-valinnalla)
+* Käsitellyt projektit: (skriptin viimeisimmän ajon mukaan)
+* Siirron kesto:
+* `bin/doctor`-tuloste (toolkitia käytettäessä)
+* Toolkitin versio: `$ git rev-parse HEAD` (Toolkitia käytettäessä)
+
+Harkitse `filestore`-palvelun lokitiedostojen liittämistä sähköpostiin. Löydät ne `sharelatex`-kontista polusta `/var/log/overleaf/filestore.log` ja voit viedä ne näin:
+
+```bash
+$ docker cp sharelatex:/var/log/overleaf/filestore.log .
+# replace <timestamp> with the timestamp as printed by the script
+$ docker cp sharelatex:/var/log/overleaf/file-migration-<timestamp>.log .
+```
+
+Poista lokitiedostoista kaikki arkaluonteiset tiedot ennen niiden liittämistä.
+
+#### Puuttuvat tiedostot
+
+Server Pron/CE:n vanhemmat versiot loivat tiedostopuun merkinnät ennen kuin käyttäjien lataukset olivat valmiita, mikä saattoi saada tiedostot näyttämään puuttuvilta latauksen epäonnistuessa. Saatat löytää muutamia tällaisia tapauksia virheiksi raportoituina, kun kaikki tiedostopuut käsitellään.
+
+Jos puuttuvia tiedostoja on vähän, harkitse näiden tapausten manuaalista tarkistamista ja niiden poistamista editorista selaimessa.
+
+Jos puuttuvia tiedostoja on paljon, harkitse yhteydenottoa tukeen, katso yllä oleva sähköpostipohja.
+
+#### Rikkinäisten tiedostopuiden etsiminen
+
+Siirto voi epäonnistua projekteissa, joiden tiedostopuu on virheellinen (esimerkiksi tiedostonimet ovat tyhjiä). Voit etsiä luettelon näistä ongelmista `find_malformed_filetrees`-skriptillä, joka tarkistaa kaikki tietokannan projektit:
+
+```bash wrap
+$ bin/docker-compose exec sharelatex /bin/bash -c "cd /overleaf/services/web && /sbin/setuser www-data node scripts/find_malformed_filetrees.mjs > /tmp/malformed-file-trees.json"
+```
+
+Korjaa virheelliset polut `fix_malformed_filetree`-skriptillä ajamalla komento kerran kutakin virheellistä polkua kohden:
+
+```bash wrap
+$ bin/docker-compose exec sharelatex /bin/bash -c "cd /overleaf/services/web && /sbin/setuser www-data node scripts/fix_malformed_filetree.mjs --logs=/tmp/malformed-file-trees.json"
+```

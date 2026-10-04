@@ -1,0 +1,123 @@
+---
+title: Konfigurera kompilering i sandlåda
+icon: box-archive
+---
+
+Det finns vissa skillnader mellan utvecklings- och produktionsmiljön om du vill konfigurera kompilering i sandlåda för utveckling. Det finns tre saker du behöver tänka på:
+
+* Problem med filbehörigheter
+* Delad volym mellan history-v1 och filestore
+* Problem med underkataloger
+
+### Aktivera kompilering i sandlåda
+
+Här behöver vi bara aktivera Sandbox Compiles på samma sätt som i Overleaf CE. Det enda vi behöver tänka på är användaren. Här sätter vi den till root.
+
+I produktionsmiljön använder vi www-data som delad användare mellan Overleaf-containern och TeX-kompileringscontainern. I utvecklingsmiljön är däremot node standardanvändaren i containern, och det finns ingen www-data-användare att koppla till. Därför använder vi root som en tillfällig lösning.
+
+<Warning>
+
+Använd inte en egenbyggd image, eftersom du då kan stöta på en rad fel.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Åtgärda filbehörigheter
+
+LaTeX körs i syskoncontainrarna som den användare som anges i miljövariabeln `TEXLIVE_IMAGE_USER`. I exemplet ovan är den satt till `root`, som har uid `0`. Det skapar problem med ovanstående behörigheter, eftersom root-användaren inte har behörighet att skriva till underkataloger i `compiles`.
+
+En snabb lösning är att ge gruppen `root` ägarskap och läs- och skrivbehörighet till `compiles`, med `setgid` satt så att nya underkataloger också ärver detta ägarskap:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Detaljerad dokumentation finns i `services/clsi/README.md`.
+
+### Delad volym mellan history-v1 och filestore
+
+Som standard fungerar filestore som en brygga mellan S3 och övriga tjänster i Overleaf. I Overleaf CE eller Server Pro lagras dock alla filer lokalt som standard. Därför har Overleaf infört en ganska knepig metod.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Samtidigt används `data/history` även av historiktjänsten. På så sätt kan de dela samma data mellan olika mikrotjänster. Du måste lägga till volymen `history-v1-buckets` i filestore-tjänsten i utvecklingsmiljön. Annars **kan clsi inte hämta blob-filer från filestore-tjänsten**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+Du måste också lägga till BUCKET-namnen i inställningarna i `dev.env`:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Använd underkataloger
+
+Filestore använder useSubdirectories satt till true som standard, men i utvecklingsmiljön **plattar history v1 ut all data.** Det orsakar vissa konflikter. För att åtgärda detta behöver du lägga till följande:&#x20;
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+I history v1 lagras alla `project_blobs`-filer ursprungligen så här:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Du måste sätta useSubdirectories till `true` för att byta till underkatalogsläge. Då ersätts det ursprungliga `_` i blob-namnet med `/`.

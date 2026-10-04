@@ -1,0 +1,151 @@
+---
+title: Mikrousługi
+icon: microchip
+---
+
+Zalecanym sposobem wdrażania instancji Overleaf Server CE i Overleaf Pro oraz zarządzania nimi jest korzystanie z Toolkit.
+
+Toolkit upraszcza tworzenie instancji Overleaf dzięki zestawowi skryptów, które ukrywają złożoność orkiestracji wymaganych mikrousług. Wystarczy uruchomić dołączony skrypt inicjalizacyjny i podać kilka opcji konfiguracyjnych, takich jak ścieżki do pamięci trwałej, a Toolkit zajmie się utworzeniem i połączeniem mikrousług składających się na Twoją instancję Overleaf Server CE lub Pro.
+
+Dzięki temu możesz skupić się na dostosowywaniu doświadczeń użytkowników i wdrażaniu konkretnych funkcji Twojej instancji on-premise. Toolkit obsługuje całą złożoność w tle, umożliwiając uproszczone wdrożenie instancji Overleaf.
+
+<Info>
+
+Ze względów historycznych główny kontener Overleaf nosi nazwę `sharelatex` i bazuje na obrazie Docker `sharelatex/sharelatex`. Wynika to z faktu, że technologia opiera się na kodzie ShareLaTeX, który został połączony z Overleaf. Więcej szczegółów znajdziesz w [tym wpisie na blogu](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf). W przyszłości nazwa ta zostanie zmieniona zgodnie z konwencją nazewnictwa Overleaf.
+
+</Info>
+
+#### Architektura
+
+Wewnątrz kontenera Overleaf oprogramowanie działa jako zestaw mikrousług zarządzanych przez `runit`. Niektóre z ciekawszych plików wewnątrz kontenera to:
+
+* `/etc/service/`: pliki inicjalizacyjne mikrousług.
+* `/var/log/overleaf/`: logi poszczególnych mikrousług.
+* `/overleaf/services/`: kod poszczególnych mikrousług.
+* `/var/lib/overleaf/`: punkt montowania danych trwałych (odpowiada katalogowi wskazanemu przez `OVERLEAF_DATA_PATH` na hoście).
+
+#### Kontenery MongoDB i Redis
+
+Overleaf zależy od dwóch zewnętrznych baz danych: MongoDB i Redis. Domyślnie Toolkit tworzy osobny kontener dla każdej z tych baz danych, oprócz kontenera Overleaf — łącznie są to trzy kontenery Docker.
+
+<Info>
+
+Jeśli wolisz połączyć się z istniejącą instancją MongoDB lub Redis, możesz to zrobić, ustawiając odpowiednie opcje w pliku konfiguracyjnym [overleaf.rc](/pl/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Edytor i proces kompilacji
+
+Ta sekcja zawiera ogólny przegląd obsługi dokumentów i procesu kompilacji.
+
+<Info>
+
+Ta strona opisuje proces kompilacji z użyciem Sandboxed Compiles, dostępnych wyłącznie w Overleaf Pro. W Server CE proces kompilacji korzysta ze zwykłych podprocesów — zastąp elementy odnoszące się do **kontenera** jednym elementem **uruchom kompilację w podprocesie**.
+
+</Info>
+
+Komponenty / aktorzy:
+
+* `user` — użytkownik aplikacji
+* `editor` — aplikacja kliencka działająca w przeglądarce
+* `clsi` — mikrousługa służąca do kompilowania plików PDF
+* `document-updater` — mikrousługa przetwarzająca aktualizacje dokumentów
+* `filestore` — mikrousługa obsługująca pliki binarne
+* `real-time` — mikrousługa obsługująca WebSockety
+* `web` — (nie tak bardzo) mikrousługa obsługująca żądania API
+
+**Buforowanie w Redis**
+
+* **user**: wczytuje stronę edytora
+* **editor**: otwiera WebSocket
+* **editor**: wysyła przez WebSocket żądanie otwarcia dokumentu
+  * **real-time** -> **document-updater**: dokument jest wczytywany z MongoDB do Redis
+* **editor**: wysyła przez WebSocket aktualizację dokumentu
+  * **real-time** -> **document-updater**: dokument jest aktualizowany w Redis
+* **editor**: wysyła kolejne żądania kompilacji
+  * Po upływie 5 minut od ostatniego zapisu (dla każdego dokumentu):
+    * **document-updater**: zapisuje dokument z Redis do MongoDB
+* **editor**: wysyła kolejne aktualizacje
+  * co 100 aktualizacji (dla każdego dokumentu):
+    * **document-updater**: zapisuje historię dokumentu z Redis do MongoDB
+* **user**: opuszcza edytor / zamyka kartę przeglądarki
+  * 5 minut później
+    * **real-time**: sprawdza, czy są inni współpracownicy; jeśli nie ma:
+      * **real-time** -> **document-updater**: zapisuje dokumenty z Redis do MongoDB
+
+**Odczyt z MongoDB do Redis**
+
+* **document-updater** -> **web** -> **docstore**: odczyt z MongoDB
+
+**Zapis z Redis do MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: zapis do MongoDB
+
+**Kompilacja — tryb synchronizacji "full"**
+
+* **editor**: wysyła żądanie kompilacji z trybem synchronizacji ustawionym na "full"
+* **web** -> **document-updater**: wszystkie dokumenty są zapisywane z Redis do MongoDB
+* **web** -> **docstore**: wszystkie dokumenty są pobierane z MongoDB
+* **web** -> **clsi**: żądanie kompilacji jest wysyłane do `clsi` i zawiera:
+  * tryb synchronizacji
+  * skrót (hash) drzewa plików -> "stan projektu"
+  * wszystkie dokumenty wraz z zawartością -> obowiązuje limit 7 MB treści żądania
+  * adresy URL plików binarnych do osobnego pobrania
+* **clsi**: sprawdza stan na dysku względem trybu synchronizacji i "stanu projektu"
+  * to pełna synchronizacja, więc poprzedni stan na dysku można zignorować
+* **clsi**: czyści katalog kompilacji
+* **clsi**: zapisuje wszystkie dokumenty w katalogu kompilacji
+* **clsi**: zapisuje wszystkie pliki binarne w katalogu kompilacji
+  * `clsi` kopiuje pliki z lokalnej pamięci podręcznej danego projektu
+  * w razie braku w pamięci podręcznej:
+    * **clsi** -> **filestore**: pobiera pliki
+* **clsi**: zapisuje "stan projektu"
+* **clsi**: upewnia się, że istnieje kontener Docker z wymaganą konfiguracją
+  * buduje opcje kontenera, w tym wersję texlive
+  * oblicza skrót opcji
+  * nazwa kontenera: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: uruchamia kontener i przesyła stdout/stderr do pamięci -> limit 2 MB
+* **clsi**: pozostawia zatrzymany kontener -> jest usuwany po 24 godzinach
+* **clsi**: zapisuje stdout/stderr na dysku
+* **clsi**: kopiuje pliki wyjściowe do unikalnego katalogu wyjściowego
+  * build-id składa się z 8 losowych bajtów oraz znacznika czasu z dokładnością do milisekund
+  * usuwa wszystkie katalogi kompilacji oprócz 3 ostatnich (użytkownik anonimowy) / ostatniego (użytkownik zalogowany)
+* **clsi**: kompilacja zakończyła się błędem / przekroczeniem limitu czasu
+  * usuwa pamięć podręczną kompilacji — może zawierać niekompletne pliki / uszkodzone dane
+* **editor**: pobiera output.log i output.pdf
+
+**Kompilacja — tryb synchronizacji "incremental"**
+
+* **editor**: wysyła żądanie kompilacji z trybem synchronizacji ustawionym na "incremental"
+* **web** -> **document-updater**: pobiera dokumenty z Redis
+  * skrót "stanu projektu" jest również przechowywany w Redis
+  * **web** wysyła skrót drzewa plików do `document-updater`, a `document-updater` może w razie niezgodności zamienić kompilację przyrostową na pełną
+    * zobacz proces kompilacji wykonywany, gdy edytor zażądał kompilacji "full"
+* **web** -> **clsi**: żądanie kompilacji jest wysyłane do `clsi` i zawiera:
+  * tryb synchronizacji
+  * skrót drzewa plików -> "stan projektu"
+  * wszystkie dokumenty z Redis wraz z zawartością -> obowiązuje limit 7 MB treści żądania
+  * bez plików binarnych
+* **clsi**: sprawdza stan na dysku względem trybu synchronizacji i "stanu projektu"
+  * to synchronizacja przyrostowa, więc "stan projektu" musi się zgadzać
+  * w razie niezgodności: odpowiada kodem 409, a web ponawia próbę z synchronizacją "full"
+    * zobacz proces kompilacji wykonywany, gdy edytor zażądał kompilacji "full"
+* **clsi**: zapisuje zaktualizowane dokumenty w katalogu kompilacji
+* **clsi**: upewnia się, że istnieje kontener Docker z wymaganą konfiguracją
+  * buduje opcje kontenera, w tym wersję texlive
+  * oblicza skrót opcji
+  * nazwa kontenera: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: uruchamia kontener i przesyła stdout/stderr do pamięci -> limit 2 MB
+* **clsi**: pozostawia zatrzymany kontener -> jest usuwany po 24 godzinach
+* **clsi**: zapisuje stdout/stderr na dysku
+* **clsi**: kopiuje pliki wyjściowe do unikalnego katalogu wyjściowego
+  * build-id składa się z 8 losowych bajtów oraz znacznika czasu z dokładnością do milisekund
+  * usuwa wszystkie katalogi kompilacji oprócz 3 ostatnich (użytkownik anonimowy) / ostatniego (użytkownik zalogowany)
+* **clsi**: kompilacja zakończyła się błędem / przekroczeniem limitu czasu
+  * usuwa pamięć podręczną kompilacji — może zawierać niekompletne pliki / uszkodzone dane
+* **editor**: pobiera output.log i output.pdf
+
+**Kompilacja — przełączanie między trybami**
+
+* **editor**: wykrywa błąd kompilacji — następna kompilacja jest kompilacją "full"
+* **editor**: wykrywa udaną kompilację — następna kompilacja jest kompilacją "incremental"
