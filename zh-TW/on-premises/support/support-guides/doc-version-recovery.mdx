@@ -1,0 +1,158 @@
+---
+title: （v5.0.1 遷移）文件版本復原
+icon: arrow-rotate-left
+---
+
+<Info>
+
+如果您從未執行過 Server Pro 5.0.1 版或 Community Edition 5.0.1 版，或是以 5.0.1 版啟動全新的執行個體，則不需要執行此復原流程。
+
+</Info>
+
+**本頁更新紀錄：**
+
+* （2024-04-22 13:40 BST）：新增步驟「停止新的更新進入系統，並將所有變更排清至 MongoDB」。
+* （2024-04-23 11:45 BST）：考量 5.0.1 中損壞的排清作業，並在曾啟動 5.0.2 時略過排清。
+
+復原所需的時間取決於執行個體中專案的數量與大小，以及歷史紀錄儲存區用於存放區塊（chunk）的儲存後端（由 `OVERLEAF_HISTORY_CHUNKS_BUCKET` 定義）。
+
+復原流程會延遲 Server Pro 容器內應用程式的啟動，在此期間網站會呈現離線狀態。我們僅支援從單一 Server Pro 容器執行個體執行復原，所有其他水平擴展的 worker 都必須處於離線狀態。
+
+如有需要，您可以停止並繼續復原流程。
+
+根據我們的效能測試，在現代硬體（3GHz CPU 時脈與本機 NVMe 儲存裝置）上，復原流程每分鐘約可處理 1 萬個小型專案。舉例來說，對於擁有 10 萬個專案的執行個體，請安排至少可容許 10+2 分鐘停機時間的維護時段。使用以下查詢估算您執行個體中的專案數量：
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+開始之前，請完整閱讀以下復原步驟。Server Pro 客戶如有任何問題，歡迎聯絡 [support@overleaf.com](mailto:support@overleaf.com)。
+
+### 復原流程
+
+<Steps>
+<Step title="拉取發行版映像檔">
+拉取 `5.0.3` 發行版映像檔。
+</Step>
+
+<Step title="找出幾個專案">
+依 id 找出幾個缺少歷史紀錄的專案；最好您擁有修改其中一個專案的權限。
+</Step>
+
+<Step title="安排維護">
+為停機時間安排維護時段。
+</Step>
+
+<Step title="只保留一個 worker">
+使用水平擴展架構時，停止除一個以外的所有 worker。
+</Step>
+
+<Step title="停止新的更新並將所有變更排清至 MongoDB">
+停止新的更新進入系統，並將所有變更排清至 MongoDB：
+
+1. 透過 `https://my-server-pro.example.com/admin#open-close-editor` 管理面板中的「Open/Close Editor」分頁，手動關閉編輯器並中斷所有使用者的連線。
+2.  停止 Websocket/real-time 服務。
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  等待 real-time 服務結束（顯示 `down:` 即表示已結束）。
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  若已啟用 git-bridge 容器，請將其停止。
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  若您從未執行過 5.0.2：手動執行文件更新的排清，並等待其成功完成。
+
+    發生錯誤時可以重複執行此指令。如果連續執行時都看到非零的 `failureCount`，請停止遷移（透過 `docker restart git-bridge sharelatex` 還原服務）並聯絡支援團隊。
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  若您從未執行過 5.0.2：確認所有變更都已從 redis 排清。
+
+    如果 `redis-cli` 有任何輸出，請停止遷移（透過 `docker restart git-bridge sharelatex` 還原服務）並聯絡支援團隊。
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  嘗試排清所有待處理的歷史紀錄變更。
+
+    由於錯誤的資料庫遷移導致部分專案的歷史紀錄損壞，此排清只能盡力而為。任何失敗都會在復原流程結束時透過重新同步歷史紀錄來處理。
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="進行備份">
+建議對執行個體進行[一致性備份](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)。
+</Step>
+
+<Step title="升級">
+升級至 `5.0.3` 版。
+</Step>
+
+<Step title="自動復原">
+復原流程會在容器啟動時自動執行。
+</Step>
+
+<Step title="追蹤進度">
+您可以透過 tail 日誌檔 `/var/lib/overleaf/data/history/doc-version-recovery.log` 追蹤指令碼的進度。它會在開始時輸出專案總數，並在每處理 1000 個專案後輸出摘要。
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="等待復原流程完成">
+等待復原流程完成：您可以 tail 上述日誌檔直到輸出 `Done.` 這一行，或等待 Server Pro 容器的標準輸出顯示 `Finished recovery of doc versions.`。
+</Step>
+
+<Step title="驗證復原流程">
+開啟幾個先前缺少歷史紀錄之專案的歷史紀錄窗格，以驗證復原流程。
+
+1.  加速要測試之專案的重新同步（它們最終都會被處理，但我們不想等到輪到它們。）
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    （對每個要測試的 project-id 重複執行，每次將 `000000000000000000000000` 替換為一個 project-id。）
+2. 開啟這些專案的專案編輯器 `https://my-server-pro.example.com/project/000000000000000000000000`
+3. 開啟專案的「History」窗格並查看最新內容。
+4. 選用：再次關閉「History」窗格。進行一項程式碼變更，例如在檔頭加入註解。
+5. 選用：重新編譯以觸發本機變更的排清。再次開啟「History」窗格並查看變更。完成後，復原該變更。
+</Step>
+
+<Step title="對於水平擴展...">
+重新啟動其他 worker。
+</Step>
+
+<Step title="保持執行個體運作">
+請讓執行復原流程的執行個體持續運作。它會在背景以並行度 1 重新同步所有專案的歷史紀錄，這會使基礎負載略微升高。（您可以重新啟動執行個體，但重新同步需要從頭開始。）
+</Step>
+
+<Step title="完成後請通知我們">
+Server Pro 客戶：完成復原流程後，請通知支援團隊。
+</Step>
+</Steps>

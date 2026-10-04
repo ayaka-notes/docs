@@ -1,0 +1,123 @@
+---
+title: サンドボックスコンパイルのセットアップ
+icon: box-archive
+---
+
+開発環境でサンドボックスコンパイルをセットアップする場合、開発環境と本番環境にはいくつかの違いがあります。注意すべき点は次の 3 つです。
+
+* ファイル権限の問題
+* history-v1 と filestore 間のボリューム共有
+* サブディレクトリの問題
+
+### サンドボックスコンパイルを有効にする
+
+ここでは、Overleaf CE と同様にサンドボックスコンパイルを有効にするだけです。ただし、ユーザーには注意が必要です。ここでは root に設定します。
+
+本番環境では、Overleaf コンテナと TeX コンパイルコンテナの間で共有するユーザーとして www-data を使用します。しかし、開発環境ではコンテナのデフォルトユーザーは node であり、これに対応する www-data ユーザーが存在しません。そのため、回避策として root を使用します。
+
+<Warning>
+
+自分でビルドしたイメージは使用しないでください。一連のエラーが発生する可能性があります。
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### ファイル権限を修正する
+
+LaTeX は、`TEXLIVE_IMAGE_USER` 環境変数で指定されたユーザーとして兄弟コンテナ内で実行されます。上の例では、uid が `0` の `root` に設定されています。root ユーザーには `compiles` のサブフォルダーへの書き込み権限がないため、上記の権限設定では問題が発生します。
+
+手早い解決策は、`compiles` のグループ所有権を `root` に与えて読み書き権限を付与し、さらに `setgid` を設定して新しいサブフォルダーにもこの所有権が継承されるようにすることです。
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+詳細なドキュメントは `services/clsi/README.md` を参照してください。
+
+### history-v1 と filestore 間のボリューム共有
+
+デフォルトでは、filestore は S3 と Overleaf の他のサービスとの橋渡し役を担います。しかし、Overleaf CE や Server Pro では、デフォルトですべてのファイルがローカルに保存されます。そのため、Overleaf は非常にトリッキーな方法を導入しました。
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+同時に、`data/history` は history サービスでも使用されます。このようにして、異なるマイクロサービス間で同じデータを共有できます。開発環境の filestore サービスに `history-v1-buckets` ボリュームを追加する必要があります。そうしないと、**clsi が filestore サービスから blob ファイルを取得できなくなります**。
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+また、`dev.env` の設定に BUCKET 名を追加する必要があります。
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### サブディレクトリを使用する
+
+filestore はデフォルトで useSubdirectories を true として使用しますが、開発環境では history v1 が**すべてのデータをフラット化します。** これにより競合が発生します。これを解決するには、次の設定を追加する必要があります。&#x20;
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+history v1 では、もともとすべての `project_blobs` ファイルが次のように保存されています。
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+サブディレクトリモードを使用するには、useSubdirectories を `true` に設定する必要があります。これにより、blob 内の元の `_` は `/` に置き換えられます。

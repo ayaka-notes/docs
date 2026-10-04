@@ -1,0 +1,692 @@
+---
+title: 水平スケーリング
+icon: distribute-spacing-horizontal
+---
+
+<Check>
+
+Ayakaleaf Pro は水平スケーリングをサポートしています。複数のレプリカで正しく動作することをテストし、検証済みです。
+
+</Check>
+
+このドキュメントでは、Ayakaleaf Pro を複数のノードで実行するための技術要件を示し、ガイドラインを提供します。
+
+<Danger>
+
+Server CE/Server Pro `5.0.3` 以降では、環境変数の名称が `SHARELATEX_*` から `OVERLEAF_*` に変更されています。
+
+`4.x` 以前のバージョンを使用している場合は、変数に適切なプレフィックスが付いていることを確認してください（例：`OVERLEAF_SITE_URL` ではなく `SHARELATEX_SITE_URL`）
+
+</Danger>
+
+水平スケーリングのセットアップには多大な労力が必要です。水平スケーリングは、一定の規模に達した場合に**のみ**検討することをお勧めします。たとえば、総ユーザー数 1,000 人の Server Pro インストールが、4 コアプロセッサ 2 基と 32GB のシステムメモリを搭載した単一サーバーで正常に構築された実績があります。推奨事項については、[ハードウェア要件](/ja/on-premises/getting-started/requirements/hardware-requirements)のドキュメントを参照してください。
+
+水平スケーリングを使用した Server Pro の導入には、ロードバランサーや S3 互換ストレージバックエンドなど、一連の外部コンポーネントが必要です。
+
+設定ミスが原因と考えられる Server Pro コンテナ内のエラーのトラブルシューティングや、このドキュメントに基づく一般的なアドバイスについてはお手伝いできます。ただし、サードパーティのアプリケーションやシステムの設定についてはサポートを提供できません。
+
+外部コンポーネントを提供するためのハードウェアやソフトウェアに固有の技術的な問題の解決は、サポート条件の対象外です。
+
+### 要件
+
+<Frame>
+  <img src="/images/on-premises/img-f045c922.jpg" alt="" />
+</Frame>
+
+#### 外部の集中データストレージ
+
+Server Pro のデータストレージは、4 つのデータストアに分けられます：
+
+*   **MongoDB**
+
+    * ほとんどのデータは MongoDB に永続化されます。
+    * ローカルインスタンス、または [MongoDB](https://www.mongodb.com/atlas) Atlas（AWS インフラストラクチャ上で動作するフルマネージドの MongoDB サービス）などの外部インスタンスのいずれかをサポートしています。<br />
+
+    **注意：** 残念ながら、CosmoDB/DocumentDB などの MongoDB 互換データベースは、Server Pro でテストしていないため、現時点では公式にサポートしていません。互換データベースで Server Pro を導入できる**可能性**はありますが、公式にサポートしているのは MongoDB を使用した導入のみです。<br />
+*   **Redis**
+
+    * Redis は、MongoDB にフラッシュされる前の保留中のドキュメント更新などの一時データを保存します。
+    * Redis は、異なるサービス間でのドキュメント更新の伝達や、特定のプロジェクトにおける状態変化のエディターへの通知に使用されます。
+    * Redis は、ユーザーセッションの保存に使用されます。
+    * ローカルインスタンスと外部インスタンスのいずれもサポートしています。<br />
+
+    **注意：** 残念ながら、KeyDB/Valkey などの Redis 互換キーバリューストアは、Server Pro でテストしていないため、現時点では公式にサポートしていません。互換ストアで Server Pro を導入できる**可能性**はありますが、公式にサポートしているのは Redis を使用した導入のみです。<br />
+*   **プロジェクトファイルと履歴ファイル**
+
+    *   編集不可能なプロジェクトファイルは、MongoDB の外部に保存されます。
+
+        新しいプロジェクト履歴システム（Server Pro 3.5 以降）も、履歴を MongoDB の外部に保存します。
+    * 小規模な単一インスタンスの場合は、ローカルファイルシステム（ローカル SSD、NFS、EBS をバックエンドにできます）または [S3 互換データストレージシステム](/ja/on-premises/configuration/overleaf-toolkit/s3)のいずれかをサポートしています。
+    * 水平スケーリングの場合は、S3 互換データストレージシステム**のみ**をサポートしています。<br />
+
+    **重要：** NFS/Amazon EFS/Amazon EBS は水平スケーリングでは**サポートされていません**。詳細については、Server Pro のストレージのスケーリングに関する[ハードウェアストレージ](/ja/on-premises/getting-started/requirements/hardware-requirements#storage)要件のセクションを参照してください。
+* **一時ファイル**
+  * 最適なパフォーマンスを得るには、LaTeX のコンパイルを高速なローカルディスク上で実行する必要があります。コンパイルの出力を永続化したりバックアップしたりする必要はありません。
+  * 新しいファイルアップロードのバッファリングやプロジェクトの zip ファイルの作成も、ローカルディスクを使用することでメリットがあります。
+
+<Danger>
+
+ローカルディスクの使用を強く推奨します。ネットワークディスク（NFS や EBS など）を使用すると、予期しないコンパイルエラーやその他のパフォーマンスの問題が発生する可能性があります。
+
+</Danger>
+
+#### **Git-bridge**
+
+<Info>
+
+Git-bridge は、Server Pro のバージョン 4.0.1 以降で利用できます。
+
+</Info>
+
+Git リポジトリはローカルディスクに保存されます。レプリケーションのオプションはありません。Git-bridge は**シングルトン**として実行する必要があります。最適なパフォーマンスを得るには、git-bridge のデータにローカルディスクを使用することをお勧めします。git-bridge のデータディスクは定期的にバックアップする必要があります。
+
+水平スケーリングを使用したデータストレージには、次のものが必要です：
+
+* すべての Server Pro インスタンスからアクセス可能な中央の MongoDB インスタンス
+* すべての Server Pro インスタンスからアクセス可能な中央の Redis インスタンス
+* プロジェクトファイルと履歴ファイル用の中央の S3 互換ストレージバックエンド
+* 一時ファイル用の各インスタンス上のローカルディスク
+* git-bridge のデータ用の、git-bridge コンテナをホストするインスタンス上のローカルディスク
+
+#### ロードバランサーの要件
+
+*   **永続的なルーティング**（例：Cookie を使用）
+
+    この要件は、次のコンポーネントに起因します：
+
+    * Server Pro のリアルタイム編集機能は WebSocket を使用し、XHR ポーリングにフォールバックします。各編集セッションはサーバー側にローカルな状態を持つため、特定の編集セッションのリクエストは常に同じ Server Pro インスタンスにルーティングされる必要があります。共同編集機能は、複数の Server Pro インスタンス間で更新を共有するために Redis の [Pub/Sub](https://redis.io/docs/latest/develop/interact/pubsub/) を使用します。
+    * LaTeX のコンパイルでは、パフォーマンスを最適化するために出力とコンパイルキャッシュをローカルに保持します。ある Server Pro インスタンスにコンパイルリクエストを送信した後、その後の PDF やログのダウンロードリクエストは同じ Server Pro インスタンスにルーティングされる必要があります。
+* 大きな LaTeX ドキュメントのコンパイルをサポートするための**長いリクエストタイムアウト**
+* 最適なパフォーマンスのための **WebSocket サポート**
+* **50MB の POST ペイロードサイズ**
+*   **キープアライブタイムアウト**は、Server Pro のキープアライブタイムアウトより短くする必要があります
+
+    Server Pro のキープアライブタイムアウトは、環境変数 `NGINX_KEEPALIVE_TIMEOUT` で設定できます。デフォルト値は 65 秒です。
+
+    デフォルトの場合、ロードバランサーのキープアライブタイムアウトを 60 秒にすれば動作します。
+
+    `NGINX_KEEPALIVE_TIMEOUT=120` の場合、ロードバランサーでは 115 秒を選択できます。
+*   **クライアント IP**
+
+    リクエストヘッダー `X-Forwarded-For` にクライアント IP を設定します。
+*   **SSL を終端する**場合
+
+    ロードバランサーでリクエストヘッダー `X-Forwarded-Proto: https` を追加する必要があります。
+
+<Accordion title="HAProxy の設定サンプル">
+
+```text
+global
+  group haproxy
+  user haproxy
+
+  # Verbose logging
+  log stdout format raw local0 debug
+
+defaults
+  mode                    http
+  option                  httpchk HEAD /status
+  http-check              expect status 200
+  default-server          check
+
+  # Verbose logging
+  log                     global
+  option                  httplog
+
+  # Reroute to a different backend if the sticky one is down
+  option                  redispatch 1
+  # These retries are for TCP connect errors, not on HTTP status 500 responses
+  retries                 3
+
+  # Sticky session for 24h of inactivity -- compile output is deleted after 24h
+  cookie                  server-pro-ha insert maxidle 24h
+
+  # Try to connect to any backend for 1min, then return 503
+  timeout queue           1m
+  # Give Server Pro instances 15s to startup
+  timeout connect         15s
+
+  # Abort requests from very slow clients (allow 1min of inactivity when reading a request)
+  timeout client          1m
+
+  # Allow slow compiles -- hard-coded limit in clsi is 10min
+  timeout server          10m
+
+  # Disconnect the editor after 23h -- 1h ahead of their last use yesterday
+  timeout tunnel          23h
+
+  # Note: The keepalive behavior in haproxy works great with the default keepalive setup in Server Pro.
+  #       Haproxy is cleaning up connections in the background and it will redispatch requests when needed.
+
+listen server-pro-ha-http
+  bind :80
+  http-request redirect scheme https unless { ssl_fc }
+
+listen server-pro-ha-https
+  bind :443 ssl crt /etc/ssl/certs/ssl-key-and-certificate-bundle.pem
+
+  # Tell the application that we are behind https
+  http-request set-header X-Forwarded-Proto https
+
+  # Tell the application the actual client ip
+  option forwardfor
+
+  # See https://hstspreload.org/#deployment-recommendations
+  http-response set-header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload;"
+
+  # Route git traffic to the sibling container of the git-bridge
+  use-server server-pro-ha-1 if { path_beg /git/ }
+
+  # Debugging
+  http-response add-header X-Served-By %s
+  stats enable
+  stats uri /haproxy
+
+  server server-pro-ha-1 198.18.1.1:80 cookie server-pro-ha-1
+  server server-pro-ha-2 198.18.1.2:80 cookie server-pro-ha-2
+  server server-pro-ha-3 198.18.1.3:80 cookie server-pro-ha-3
+```
+
+</Accordion>
+
+#### Server Pro の設定
+
+**シークレット**
+
+Server Pro インスタンス間で共有シークレットを一致させる必要があります：
+
+* `WEB_API_PASSWORD`（Web API 認証）
+* `STAGING_PASSWORD` と `V1_HISTORY_PASSWORD` は同じ値（履歴認証）
+* `CRYPTO_RANDOM`（セッション Cookie 用）
+* `OT_JWT_AUTH_KEY`（履歴認証）
+
+これらのシークレットはすべて、それぞれ固有の値で設定し、インスタンス間で共有する必要があります。
+
+設定されていない状態でユーザーのリクエストが異なる Server Pro インスタンスにルーティングされると、リクエストは認証チェックに失敗し、頻繁にログインページにリダイレクトされたり、UI での操作が予期しない形で失敗したりします。
+
+設定されていない場合、Server Pro は `/dev/urandom` から取得した 32 バイト（256 ビット）のランダムデータに基づいて、各シークレットに新しいランダムな値を使用します。
+
+```bash wrap
+# https://github.com/overleaf/overleaf/blob/45ca0f796c679103efd305ddbef28073c4a5de32/server-ce/init_scripts/00_regen_sharelatex_secrets.sh#L14
+dd if=/dev/urandom bs=1 count=32 2>/dev/null | base64 -w 0 | rev | cut -b 2- | rev | tr -d '\n+/'
+```
+
+**MongoDB**
+
+`OVERLEAF_MONGO_URL`（バージョン `4.x` 以前では `SHARELATEX_MONGO_URL`）を中央の MongoDB インスタンスに向けます。
+
+**Redis**
+
+`OVERLEAF_REDIS_HOST`（バージョン `4.x` 以前では `SHARELATEX_REDIS_HOST`）と `REDIS_HOST` を中央の Redis インスタンスに向けます。
+
+**プロジェクトファイルと履歴ファイル用の S3 互換ストレージ**
+
+詳細については、[S3 互換ストレージ](/ja/on-premises/configuration/overleaf-toolkit/s3)のドキュメントを参照してください。
+
+**一時ファイル**
+
+ローカル SSD を `/var/lib/overleaf`（バージョン `4.x` 以前では `/var/lib/sharelatex`）にバインドマウントするデフォルトの構成で十分です。`SANDBOXED_COMPILES_HOST_DIR` は必ずホスト上のマウントポイントに向けてください。
+
+<Danger>
+
+ローカルディスクの使用を強く推奨します。ネットワークディスク（NFS や EBS など）を使用すると、予期しないコンパイルエラーやその他のパフォーマンスの問題が発生する可能性があります。
+
+</Danger>
+
+**プロキシの設定**
+
+* 正確なクライアント IP を取得するために、`OVERLEAF_BEHIND_PROXY=true`（バージョン `4.x` 以前では `SHARELATEX_BEHIND_PROXY`）を設定します。
+* `TRUSTED_PROXY_IPS` にロードバランサーの IP を設定します（カンマ区切りで複数の CIDR を指定できます）。
+
+**Git-bridge の統合**
+
+<Info>
+
+Git-bridge は、Server Pro のバージョン 4.0.1 以降で利用できます。
+
+</Info>
+
+git-bridge コンテナには、受信した git リクエストを処理するための兄弟（sibling）Server Pro コンテナが必要です。この兄弟コンテナは、通常のユーザートラフィックも処理できます。サンプル構成では最初のインスタンスが git-bridge の兄弟コンテナとして機能していますが、実際にはどのインスタンスでもその役割を果たせます。
+
+なぜ 1 つの Server Pro コンテナを git-bridge の兄弟として指定する必要があるのでしょうか？Server Pro は、履歴サービスのダウンロード URL を git-bridge に渡します。これらの履歴 URL に git-bridge コンテナからアクセスできるように設定する必要があるのです。
+
+Server Pro コンテナの設定：
+
+* `GIT_BRIDGE_ENABLED` を `'true'` に設定します
+* `GIT_BRIDGE_HOST` を `<git-bridge container name>`（例：`git-bridge`）に設定します
+* `GIT_BRIDGE_PORT` を `8000` に設定します
+*   `V1_HISTORY_URL` を `http://<server-pro sibling container name>:3100/api` に設定します。
+
+    注意：これは git-bridge コンテナの兄弟コンテナでのみ必要です。その他のインスタンスでは、デフォルトである localhost の URL を使用できます。
+
+git-bridge コンテナの設定：
+
+* `GIT_BRIDGE_API_BASE_URL` を `http://<server-pro sibling container name>/api/v0`（例：`http://server-pro-ha-1/api/v0`）に設定します
+* `GIT_BRIDGE_OAUTH2_SERVER` を `http://<server-pro sibling container name>`（例：`http://server-pro-ha-1`）に設定します
+* `GIT_BRIDGE_POSTBACK_BASE_URL` を `http://<git-bridge container name>:8000`（例：`http://git-bridge:8000`）に設定します
+* `GIT_BRIDGE_ROOT_DIR` をバインドマウントした git-bridge のデータディスク（例：`/data/git-bridge`）に設定します
+
+<Accordion title="docker-compose.yml の設定サンプル">
+
+以下の構成は、自己完結型のセットアップを示しています。デモを動作させるには、有効な SSL 鍵／証明書を用意し、`OVERLEAF_SITE_URL`（バージョン `4.x` 以前では `SHARELATEX_SITE_URL`）を調整する必要があります。実際のセットアップでは、インラインで記載されているとおり、ダミーのシークレットを実際のシークレットに置き換える必要があります。また、実際のセットアップでは、個々のコンテナを専用のノードに移し、IP アドレスをローカルネットワークの構成に合わせて調整する必要があります。
+
+```yaml
+version: '2.2'
+
+# Actual horizontal scaling setup: pick your own network and replace IPs in config.
+networks:
+    default:
+        ipam:
+            config:
+                # This subnet is part of a reserved subnet used for benchmarking
+                # https://tools.ietf.org/html/rfc2544
+                # The full subnet is 198.18.0.0/15
+                # Use 198.18.0.0/24 for lb and dbs
+                # Use 198.18.1.0/24 for server-pro
+                # Use 198.18.0.128/25 for ephemeral container
+                - gateway: 198.18.0.1
+                  ip_range: 198.18.0.128/25
+                  subnet: 198.18.0.0/23
+
+services:
+    # Actual horizontal scaling setup: run haproxy outside docker on a separate host.
+    lb:
+        image: haproxy:2.6
+        container_name: lb
+        user: root
+        logging:
+            driver: local
+            options:
+                max-size: 10g
+                max-file: '100'
+        volumes:
+            - ./haproxy.conf:/usr/local/etc/haproxy/haproxy.cfg
+            # $ cat certificate.pem key.pem > ssl-key-and-certificate-bundle.pem
+            - /path/to/ssl-key-and-certificate-bundle.pem:/etc/ssl/certs/ssl-key-and-certificate-bundle.pem
+        # Alternative to "ports": use host network to avoid docker-proxy overhead
+        network_mode: host
+
+        # Alternative to "network_mode: host": use docker-proxy for network isolation
+        # ports:
+        #     - "80:80"
+        #     - "443:443"
+        # networks:
+        #     default:
+        #         ipv4_address: 198.18.0.2
+
+        # Actual horizontal scaling setup: remove these as they run on other hosts.
+        depends_on:
+            server-pro-ha-1:
+                condition: service_started
+            server-pro-ha-2:
+                condition: service_started
+            server-pro-ha-3:
+                condition: service_started
+
+    # Actual horizontal scaling setup: run this container next to server-pro-ha-1.
+    # For Server Pro 4.0 onwards.
+    git-bridge:
+        restart: always
+        # The tag should match the `server-pro-ha-1` container tag.
+        image: quay.io/sharelatex/git-bridge:4.0.1
+        volumes:
+            # Actual horizontal scaling setup: point /data/git-bridge at a dedicated local ssd.
+            - ~/git_bridge_data:/data/git-bridge
+        container_name: git-bridge
+        environment:
+            GIT_BRIDGE_API_BASE_URL: "http://server-pro-ha-1/api/v0"
+            GIT_BRIDGE_OAUTH2_SERVER: "http://server-pro-ha-1"
+            GIT_BRIDGE_POSTBACK_BASE_URL: "http://198.18.0.6:8000"
+            GIT_BRIDGE_ROOT_DIR: "/data/git-bridge"
+        user: root
+        command: ["/server-pro-start.sh"]
+
+        # Actual horizontal scaling setup: run on host 198.18.0.6 and expose port
+        # ports:
+        #     - "8000:8000"
+        networks:
+            default:
+                ipv4_address: 198.18.0.6
+
+    # Actual horizontal scaling setup: run this container on a separate host.
+    server-pro-ha-1: &server-pro-ha-config
+        restart: always
+        image: quay.io/sharelatex/sharelatex-pro:4.0.1
+        container_name: server-pro-ha-1
+        hostname: server-pro-ha-1
+        depends_on:
+            # Actual horizontal scaling setup: keep this entry.
+            git-bridge:
+                condition: service_started
+
+            # Actual horizontal scaling setup: remove the ones below as they run on other hosts.
+            mongo:
+                condition: service_healthy
+            redis:
+                condition: service_started
+            minio:
+                condition: service_started
+            mongo_replica_set_setup:
+                condition: service_completed_successfully
+            minio_setup:
+                condition: service_completed_successfully
+        stop_grace_period: 60s
+        volumes:
+            - /tmp/scratch-disk1:/var/lib/sharelatex
+            - /var/run/docker.sock:/var/run/docker.sock
+        environment: &server-pro-ha-environment
+            # Actual horizontal scaling setup: provide your own domain/app name.
+            OVERLEAF_SITE_URL: 'https://overleaf.example.com'
+            OVERLEAF_APP_NAME: Server Pro Horizontal Scaling Demo
+
+            OVERLEAF_MONGO_URL: mongodb://198.18.0.3/sharelatex
+            OVERLEAF_REDIS_HOST: 198.18.0.4
+            REDIS_HOST: 198.18.0.4
+
+            ENABLED_LINKED_FILE_TYPES: 'project_file,project_output_file'
+            EMAIL_CONFIRMATION_DISABLED: 'true'
+
+            SANDBOXED_COMPILES: 'true'
+            SANDBOXED_COMPILES_SIBLING_CONTAINERS: 'true'
+            SANDBOXED_COMPILES_HOST_DIR: '/tmp/scratch-disk1/data/compiles'
+
+            # S3
+            # Actual horizontal scaling setup: pick secure credentials.
+            OVERLEAF_FILESTORE_BACKEND: s3
+            OVERLEAF_FILESTORE_USER_FILES_BUCKET_NAME: overleaf-user-files
+            OVERLEAF_FILESTORE_TEMPLATE_FILES_BUCKET_NAME: overleaf-template-files
+            OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID: OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID
+            OVERLEAF_FILESTORE_S3_SECRET_ACCESS_KEY: OVERLEAF_FILESTORE_S3_SECRET_ACCESS_KEY
+            OVERLEAF_FILESTORE_S3_ENDPOINT: http://198.18.0.5:9000
+            OVERLEAF_FILESTORE_S3_PATH_STYLE: 'true'
+            OVERLEAF_FILESTORE_S3_REGION: ''
+
+            OVERLEAF_HISTORY_BACKEND: "s3"
+            OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET: "overleaf-project-blobs"
+            OVERLEAF_HISTORY_CHUNKS_BUCKET: "overleaf-chunks"
+            OVERLEAF_HISTORY_S3_ACCESS_KEY_ID: "OVERLEAF_HISTORY_S3_ACCESS_KEY_ID"
+            OVERLEAF_HISTORY_S3_SECRET_ACCESS_KEY: "OVERLEAF_HISTORY_S3_SECRET_ACCESS_KEY"
+            OVERLEAF_HISTORY_S3_ENDPOINT: http://198.18.0.5:9000
+            OVERLEAF_HISTORY_S3_PATH_STYLE: 'true'
+            OVERLEAF_HISTORY_S3_REGION: ''
+            # /S3
+
+            # git-bridge
+            GIT_BRIDGE_ENABLED: 'true'
+            GIT_BRIDGE_HOST: 198.18.0.6
+            GIT_BRIDGE_PORT: 8000
+            # Only needed on the sibling instance of git-bridge
+            V1_HISTORY_URL: "http://server-pro-ha-1:3100/api"
+            # /git-bridge
+
+            # Horizontal scaling
+            # Actual horizontal scaling setup: pick secure credentials.
+            WEB_API_PASSWORD: WEB_API_PASSWORD
+            STAGING_PASSWORD: V1_HISTORY_PASSWORD
+            V1_HISTORY_PASSWORD: V1_HISTORY_PASSWORD
+            CRYPTO_RANDOM: CRYPTO_RANDOM
+            OT_JWT_AUTH_KEY: OT_JWT_AUTH_KEY
+            OVERLEAF_BEHIND_PROXY: 'true'
+            # Actual horizontal scaling setup: IPs of load balancers
+            TRUSTED_PROXY_IPS: 198.18.0.1,198.18.0.2
+            # /Horizontal scaling
+
+        # Actual horizontal scaling setup: run on host 198.18.1.1 and expose ports
+        # ports:
+        #     - "80:80"
+        networks:
+            default:
+                ipv4_address: 198.18.1.1
+
+    # Actual horizontal scaling setup: run this container on a separate host.
+    server-pro-ha-2:
+        <<: *server-pro-ha-config
+        hostname: server-pro-ha-2
+        container_name: server-pro-ha-2
+        volumes:
+            - /tmp/scratch-disk2:/var/lib/sharelatex
+            - /var/run/docker.sock:/var/run/docker.sock
+        environment:
+            <<: *server-pro-ha-environment
+            SANDBOXED_COMPILES_HOST_DIR: '/tmp/scratch-disk2/data/compiles'
+            V1_HISTORY_URL: "http://localhost:3100/api"
+
+        # Actual horizontal scaling setup: run on host 198.18.1.2 and expose ports
+        # ports:
+        #     - "80:80"
+        networks:
+            default:
+                ipv4_address: 198.18.1.2
+
+    # Actual horizontal scaling setup: run this container on a separate host.
+    server-pro-ha-3:
+        <<: *server-pro-ha-config
+        hostname: server-pro-ha-3
+        container_name: server-pro-ha-3
+        volumes:
+            - /tmp/scratch-disk3:/var/lib/sharelatex
+            - /var/run/docker.sock:/var/run/docker.sock
+        environment:
+            <<: *server-pro-ha-environment
+            SANDBOXED_COMPILES_HOST_DIR: '/tmp/scratch-disk3/data/compiles'
+            V1_HISTORY_URL: "http://localhost:3100/api"
+
+        # Actual horizontal scaling setup: run on host 198.18.1.3 and expose ports
+        # ports:
+        #     - "80:80"
+        networks:
+            default:
+                ipv4_address: 198.18.1.3
+
+    # Actual horizontal scaling setup: run this container on a separate host.
+    minio:
+        image: minio/minio:RELEASE.2023-05-18T00-05-36Z
+        container_name: minio
+        command: server /data
+        volumes:
+            # Actual horizontal scaling setup: run minio with multiple disks, see minio docs.
+            - ~/minio_data:/data
+        environment:
+            # Actual horizontal scaling setup: pick secure credentials.
+            MINIO_ROOT_USER: MINIO_ROOT_USER
+            MINIO_ROOT_PASSWORD: MINIO_ROOT_PASSWORD
+
+        # Actual horizontal scaling setup: run on host 198.18.0.5 and expose port
+        # ports:
+        #     - "9000:9000"
+        networks:
+            default:
+                ipv4_address: 198.18.0.5
+
+    # Actual horizontal scaling setup: run this setup once on a separate host.
+    minio_setup:
+        depends_on:
+            - minio
+        image: minio/mc:RELEASE.2023-05-18T16-59-00Z
+        entrypoint: sh
+        command:
+            - '-c'
+            # Actual horizontal scaling setup: pick secure credentials.
+            - |
+                mc alias set s3 http://198.18.0.5:9000 MINIO_ROOT_USER MINIO_ROOT_PASSWORD \
+                || sleep 10 && \
+                mc alias set s3 http://198.18.0.5:9000 MINIO_ROOT_USER MINIO_ROOT_PASSWORD \
+                || sleep 10 && \
+                mc alias set s3 http://198.18.0.5:9000 MINIO_ROOT_USER MINIO_ROOT_PASSWORD \
+                || sleep 10 && \
+                mc alias set s3 http://198.18.0.5:9000 MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+
+                mc mb --ignore-existing s3/overleaf-user-files
+                mc mb --ignore-existing s3/overleaf-template-files
+                mc admin user add s3 \
+                  OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID \
+                  OVERLEAF_FILESTORE_S3_SECRET_ACCESS_KEY
+
+                mc mb --ignore-existing s3/overleaf-project-blobs
+                mc mb --ignore-existing s3/overleaf-chunks
+                mc admin user add s3 \
+                  OVERLEAF_HISTORY_S3_ACCESS_KEY_ID \
+                  OVERLEAF_HISTORY_S3_SECRET_ACCESS_KEY
+
+                echo '
+                  {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:ListBucket"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-user-files"
+                      },
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:PutObject",
+                          "s3:GetObject",
+                          "s3:DeleteObject"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-user-files/*"
+                      },
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:ListBucket"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-template-files"
+                      },
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:PutObject",
+                          "s3:GetObject",
+                          "s3:DeleteObject"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-template-files/*"
+                      }
+                    ]
+                  }' > policy-filestore.json
+
+                echo '
+                  {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:ListBucket"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-project-blobs"
+                      },
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:PutObject",
+                          "s3:GetObject",
+                          "s3:DeleteObject"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-project-blobs/*"
+                      },
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:ListBucket"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-chunks"
+                      },
+                      {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:PutObject",
+                          "s3:GetObject",
+                          "s3:DeleteObject"
+                        ],
+                        "Resource": "arn:aws:s3:::overleaf-chunks/*"
+                      }
+                    ]
+                  }' > policy-history.json
+
+                # Put the contents of the policy from the previous section in policy-filestore.json
+                # Reminder: Replace the bucket names accordingly.
+                mc admin policy create s3 overleaf-filestore policy-filestore.json
+                mc admin policy attach s3 overleaf-filestore \
+                  --user=OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID || true
+
+                mc admin policy create s3 overleaf-history policy-history.json
+                mc admin policy attach s3 overleaf-history \
+                  --user=OVERLEAF_HISTORY_S3_ACCESS_KEY_ID || true
+
+    # Actual horizontal scaling setup: run this container on a separate host.
+    mongo:
+        restart: always
+        image: mongo:4.4
+        container_name: mongo
+        command: "--replSet overleaf"
+        expose:
+            - 27017
+        volumes:
+            - ~/mongo_data:/data/db
+        healthcheck:
+            test: echo 'db.stats().ok' | mongo localhost:27017/test --quiet
+            interval: 10s
+            timeout: 10s
+            retries: 5
+
+        # Actual horizontal scaling setup: run on host 198.18.0.3 and expose port
+        # ports:
+        #     - "27017:27017"
+        networks:
+            default:
+                ipv4_address: 198.18.0.3
+
+    mongo_replica_set_setup:
+        image: mongo:4.4
+        entrypoint: sh
+        depends_on:
+            mongo:
+                condition: service_healthy
+        command:
+            - '-c'
+            - |
+                mongo 198.18.0.3 --eval "rs.initiate({ _id: \"overleaf\", members: [ { _id: 0, host: \"198.18.0.3:27017\" } ] })"
+
+    # Actual horizontal scaling setup: run this container on a separate host.
+    redis:
+        restart: always
+        image: redis:6.2
+        container_name: redis
+        expose:
+            - 6379
+        volumes:
+            - ~/redis_data:/data
+
+        # Actual horizontal scaling setup: run on host 198.18.0.4 and expose port
+        # ports:
+        #     - "6379:6379"
+        networks:
+            default:
+                ipv4_address: 198.18.0.4
+```
+
+</Accordion>
+
+#### ハードウェア
+
+水平スケーリングに参加するすべての Server Pro インスタンスで、同じハードウェア仕様を使用することを推奨します。
+
+Server Pro インスタンスの[ハードウェア仕様](/ja/on-premises/getting-started/requirements/hardware-requirements)に関する一般的な推奨事項が適用されます。
+
+#### Server Pro のアップグレード
+
+アップグレードプロセスの一環として、Server Pro はデータベースのマイグレーションを自動的に実行します。これらのマイグレーションは、複数のインスタンスから並行して実行するようには設計されて**いません**。
+
+マイグレーションは、実際の Web アプリケーションが起動する前に完了している必要があります。ログで `Finished migrations` というエントリを確認するか、アプリケーションがトラフィックを受け付けるようになるまで待ちます。
+
+アップグレード手順は次のとおりです：
+
+1. メンテナンス時間帯を設定する
+2. Server Pro のすべてのインスタンスを停止する
+3. [ドキュメント](/ja/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)の説明に従って、整合性のあるバックアップを取得する
+4. 新しいバージョンで Server Pro のインスタンスを 1 つ起動する
+5. 新しいインスタンスが期待どおりに動作することを確認する
+6. 新しいバージョンで他のインスタンスを起動する

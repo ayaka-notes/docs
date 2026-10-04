@@ -1,0 +1,158 @@
+---
+title: （v5.0.1 移行）ドキュメントバージョンの復旧
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Server Pro バージョン 5.0.1 または Community Edition バージョン 5.0.1 を一度も実行したことがない場合、あるいは 5.0.1 で新規インスタンスを開始した場合は、この復旧プロセスを実行する必要はありません。
+
+</Info>
+
+**このページの更新履歴：**
+
+* （2024-04-22 13:40 BST）：「新しい更新がシステムに入らないようにし、すべての変更を MongoDB にフラッシュする」手順を追加しました。
+* （2024-04-23 11:45 BST）：5.0.1 におけるフラッシュの失敗を考慮し、5.0.2 を起動済みの場合はフラッシュをスキップするようにしました。
+
+復旧にかかる時間は、インスタンス内のプロジェクトの数とサイズ、および履歴ストアがチャンクに使用するストレージバックエンド（`OVERLEAF_HISTORY_CHUNKS_BUCKET` で定義）によって異なります。
+
+復旧プロセスにより、Server Pro コンテナ内のアプリケーションの起動が遅れます。その間、サイトはオフラインとして表示されます。復旧の実行は Server Pro コンテナの単一インスタンスからのみサポートされており、水平スケーリング用の他のワーカーはすべてオフラインにする必要があります。
+
+必要に応じて、復旧プロセスを停止して再開することができます。
+
+当社のパフォーマンステストによると、最新のハードウェア（CPU クロック 3GHz、ローカル NVMe ストレージ）では、復旧プロセスは 1 分あたり約 1 万件の小規模プロジェクトを処理できます。たとえば、10 万件のプロジェクトを持つインスタンスの場合、少なくとも 10＋2 分のダウンタイムを確保できるメンテナンス時間を設けてください。インスタンス内のプロジェクト数を見積もるには、次のクエリを使用します。
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+開始する前に、以下の復旧手順をすべてお読みください。Server Pro のお客様は、ご質問があれば [support@overleaf.com](mailto:support@overleaf.com) までお気軽にお問い合わせください。
+
+### 復旧プロセス
+
+<Steps>
+<Step title="リリースイメージを取得する">
+`5.0.3` のリリースイメージを取得します。
+</Step>
+
+<Step title="いくつかのプロジェクトを特定する">
+履歴が欠落しているプロジェクトをいくつか ID で特定します。そのうちの 1 つを変更する権限があるのが理想的です。
+</Step>
+
+<Step title="メンテナンスを計画する">
+ダウンタイムのためのメンテナンス時間を計画します。
+</Step>
+
+<Step title="1 つを除くすべてのワーカーを停止する">
+水平スケーリング構成を使用している場合は、1 つを除くすべてのワーカーを停止します。
+</Step>
+
+<Step title="新しい更新を停止し、すべての変更を MongoDB にフラッシュする">
+新しい更新がシステムに入らないようにし、すべての変更を MongoDB にフラッシュします。
+
+1. `https://my-server-pro.example.com/admin#open-close-editor` の管理パネルの「Open/Close Editor」タブで、エディターを閉じ、すべてのユーザーを手動で切断します。
+2.  Websocket/リアルタイムサービスを停止します。
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  `down:` と表示されるまで、リアルタイムサービスが終了するのを待ちます。
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  git-bridge コンテナが有効な場合は停止します。
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  5.0.2 を一度も実行したことがない場合：ドキュメントの更新を手動でフラッシュし、正常に完了するまで待ちます。
+
+    エラーが発生した場合は、コマンドを繰り返し実行できます。連続した実行で `failureCount` が 0 以外になる場合は、移行を中止し（`docker restart git-bridge sharelatex` でサービスを復元します）、サポートにお問い合わせください。
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  5.0.2 を一度も実行したことがない場合：すべての変更が Redis からフラッシュされたことを確認します。
+
+    `redis-cli` から何らかの出力があった場合は、移行を中止し（`docker restart git-bridge sharelatex` でサービスを復元します）、サポートにお問い合わせください。
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  保留中の履歴の変更をフラッシュしてみます。
+
+    データベース移行の不具合により履歴が壊れているプロジェクトもあるため、このフラッシュはベストエフォートとなります。失敗したものは、復旧プロセスの最後に行う履歴の再同期で対処されます。
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="バックアップを取得する">
+インスタンスの [整合性のあるバックアップ](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) を取得することを検討してください。
+</Step>
+
+<Step title="アップグレードする">
+バージョン `5.0.3` にアップグレードします。
+</Step>
+
+<Step title="自動復旧">
+復旧プロセスは、コンテナの起動時に自動的に実行されます。
+</Step>
+
+<Step title="進行状況を確認する">
+ログファイル `/var/lib/overleaf/data/history/doc-version-recovery.log` を tail することで、スクリプトの進行状況を確認できます。開始時にプロジェクトの総数が出力され、1000 件のプロジェクトを処理するごとに概要が出力されます。
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="復旧プロセスの完了を待つ">
+上記のログファイルを tail して `Done.` の行が出力されるまで待つか、Server Pro コンテナの標準出力に `Finished recovery of doc versions.` が出力されるまで待って、復旧プロセスの完了を確認します。
+</Step>
+
+<Step title="復旧プロセスを検証する">
+以前に履歴が欠落していたいくつかのプロジェクトの履歴ペインを開いて、復旧プロセスを検証します。
+
+1.  テストするプロジェクトの再同期を早めます（いずれは処理されますが、順番が回ってくるのを待ちたくないためです）。
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    （テストするプロジェクト ID ごとに繰り返し、`000000000000000000000000` を 1 つずつプロジェクト ID に置き換えてください。）
+2. プロジェクト `https://my-server-pro.example.com/project/000000000000000000000000` のエディターを開きます。
+3. プロジェクトの「History」ペインを開き、最新の内容を確認します。
+4. 任意：「History」ペインを再び閉じます。ヘッダーにコメントを追加するなど、コードを変更します。
+5. 任意：再コンパイルを実行して、ローカルの変更のフラッシュをトリガーします。「History」ペインを再び開いて変更を確認します。完了したら、変更を元に戻します。
+</Step>
+
+<Step title="水平スケーリングの場合...">
+他のワーカーを再び起動します。
+</Step>
+
+<Step title="インスタンスを実行したままにする">
+復旧プロセスを実行したインスタンスは、実行したままにしてください。バックグラウンドで、並行数 1 ですべてのプロジェクトの履歴を再同期します。これにより、ベース負荷がわずかに上昇します（インスタンスを再起動することもできますが、再同期は最初からやり直しになります）。
+</Step>
+
+<Step title="完了したらお知らせください">
+Server Pro のお客様へ：復旧プロセスが完了したら、サポートチームにお知らせください。
+</Step>
+</Steps>

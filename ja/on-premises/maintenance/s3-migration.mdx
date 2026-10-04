@@ -1,0 +1,179 @@
+---
+title: S3 への移行
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+## S3 への移行
+
+<Info>
+
+この手順は v5.x 以降を対象としています。それより前のバージョンでこのガイドに従う場合は、パス名では `overleaf` の代わりに `sharelatex` を、環境変数では `OVERLEAF_` の代わりに `SHARELATEX_` プレフィックスを使用してください。
+
+</Info>
+
+<Check>
+
+**ぜひご意見をお聞かせください！** 移行したファイル数、全体の容量、移行にかかった時間を共有していただける場合は、[`ayaka-notes@outlook.com`](mailto:support@overleaf.com) までメールでお知らせください。
+
+</Check>
+
+このガイドでは、ディスク上のストレージから S3 互換のオブジェクトストレージへの移行手順を説明します。[S3 のセットアップ](/ja/on-premises/configuration/overleaf-toolkit/s3)に関する導入ドキュメントの各セクションを参照します。
+
+### 要件
+
+* 接続先となる S3 互換のオブジェクトストレージ（選択肢については [#s3-setup](/ja/on-premises/configuration/overleaf-toolkit/s3#s3-setup  "mention") を参照）
+* 既存データを移行するための空きディスク容量（現在のディスク使用量程度）
+* 実際の移行を行うためのメンテナンス時間
+* 復元できるようにするための、設定を含む完全なバックアップ
+
+### 移行に必要なディスク容量の見積もり
+
+`du` を使って現在のディスク使用量を計算できます。
+
+```shell
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/user_files
+
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/template_files
+```
+
+現在のサーバーに十分な空きディスク容量がない場合は、サーバーに別のディスクを接続してみてください。
+
+<Info>
+
+history ディレクトリはすでに正しいレイアウトになっています。バインドマウントされたソースフォルダーから直接アップロードできるため、追加のディスク容量は必要ありません。
+
+</Info>
+
+### 移行手順
+
+#### ステップ 0: インスタンスを停止する
+
+すべてのユーザーファイル／テンプレートファイルが確実に移行されるようにする必要があります。新しくアップロードされたファイルの取りこぼしを防ぐため、インスタンスを停止するのが最善です。
+
+停止手順については、一貫性のあるバックアップの実行に関するガイドを参照してください。
+
+#### ステップ 1: ディレクトリレイアウトを書き換える
+
+S3 にアップロードするために、プロジェクトファイルのディレクトリレイアウトを書き換える必要があります。filestore のローカルストレージでのディレクトリレイアウトは `<project-id>_<file-id>` で、S3 でのディレクトリレイアウトは `<project-id>/<file-id>` です。
+
+以下では、新しいディレクトリレイアウトのファイルを保存する場所として `/srv/overleaf-s3-migration` を使用します。
+
+`tar` を使ってレイアウトを書き換えることができます。
+
+```shell
+mkdir -p /srv/overleaf-s3-migration/user_files \
+         /srv/overleaf-s3-migration/template_files
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/user_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/user_files \
+  --transform=sx_x/x
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/template_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/template_files \
+  --transform=sx_x/xg
+```
+
+#### ステップ 2: ファイルをアップロードする
+
+好みに応じて、minio mc S3 クライアントまたは aws cli を使用して、S3 互換のオブジェクトストレージにファイルをアップロードできます。
+
+**aws cli**
+
+<Info>
+
+* ここでは、`overleaf-user-files`、`overleaf-template-files`、`overleaf-project-blobs`、`overleaf-chunks` を実際の S3 バケット名に置き換えてください。
+* また、`/srv/overleaf-bind-mount` を `/var/lib/overleaf` のバインドマウントのローカルパスに置き換えてください。デフォルトでは、docker-compose.yml によるデプロイでは `~/overleaf_data`、Toolkit を使用する場合は `<toolkit-checkout>/data/overleaf` です。
+
+</Info>
+
+```shell wrap
+aws s3 sync /srv/overleaf-s3-migration/user_files s3://overleaf-user-files
+aws s3 sync /srv/overleaf-s3-migration/template_files s3://overleaf-template-files
+
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3://overleaf-project-blobs
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-chunks s3://overleaf-chunks
+```
+
+**minio mc**
+
+ここではサーバーエイリアスとして "s3" を使用していますが、別の名前を付けている場合もあります。
+
+```shell wrap
+mc mirror /srv/overleaf-s3-migration/user_files s3/overleaf-user-files
+mc mirror /srv/overleaf-s3-migration/template_files s3/overleaf-template-files
+
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3/overleaf-project-blobs
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-chunks s3/overleaf-chunks
+```
+
+#### ステップ 3: S3 を参照するようにしてインスタンスを起動する
+
+[S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3) セットアップガイドの [変数の概要](/ja/on-premises/configuration/overleaf-toolkit/s3#overview-of-variables) セクションに記載されているとおり、S3 関連のすべての変数を設定に追加します。
+
+Docker Compose によるデプロイの場合は、volumes セクションからデータディレクトリのバインドマウントを削除することもできます。
+
+<Check>
+
+[一時ファイル用のスクラッチディスクのバインドマウント](/ja/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem)はそのまま残しておいてください。
+
+</Check>
+
+これでインスタンスを起動し、移行を検証できます。
+
+* エディターでバイナリファイルをプレビューできる
+* 画像を含む PDF をコンパイルできる
+* 新しいファイルをアップロードできる
+
+### ロールバック
+
+手順を逆にたどることで、移行を安全にロールバックできます。
+
+1. インスタンスを停止する
+2. コピー元とコピー先を入れ替えてファイルをミラーリングし直す
+3. 逆の `transform` を使って新しいファイルをローカルディレクトリに書き戻す
+4. 古い設定でインスタンスを再起動する
+
+```shell wrap
+# When using aws cli
+aws s3 sync s3://overleaf-user-files /srv/overleaf-s3-migration/user_files
+aws s3 sync s3://overleaf-template-files /srv/overleaf-s3-migration/template_files
+aws s3 sync s3://overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+aws s3 sync s3://overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+
+# When using minio mc
+mc mirror s3/overleaf-user-files /srv/overleaf-s3-migration/user_files
+mc mirror s3/overleaf-template-files /srv/overleaf-s3-migration/template_files
+mc mirror s3/overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+mc mirror s3/overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+```
+
+```shell
+# Write files into local Server CE/Server Pro
+tar --create --directory /srv/overleaf-s3-migration/user_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/user_files \
+      --transform=sx./xx --transform=sx/x_x \
+      --wildcards '*/*/*'
+
+tar --create --directory /srv/overleaf-s3-migration/template_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/template_files \
+      --transform=sx./xx --transform=sx/x_xg \
+      --wildcards '*/*/*/*/pdf-converted-cache/*' \
+      --wildcards '*/*/*/*/pdf' \
+      --wildcards '*/*/*/*/zip'
+```
+
+<Info>
+
+1 つ目の transform はトップレベルのフォルダーを削除します。2 つ目の transform はディレクトリレイアウトをフラットな構造に変更します。wildcards により、親（プロジェクト）フォルダーではなくファイルのみが展開されます。
+
+</Info>

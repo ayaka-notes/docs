@@ -1,0 +1,194 @@
+---
+title: Daten und Backups
+icon: database
+---
+
+Im Zuge der Weiterentwicklung von Overleaf müssen wir gelegentlich das Datenschema in der Datenbank ändern. Dieser Vorgang wird mit Migrationsskripten automatisiert. Diese wurden zuerst auf [overleaf.com](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit) ausgeführt, der größten Overleaf-Instanz der Welt, sodass die meisten Eventualitäten bereits aufgetreten sind. Für Ihre Daten übernehmen wir jedoch keine Garantie. Bitte erstellen Sie **vor** dem Upgrade Ihrer Instanz ein **konsistentes** Backup Ihrer Daten.
+
+<Info>
+
+Beim Upgrade auf ein neues Docker-Image werden alle Migrationen, die **noch nicht** ausgeführt wurden, automatisch ausgeführt. Je nach Größe Ihres Datenbestands kann dies einige Zeit dauern; den Fortschritt können Sie in den Logs verfolgen. Weitere Informationen finden Sie in unserer Dokumentation zum [Logging](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging).
+
+</Info>
+
+### Datenspeicherung
+
+Overleaf Community Edition und Server Pro speichern ihre Daten an drei verschiedenen Orten:
+
+* **MongoDB-Datenbank:** Hier befinden sich Benutzer- und Projektdaten.
+* **Redis:** dient als Hochleistungs-Cache für in Bearbeitung befindliche Daten und speichert vor allem Informationen zu Projektbearbeitungen und zur Zusammenarbeit.
+* **Overleaf-Dateisystem:** speichert nicht bearbeitbare Projektdateien (einschließlich Bilder) und dient außerdem als temporärer Festplatten-Cache während der Projektkompilierung.
+
+<Info>
+
+Je nachdem, wann Ihre Instanz eingerichtet wurde, kann dies `~/sharelatex_data` oder `~/overleaf_data` sein.
+
+</Info>
+
+<Check>
+
+Für Projektdateien und Daten des vollständigen Projektverlaufs unterstützen wir auch S3-kompatible Speicher-Backends.
+
+</Check>
+
+Weitere Informationen zur Ordnerstruktur auf der Festplatte finden Sie unter „Ordner im Detail“.
+
+### Performing a consistent backup
+
+Bei einem konsistenten Backup müssen drei Speicher berücksichtigt werden:
+
+* MongoDB
+* Redis
+* Daten des Overleaf-Dateisystems
+
+Für ein konsistentes Backup ist es **zwingend erforderlich**, dass Benutzer während des Backups keine neuen Daten erzeugen. Wir empfehlen daher, ein Wartungsfenster einzuplanen, in dem Benutzer weder auf die Instanz zugreifen noch ihre Projekte bearbeiten können.
+
+Bevor Sie mit dem Backup beginnen, müssen Sie Ihre Instanz offline nehmen. Ab Server Pro `3.5.0` werden beim Herunterfahren das Schließen der Website und das Trennen der Benutzer automatisch erledigt.
+
+Um Ihre Instanz herunterzufahren, führen Sie `bin/docker-compose stop sharelatex` aus, wenn Sie eine Toolkit-Bereitstellung betreiben, oder `docker compose stop sharelatex`, wenn Sie Docker Compose verwenden.
+
+Sobald der Container `sharelatex` gestoppt ist, können Sie mit dem Backup beginnen.
+
+Nachdem das Backup **erfolgreich** abgeschlossen ist, müssen Sie den Container `sharelatex` wieder starten. Führen Sie dazu `bin/docker-compose start sharelatex` aus, wenn Sie eine Toolkit-Bereitstellung betreiben, oder `docker compose start sharelatex`, wenn Sie Docker Compose verwenden.
+
+<Danger>
+
+* Backups sollten auf einem anderen Server als dem gespeichert werden, auf dem Ihre Overleaf-Instanz läuft – idealerweise an einem ganz anderen Standort.
+* Die Replikation von Datenbanken auf mehrere MongoDB-Instanzen kann eine gewisse Redundanz bieten, schützt aber nicht vor Datenbeschädigung.
+* Das Testen Ihrer Backups ist der beste Weg, um sicherzustellen, dass sie vollständig und funktionsfähig sind.
+
+</Danger>
+
+### MongoDB
+
+MongoDB enthält das Kommandozeilenwerkzeug [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/), mit dem Sie ein Backup der in der Datenbank gespeicherten Benutzer- und Projektdaten erstellen können.
+
+### Daten des Overleaf-Dateisystems
+
+Bei Toolkit-Bereitstellungen wird der Speicherort Ihrer nicht bearbeitbaren Dateien in `config/overleaf.rc` über die Umgebungsvariable `OVERLEAF_DATA_PATH` festgelegt. Je nachdem, wann Ihre Instanz erstellt wurde, kann dies jedoch `data/sharelatex` sein.
+
+Um ein vollständiges Backup zu erstellen, muss dieses Verzeichnis mit einem Werkzeug wie **rsync** rekursiv kopiert werden.
+
+### Redis
+
+Redis speichert Benutzersitzungen und ausstehende Dokumentaktualisierungen, bevor diese in MongoDB geschrieben werden.
+
+Die Persistenz über Append Only File (AOF) ist die empfohlene Konfiguration für die Redis-Persistenz.
+
+Bei **Neuinstallationen** mit dem Toolkit ist die AOF-Persistenz standardmäßig aktiviert. Bestehende Nutzer finden [hier](/de/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) weitere Informationen zur Aktivierung von AOF.
+
+Wenn Sie RDB-Snapshots weiterhin zusätzlich zur AOF-Persistenz verwenden, können Sie die RDB-Datei als Backup an einen sicheren Ort kopieren.
+
+### Daten zwischen Servern migrieren
+
+Im Idealfall befinden sich in der neuen Instanz noch keine wertvollen Daten. Wir haben kein Verfahren zum Zusammenführen der Daten mehrerer Instanzen.
+
+Unter der Annahme, dass die neue Instanz noch keine Daten enthält, können Sie die folgenden Schritte ausführen. Grob gesagt erstellen wir ein Tar-Archiv der Volumes `mongo`, `redis` und `overleaf`, kopieren es auf den neuen Server und entpacken es dort wieder.
+
+#### Toolkit
+
+```bash
+# Gracefully shutdown the old instance
+old-server$ bin/stop
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar config/ data/
+
+# Copy the backup-old-server.tar file from the old-server to the
+# new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ bin/stop
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv config/ data/ backup-new-server/
+
+# Populate config/data dir again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ bin/up
+```
+
+#### Docker Compose
+
+```bash wrap
+# Gracefully shutdown the old instance
+old-server$ docker stop sharelatex
+old-server$ docker stop mongo redis
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar ~/OVERLEAF_data ~/mongo_data ~/redis_data
+
+# Copy the backup-old-server.tar file from the old-server to
+# the new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ docker stop sharelatex
+new-server$ docker stop mongo redis
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv ~/OVERLEAF_data ~/mongo_data ~/redis_data backup-new-server/
+
+# Populate data dirs again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ docker start mongo redis
+new-server$ docker start sharelatex
+```
+
+Je nach Ihrer **docker-compose.yml**-Datei müssen Sie möglicherweise die Pfade der Volumes `mongo`, `redis` und `overleaf` anpassen.
+
+<Info>
+
+Bei Ausführung als Root-Benutzer (oder mit sudo) behält tar Dateieigentümer/-gruppe und Berechtigungen bei, was für die Wiederherstellung des Backups entscheidend ist.
+
+</Info>
+
+### Ordner im Detail
+
+<Info>
+
+Die folgenden Ordner sind zusätzlich gekennzeichnet:
+
+* (b) in Backups aufnehmen, am besten bei gestoppter Instanz, um Konsistenz sicherzustellen
+* (d) kann gelöscht werden
+* (e) flüchtige Dateien, können bei gestoppter Instanz gelöscht werden
+
+</Info>
+
+1. `~/mongo_data` (b)
+   * MongoDB-Datenverzeichnis
+2. `~/redis_data` (b)
+   * Redis-Datenverzeichnis
+3. `~/overleaf_data`
+   1. bin
+      1. synctex (d)
+         * in der neuesten Version ungenutzt; früher wurde eine eigene synctex-Binärdatei verwendet (synctex dient der Zuordnung zwischen .tex-Dateien und der PDF)
+   2. data
+      1. cache (e)
+         * Cache für Binärdateien bei Kompilierungen
+      2. compiles (e)
+         * hier findet die LaTeX-Kompilierung statt
+      3. db.sqlite (d)
+         * in der neuesten Version ungenutzt; speicherte früher clsi-Cache-Details (diese liegen jetzt entweder in einfachen In-Memory-Maps oder werden von der Festplatte ermittelt)
+      4. db.sqlite-wal (d)
+         * in der neuesten Version ungenutzt, siehe db.sqlite
+      5. output (e)
+         * Speicher für die Ausgabe der LaTeX-Kompilierung zur Auslieferung an den Client
+      6. template\_files (b)
+         * Bildvorschauen des Vorlagensystems (nur Server Pro)
+      7. user\_files (b)
+         * Binärdateien von Projekten
+      8. history (b)
+         * Dateien des vollständigen Projektverlaufs
+   3. tmp
+      1. dumpFolder (e)
+         * temporäre Dateien bei der Verarbeitung von ZIP-Dateien
+      2. uploads (e)
+         * Zwischenspeicherung von Datei-Uploads (Binärdatei / neues Projekt aus ZIP-Upload)
+      3. projectHistories (e)
+         * temporäre Dateien für Migrationen des vollständigen Projektverlaufs

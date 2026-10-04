@@ -1,0 +1,158 @@
+---
+title: （v5.0.1 迁移）文档版本恢复
+icon: arrow-rotate-left
+---
+
+<Info>
+
+如果您从未运行过 Server Pro 5.0.1 版或社区版 5.0.1 版，或者您是使用 5.0.1 版全新启动的实例，则无需执行此恢复过程。
+
+</Info>
+
+**本页更新记录：**
+
+* （2024-04-22 13:40 BST）：新增步骤“阻止新的更新进入系统，并将所有更改刷新到 MongoDB”。
+* （2024-04-23 11:45 BST）：考虑 5.0.1 中失败的刷新操作，并在已启动过 5.0.2 时跳过刷新。
+
+恢复所需时间取决于实例中项目的数量和大小，以及历史存储用于存放 chunk 的存储后端（由 `OVERLEAF_HISTORY_CHUNKS_BUCKET` 定义）。
+
+恢复过程会延迟 Server Pro 容器内应用程序的启动，在此期间站点将显示为离线。我们仅支持在单个 Server Pro 容器实例中运行恢复，所有其他水平扩展的 worker 都需要处于离线状态。
+
+如有需要，您可以停止并恢复该恢复过程。
+
+根据我们的性能测试，在现代硬件（3GHz CPU 主频和本地 NVMe 存储）上，恢复过程每分钟大约可以处理 1 万个小型项目。例如，对于拥有 10 万个项目的实例，请安排一个至少允许 10+2 分钟停机时间的维护窗口。使用以下查询估算实例中的项目数量：
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+开始之前，请完整阅读以下恢复步骤。如有任何问题，欢迎 Server Pro 客户联系 [support@overleaf.com](mailto:support@overleaf.com)。
+
+### 恢复过程
+
+<Steps>
+<Step title="拉取发布镜像">
+拉取 `5.0.3` 发布镜像。
+</Step>
+
+<Step title="确定若干项目">
+通过 id 确定几个缺少历史记录的项目；理想情况下，您应有权限修改其中一个项目。
+</Step>
+
+<Step title="安排维护">
+为停机安排一个维护窗口。
+</Step>
+
+<Step title="仅保留一个 worker">
+如果使用水平扩展部署，请停止除一个 worker 以外的所有 worker。
+</Step>
+
+<Step title="阻止新的更新并将所有更改刷新到 MongoDB">
+阻止新的更新进入系统，并将所有更改刷新到 MongoDB：
+
+1. 通过 `https://my-server-pro.example.com/admin#open-close-editor` 管理面板中的“Open/Close Editor”选项卡关闭编辑器，并手动断开所有用户的连接。
+2.  停止 Websocket/real-time 服务。
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  等待 real-time 服务退出，以 `down:` 为标志。
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  如果启用了 git-bridge 容器，请将其停止。
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  如果您从未运行过 5.0.2：手动触发文档更新的刷新，并等待其成功完成。
+
+    出错时可以重复执行该命令。如果在连续运行中看到 `failureCount` 不为零，请停止迁移（通过 `docker restart git-bridge sharelatex` 恢复服务）并联系支持团队。
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  如果您从未运行过 5.0.2：确保所有更改都已从 redis 中刷新出去。
+
+    如果 `redis-cli` 有任何输出，请停止迁移（通过 `docker restart git-bridge sharelatex` 恢复服务）并联系支持团队。
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  尝试刷新所有待处理的历史更改。
+
+    这只能是尽力而为的刷新，因为部分项目的历史记录已因错误的数据库迁移而损坏。任何失败都将在恢复过程结束时通过重新同步历史记录来处理。
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="进行备份">
+建议对实例进行一次[一致性备份](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)。
+</Step>
+
+<Step title="升级">
+升级到 `5.0.3` 版本。
+</Step>
+
+<Step title="自动恢复">
+恢复过程会在容器启动时自动运行。
+</Step>
+
+<Step title="跟踪进度">
+您可以通过 tail 日志文件 `/var/lib/overleaf/data/history/doc-version-recovery.log` 来跟踪脚本的进度。它会在开始时打印项目总数，并在每处理 1000 个项目后打印一次摘要。
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="等待恢复过程完成">
+等待恢复过程完成：可以持续 tail 上述日志文件，直到打印出 `Done.` 行；或者等待 Server Pro 容器的标准输出中打印出 `Finished recovery of doc versions.`。
+</Step>
+
+<Step title="验证恢复过程">
+打开几个此前缺少历史记录的项目的历史面板，以验证恢复过程。
+
+1.  加快待测试项目的重新同步（它们最终都会被处理，但我们不想等待轮到它们。）
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    （对每个待测试的项目 id 重复执行，每次将 `000000000000000000000000` 替换为一个项目 id。）
+2. 打开项目的编辑器 `https://my-server-pro.example.com/project/000000000000000000000000`
+3. 打开项目的“History”面板，查看最新内容。
+4. 可选：再次关闭“History”面板。修改代码，例如在文件头部添加一条注释。
+5. 可选：重新编译以触发本地更改的刷新。再次打开“History”面板并查看该更改。完成后撤销该更改。
+</Step>
+
+<Step title="对于水平扩展部署……">
+重新启动其他 worker。
+</Step>
+
+<Step title="保持实例运行">
+请保持执行恢复过程的实例持续运行。它将在后台以并发数 1 为所有项目重新同步历史记录，这会导致基础负载略有升高。（您可以重启实例，但重新同步将需要从头开始。）
+</Step>
+
+<Step title="完成后请告知我们">
+Server Pro 客户：完成恢复过程后，请告知支持团队。
+</Step>
+</Steps>

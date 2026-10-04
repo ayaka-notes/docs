@@ -1,0 +1,179 @@
+---
+title: S3 迁移
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+## S3 迁移
+
+<Info>
+
+以下说明适用于 v5.x 及更高版本。如果你按照本指南操作的是更早的版本，请在路径名中使用 `sharelatex` 代替 `overleaf`，并在环境变量中使用 `SHARELATEX_` 前缀代替 `OVERLEAF_`。
+
+</Info>
+
+<Check>
+
+**我们很期待听到你的反馈！** 如果你愿意与我们分享你迁移了多少文件、它们的总体积以及迁移耗时多久，请发送电子邮件至 [`ayaka-notes@outlook.com`](mailto:support@overleaf.com)。
+
+</Check>
+
+本指南将引导你从磁盘存储迁移到 S3 兼容的对象存储。文中会引用 [S3 设置](/zh-CN/on-premises/configuration/overleaf-toolkit/s3)介绍文档中的部分章节。
+
+### 要求
+
+* 一个可供连接的 S3 兼容对象存储，可选方案请参见 [#s3-setup](/zh-CN/on-premises/configuration/overleaf-toolkit/s3#s3-setup  "mention")
+* 用于迁移现有数据的可用磁盘空间，大小约等于当前磁盘占用
+* 一个用于实际执行迁移的维护窗口
+* 一份完整备份（包括配置），以便能够从中恢复
+
+### 估算迁移所需的磁盘空间
+
+我们可以使用 `du` 计算当前的磁盘占用：
+
+```shell
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/user_files
+
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/template_files
+```
+
+如果当前服务器上的可用磁盘空间不足，可以尝试为服务器挂载另一块磁盘。
+
+<Info>
+
+历史记录目录已经具有正确的布局。你可以直接从绑定挂载的源文件夹上传，无需任何额外的磁盘空间。
+
+</Info>
+
+### 迁移步骤
+
+#### 第 0 步：关闭实例
+
+我们需要确保所有用户/模板文件都会被迁移。最好关闭实例，以免遗漏新上传的文件。
+
+关闭流程请参阅我们关于执行一致性备份的指南。
+
+#### 第 1 步：重写目录布局
+
+为了将项目文件上传到 S3，我们需要重写其目录布局。filestore 本地存储的目录布局是 `<project-id>_<file-id>`，而 S3 中的目录布局是 `<project-id>/<file-id>`。
+
+下文中使用 `/srv/overleaf-s3-migration` 来存放采用新目录布局的文件。
+
+我们可以利用 `tar` 来重写布局：
+
+```shell
+mkdir -p /srv/overleaf-s3-migration/user_files \
+         /srv/overleaf-s3-migration/template_files
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/user_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/user_files \
+  --transform=sx_x/x
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/template_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/template_files \
+  --transform=sx_x/xg
+```
+
+#### 第 2 步：上传文件
+
+根据你的偏好，可以使用 minio mc S3 客户端或 aws cli 将文件上传到 S3 兼容的对象存储。
+
+**aws cli**
+
+<Info>
+
+* 请将此处的 `overleaf-user-files`、`overleaf-template-files`、`overleaf-project-blobs` 和 `overleaf-chunks` 替换为你的 S3 存储桶名称。
+* 同时将 `/srv/overleaf-bind-mount` 替换为 `/var/lib/overleaf` 绑定挂载的本地路径。默认情况下，在 docker-compose.yml 部署中它是 `~/overleaf_data`，使用 Toolkit 时则是 `<toolkit-checkout>/data/overleaf`。
+
+</Info>
+
+```shell wrap
+aws s3 sync /srv/overleaf-s3-migration/user_files s3://overleaf-user-files
+aws s3 sync /srv/overleaf-s3-migration/template_files s3://overleaf-template-files
+
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3://overleaf-project-blobs
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-chunks s3://overleaf-chunks
+```
+
+**minio mc**
+
+这里我们使用的服务器别名是 "s3"，你可能使用了其他名称。
+
+```shell wrap
+mc mirror /srv/overleaf-s3-migration/user_files s3/overleaf-user-files
+mc mirror /srv/overleaf-s3-migration/template_files s3/overleaf-template-files
+
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3/overleaf-project-blobs
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-chunks s3/overleaf-chunks
+```
+
+#### 第 3 步：启动指向 S3 的实例
+
+将所有与 S3 相关的变量添加到你的配置中，具体请参见 [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3) 设置指南中的[变量概览](/zh-CN/on-premises/configuration/overleaf-toolkit/s3#overview-of-variables)一节。
+
+对于 Docker Compose 部署，你还可以从 volumes 部分中移除数据目录的绑定挂载。
+
+<Check>
+
+请保留[用于临时文件的暂存磁盘绑定挂载](/zh-CN/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem)。
+
+</Check>
+
+现在你可以启动实例并验证迁移结果：
+
+* 可以在编辑器中预览二进制文件
+* 可以编译包含图片的 PDF
+* 可以上传新文件
+
+### 回滚
+
+你可以通过反向执行各步骤来平稳地回滚迁移：
+
+1. 关闭实例
+2. 交换源/目标的顺序，将文件镜像回来
+3. 使用相反的 `transform` 将新文件写回本地目录
+4. 使用旧配置重新启动实例
+
+```shell wrap
+# When using aws cli
+aws s3 sync s3://overleaf-user-files /srv/overleaf-s3-migration/user_files
+aws s3 sync s3://overleaf-template-files /srv/overleaf-s3-migration/template_files
+aws s3 sync s3://overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+aws s3 sync s3://overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+
+# When using minio mc
+mc mirror s3/overleaf-user-files /srv/overleaf-s3-migration/user_files
+mc mirror s3/overleaf-template-files /srv/overleaf-s3-migration/template_files
+mc mirror s3/overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+mc mirror s3/overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+```
+
+```shell
+# Write files into local Server CE/Server Pro
+tar --create --directory /srv/overleaf-s3-migration/user_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/user_files \
+      --transform=sx./xx --transform=sx/x_x \
+      --wildcards '*/*/*'
+
+tar --create --directory /srv/overleaf-s3-migration/template_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/template_files \
+      --transform=sx./xx --transform=sx/x_xg \
+      --wildcards '*/*/*/*/pdf-converted-cache/*' \
+      --wildcards '*/*/*/*/pdf' \
+      --wildcards '*/*/*/*/zip'
+```
+
+<Info>
+
+第一个 transform 移除顶层文件夹。第二个 transform 将目录布局改为扁平结构。通配符确保只提取文件，而不提取其父级（项目）文件夹。
+
+</Info>
