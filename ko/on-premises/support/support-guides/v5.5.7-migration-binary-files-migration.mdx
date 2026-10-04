@@ -1,0 +1,288 @@
+---
+title: (v5.5.7 마이그레이션) 바이너리 파일 마이그레이션
+icon: arrows-rotate
+---
+
+## 바이너리 파일 마이그레이션
+
+곧 출시될 Server Pro 및 Community Edition의 메이저 버전 `6.0` 릴리스는 바이너리 파일의 스토리지 사용량을 절반으로 줄입니다. 버전 `5.5.7`에는 온라인 마이그레이션이 포함되어 있어 업그레이드 과정에서 다운타임을 최소화할 수 있습니다.
+
+Server Pro `4.x`부터 바이너리 파일은 "filestore"의 활성 파일 저장소와 전체 프로젝트 기록 시스템에 두 번 저장되었습니다. 앞으로는 각 파일의 사본 하나만 전체 프로젝트 기록 시스템에 저장됩니다.
+
+통합 저장 시스템으로의 마이그레이션은 두 부분으로 구성됩니다. 마이그레이션 단계를 제어하는 새 플래그와, 모든 활성 프로젝트 및 소프트 삭제된 프로젝트를 처리하는 스크립트입니다.
+
+단계:
+
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=0` (기본값): 파일을 filestore에서 읽고 filestore에 씁니다. 파일은 기록에 비동기적으로 기록됩니다.
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1`: 파일을 기록에서 읽되 실패하면 filestore로 대체하며, filestore와 기록 모두에 씁니다. `OVERLEAF_FILESTORE_MIGRATION_LEVEL=0`으로 다운그레이드할 수 있습니다.
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=2`: 파일을 기록에서만 읽고 씁니다. "오프라인"으로 수행한 경우가 아니면 `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1`로 다운그레이드할 수 없습니다.
+
+데이터를 [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3)에 저장하고 filestore(`OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID`)와 기록(`OVERLEAF_HISTORY_S3_ACCESS_KEY_ID`)에 별도의 서비스 계정을 사용하는 경우: filestore 사용자에게 blob용 기록 버킷 `OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET`에 대한 읽기 권한을 부여하세요. 앞으로는 filestore 서비스가 컴파일러 서비스의 읽기 요청을 처리합니다.
+
+<Warning>
+
+바이너리 파일 마이그레이션은 먼저 비프로덕션/샌드박스 환경에서 수행할 것을 강력히 권장합니다.
+
+</Warning>
+
+<Check>
+
+표준 Server Pro 라이선스는 프로덕션 환경 하나와 비프로덕션/샌드박스 환경 하나에서 애플리케이션을 실행할 수 있도록 허용합니다. 테스트용 비프로덕션 환경을 마련할 것을 강력히 권장합니다.
+
+</Check>
+
+<Info>
+
+Server Pro/CE 버전 `6.0`으로 업그레이드한 후 이전 버전으로 다운그레이드하려면 전체 시스템 백업에서 복원해야 합니다.
+
+</Info>
+
+### 마이그레이션 절차
+
+<Steps>
+<Step title="백업 생성">
+**mongo**, **redis**, **sharelatex** 디렉터리의 일관된 스냅샷으로 인스턴스의 전체 [백업](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)을 만듭니다.
+</Step>
+
+<Step title="업데이트">
+**Toolkit:** `$ bin/upgrade` 스크립트를 사용하여 **toolkit**을 최신 버전으로 업그레이드합니다. **Upgrade** image? 프롬프트가 표시되면 확인하지 **말고**, 대신 **config/version** 파일을 직접 편집하여 값을 `5.5.7`로 설정합니다.
+
+**레거시 docker-compose.yml:** `sharelatex` 서비스의 버전을 `5.5.7`로 업데이트합니다.
+</Step>
+
+<Step title="영향을 받는 프로젝트 수 추정">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --report"
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --report"
+```
+
+출력 예시:
+
+```text
+Current status:
+- Total number of projects: 10
+- Total number of deleted projects: 5
+Sampling 1000 projects to estimate progress...
+Sampled stats for projects:
+- Sampled projects: 9 (90% of all projects)
+- Sampled projects with all hashes present: 5
+- Percentage of projects that need back-filling hashes: 44% (estimated)
+- Sampled projects have 11 files that need to be checked against the full project history system.
+- Sampled projects have 3 files that need to be uploaded to the full project history system (estimating 27% of all files).
+Sampled stats for deleted projects:
+- Sampled deleted projects: 4 (80% of all deleted projects)
+- Sampled deleted projects with all hashes present: 3
+- Percentage of deleted projects that need back-filling hashes: 25% (estimated)
+- Sampled deleted projects have 2 files that need to be checked against the full project history system.
+- Sampled deleted projects have 1 files that need to be uploaded to the full project history system (estimating 50% of all files).
+```
+</Step>
+
+<Step title="프로젝트 기록 대기열 플러시">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /overleaf/bin/flush-history-queues
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /overleaf/bin/flush-history-queues
+```
+
+모든 프로젝트가 플러시될 때까지(`"project_ids":0`) 플러시를 반복합니다.
+
+```text
+found projects {"project_ids":0,"limit":100000,"ts":"2025-09-01T10:35:33.353Z"}
+total {"succeededProjects":0,"failedProjects":0}
+```
+
+<Danger>
+
+"failedProjects"가 0이 아니면 바이너리 파일 마이그레이션을 계속하지 말고 지원팀에 문의하세요.
+
+</Danger>
+</Step>
+
+<Step title="마이그레이션 단계를 1로 진행">
+Toolkit: `config/variables.env`에서 `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1`을 설정합니다.
+
+레거시 docker-compose.yml: `sharelatex` 서비스의 `environment` 섹션에서 `OVERLEAF_FILESTORE_MIGRATION_LEVEL: '1'`을 설정합니다.
+</Step>
+
+<Step title="구성 변경 적용 및 인스턴스 시작">
+Toolkit: `bin/up -d`
+
+레거시 docker-compose.yml: `docker compose up -d`
+</Step>
+
+<Step title="바이너리 파일 접근 확인">
+브라우저의 Overleaf 편집기에서 프로젝트를 열고 이미지와 같은 바이너리 파일을 선택합니다.
+</Step>
+
+<Step title="마이그레이션 스크립트 실행">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --all"
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --all"
+```
+
+<Danger>
+
+**sharelatex** 컨테이너 외부에 [로그를 영속화](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging#persisting-logs)하는 경우, 출력 로그 파일을 쓸 수 있도록 로그 디렉터리의 소유자가 `www-data` 사용자(uid=33)로 설정되어 있는지 확인하세요.
+
+</Danger>
+
+출력은 다음과 같아야 합니다.
+
+```bash
+Set UV_THREADPOOL_SIZE=16
+{"name":"default","hostname":"c25e9faaeb53","pid":971,"level":30,"backend":"fs","msg":"Loading backend","time":"2025-07-25T15:00:58.166Z","v":0}
+Writing logs into /var/log/overleaf/file-migration-2025-07-25T15_00_58_199Z.log
+Starting project file backup...
+Loaded global blobs: 0
+Processing non-deleted projects...
+Processed 1 projects, elapsed time 0s
+Done updating live projects
+Processing deleted projects...
+The collection deletedProjects appears to be empty.
+
+Done updating deleted projects
+Done.
+
+```
+
+마이그레이션이 성공하면 종료 코드 `0`과 함께 실패가 없음을 나타내는 마지막 줄이 출력됩니다.
+
+```bash
+Done.
+```
+
+로그 파일은 다음과 같습니다(스크립트가 출력한 경로를 사용하세요).
+
+```bash wrap
+$ docker cp sharelatex:/var/log/overleaf/file-migration-2025-07-25T15_00_58_199Z.log .
+$ cat file-migration-2025-07-25T15_00_58_199Z.log
+{"name":"file-migration","hostname":"c25e9faaeb53","pid":971,"level":30,"end":"68839a8f577b9f009d947b27 (2025-07-25T14:54:07.000Z)","msg":"actually completed batch","time":"2025-07-25T15:00:58.379Z","v":0}
+{"name":"file-migration","hostname":"c25e9faaeb53","pid":971,"level":30,"time":"2025-07-25T15:00:58.383Z","LOGGING_IDENTIFIER":"4effa2000000000000000000","projects":1,"blobs":6,"filesWithHash":5,"filesWithoutHash":2,"filesDuplicated":0,"filesRetries":0,"filesFailed":0,"fileTreeUpdated":0,"badFileTrees":0,"globalBlobsCount":0,"globalBlobsEgress":0,"projectDeleted":0,"projectHardDeleted":0,"fileHardDeleted":0,"mongoUpdates":1,"readFromGCSCount":7,"readFromGCSIngress":28532,"writeToGCSCount":5,"writeToGCSEgress":300,"readFromGCSThroughputMiBPerSecond":0.14925639825786063,"eventLoop":{"idle":48.277844,"active":381.53244699971054,"utilization":0.8876763888372498},"diff":{"eventLoop":{"idle":48.223536,"active":134.04030200059555,"utilization":0.7354190687027976},"projects":1,"blobs":6,"filesWithHash":5,"filesWithoutHash":2,"filesDuplicated":0,"filesRetries":0,"filesFailed":0,"fileTreeUpdated":0,"badFileTrees":0,"globalBlobsCount":0,"globalBlobsEgress":0,"projectDeleted":0,"projectHardDeleted":0,"fileHardDeleted":0,"mongoUpdates":1,"readFromGCSCount":7,"readFromGCSIngress":28532,"writeToGCSCount":5,"writeToGCSEgress":300,"readFromGCSThroughputMiBPerSecond":0.14925639825786063},"deferredBatches":[],"msg":"file-migration stats","v":0}
+```
+</Step>
+
+<Step title="인스턴스 중지">
+Toolkit: `bin/stop sharelatex`
+
+레거시 docker-compose.yml: `docker compose stop sharelatex`
+</Step>
+
+<Step title="애플리케이션이 이전 파일에 접근할 수 없도록 설정">
+이제 이전 파일을 보조 스토리지로 옮길 수 있습니다. 나중에 문제가 발생할 경우에 대비해 파일을 한동안 보관할 것을 권장합니다.
+
+```bash wrap
+# Toolkit users:
+$ bin/docker-compose run --rm --entrypoint mv sharelatex --no-clobber --verbose /var/lib/overleaf/data/user_files /var/lib/overleaf/data/old_user_files
+
+# Legacy docker-compose.yml users:
+# We are assuming that you are using the default bind-mount in /var/lib/overleaf
+$ docker compose run --rm --entrypoint mv sharelatex --no-clobber --verbose /var/lib/overleaf/data/user_files /var/lib/overleaf/data/old_user_files
+# In case you are using selective bind-mounts, you can simply remove the bind-mount for /var/lib/overleaf/data/user_files inside the container.
+```
+</Step>
+
+<Step title="마이그레이션 단계를 2로 진행">
+Toolkit: `config/variables.env`에서 `OVERLEAF_FILESTORE_MIGRATION_LEVEL=2`를 설정합니다.
+
+레거시 docker-compose.yml: `sharelatex` 서비스의 `environment` 섹션에서 `OVERLEAF_FILESTORE_MIGRATION_LEVEL: '2'`를 설정합니다.
+</Step>
+
+<Step title="구성 변경 적용 및 인스턴스 시작">
+Toolkit: `bin/up -d`
+
+레거시 docker-compose.yml: `docker compose up -d`
+</Step>
+
+<Step title="바이너리 파일 접근 확인">
+브라우저의 Overleaf 편집기에서 프로젝트를 열고 이미지와 같은 바이너리 파일을 선택합니다.
+</Step>
+</Steps>
+
+#### 오프라인 마이그레이션
+
+바이너리 파일 마이그레이션 스크립트가 실행되는 동안 사용자가 로그인하지 못하도록 하려면 다음 단계를 따르세요.
+
+* 관리자 계정으로 Overleaf 인스턴스에 로그인합니다
+* **Admin** 버튼을 클릭하고 **Manage Site**를 선택합니다
+* **Open/Close Editor** 탭을 클릭합니다
+* **Close Editor** 버튼을 클릭합니다
+* **Disconnect all users** 버튼을 클릭합니다
+
+이렇게 하면 로그인한 사용자는 유지 관리 페이지로 리디렉션되며, 로그인 페이지를 방문하는 새 사용자도 유지 관리 페이지를 보게 되어 로그인할 수 **없습니다**.
+
+인스턴스를 다시 시작할 때는 이 단계를 반복해야 합니다. 사이트를 다시 열려면 인스턴스를 다시 시작하기만 하면 됩니다.
+
+#### 온라인 마이그레이션
+
+애플리케이션이 실행 중인 상태에서도 마이그레이션 스크립트를 실행할 수 있습니다. 몇 가지 고려 사항이 있습니다.
+
+* 마이그레이션 과정은 IO 집약적이므로 스크립트가 실행되는 동안 리소스 사용량을 모니터링해야 합니다.
+* 처리 동시성이 높으면 `filestore` 서비스의 이벤트 루프가 일부 차단되어 사용자 경험이 저하될 수 있습니다. 기본값인 `--concurrency=10` 및 `--concurrent-batches=1`로 시작할 것을 권장합니다.
+* 스크립트는 언제든지 중지할 수 있습니다. 다시 시작하면 이전 프로젝트를 검증하고 이미 처리된 파일은 건너뜁니다. 덜 바쁜 시간대(예: 야간)에 마이그레이션을 실행하려는 경우에 유용합니다.
+
+프로젝트 수가 1000개 미만이라면(`--report`로 실행한 마이그레이션 스크립트의 출력 참고) 사이트를 닫고 유지 관리 시간대에 오프라인으로 마이그레이션을 실행할 것을 권장합니다. 프로젝트 수가 많다면 스크립트를 실행하고 진행 상황을 모니터링한 다음, 상황에 따라 온라인으로 계속 실행할지 오프라인으로 실행할지 결정할 수 있습니다.
+
+#### 레거시 바이너리 파일 데이터 정리
+
+마이그레이션을 완료하고 프로젝트가 여전히 모든 파일에 접근할 수 있는지 확인했다면 `/var/lib/overleaf/data/user_files`의 이전 파일 저장소를 제거할 수 있습니다. 이 파일들은 한동안 보관할 것을 강력히 권장합니다. 먼저 폴더 이름을 변경하여 애플리케이션이 접근할 수 없도록 할 수 있습니다.
+
+### 문제 해결
+
+여기에 문제 해결 조언을 추가할 예정입니다. 일반적으로 Server Pro 고객에게만 지원을 제공하지만, 이 마이그레이션의 특성상 바이너리 파일 마이그레이션과 관련된 문제를 겪는 CE 고객도 최선을 다해 지원하겠습니다.
+
+바이너리 파일 마이그레이션 스크립트가 실패하면(즉, 오류와 함께 종료되거나 실패한 프로젝트 수가 0이 아닌 값으로 출력되면) 다음 세부 정보를 이메일 [support+filestoremigration@overleaf.com](mailto:support+filestoremigration@overleaf.com?subject=Binary%20file%20migration%20problem&body=Instance%20Type%3A%20CE%20or%20Server%20Pro%20%28delete%20as%20appropriate%29%0A%0AInstallation%20Type%3A%20Overleaf%20toolkit%20or%20docker-compose.yml%20or%20other%20%28delete%20as%20appropriate%29%0A%0AScript%20output%3A%0A%0Abin%2Fdoctor%20output%20%28if%20using%20toolkit%29%3A%0A)로 지원팀에 보내 주세요.
+
+제목: Binary file migration problem
+
+본문:
+
+* 인스턴스 유형: CE 또는 Server Pro (해당하지 않는 항목 삭제)
+* 설치 유형: Overleaf toolkit, `docker-compose.yml` 또는 기타 (해당하지 않는 항목 삭제)
+* 버전: 5.5.x (toolkit: `$ cat config/version`)
+* 마이그레이션 스크립트 출력(컨테이너의 `/var/log/overleaf` 아래에 있음)
+* 보고서: (`--report`로 마이그레이션 스크립트 실행)
+* 처리된 프로젝트: (스크립트의 마지막 실행 기준)
+* 마이그레이션 소요 시간:
+* `bin/doctor` 출력(toolkit 사용 시)
+* Toolkit 버전: `$ git rev-parse HEAD` (Toolkit 사용 시)
+
+`filestore` 서비스의 로그 파일을 이메일에 첨부하는 것도 고려해 주세요. 로그 파일은 `sharelatex` 컨테이너 내부의 `/var/log/overleaf/filestore.log`에 있으며, 다음과 같이 내보낼 수 있습니다.
+
+```bash
+$ docker cp sharelatex:/var/log/overleaf/filestore.log .
+# replace <timestamp> with the timestamp as printed by the script
+$ docker cp sharelatex:/var/log/overleaf/file-migration-<timestamp>.log .
+```
+
+첨부하기 전에 로그 파일에서 민감한 정보를 삭제해 주세요.
+
+#### 누락된 파일
+
+이전 버전의 Server Pro/CE는 사용자 업로드가 완료되기 전에 파일 트리 항목을 생성했기 때문에, 업로드가 실패하면 파일이 누락된 것으로 표시될 수 있었습니다. 모든 파일 트리를 처리할 때 이러한 경우 몇 건이 오류로 보고될 수 있습니다.
+
+누락된 파일 수가 적다면 이러한 경우를 직접 검토하고 브라우저의 편집기에서 삭제하는 것을 고려하세요.
+
+누락된 파일 수가 많다면 지원팀에 문의하는 것을 고려하세요. 위의 이메일 템플릿을 참고하세요.
+
+#### 손상된 파일 트리 찾기
+
+파일 트리의 형식이 잘못된 프로젝트(예: 파일 이름이 비어 있는 경우)에서는 마이그레이션이 실패할 수 있습니다. 데이터베이스의 모든 프로젝트를 검사하는 `find_malformed_filetrees` 스크립트를 사용하여 이러한 문제 목록을 찾을 수 있습니다.
+
+```bash wrap
+$ bin/docker-compose exec sharelatex /bin/bash -c "cd /overleaf/services/web && /sbin/setuser www-data node scripts/find_malformed_filetrees.mjs > /tmp/malformed-file-trees.json"
+```
+
+잘못된 경로를 수정하려면 `fix_malformed_filetree` 스크립트를 사용하여 잘못된 경로마다 한 번씩 명령을 실행합니다.
+
+```bash wrap
+$ bin/docker-compose exec sharelatex /bin/bash -c "cd /overleaf/services/web && /sbin/setuser www-data node scripts/fix_malformed_filetree.mjs --logs=/tmp/malformed-file-trees.json"
+```

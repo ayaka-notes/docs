@@ -1,0 +1,151 @@
+---
+title: Microservicios
+icon: microchip
+---
+
+La forma recomendada de desplegar y gestionar instancias de Overleaf Server CE y Overleaf Pro es mediante el Toolkit.
+
+El Toolkit simplifica la creación de tu instancia de Overleaf mediante una serie de scripts personalizados que abstraen la orquestación de los microservicios necesarios. Basta con ejecutar el script de inicialización incluido y proporcionar algunas opciones de configuración, como las rutas de almacenamiento persistente, y el Toolkit se encargará de aprovisionar y conectar los microservicios que componen tu instancia de Overleaf Server CE o Pro.
+
+Esto te deja libre para centrarte en personalizar la experiencia de usuario e implementar las funcionalidades específicas de tu instancia on-premise. El Toolkit gestiona toda la complejidad entre bastidores, lo que permite un despliegue simplificado de tu instancia de Overleaf.
+
+<Info>
+
+Por motivos históricos, el contenedor principal de Overleaf se llama `sharelatex` y se basa en la imagen Docker `sharelatex/sharelatex`. Esto se debe a que la tecnología se basa en el código de ShareLaTeX, que se fusionó con Overleaf. Consulta [esta entrada del blog](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf) para más detalles. En algún momento futuro se renombrará para ajustarse a la nomenclatura de Overleaf.
+
+</Info>
+
+#### Arquitectura
+
+Dentro del contenedor de Overleaf, el software se ejecuta como un conjunto de microservicios gestionados por `runit`. Algunos de los archivos más interesantes dentro del contenedor son:
+
+* `/etc/service/`: archivos de inicialización de los microservicios.
+* `/var/log/overleaf/`: logs de cada microservicio.
+* `/overleaf/services/`: código de los distintos microservicios.
+* `/var/lib/overleaf/`: el punto de montaje de los datos persistentes (corresponde al directorio indicado por `OVERLEAF_DATA_PATH` en el host).
+
+#### Los contenedores de MongoDB y Redis
+
+Overleaf depende de dos bases de datos externas: MongoDB y Redis. De forma predeterminada, el Toolkit aprovisionará un contenedor para cada una de estas bases de datos, además del contenedor de Overleaf, con un total de tres contenedores Docker.
+
+<Info>
+
+Si prefieres conectarte a una instancia existente de MongoDB o Redis, puedes hacerlo configurando los ajustes correspondientes en el archivo de configuración [overleaf.rc](/es/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Editor y proceso de compilación
+
+Esta sección ofrece una visión general del manejo de documentos y del proceso de compilación.
+
+<Info>
+
+Esta página describe el proceso de compilación con Sandboxed Compiles, disponible solo en Overleaf Pro. En Server CE, el proceso de compilación usa subprocesos simples: sustituye los elementos que hacen referencia a un **contenedor** por un único elemento **ejecutar la compilación en un subproceso**.
+
+</Info>
+
+Componentes / actores:
+
+* `user` — Un usuario de la aplicación
+* `editor` — La aplicación cliente que se ejecuta en el navegador
+* `clsi` — El microservicio usado para compilar PDF
+* `document-updater` — El microservicio usado para procesar las actualizaciones de documentos
+* `filestore` — El microservicio que gestiona los archivos binarios
+* `real-time` — El microservicio usado para gestionar los web sockets
+* `web` — El (no tan) microservicio usado para gestionar las peticiones a la API
+
+**Caché en Redis**
+
+* **user**: carga la página del editor
+* **editor**: abre un web socket
+* **editor**: envía una petición para abrir un documento a través del web socket
+  * **real-time** -> **document-updater**: el documento se carga desde MongoDB en Redis
+* **editor**: envía una actualización del documento a través del web socket
+  * **real-time** -> **document-updater**: el documento se actualiza en Redis
+* **editor**: envía más peticiones de compilación
+  * Cuando han pasado 5 minutos desde el último volcado (por documento):
+    * **document-updater**: vuelca el documento de Redis a MongoDB
+* **editor**: envía más actualizaciones
+  * cada 100 actualizaciones (por documento):
+    * **document-updater**: vuelca el historial del documento de Redis a MongoDB
+* **user**: sale del editor/cierra la pestaña del navegador
+  * 5 minutos después
+    * **real-time**: comprueba si hay otros colaboradores; si no hay ninguno:
+      * **real-time** -> **document-updater**: vuelca los documentos de Redis a MongoDB
+
+**Lectura de MongoDB a Redis**
+
+* **document-updater** -> **web** -> **docstore**: lee desde MongoDB
+
+**Volcado de Redis a MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: escribe en MongoDB
+
+**Compilación — modo de sincronización "full"**
+
+* **editor**: envía una petición de compilación con el modo de sincronización establecido en "full"
+* **web** -> **document-updater**: todos los documentos se vuelcan de Redis a MongoDB
+* **web** -> **docstore**: todos los documentos se descargan de MongoDB
+* **web** -> **clsi**: la petición de compilación se envía a `clsi`, e incluye:
+  * el modo de sincronización
+  * un hash del árbol de archivos -> el "estado del proyecto"
+  * todos los documentos con su contenido -> sujeto al límite de 7 MB del cuerpo de la petición
+  * las URL de los archivos binarios para descargarlos por separado
+* **clsi**: comprueba el estado en disco con el modo de sincronización y el "estado del proyecto"
+  * es una sincronización completa, por lo que se puede ignorar el estado anterior en disco
+* **clsi**: limpia el directorio de compilación
+* **clsi**: escribe todos los documentos en el directorio de compilación
+* **clsi**: escribe todos los archivos binarios en el directorio de compilación
+  * `clsi` copia los archivos desde una caché local por proyecto
+  * si no están en caché:
+    * **clsi** -> **filestore**: descarga los archivos
+* **clsi**: escribe el "estado del proyecto"
+* **clsi**: se asegura de que existe un contenedor Docker con la configuración deseada
+  * construye las opciones del contenedor, incluida la versión de texlive
+  * calcula el hash de las opciones
+  * nombre del contenedor: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: inicia el contenedor y transmite stdout/stderr a memoria -> límite de 2 MB
+* **clsi**: deja atrás el contenedor detenido -> se limpia tras 24 h
+* **clsi**: escribe stdout/stderr en disco
+* **clsi**: copia los archivos de salida en un directorio de salida único
+  * build-id compuesto por 8 bytes aleatorios más una marca de tiempo con precisión de ms
+  * elimina todas las carpetas de compilación excepto las 3 últimas (anónimo) / la última (usuario con sesión iniciada)
+* **clsi**: la compilación falló/agotó el tiempo
+  * elimina la caché de compilación — puede contener archivos parciales/caché corrupta
+* **editor**: descarga output.log y output.pdf
+
+**Compilación — modo de sincronización "incremental"**
+
+* **editor**: envía una petición de compilación con el modo de sincronización establecido en "incremental"
+* **web** -> **document-updater**: obtiene los documentos desde Redis
+  * el hash del "estado del proyecto" también se almacena en Redis
+  * **web** envía el hash del árbol de archivos a `document-updater`, y `document-updater` puede convertir la compilación incremental en una compilación completa si no coincide
+    * consulta el proceso de compilación tal como se realiza cuando el editor solicita una compilación "full"
+* **web** -> **clsi**: la petición de compilación se envía a `clsi`, e incluye:
+  * el modo de sincronización
+  * un hash del árbol de archivos -> el "estado del proyecto"
+  * todos los documentos de Redis con su contenido -> sujeto al límite de 7 MB del cuerpo de la petición
+  * ningún archivo binario
+* **clsi**: comprueba el estado en disco con el modo de sincronización y el "estado del proyecto"
+  * es una sincronización incremental, por lo que el "estado del proyecto" debe coincidir
+  * si no coincide: responde con 409 y deja que web reintente con sincronización "full"
+    * consulta el proceso de compilación tal como se realiza cuando el editor solicita una compilación "full"
+* **clsi**: escribe los documentos actualizados en el directorio de compilación
+* **clsi**: se asegura de que existe un contenedor Docker con la configuración deseada
+  * construye las opciones del contenedor, incluida la versión de texlive
+  * calcula el hash de las opciones
+  * nombre del contenedor: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: inicia el contenedor y transmite stdout/stderr a memoria -> límite de 2 MB
+* **clsi**: deja atrás el contenedor detenido -> se limpia tras 24 h
+* **clsi**: escribe stdout/stderr en disco
+* **clsi**: copia los archivos de salida en un directorio de salida único
+  * build-id compuesto por 8 bytes aleatorios más una marca de tiempo con precisión de ms
+  * elimina todas las carpetas de compilación excepto las 3 últimas (anónimo) / la última (usuario con sesión iniciada)
+* **clsi**: la compilación falló/agotó el tiempo
+  * elimina la caché de compilación — puede contener archivos parciales/caché corrupta
+* **editor**: descarga output.log y output.pdf
+
+**Compilación — cambio entre modos**
+
+* **editor**: detecta un fallo de compilación; la siguiente compilación es una compilación "full"
+* **editor**: detecta una compilación correcta; la siguiente compilación es una compilación "incremental"
