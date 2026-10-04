@@ -1,40 +1,61 @@
-# Mintlify Starter Kit
+# Ayakaleaf Pro Docs
 
-Use the starter kit to get your docs deployed and ready to customize.
+Source for the Ayakaleaf Pro documentation site, built with [Mintlify](https://mintlify.com).
 
-Click the green **Use this template** button at the top of this repo to copy the Mintlify starter kit. The starter kit contains examples with
+The site has one top tab per GitBook section:
 
-- Guide pages
-- Navigation
-- Customizations
-- API reference pages
-- Use of popular components
+| Tab | Path | Content |
+| --- | --- | --- |
+| Home | `/` | Landing page |
+| On-Premises | `/on-premises` | Installation, configuration, and maintenance |
+| Blog | `/blog` | Release notes and articles |
+| TeXLive | `/texlive` | TeX Live images and LaTeX skills |
+| Developer | `/dev` | Development environment and data model |
 
-**[Follow the full quickstart guide](https://starter.mintlify.com/quickstart)**
+## Migration from GitBook
 
-## AI-assisted writing
+During the transition period, the content source of truth is the GitBook Git Sync repository [ayaka-notes/ayakaleaf-docs](https://github.com/ayaka-notes/ayakaleaf-docs). Only the English content is migrated.
 
-Set up your AI coding tool to work with Mintlify:
+`scripts/gitbook-to-mintlify/convert.py` regenerates the Mintlify pages from that repository:
 
 ```bash
-npx skills add https://mintlify.com/docs
+git clone https://github.com/ayaka-notes/ayakaleaf-docs ../ayakaleaf-docs
+pip install pyyaml
+python3 scripts/gitbook-to-mintlify/convert.py --src ../ayakaleaf-docs --strict
+python3 scripts/gitbook-to-mintlify/check_leftovers.py
+npx mint validate
+npx mint broken-links
 ```
 
-This command installs Mintlify's documentation skill for your configured AI tools like Claude Code, Cursor, Windsurf, and others. The skill includes component reference, writing standards, and workflow guidance.
+The script overwrites these generated files on every run, so don't edit them by hand while GitBook is still the source:
 
-See the [AI tools guides](/ai-tools) for tool-specific setup.
+- `index.mdx` and the `on-premises/`, `blog/`, `texlive/`, `latex/`, and `dev/` folders
+- `images/<section>/` (GitBook assets, including files mirrored from the GitBook CDN)
+- `navigation` and `redirects` in `docs.json`
+
+All other `docs.json` settings, such as theme, colors, logo, and navbar, are kept.
+
+Sections listed in `UNPUBLISHED` in the script are indexed but not generated. The LaTeX knowledge base (`latex/en`, about 500 pages) is unpublished for now. Links that point into it are rendered as plain text. To publish it, remove `"latex"` from `UNPUBLISHED` and run the script again.
+
+The script converts:
+
+- `SUMMARY.md` into tabs and groups. Entries with children become groups with a `root` page.
+- `{% hint %}` into `<Info>`, `<Check>`, `<Warning>`, and `<Danger>`.
+- `{% stepper %}` into `<Steps>`, `{% tabs %}` into `<Tabs>`, and `{% columns %}` into `<Columns>`.
+- `{% content-ref %}` and `{% file %}` into `<Card>`, and `{% embed %}` into a YouTube iframe, `<video>`, or `<Card>`.
+- `{% code %}` options (title, wrap, expandable) into code block meta.
+- GitBook HTML into Mintlify components or JSX: card tables, `<figure>`, `<details>`, buttons, `<i class="fa-*">` icons, and `<pre>` code blocks.
+- Page `icon`, `description`, and sidebar titles from the frontmatter.
+- Internal links, including `app.gitbook.com/s/<space>` links and `"mention"` links.
+
+`--strict` exits with a non-zero code when there are warnings, so CI can catch content that needs attention.
 
 ## Development
 
-Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
+Install the [Mintlify CLI](https://www.npmjs.com/package/mint) and run it from the repository root:
 
-```
+```bash
 npm i -g mint
-```
-
-Run the following command at the root of your documentation, where your `docs.json` is located:
-
-```
 mint dev
 ```
 
@@ -42,14 +63,4 @@ View your local preview at `http://localhost:3000`.
 
 ## Publishing changes
 
-Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to your deployment. Changes are deployed to production automatically after pushing to the default branch.
-
-## Need help?
-
-### Troubleshooting
-
-- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
-- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
-
-### Resources
-- [Mintlify documentation](https://mintlify.com/docs)
+The Mintlify GitHub app deploys the default branch to production automatically after each push.
