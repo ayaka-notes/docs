@@ -1,0 +1,130 @@
+---
+title: Pandoc 가져오기 및 내보내기
+icon: file-lines
+---
+
+### Pandoc 가져오기 / 내보내기
+
+Overleaf는 [Pandoc](https://pandoc.org/)을 사용하여 문서를 LaTeX로, 또는 LaTeX에서 다른 형식으로 변환할 수 있습니다. 변환은 `clsi` 서비스가 관리하는 **샌드박스 Docker 컨테이너** 내부에서 실행되므로, 이 기능은 기본적으로 비활성화되어 있으며 몇 가지 환경 변수로 활성화해야 합니다.
+
+#### 기능
+
+| 방향  | 변환                | 형식                    | 위치                                                                                           |
+| ---------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| **가져오기** | 문서 → LaTeX 프로젝트 | `docx`, `markdown`         | _새 프로젝트 → 가져오기_ (`.docx` / `.md`를 업로드하여 편집 가능한 `.tex` 프로젝트로 변환) |
+| **내보내기** | LaTeX 프로젝트 → 문서 | `docx`, `markdown`, `html` | _메뉴 → 다운로드 / 내보내기_ (Pandoc을 통해 프로젝트를 렌더링)                                 |
+
+***
+
+### 환경 변수
+
+중요한 변수는 **두 개**이며, 비슷해 보이지만 관련이 **없는** 변수가 하나 있습니다.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — 마스터 스위치
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* 유형: boolean(`true`이면 활성화되고, 그 외의 값이면 비활성화됩니다).
+* **`web`과 `clsi` 서비스 모두에 설정해야 합니다.** 두 서비스는 별도의 구성을 가진 별개의 프로세스입니다:
+  * `web`은 이 값을 `enablePandocConversions`(`services/web/config/settings.defaults.js`)로 읽습니다. 이 값은 가져오기 라우트, 내보내기 라우트, 그리고 프런트엔드에 가져오기/내보내기 UI 표시 여부를 알려주는 `ol-ExposedSettings.enablePandocConversions` 플래그를 제어합니다.
+  * `clsi`는 이 값을 `enablePandocConversions`(`services/clsi/config/settings.defaults.cjs`)로 읽습니다. 이 값은 Pandoc을 실행하는 엔드포인트를 제어합니다.
+* `web`에서는 활성화되어 있지만 `clsi`에서는 활성화되지 않은 경우(또는 그 반대의 경우) UI는 표시되지만 변환은 실패합니다. 두 설정을 항상 일치시키세요.
+
+2\. `PANDOC_IMAGE` — clsi가 변환을 위해 실행하는 컨테이너 이미지
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### 사전 요구 사항
+
+변환은 `clsi`가 생성하는 Docker 컨테이너로 실행되므로:
+
+1. **`clsi`는 Docker에 접근할 수 있는 샌드박스 모드로 실행되어야 합니다.** 개발 스택에서 `clsi`에는 이미 `SANDBOXED_COMPILES=true`가 설정되어 있고 호스트 Docker 소켓(`/var/run/docker.sock`)이 마운트되어 있습니다.
+2. 첫 번째 변환 전에 해당 Docker 호스트에 **`PANDOC_IMAGE`가 존재해야 합니다**(pull하거나 로컬에서 빌드).
+
+***
+
+### 빠른 설정
+
+개발 스택(`develop/dev.env`)에는 이미 다음이 포함되어 있습니다:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+공식 이미지는 비공개이므로, 기능을 사용하기 전에 번들된 이미지를 **한 번** 빌드하세요:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+그런 다음 `clsi`와 `web`이 변수를 인식하도록 스택을 (재)시작합니다.
+
+***
+
+### Pandoc 이미지 빌드
+
+clsi는 Pandoc을 일반적인 방식으로 호출하므로(사용자 지정 템플릿/필터 없음) 기본 Pandoc 이미지로도 작동합니다. 런타임에 필요한 세 가지 필수 요소만 있으면 되며, 이는 모두 `develop/pandoc/Dockerfile`에서 처리됩니다:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+태그가 `PANDOC_IMAGE`와 일치하도록 빌드하고 태그를 지정합니다:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+프로덕션 환경에서는 재현 가능한 빌드를 위해 `pandoc/core`를 `latest` 대신 특정 버전으로 고정하고, `PANDOC_IMAGE`를 사용하는 레지스트리 경로로 설정하세요.
+
+***
+
+### 문제 해결
+
+| 증상                                             | 가능한 원인                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| 가져오기/내보내기 버튼이 표시되지 않음                  | **web**에서 `ENABLE_PANDOC_CONVERSIONS`가 `true`가 아님                                             |
+| UI는 표시되지만 서버 오류로 변환이 실패함 | **clsi**에 `ENABLE_PANDOC_CONVERSIONS`가 설정되지 않았거나, Docker 호스트에 `PANDOC_IMAGE`가 없음 |
+| 이미지를 pull할 때 `clsi` 오류 발생(401)                | `PANDOC_IMAGE`가 여전히 비공개 기본값을 가리키고 있음. 직접 이미지를 빌드하거나 해당 이미지를 가리키도록 설정             |
+| 컨테이너가 `pandoc pandoc …`을 실행함 / 잘못된 인수       | 이미지에 `pandoc` `ENTRYPOINT`가 있음. `ENTRYPOINT []`를 사용                                        |
+| 가져오기 결과가 비어 있음 / zip 단계 실패             | 이미지에 `zip`이 설치되어 있지 않음                                                           |
+| 변환된 파일에서 권한 오류 발생                | 이미지에 UID 1000의 `tex` 사용자가 없음                                                           |

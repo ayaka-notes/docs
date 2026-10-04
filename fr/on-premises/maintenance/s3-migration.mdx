@@ -1,0 +1,179 @@
+---
+title: Migration vers S3
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+## Migration vers S3
+
+<Info>
+
+Ces instructions concernent les versions v5.x et ultérieures. Si vous suivez ce guide pour une version antérieure, utilisez `sharelatex` au lieu de `overleaf` dans les chemins, et le préfixe `SHARELATEX_` au lieu de `OVERLEAF_` pour les variables d'environnement.
+
+</Info>
+
+<Check>
+
+**Votre avis nous intéresse !** Si vous souhaitez nous indiquer combien de fichiers vous avez migrés, leur volume total et la durée de la migration, écrivez à [`ayaka-notes@outlook.com`](mailto:support@overleaf.com).
+
+</Check>
+
+Ce guide vous accompagne dans la migration d'un stockage sur disque vers un stockage objet compatible S3. Il fait référence à des sections du document d'introduction sur la [configuration S3](/fr/on-premises/configuration/overleaf-toolkit/s3).
+
+### Prérequis
+
+* Un stockage objet compatible S3 auquel se connecter ; consultez [#s3-setup](/fr/on-premises/configuration/overleaf-toolkit/s3#s3-setup  "mention") pour les options disponibles
+* De l'espace disque libre pour migrer les données existantes, à peu près équivalent à la taille actuelle sur disque
+* Une fenêtre de maintenance pour effectuer la migration proprement dite
+* Une sauvegarde complète, configuration comprise, permettant une restauration
+
+### Estimer l'espace disque nécessaire à la migration
+
+Nous pouvons utiliser `du` pour calculer l'utilisation actuelle du disque :
+
+```shell
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/user_files
+
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/template_files
+```
+
+Si l'espace disque disponible sur le serveur actuel est insuffisant, essayez d'y ajouter un autre disque.
+
+<Info>
+
+Les répertoires d'historique ont déjà la bonne structure. Vous pouvez les téléverser directement depuis le dossier source monté (bind mount), sans avoir besoin d'espace disque supplémentaire.
+
+</Info>
+
+### Étapes de la migration
+
+#### Étape 0 : arrêter l'instance
+
+Nous devons nous assurer que tous les fichiers utilisateur et de modèles seront migrés. Le mieux est d'arrêter l'instance afin de ne pas manquer de fichiers nouvellement téléversés.
+
+Consultez notre guide sur la réalisation d'une sauvegarde cohérente pour la procédure d'arrêt.
+
+#### Étape 1 : réécrire la structure des répertoires
+
+Nous devons réécrire la structure des répertoires des fichiers de projet pour pouvoir les téléverser vers S3. La structure des répertoires du stockage local dans le filestore est `<project-id>_<file-id>`, tandis que celle de S3 est `<project-id>/<file-id>`.
+
+Dans ce qui suit, `/srv/overleaf-s3-migration` sert à stocker les fichiers selon la nouvelle structure de répertoires.
+
+Nous pouvons utiliser `tar` pour réécrire la structure :
+
+```shell
+mkdir -p /srv/overleaf-s3-migration/user_files \
+         /srv/overleaf-s3-migration/template_files
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/user_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/user_files \
+  --transform=sx_x/x
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/template_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/template_files \
+  --transform=sx_x/xg
+```
+
+#### Étape 2 : téléverser les fichiers
+
+Selon votre préférence, vous pouvez utiliser le client S3 minio mc ou l'aws cli pour téléverser les fichiers vers votre stockage objet compatible S3.
+
+**aws cli**
+
+<Info>
+
+* Remplacez ici `overleaf-user-files`, `overleaf-template-files`, `overleaf-project-blobs` et `overleaf-chunks` par les noms de vos buckets S3.
+* Remplacez également `/srv/overleaf-bind-mount` par le chemin local du bind mount de `/var/lib/overleaf`. Par défaut, il s'agit de `~/overleaf_data` dans un déploiement docker-compose.yml et de `<toolkit-checkout>/data/overleaf` avec le Toolkit.
+
+</Info>
+
+```shell wrap
+aws s3 sync /srv/overleaf-s3-migration/user_files s3://overleaf-user-files
+aws s3 sync /srv/overleaf-s3-migration/template_files s3://overleaf-template-files
+
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3://overleaf-project-blobs
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-chunks s3://overleaf-chunks
+```
+
+**minio mc**
+
+Nous utilisons ici l'alias de serveur « s3 » ; vous avez peut-être choisi un autre nom.
+
+```shell wrap
+mc mirror /srv/overleaf-s3-migration/user_files s3/overleaf-user-files
+mc mirror /srv/overleaf-s3-migration/template_files s3/overleaf-template-files
+
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3/overleaf-project-blobs
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-chunks s3/overleaf-chunks
+```
+
+#### Étape 3 : démarrer l'instance en la pointant vers S3
+
+Ajoutez toutes les variables liées à S3 à votre configuration, comme indiqué dans la section [Vue d'ensemble des variables](/fr/on-premises/configuration/overleaf-toolkit/s3#overview-of-variables) du guide de configuration [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3).
+
+Pour les déploiements Docker Compose, vous pouvez également supprimer le bind mount du répertoire de données dans la section des volumes.
+
+<Check>
+
+Conservez le [bind mount d'un disque de travail pour les fichiers éphémères](/fr/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem).
+
+</Check>
+
+Vous pouvez maintenant démarrer l'instance et valider la migration :
+
+* l'aperçu des fichiers binaires fonctionne dans l'éditeur
+* la compilation d'un PDF contenant des images fonctionne
+* le téléversement de nouveaux fichiers fonctionne
+
+### Revenir en arrière
+
+Vous pouvez annuler proprement la migration en inversant les étapes :
+
+1. Arrêtez l'instance
+2. Recopiez les fichiers en inversant la source et la destination
+3. Réécrivez les fichiers dans le répertoire local à l'aide d'une `transform` inverse
+4. Redémarrez l'instance avec l'ancienne configuration
+
+```shell wrap
+# When using aws cli
+aws s3 sync s3://overleaf-user-files /srv/overleaf-s3-migration/user_files
+aws s3 sync s3://overleaf-template-files /srv/overleaf-s3-migration/template_files
+aws s3 sync s3://overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+aws s3 sync s3://overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+
+# When using minio mc
+mc mirror s3/overleaf-user-files /srv/overleaf-s3-migration/user_files
+mc mirror s3/overleaf-template-files /srv/overleaf-s3-migration/template_files
+mc mirror s3/overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+mc mirror s3/overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+```
+
+```shell
+# Write files into local Server CE/Server Pro
+tar --create --directory /srv/overleaf-s3-migration/user_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/user_files \
+      --transform=sx./xx --transform=sx/x_x \
+      --wildcards '*/*/*'
+
+tar --create --directory /srv/overleaf-s3-migration/template_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/template_files \
+      --transform=sx./xx --transform=sx/x_xg \
+      --wildcards '*/*/*/*/pdf-converted-cache/*' \
+      --wildcards '*/*/*/*/pdf' \
+      --wildcards '*/*/*/*/zip'
+```
+
+<Info>
+
+La première transformation supprime le dossier de premier niveau. La seconde transforme la structure des répertoires en une structure à plat. Les wildcards garantissent que seuls les fichiers sont extraits, et non leurs dossiers parents (de projet).
+
+</Info>
