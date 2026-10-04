@@ -1,0 +1,636 @@
+---
+title: 'Benchmark de Overleaf: una investigación en profundidad de la compilación concurrente de LaTeX en Overleaf (SaaS y autoalojado)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Resumen
+
+Los despliegues autoalojados de Overleaf suelen dimensionarse con una única regla empírica: un núcleo de CPU y un gigabyte de memoria por cada cinco a diez usuarios concurrentes. Mostramos que esta regla no solo es imprecisa, sino estructuralmente errónea, porque supone que una única dimensión de recursos determina la capacidad cuando en realidad lo hacen dos muros independientes, y porque dos parámetros de software —ninguno de ellos de hardware— dominan el resultado por factores de hasta cuatro.
+
+Medimos un despliegue estándar de Ayakaleaf Pro v6.2.2 con compilación aislada (TeX Live 2025) en 21 configuraciones de CPU/memoria dentro de invitados QEMU/KVM cuyos núcleos anfitriones tienen la frecuencia fijada a 3,0 GHz. La carga de trabajo es una tesis XeLaTeX real de 63 páginas compilada simultáneamente por hasta varios cientos de cuentas de usuario distintas. Descubrimos que, por debajo de 32 GiB de memoria del invitado, el número de núcleos es casi irrelevante —con 16 GiB, la capacidad medida de invitados con 4, 8 y 16 vCPU difiere en menos de un 8 %— y que la capacidad está determinada, en cambio, por un muro de memoria superlineal que surge de la caché de páginas compartida sobre el árbol de TeX Live.
+
+Para comprobar si estas leyes sobreviven a un cambio de escala de un orden de magnitud, repetimos el barrido en un único servidor de 64 núcleos y 995 GiB. Sostiene 1024 compilaciones en frío simultáneas con un 100 % de éxito —ocho veces su número de hilos— y nunca alcanzamos su techo. La cifra útil no es ese techo, sino el codo por debajo de él: la latencia de cola crece entre un 20 y un 40 % por cada duplicación hasta $N=256$, y después un 190 % en $N=512$. Por tanto, una capacidad expresada como «la mayor concurrencia que no falla» sobrestimaría el punto de operación utilizable en un factor de cuatro. En esa máquina, la memoria nunca es el recurso limitante; el límite es la CPU junto con la velocidad a la que el daemon de contenedores puede admitir nuevos sandboxes, que se satura cerca de 200 independientemente de cuántas compilaciones se soliciten.
+
+Además, identificamos dos efectos a nivel de implementación invisibles para la planificación de capacidad. En primer lugar, CLSI impone un techo codificado de forma fija de 65 compilaciones simultáneas que no se expone mediante ninguna variable de entorno; por encima de él, los usuarios reciben HTTP 503 inmediatamente en lugar de quedar en cola. En segundo lugar, el límite de memoria por contenedor del Docker runner ha sido ineficaz desde su introducción en 2018, tanto por su magnitud como por su ubicación, de modo que un evento de falta de memoria tumba todo el host en lugar de una sola compilación. Eliminar el techo de concurrencia y elevar el tiempo de espera de compilación predeterminado de 180 s a 300 s aumenta la capacidad medida de un invitado de 8 vCPU / 48 GiB de 64 a 268 compilaciones concurrentes: un factor de 4,2 sin coste de hardware.
+
+Por último, mostramos que la concurrencia en este sistema no aporta más que tiempo compartido, y que la carga de trabajo está limitada únicamente por la frecuencia de reloj. Una ley de degradación ajustada $T(N)=T_1\max(1,N/C)^{b}$ da $b=0.914$, cerca de una ralentización perfectamente proporcional, y un barrido de frecuencias en todo el rango de 1,0–5,5 GHz de la máquina hace converger treinta mediciones sobre $T=(k/f)\max(1,N/C)$ con $k=27.9 GHz·s$ y una dispersión residual del 5,1 %. Una frecuencia 5,5 veces mayor proporciona una aceleración de 5,5 veces sin rendimientos decrecientes; en ese sentido, la frecuencia y los núcleos aportan cosas distintas: la frecuencia hace más rápida la compilación de cada usuario, los núcleos solo admiten más usuarios.
+
+## 1. Introducción
+
+Overleaf es el editor colaborativo de LaTeX dominante, y su distribución local (on-premises) está ampliamente desplegada en universidades y grupos de investigación que no pueden enviar manuscritos inéditos a una nube de terceros. Dimensionar un despliegue de este tipo es una cuestión práctica recurrente: con un presupuesto de hardware fijo, ¿cuántas personas pueden pulsar realmente «Recompile» al mismo tiempo?
+
+La recomendación oficial es una regla lineal —aproximadamente un núcleo y un gigabyte por cada cinco a diez usuarios concurrentes—, que presupone que la capacidad escala de forma suave y conjunta en ambos recursos. Nuestras mediciones lo contradicen de tres maneras.
+
+### 1.1 La capacidad está determinada por dos muros independientes, no por uno
+
+Una configuración falla o bien porque se agota la memoria, en cuyo caso el propio stack de Overleaf muere y devuelve HTTP 502, o bien porque las compilaciones superan el tiempo de espera del servidor, en cuyo caso CLSI informa `timedout` mientras gigabytes de memoria permanecen sin usar. Estos dos regímenes tienen un comportamiento de escalado completamente distinto y remedios distintos. Añadir núcleos a una configuración limitada por memoria no solo es ineficiente, sino que en ocasiones es contraproducente: medimos configuraciones en las que aumentar el número de núcleos _reduce_ la capacidad, porque más núcleos hacen que las compilaciones concurrentes avancen al unísono, de modo que sus picos de demanda de memoria coinciden en lugar de intercalarse.
+
+### 1.2 Los parámetros de software dominan sobre el hardware
+
+El tiempo de espera de compilación es un campo por usuario en MongoDB cuyo valor predeterminado de 180 s limita silenciosamente las configuraciones limitadas por CPU. Elevarlo a 300 s multiplica la capacidad medida hasta por 4,2 con el mismo hardware. Por otra parte, CLSI rechaza más de 65 compilaciones simultáneas mediante una constante codificada de forma fija. Cualquier estudio de capacidad —y cualquier despliegue— que no tenga en cuenta ambos factores está midiendo el software, no la máquina.
+
+### 1.3 La concurrencia es tiempo compartido, no paralelismo
+
+Como una compilación de LaTeX es de un solo hilo, atender a $N$ usuarios simultáneos en $C$ núcleos no hace que el sistema termine antes; hace que cada usuario espere proporcionalmente más. Por tanto, la pregunta «cuántos usuarios concurrentes se admiten» está mal planteada hasta que se fija cuánto tiempo está dispuesto a esperar un usuario. Hacemos explícita esta dependencia y la cuantificamos.
+
+### 1.4 Contribuciones
+
+* Una matriz de capacidad sobre 21 configuraciones de CPU/memoria medidas en condiciones de frecuencia fijada y verificadas mediante repetición, con la restricción limitante identificada para cada configuración a partir de su firma de fallo.
+* Dos modelos ajustados: un modelo de capacidad que separa un muro de memoria superlineal de un techo de CPU, y un modelo de latencia que establece un comportamiento de tiempo compartido puro.
+* La identificación y confirmación experimental de dos problemas de implementación en el sistema desplegado, incluido un límite de memoria de contenedor que no funciona desde 2018.
+* Una cuantificación del compromiso entre tiempo de espera de compilación y capacidad, que sostenemos que debe indicarse junto a cualquier cifra de concurrencia.
+
+## 2. Contexto
+
+### 2.1 Ruta de compilación
+
+Una solicitud de compilación de Overleaf viaja `web` $\rightarrow$ `clsi` $\rightarrow$ un contenedor de compilación. En un despliegue con compilaciones aisladas (`SIBLING_CONTAINERS_ENABLED=true`), CLSI no ejecuta `latexmk` dentro de su propio proceso; pide al daemon de Docker del host, accesible a través de un socket montado (bind-mount), que inicie un contenedor nuevo a partir de una imagen de TeX Live con el directorio del proyecto montado en `/compile`. Por tanto, una compilación es un contenedor de vida corta que ejecuta un proceso `latexmk`.
+
+De ello se derivan tres consecuencias, y las tres condicionan las mediciones de este artículo. En primer lugar, la unidad de trabajo es un proceso de un solo hilo: XeLaTeX no se paraleliza. En segundo lugar, el aislamiento de recursos por compilación es lo que solicite el Docker runner; en §6.2 mostramos que, en la práctica, no solicita nada. En tercer lugar, el conjunto de trabajo no está dominado por el documento, sino por el árbol de TeX Live, un corpus de solo lectura de aproximadamente 32 GiB del que leen todas las compilaciones concurrentes y que, por tanto, comparten a través de la caché de páginas del host. Esta compartición es el origen del escalado superlineal de memoria que observamos.
+
+### 2.2 Habilitar las compilaciones aisladas
+
+Overleaf Community Edition ejecuta `latexmk` dentro del propio contenedor de la aplicación. Ayakaleaf Pro, al igual que Overleaf Server Pro, puede en cambio ejecutar cada compilación en un contenedor _hermano_ (sibling): un contenedor iniciado por la aplicación en el daemon de Docker _del host_, en lugar de anidado dentro del contenedor de la aplicación. Dos ajustes del toolkit lo activan:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+El toolkit monta el socket de Docker del host en el contenedor de la aplicación y traduce estos ajustes al entorno que lee CLSI: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` y `SANDBOXED_COMPILES_HOST_DIR`, siendo esta última la ruta _del host_ del directorio de compilación. Esa ruta importa: como el daemon que inicia el contenedor de compilación es el del host, el bind mount que recibe debe poder resolverse en el espacio de nombres del host, no en el del contenedor de la aplicación. Además, el `config/env.sh` de Server Pro fuerza `TEXLIVE_IMAGE_USER=www-data` en este modo para que los archivos escritos por el contenedor de compilación tengan un propietario coherente.
+
+La verificación es directa: durante una compilación, el host muestra un contenedor llamado `project-{projectId}-{userId}-{hash}` que ejecuta `latexmk` desde la imagen de TeX Live y termina con código 0. Esta es la unidad cuya multiplicidad medimos a lo largo del artículo, y cuya ausencia total de límites de recursos documentamos en §6.2.
+
+**Por qué esto importa para el estudio.**
+
+
+Los contenedores hermanos hacen que la medición sea limpia —cada compilación es una entidad del sistema operativo observable y planificada de forma independiente—, pero también implican que es el kernel del invitado, y no Overleaf, quien arbitra la CPU y la memoria entre compilaciones. Por tanto, cada ley de escalado de este artículo es una propiedad del planificador de Linux aplicado a $N$ procesos de un solo hilo, y por eso es tan regular.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Figura 1.** Una solicitud de compilación, trazada a través de los microservicios de la edición comunitaria. La división en los pasos y es relevante para la capacidad: el texto del documento se copia en el cuerpo de la solicitud, mientras que los recursos binarios se pasan por referencia y `clsi` los descarga. Ninguno de los dos domina: el coste de compilación de un proyecto lo determina el árbol de TeX Live de 32 GiB que cada compilación concurrente lee a través de la caché de páginas compartida.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Figura 2.** Tres topologías de despliegue y dónde se sitúa en cada una el techo de compilaciones por instancia; los paneles apilados indican replicación. La constante de 65 compilaciones protege _un_ CLSI, de modo que la flota SaaS la multiplica por instancias y zonas (a), y el escalado horizontal que admiten Server Pro y Ayakaleaf Pro la multiplica por instancias (c), a costa de MongoDB, Redis y un almacenamiento compatible con S3 centralizados, un balanceador de carga con afinidad de sesión por cookie (la salida de compilación se escribe en el disco local de la instancia, por lo que una compilación y la posterior descarga de su PDF deben llegar a la misma instancia) y un `git-bridge` único. El valor predeterminado del toolkit (b), que es lo que medimos, tiene un multiplicador de uno, de modo que una constante dimensionada para un miembro de una flota se convierte en el techo de toda la instalación.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Figura 3.** Selección de shard en `clsi-cache`. Un proyecto se asigna mediante $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, es decir, el espacio de hash se divide en tantos sectores iguales como shards haya. Esto es hashing por _módulo_, no hashing consistente basado en anillo: ampliar la flota de tres shards a cuatro reparticiona todo el espacio y reasigna prácticamente todos los proyectos (a, b). Precisamente por eso la implementación necesita una rampa explícita de resharding en línea, que traslada una fracción linealmente creciente de proyectos de `currentShards` a `desiredShards` a lo largo de una ventana de tiempo, en lugar del movimiento de $K/n$ que daría un anillo de hashing consistente. Cuando salta el disyuntor (circuit breaker) de un shard, se incrementa la sal $i$ y se elimina el shard de la lista de candidatos, de modo que la búsqueda sigue sondeando en lugar de fallar (c).
+
+### 2.3 Los dos modos de fallo
+
+Cada configuración que medimos falla exactamente de una de dos maneras, y la distinción es visible en el estado de la respuesta, en lugar de inferirse:
+
+* **Agotamiento de memoria**: el propio stack de Overleaf deja de responder y la solicitud devuelve **HTTP 502**. La memoria disponible del invitado en el nivel que falla suele estar por debajo de 500 MiB.
+* **Tiempo de espera de compilación agotado**: CLSI termina la compilación al alcanzar el tiempo de espera por usuario e informa del estado `timedout`. La memoria disponible en el nivel que falla suele ser de varios gigabytes.
+
+Clasificamos cada configuración por esta firma y no mediante una heurística sobre proporciones de recursos, lo que permite responder a la pregunta «¿contra qué muro chocamos?» a partir de los propios datos.
+
+## 3. Metodología
+
+### 3.1 Banco de pruebas y control de frecuencia
+
+Todos los invitados se ejecutan bajo QEMU/KVM en un único host Intel Core i9-14900K con 62 GiB de RAM y almacenamiento NVMe. El invitado es Ubuntu 24.04 con Docker 29.7 y el Overleaf Toolkit desplegando Ayakaleaf Pro v6.2.2 con compilaciones aisladas sobre `texlive-full:2025.1`.
+
+Una CPU de escritorio convencional es un mal sustituto de un servidor a menos que se controle su frecuencia. KVM no ofrece ningún mecanismo para fijar una frecuencia virtual: una vCPU es un hilo del host y funciona a la frecuencia a la que funcione el núcleo del host. Por ello restringimos directamente el host, desactivando el turbo y fijando `scaling_max_freq` a 3,0 GHz en todos los núcleos, y fijamos las vCPU del invitado a P-cores físicos con `taskset`. La distinción importa en una CPU de núcleos híbridos: los E-cores de este modelo tienen una frecuencia base de 2,4 GHz y _no pueden_ alcanzar 3,0 GHz una vez desactivado el turbo, de modo que una ejecución que se desvíe hacia ellos mide silenciosamente una máquina más lenta. Bajo carga completa verificamos exactamente 3000 MHz en los dieciséis hilos fijados. Un script de comprobación verifica este invariante antes de cada benchmark y se niega a empezar en caso contrario; detectó un restablecimiento silencioso del governor durante el estudio.
+
+### 3.2 Un segundo banco de pruebas: un único runner grande
+
+La matriz de QEMU aísla una variable cada vez, pero llega a su máximo en dieciséis hilos fijados. Para comprobar si las mismas leyes se siguen cumpliendo un orden de magnitud más arriba, repetimos el barrido de concurrencia en un único servidor grande: un AMD EPYC 7773X (Milan-X, 64 núcleos / 128 hilos, 768 MiB de L3) con 995 GiB de RAM, ejecutando la misma imagen de Ayakaleaf Pro v6.2.2 sobre el mismo `texlive-full:2025.1`. A diferencia de los invitados QEMU, esta máquina no tiene la frecuencia fijada: es un servidor de clase de producción y lo medimos como tal.
+
+Fueron necesarias dos precauciones operativas que merece la pena mencionar, porque sin ellas el experimento mide el arnés de pruebas en lugar del servidor. En primer lugar, cada contenedor se confinó a un slice de `systemd` con `MemoryMax=940 GiB`, de modo que un barrido descontrolado agote un cgroup en lugar del host. En segundo lugar, las compilaciones aisladas las crea el daemon del host y cada una ensucia su propia capa copy-on-write —medida en 116 MiB por contenedor aunque la imagen base de 20,6 GiB sea compartida—, así que el directorio raíz de datos de Docker se trasladó a un dispositivo NVMe dedicado. Un barrido con $N=1024$ escribe unos 119 GiB de capas temporales, que no caben en un sistema de archivos raíz estándar.
+
+### 3.3 Carga de trabajo
+
+El documento es una tesis de máster real de 63 páginas (plantilla de la SJTU) compilada con XeLaTeX mediante `latexmk`, que contiene figuras TikZ, procesamiento de bibliografía con `biblatex` y recursos PDF incrustados; es decir, una carga realista y no sintética. Una sola compilación en un invitado sin carga tarda entre 8,6 y 9,8 s en todas las configuraciones, lo que usamos como línea base sin contención $T_1$.
+
+### 3.4 Generación de carga
+
+Creamos 512 cuentas de usuario reales y damos a cada una su propia copia del proyecto, de modo que las compilaciones concurrentes compitan exactamente como lo harían usuarios independientes, en lugar de compartir un bloqueo de proyecto. Las solicitudes se emiten desde el host contra el puerto redirigido del invitado, de modo que la generación de carga no consume CPU del invitado.
+
+La concurrencia es _simultánea_, no escalonada. Primero se establece cada sesión —inicio de sesión, token CSRF, selección del compilador— y solo entonces cada hilo espera hasta un instante común de reloj, calculado una vez y compartido, antes de emitir su `POST /project/:id/compile`. La distinción no es pedante. Una rampa escalonada mide el rendimiento con una cola estable; una ráfaga simultánea mide lo que ocurre cuando un aula llena de estudiantes pulsa el mismo botón tras el mismo anuncio de fecha límite, que es el caso que realmente temen los operadores. Ambos difieren en más de un factor constante, porque el segundo llena la cola de compilación más rápido de lo que el daemon puede vaciarla.
+
+Hubo que eliminar cuatro obstáculos prácticos antes de poder generar esa ráfaga con fidelidad. Vale la pena dejar constancia de cada uno, porque cada uno degrada silenciosamente el experimento hasta convertirlo en una medición del arnés y no del servidor.
+
+#### 3.4.1 Dos limitadores de tasa, no uno
+
+Overleaf limita los inicios de sesión por dirección de origen —20 intentos por minuto— y todo nuestro tráfico procede de un único host. Asignar a cada usuario simulado una dirección `X-Forwarded-For` distinta elimina ese límite, pero se topa inmediatamente con otro más grueso: un presupuesto por subred de unos 200 por minuto. Por tanto, repartir a los usuarios en un bloque contiguo falla en la cuenta número 201. En su lugar, derivamos la dirección sintética del índice de usuario para que usuarios consecutivos caigan en distintos `/24`,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+lo que mantiene holgados ambos limitadores para toda la población de 1024.
+
+#### 3.4.2 La cabecera inyectada se descarta de forma predeterminada
+
+Establecer la cabecera no basta. Express solo respeta `X-Forwarded-For` para los pares en los que se le ha indicado que confíe, y `trustedProxyIps` de Overleaf tiene como valor predeterminado `loopback`. Como el generador de carga llega a la aplicación a través del bridge del contenedor y no por la interfaz loopback, la cabecera se analiza y luego se descarta, y todos los usuarios simulados vuelven a colapsar en una única dirección. El síntoma es una oleada de `HTTP 429` justo en el vigésimo inicio de sesión, que es fácil de confundir con una sobrecarga del servidor. La red de la pasarela debe añadirse explícitamente a la cadena de confianza; en el despliegue en clúster de §4.3 también deben añadirse los CIDR de pods y servicios.
+
+#### 3.4.3 Un balanceador de carga sobrescribirá la cabecera que se le pidió conservar
+
+Cuando la instancia está detrás de un proxy, la directiva convencional `option forwardfor` _añade_ la dirección real del cliente a la cadena, que es el comportamiento correcto en producción y exactamente el incorrecto aquí: la dirección sintética queda desplazada por la del propio generador de carga. La directiva debe matizarse como `option forwardfor if-none`, para que el proxy añada un valor solo cuando el cliente no haya proporcionado ninguno.
+
+#### 3.4.4 El cliente se queda sin descriptores de archivo antes de que el servidor se quede sin capacidad
+
+Con $N=1024$, el generador mantiene más de mil sockets simultáneos, y el límite flexible predeterminado de 1024 descriptores se alcanza durante el establecimiento de las sesiones, no durante la medición. El fallo es silencioso: tres sesiones no llegan a establecerse y la ejecución informa de 1021 en lugar de 1024, mientras que un hilo de muestreo que lanza un shell para contar contenedores muere con `EMFILE` y trunca silenciosamente la telemetría. Hay que elevar el límite flexible en el generador —el límite estricto de nuestro host ya era 1048576— y repetir la ejecución. En §4.3 presentamos ambas ejecuciones: la corregida completa 1024 de 1024 con una mediana a menos de 1,2 s de la truncada, por lo que consideramos la primera utilizable pero no concluyente.
+
+### 3.5 Protocolo de medición
+
+Varias decisiones metodológicas resultaron necesarias para la reproducibilidad.
+
+#### 3.5.1 Calentamiento
+
+En un invitado recién arrancado, la caché de páginas está vacía y las primeras compilaciones miden la E/S de arranque en frío en lugar de la capacidad en estado estacionario: la misma configuración de 2 vCPU / 2 GiB da 36,5 s en frío y 9,8 s en caliente, un factor de 3,7. Por ello, cada configuración realiza tras el arranque dos compilaciones individuales de calentamiento que se descartan.
+
+#### 3.5.2 Criterio de aprobación
+
+Un nivel de concurrencia se aprueba solo si _todas_ las compilaciones tienen éxito y el nivel sobrevive a una repetición. Esto es más estricto que un umbral de tasa de éxito, y es importante: con 4 vCPU / 16 GiB, un nivel de 32 se aprobó una vez con una mediana de 80,2 s y luego agotó el tiempo de espera en las 32 compilaciones al repetirse, así que informamos de 31.
+
+#### 3.5.3 Búsqueda
+
+Los niveles se localizan mediante acotamiento exponencial a partir de una semilla predicha por el modelo, seguido de una bisección entera exacta. Como el criterio es de todo o nada, un nivel queda resuelto con su primer fallo, así que abandonamos las solicitudes restantes en curso en cuanto una falla, excepto en niveles pequeños, donde las compilaciones abandonadas saturan tanto un invitado pequeño que nunca se recupera.
+
+#### 3.5.4 Aislamiento entre niveles
+
+Antes de empezar el siguiente nivel, se vacían los contenedores de compilación y se sondea la aplicación web hasta que vuelve a responder. Sin esto, un nivel que sigue a un fallo registra un falso fallo con cero sesiones.
+
+#### 3.5.5 Higiene del host
+
+Se apagaron las máquinas virtuales no relacionadas del host: con 24 GiB de memoria del host comprometidos en otro lugar, la misma configuración del invitado registraba una carga media de 11,7 en lugar de 3,2 con idéntica concurrencia. La presión de memoria del host se propaga al invitado e invalida la medición.
+
+## 4. Resultados
+
+### 4.1 La matriz de capacidad
+
+La tabla 1 y la figura 4 muestran el techo medido para cada configuración. Leerla por filas es la primera sorpresa. Con 4 GiB, los invitados de 2, 4 y 8 vCPU alcanzan exactamente 9: cuadruplicar los núcleos no cambia absolutamente nada. Con 16 GiB alcanzan 54, 45 y 57: pasar de 4 a 16 núcleos aporta un 6 %, y el invitado de 8 núcleos es de hecho _peor_ que el de 4 (§5.2). Solo con 48 GiB el número de núcleos separa las configuraciones de forma decisiva: 143, 268 y 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Figura 4.** Capacidad medida en toda la matriz de configuraciones. (a) Cada configuración como una barra, agrupada por memoria y coloreada por número de núcleos; las barras sólidas están limitadas por memoria (el invitado muere con la memoria agotada) y las rayadas están limitadas por CPU (las compilaciones agotan el tiempo de espera con memoria de sobra). Leer un grupo de izquierda a derecha muestra lo poco que aporta el número de núcleos por debajo de 16 GiB; leer entre grupos muestra el rendimiento superlineal de la memoria. (b) Los mismos puntos frente al modelo ajustado $N_{\max}=\min(0.69R^{1.60},\,26.4C)$; la línea discontinua es el muro de memoria y las horizontales punteadas son los techos de CPU para cada número de núcleos. Una configuración está limitada por el primero de los dos que alcance.
+
+Leerla por columnas es la segunda: con núcleos fijos, la capacidad crece de forma superlineal con la memoria, aproximadamente como $R^{1.6}$, por el motivo de la caché de páginas desarrollado en §5.1.
+
+| memoria | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| ------: | -----: | ------: | ------: | ------: |
+|   2 GiB |      1 |       1 |       1 |       — |
+|   3 GiB |      4 |       5 |       6 |       — |
+|   4 GiB |      9 |       9 |       9 |       — |
+|   8 GiB |     21 |      22 |      26 |       — |
+|  16 GiB |      — |      54 |  **45** |      57 |
+|  32 GiB |      — | **145** |     135 |     141 |
+|  48 GiB |      — | **143** | **268** | **331** |
+
+**Tabla 1.** Máximo de compilaciones simultáneas que se completan con éxito, medido con un tiempo de espera de compilación de 300 s y con el techo de concurrencia de CLSI eliminado. La **negrita** indica una configuración limitada por CPU (las compilaciones agotan el tiempo de espera con memoria de sobra); el resto están limitadas por memoria (el stack muere con HTTP 502). La fila de 2 GiB incluye la corrección analizada en §5.2.
+
+### 4.2 La concurrencia es tiempo compartido
+
+La figura 5 recorre todos los niveles de concurrencia en un invitado fijo de 8 vCPU / 16 GiB. Dos regímenes quedan separados por un codo pronunciado exactamente en una compilación por núcleo. Por debajo de él, el tiempo medio de compilación es plano: pasa de 8,7 s en $N=1$ a 9,1 s en $N=C=8$, un cambio del 5 %. Por encima, el tiempo crece en estricta proporción a $N/C$: en $N=16,24$ medimos 18,5 s y 27,1 s, es decir, una proporción de $1:2.13:3.12$ frente a un ideal de $1:2:3$.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Figura 5.** Latencia de compilación frente a concurrencia con hardware fijo. El codo está en $N=C$; más allá, la ralentización medida sigue a $N/C$ con una diferencia de entre el 5 y el 7 %. Los quince niveles se completaron con éxito total.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Figura 6.** Latencia de compilación frente a concurrencia para varias configuraciones. Cada panel mantiene fijo el hardware y recorre la carga ofrecida; la línea vertical marca $N=C$. Las curvas son planas a su izquierda y lineales en $N/C$ a su derecha, que es la firma del tiempo compartido y no de la contención: el trabajo no se encarece, simplemente espera su turno.
+
+Ajustar $T(N)=T_1\max(1,N/C)^{b}$ sobre todas las mediciones con éxito del estudio da $b=0.914$ ($R^2_{\log}=0.904$, $n=81$). Un exponente indistinguible de la unidad es la expresión cuantitativa de que una compilación es una unidad de trabajo de un solo hilo y limitada por CPU, y de que la concurrencia ni ayuda ni perjudica más allá de repartir los núcleos. El corolario práctico resulta incómodo para la planificación de capacidad: una configuración puede absorber un número arbitrario de usuarios sin _fallar_, mientras hace que cada uno de ellos espere proporcionalmente más. Con $N=56$ en este invitado, todas las compilaciones siguen teniendo éxito, pero cada usuario espera 64,8 s en lugar de 8,7 s.
+
+### 4.3 Escalado vertical hasta 1024 compilaciones concurrentes
+
+La tabla 2 y la figura 7 muestran el barrido en el runner grande. Cada nivel es una compilación _en frío_: antes de cada nivel borramos el directorio de compilación y la caché de CLSI de todos los proyectos participantes mediante `DELETE /project/:id/output`, de modo que ningún nivel se beneficia del trabajo realizado por el nivel anterior. La línea base de una sola compilación en esta máquina es de 28,8 s, que es la cifra en frío y no debe compararse con la línea base en estado estacionario de 8,6–9,8 s usada antes; la línea base en frío en los invitados QEMU es de 28,3 s, así que, por hilo, ambas máquinas están a menos de un dos por ciento entre sí para esta carga de trabajo.
+
+| $N$ |     éxito | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | ctrs máx. |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tabla 2.** Barrido de concurrencia en un EPYC 7773X (64 núcleos / 128 hilos, 995 GiB). Todos los niveles en frío; línea base de 28,8 s. Contenedores máximos es el número máximo de sandboxes vivos simultáneamente.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Figura 7.** Escalado vertical en un único runner grande. (a) Latencia frente a la concurrencia ofrecida; la región sombreada marca el régimen más allá del codo. (b) El número de sandboxes realmente vivos nunca sigue al número solicitado —se satura cerca de 200—, mientras que el cgroup de compilación nunca usa más de una quinta parte de su límite.
+
+#### 4.3.1 La máquina nunca falla
+
+Todos los niveles se completan al 100 %, incluido $N=1024$, ocho veces el número de hilos. No encontramos el techo de capacidad de esta máquina; se nos agotó la paciencia antes de que a ella se le agotara el margen. Es la primera configuración del estudio en la que la restricción limitante no es la memoria: con $N=1024$, el cgroup de compilación alcanza un pico de 184 GiB, una quinta parte de su límite de 940 GiB, mientras la CPU está al 100 % de utilización con una carga media de 166.
+
+#### 4.3.2 La degradación es sublineal porque la admisión tiene una tasa limitada
+
+El tiempo compartido ingenuo predice que $8\times$ los hilos cuesta $8\times$ la latencia. El coste medido es $9.7\times$ respecto a una sola compilación, pero solo $3.8\times$ respecto a $N=128$, para un aumento de ocho veces en la carga ofrecida. El motivo es visible en la figura 7(b) y en la última columna de la tabla 2: aunque se emiten 1024 solicitudes simultáneamente, el número de sandboxes realmente vivos nunca supera 205. El daemon no puede crear contenedores tan rápido como los piden los clientes, así que las solicitudes se encolan en la admisión en lugar de competir dentro de la CPU. Aquí es el encolamiento lo que salva la cola de latencia, y lo hace por accidente.
+
+#### 4.3.3 El codo está en 512, no en el punto de fallo
+
+Entre $N=256$ y $N=512$, la latencia $p_{95}$ aumenta $2.9\times$ al duplicarse la carga; cada duplicación anterior costó entre $1.2\times$ y $1.4\times$. Una capacidad expresada como «el mayor $N$ que no falla» indicaría 1024 y sería inútil para un operador: en ese punto, la espera en la cola de latencia es de casi ocho minutos.
+
+### 4.4 El tiempo de compilación es inversamente proporcional a la frecuencia
+
+Como la carga de trabajo está limitada por CPU, su coste debería escalar como $1/f$. Lo comprobamos directamente recorriendo la frecuencia del host en todo el rango de la máquina, 1,0–5,5 GHz en diez pasos, en un invitado por lo demás sin cambios (figura 8). El tiempo de una sola compilación pasa de 26,5 s a 4,8 s: una frecuencia 5,5 veces mayor proporciona una aceleración de 5,5 veces sin rendimientos decrecientes en ningún punto del rango. El producto $T\!\cdot\!f$ es constante con una diferencia de menos del 2 % en las diez frecuencias.
+
+Normalizar por la cuota de núcleos hace converger las treinta mediciones —tres niveles de concurrencia a diez frecuencias— en una única constante:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+con una dispersión residual del 5,1 % en un rango en el que la propia frecuencia varía 5,5 veces. La ausencia de cualquier curvatura es en sí misma el resultado: si la carga de trabajo hubiera estado limitada por el ancho de banda de memoria o por la E/S, $T$ se aplanaría a frecuencias altas al superar la CPU al otro recurso.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Figura 8.** Barrido de frecuencias. (a) $T=k/f$ con la hipérbola ajustada. (b) Tras dividir por $\max(1,N/C)$, todos los puntos convergen en una constante, lo que confirma la ecuación (1).
+
+La ecuación (1) tiene una consecuencia directa para las compras que es fácil de enunciar y fácil de equivocar: _la frecuencia mejora la experiencia de cada usuario individual; el número de núcleos solo admite más usuarios_. Una máquina con una frecuencia un 20 % mayor compila un 20 % más rápido para todos, sin rendimientos decrecientes; el doble de núcleos no hace más rápida la compilación de nadie.
+
+## 5. Análisis
+
+### 5.1 Dos muros, ajustados por separado
+
+Cada configuración se clasifica por su firma de fallo (§2.3), y después el muro de memoria y el techo de CPU se ajustan solo con las configuraciones que realmente los alcanzan:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+con $R$ en gibibytes y $C$ en vCPU.
+
+El exponente del muro de memoria es sistemáticamente superlineal, $p>1$: el coste marginal de memoria de una compilación concurrente adicional _disminuye_ a medida que crece la memoria total, de unos 312 MiB por compilación en un invitado de 3 GiB a unos 194 MiB en uno de 32 GiB. El mecanismo es la caché de páginas compartida sobre el árbol de TeX Live descrita en §2.1: las compilaciones concurrentes leen archivos de fuentes y macros que se solapan, de modo que una caché más grande se amortiza entre más de ellas. Por eso la regla ingenua de «un gigabyte por cada cinco usuarios» subestima las máquinas grandes y sobrestima las pequeñas.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Figura 9.** Los mismos datos como dos superficies sobre el plano $(C,R)$. (a) Capacidad: la superficie ajustada es una cresta, no un plano; sube abruptamente con la memoria y es casi plana a lo largo del eje de núcleos hasta que la memoria deja de ser limitante, y por eso la fila de 48 GiB es la única en la que el número de núcleos separa las configuraciones. (b) Latencia frente a concurrencia para cada configuración, con el ajuste $T=12.6\,(N/C)^{0.91}$ mostrado en discontinua y el tiempo de espera de 180 s dibujado como un plano. Una configuración falla donde su curva sólida atraviesa ese plano, lo que hace visible lo directamente que el ajuste del tiempo de espera determina la capacidad indicada.
+
+### 5.2 Donde más núcleos empeoran las cosas
+
+La ecuación (2) es el mínimo de dos términos y, por tanto, monótona en $C$, pero las mediciones no lo son. Observamos dos inversiones en las que añadir núcleos _redujo_ la capacidad: con 16 GiB (54 frente a 45) y con 32 GiB (145 frente a 135). Ambas se producen en el régimen limitado por memoria, y el mecanismo es el mismo en las dos: con más núcleos, las compilaciones concurrentes avanzan al unísono y alcanzan su tamaño residente máximo en el mismo momento, mientras que con menos núcleos el planificador las intercala y los picos quedan escalonados. En un invitado cuyo margen de memoria ya es justo, ese escalonamiento es lo que lo mantiene vivo. Un modelo de capacidad basado en el uso medio de recursos no puede expresar esto; es una propiedad de la _coincidencia_ de los picos.
+
+Una tercera inversión aparente, con 2 GiB, la descartamos ahora. La búsqueda registra una capacidad de 2 con 2 vCPU, pero de 1 con 4 y 8 vCPU, lo que parece el mismo efecto. Al volver a examinar los barridos en bruto aparece algo más simple: con 2 GiB, el nivel $N=2$ tuvo éxito en el primer intento con los tres números de núcleos y luego falló su ejecución de confirmación en dos de los tres. El nivel no es una capacidad, sino un lanzamiento de moneda, y la entrada de 2 vCPU es el lanzamiento que salió bien por casualidad. Por tanto, indicamos el valor reproducible, 1, para los tres números de núcleos y no sacamos ninguna conclusión de la diferencia. Dejamos constancia de la corrección aquí en lugar de reformular la tabla en silencio, porque la lectura descartada es del tipo que habría respaldado una afirmación interesante.
+
+## 6. Hallazgos de implementación
+
+### 6.1 Un techo de concurrencia codificado de forma fija
+
+En invitados lo bastante grandes, la capacidad se detuvo exactamente en 65 compilaciones simultáneas independientemente de la concurrencia solicitada: con $N=66,80,96,128$ medimos $65$ éxitos y $1,15,31,63$ respuestas `unavailable` inmediatas, con el número de contenedores fijo en 65, varios gigabytes de memoria sin usar y un tiempo de compilación mediano estable en 77 s, muy por debajo de cualquier tiempo de espera.
+
+La causa es una constante en CLSI:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+La comparación no es estricta, así que el techo efectivo es $64+1=65$, lo que coincide exactamente con la medición. Las solicitudes sobrantes reciben **HTTP 503**: se _rechazan_, no se encolan, de modo que, desde el punto de vista del usuario, el botón de compilar simplemente falla. A diferencia de todos los demás parámetros ajustables del mismo archivo, este no lee ninguna variable de entorno; se introdujo en upstream en agosto de 2024 y solo puede cambiarse modificando la imagen. Con el límite elevado, el mismo invitado de 16 vCPU / 32 GiB que indicaba `success=65, unavailable=15` con $N=80$ pasó a indicar `success=80`.
+
+### 6.2 Un límite de memoria de contenedor que no funciona
+
+Al inspeccionar un contenedor de compilación activo, no se observa ningún aislamiento de recursos:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+La ausencia de cualquier cuota de CPU es intencionada y explica por qué el exponente de tiempo compartido de §4.2 es tan limpio: nada distorsiona la competencia entre compilaciones. Sin embargo, la ausencia de un límite de _memoria_ no es intencionada. El Docker runner sí solicita uno:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Esto está mal por partida doble. El valor es $1024^4=1 tebiB$ cuando el comentario pretende $1024^3$; y el campo se coloca en el nivel superior de las opciones de creación en lugar de dentro de `HostConfig`, donde lo espera la API de Docker, por lo que se descarta, como confirma el `Memory=0` observado. Ambos errores están presentes en el commit que introdujo el archivo (`9a519f0d3d`, marzo de 2018) y sobrevivieron a la conversión desde CoffeeScript, a un reformateo de todo el repositorio y a una migración de CJS a ESM, ninguna de las cuales revisó la semántica. Cabe destacar que `MAX_OUTPUT = 1024 * 1024 // 1MB` en el mismo commit es correcto, lo que indica un descuido más que un malentendido.
+
+La consecuencia es visible en nuestras mediciones con poca memoria. Como las compilaciones no tienen límite, el agotamiento de memoria no se manifiesta como Docker terminando un contenedor problemático; tumba todo el invitado. En la configuración de 2 vCPU / 2 GiB observamos la sesión SSH de monitorización bloqueada durante 300 s, una carga media de 68 en dos núcleos y, finalmente, el reinicio del propio invitado. Un límite por contenedor que funcionara degradaría el sistema con mucha más elegancia: la compilación demasiado grande fallaría y el servicio sobreviviría.
+
+El único límite que sí surte efecto es `RLIMIT_CPU`, fijado en $\text{timeout}+5$ segundos. Limita el tiempo de _CPU_, no el tiempo de reloj, y una sola compilación consume solo unos 9 s de CPU, de modo que nunca resulta limitante con ninguna concurrencia; protege frente a entradas patológicas, como una macro descontrolada. Es, no obstante, un oráculo útil: observar `Soft:305` confirma que un ajuste de tiempo de espera de 300 s se ha propagado realmente al contenedor.
+
+### 6.3 El tiempo de espera de compilación es el parámetro ajustable dominante
+
+El campo por usuario `features.compileTimeout` tiene un valor predeterminado de 180 s. Para cualquier configuración limitada por CPU, esto no es un margen de seguridad sino un ajuste de capacidad, porque una máquina que sigue calculando correctamente se declara fallida. Elevarlo a 300 s —una única actualización en MongoDB— cambia la capacidad medida hasta en un factor de 4,2 (tabla 3). El máximo es de 600 s, impuesto por `RequestParser.MAX_TIMEOUT`, por encima del cual el valor se trunca silenciosamente.
+
+| Configuración    | 180 s | 300 s |     Proporción | Restricción limitante  |
+| ---------------- | ----: | ----: | -------------: | ---------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB libres     |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB libres     |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                    |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                    |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                    |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | alcanza después el muro de memoria |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | memoria                |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | memoria                |
+
+**Tabla 3.** Efecto del tiempo de espera de compilación en la capacidad medida.
+
+Las dos últimas filas son la mitad contraintuitiva del resultado y el motivo por el que volvimos a medir todas las configuraciones con un único tiempo de espera. En las configuraciones limitadas por _memoria_, un tiempo de espera más largo _reduce_ la capacidad, porque cada compilación mantiene su conjunto residente durante más tiempo y se solapan más. Por tanto, una cifra de capacidad carece de sentido si no se indica el tiempo de espera con el que se midió, y ambas no pueden mezclarse en una misma tabla.
+
+## 7. Trabajos relacionados
+
+### 7.1 Recomendaciones del fabricante
+
+La propia documentación de hardware de Overleaf enuncia los hechos cualitativos que aquí cuantificamos: que LaTeX es de un solo hilo, que por tanto el rendimiento de un solo núcleo determina el tiempo de compilación, y que «more cores will only help if you are trying to compile more documents than you have free CPU cores» \[1]. A continuación ofrece la regla lineal de dimensionamiento —una base de 2 núcleos/3 GiB más un núcleo y un gigabyte por cada cinco a diez usuarios concurrentes— que motivó este estudio. Nuestra contribución es convertir estas afirmaciones en leyes medidas (ecuaciones (1) y (2)) y mostrar dónde falla la regla lineal: no tiene ningún término para la caché de páginas compartida que hace superlineal el muro de memoria, ni para los dos parámetros de software que dominan el resultado.
+
+### 7.2 Estudios de capacidad de compilación y CI
+
+La medición de sistemas de compilación bajo concurrencia está bien establecida fuera del ámbito de LaTeX. LightSys informa de que los sistemas de CI convencionales que compilan dentro de contenedores Docker degradan su E/S a medida que aumenta la tasa de llegada de pull requests, con un cuello de botella que aparece en torno a once solicitudes concurrentes \[17]; TAOS-CI observa que la compilación domina el tiempo de reloj de la CI, representando entre el 60 y el 67 % de la duración total del pipeline en proyectos grandes \[18]. Nuestro sistema difiere en un aspecto que resulta decisivo: una compilación de LaTeX es interactiva. Un trabajo de CI que tarda el doble es una molestia; una compilación que tarda el doble la observa directamente un usuario que espera en el panel de vista previa, y por eso tratamos el tiempo de espera no como un umbral de fallo, sino como un parámetro de capacidad.
+
+### 7.3 Sobrecostes de los contenedores
+
+Trabajos recientes descomponen la latencia de arranque de contenedores Docker según los niveles de almacenamiento \[19] y caracterizan el rendimiento de los contenedores en el edge \[20]. En nuestro caso, el arranque del contenedor por compilación se amortiza: es una pequeña constante en relación con una compilación de 9 s, y el tiempo sin contención $T_1$ que ajustamos lo absorbe. La propiedad de los contenedores que sí importa es la _ausencia_ de límites de recursos (§6.2), que convierte un desbordamiento de memoria de una compilación en un fallo de todo el host.
+
+### 7.4 LaTeX como entrada no confiable
+
+La compilación aislada existe porque TeX es un lenguaje de programación y los documentos son entradas no confiables \[21, 22]. Esa decisión de diseño es lo que hace posible este estudio —cada compilación es un contenedor aislado con un comportamiento de recursos observable— y también lo que hace que la falta de límite de memoria tenga consecuencias, ya que los operadores que lo despliegan dan por supuesto el aislamiento.
+
+### 7.5 El compilador como objeto de estudio
+
+TeX está bien documentado como lenguaje \[16], pero su comportamiento como _objetivo de compilación_ solo ha atraído atención recientemente. Tan y Rigger \[8] compilan un gran corpus de fuentes de arXiv con distintos motores y versiones de la distribución y descubren que la elección del motor no es intercambiable: solo una fracción de un uno por ciento de los documentos produce una salida idéntica byte a byte con XeTeX y pdfTeX. Ese resultado afecta directamente a nuestra metodología. La capacidad es una propiedad de un documento _y_ de un motor, por lo que un benchmark que no fije ambos no es reproducible; por eso fijamos un documento, un motor y una distribución (`texlive-full:2025.1`) en todo el estudio, e indicamos el motor en cada pie de figura. También limita la generalidad de nuestras cifras de una forma que conviene decir claramente: caracterizan XeLaTeX con este documento, no TeX en abstracto.
+
+El trabajo sobre _sistemas_ de compilación de LaTeX está impulsado en gran medida por profesionales. `l3build` \[13], del proyecto LaTeX3, estandariza las pruebas de regresión y el empaquetado, y benchmarks independientes comparan herramientas envoltorio: un estudio de 26 sistemas de compilación concluye que un preámbulo precompilado aporta aproximadamente un 20 % frente a una ejecución simple y un 40 % frente a `latexmk` \[14]. Estos optimizan la compilación _individual_. Son ortogonales a lo que medimos y se combinan con ello: una caché de preámbulo acorta $T_1$, y cada cifra de capacidad de este artículo escala con $T_1$.
+
+### 7.6 Control de concurrencia en el editor, no en el compilador
+
+La mitad colaborativa de Overleaf se apoya en una línea de trabajo bien establecida. La transformación operacional se origina con Ellis y Gibbs \[9] y el sistema Jupiter \[10] la hizo práctica para clientes con alta latencia; su diseño es reconocible en `document-updater`: un servidor que ordena las operaciones y un búfer por documento con el que se sincronizan los clientes. Los tipos de datos replicados sin conflictos \[11] resuelven el mismo problema sin un secuenciador central. Esta distinción es lo que hace que la topología de §4.3 funcione: como el búfer de actualizaciones pendientes reside en un Redis compartido y no en la memoria de una instancia, una compilación enrutada a cualquier réplica ve las últimas pulsaciones de teclado, y la afinidad de compilación puede elegirse por localidad de caché y no por corrección.
+
+### 7.7 Modelos de capacidad
+
+La ley de Amdahl \[24] acota la aceleración obtenida por paralelismo y la ley de Little \[23] relaciona la ocupación con la tasa de llegada y el tiempo de servicio; ambas se usan más arriba. La ley de escalabilidad universal de Gunther \[12] amplía la primera con un término retrógrado para el retardo de coherencia, que predice que el rendimiento alcanza un máximo y luego disminuye. Observamos que nuestro sistema _no_ presenta ese régimen retrógrado hasta $N=1024$: el rendimiento se satura y la latencia crece, pero nada colapsa. El motivo es estructural y no fortuito: las compilaciones no comparten ningún estado que deba mantenerse coherente, de modo que el término que añade la ley es casi cero, y la meseta de admisión de §4.3 limita la contención antes de que pueda importar.
+
+## 8. Recomendaciones para operadores
+
+<Steps>
+<Step title="Corrige los dos parámetros de software antes de comprar hardware">
+Ambos son gratuitos y ambos valen más que cualquier mejora de hardware individual que hayamos medido. Eleva `features.compileTimeout` a un valor que tus usuarios realmente vayan a tolerar —el máximo que acepta CLSI es de 600 s— y, si esperas superar 65 compilaciones simultáneas, eleva `compileConcurrencyLimit` en una imagen derivada o escala horizontalmente. No hacer ninguna de las dos cosas significa pagar por núcleos que el software se niega a usar.
+</Step>
+
+<Step title="Dimensiona una máquina por su codo, no por su techo">
+El barrido del runner grande (§4.3) separa dos cifras que se confunden habitualmente. El _techo_ —la mayor concurrencia que sigue devolviendo todos los PDF— es de al menos 1024 en un servidor de 64 núcleos, y nunca lo alcanzamos. El _codo_ —el punto a partir del cual la latencia de cola deja de crecer suavemente y empieza a duplicarse— está en 512, y el último punto de operación cómodo por debajo de él es 256. Entre $N=256$ y $N=512$, la espera $p_{95}$ pasa de dos minutos a casi seis; entre 512 y 1024 llega a ocho. Un operador que dimensiona según el techo entrega un sistema que técnicamente funciona y que nadie quiere usar.
+
+Para esta máquina y este documento, el punto de operación recomendado es, por tanto, de **256 compilaciones concurrentes**, que es $4\times$ el número de núcleos físicos y $2\times$ el número de hilos, y que mantiene $p_{95}$ cerca de 120 s. Sugerimos establecer `compileConcurrencyLimit` en ese valor en lugar de dejarlo alto: admitir 1024 compilaciones a la vez hace que todos esperen ocho minutos, mientras que admitir 256 y encolar el resto atiende a la mayoría de los usuarios en dos. El encolamiento perjudica a los que llegan tarde; la contención perjudica a todos.
+</Step>
+
+<Step title="Trata estas cifras como el peor caso">
+Cada nivel de la tabla 2 es una compilación en frío lanzada simultáneamente. Ninguna de las dos condiciones se da en producción: una compilación en caliente del mismo documento tarda 8,6 s frente a 28,3 s en frío, un factor de $3.3$, y los usuarios reales no pulsan el botón en el mismo segundo. Por tanto, una población en estado estacionario que recompila cada dos minutos con una tasa de aciertos de caché típica admitirá bastantes más autores de lo que sugiere por sí sola la cifra de concurrencia: del orden de mil o más autores activos en el punto de operación de 256. La cifra de concurrencia es un límite para la ráfaga instantánea, no un número de puestos.
+</Step>
+
+<Step title="Decide primero el presupuesto de latencia y luego deduce el tamaño">
+La ecuación (1) se invierte directamente. Para una espera objetivo $T$ con una frecuencia $f$ en $C$ núcleos, la concurrencia que cabe es $N \le C\,fT/k$ con $k\approx28 GHz·s$ para este documento. Un presupuesto de 60 s en 8 núcleos a 3 GHz da $N\le51$; un presupuesto de 120 s lo duplica. Publicar el presupuesto junto a la capacidad es la única forma honesta de indicar cualquiera de los dos.
+</Step>
+
+<Step title="Compra primero memoria, después núcleos, y comprueba en qué muro estás">
+Por debajo de 32 GiB apenas medimos beneficio de núcleos adicionales. El diagnóstico es barato: si los fallos aparecen como HTTP 502 con el invitado escaso de memoria, añade memoria; si aparecen como `timedout` con memoria de sobra, añade núcleos o eleva el tiempo de espera. Los operadores pueden deducirlo a partir de la misma firma de fallo que usamos para clasificar las configuraciones.
+</Step>
+
+<Step title="Prioriza la frecuencia para la experiencia y los núcleos para la población">
+Como $T\propto 1/f$ se cumple sin curvatura (2 % en 1,0–5,5 GHz), una frecuencia más alta hace más rápida cada compilación para cada usuario. Más núcleos no hacen más rápida ninguna compilación individual; solo admiten más compilaciones concurrentes. Los despliegues cuya queja es «las compilaciones son lentas» deberían comprar frecuencia; los despliegues cuya queja es «las compilaciones fallan cuando llega la fecha límite» deberían comprar memoria y núcleos.
+</Step>
+
+<Step title="Escala horizontalmente en lugar de verticalmente una vez superado el techo">
+Por encima de 65 compilaciones concurrentes, la vía admitida es el escalado horizontal (figuras 2c y 10, detalladas en §9): varias instancias de la aplicación detrás de un balanceador de carga con afinidad de sesión por cookie, que comparten MongoDB, Redis y un almacenamiento compatible con S3 centralizados, con `git-bridge` como instancia única. Esto multiplica el techo por instancia por el número de instancias, que es exactamente como el despliegue SaaS alcanza su propia capacidad.
+</Step>
+
+<Step title="No confíes en el aislamiento por compilación">
+Hasta que se corrija el límite de memoria del Docker runner (§6.2), un solo documento patológico puede agotar el host en lugar de ser terminado por sí solo. Los operadores que necesiten esa garantía deberían imponerla ellos mismos en lugar de esperarla. El mecanismo que usamos en el host grande es un slice de systemd con un techo estricto, al que luego se apunta el daemon de Docker para que cada contenedor que cree se contabilice dentro de él:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Un detalle de esto cuesta una tarde si se pasa por alto. Un slice llamado `docker-capped.slice` no se sitúa junto a `docker.slice`; se sitúa _dentro_ de él, porque el guion es el separador de jerarquía y no parte del nombre. Un techo que parece no tener efecto se ha aplicado normalmente un nivel por encima o por debajo de donde viven realmente los contenedores. Verifícalo leyendo el pico en `memory.max_usage_in_bytes` tras una ejecución, en lugar de fiarte del archivo de configuración: en nuestro host, el cgroup de compilación nunca superó una quinta parte de su techo, ni siquiera con 1024 compilaciones simultáneas, lo que en sí mismo demuestra que la restricción limitante era el daemon y no la memoria.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Figura 10.** Topología de referencia para un despliegue escalado horizontalmente, basada en la configuración que verificamos. Las réplicas de la aplicación son intercambiables y no guardan nada persistente, por lo que pueden añadirse y eliminarse libremente. Tres componentes no lo son: Redis, cuyo búfer de documentos es lo que permite que una compilación enrutada a cualquier réplica vea las últimas pulsaciones de teclado; el almacén de objetos, que pasa de ser opcional a obligatorio con más de una réplica; y `git-bridge`, que mantiene los repositorios en el disco local sin ninguna vía de replicación y debe ejecutarse como instancia única junto a una réplica designada.
+
+## 9. Un despliegue de referencia en varias máquinas
+
+Todo lo anterior mide una sola máquina. Esta sección describe la forma distribuida con suficiente detalle para construirla y —como la pregunta a la que realmente se enfrenta un operador no es _cómo_, sino _si_ merece la pena— indica primero el punto a partir del cual compensa el esfuerzo.
+
+### 9.1 Cuándo está justificada la forma distribuida
+
+Una sola máquina es más barata de operar en todos los aspectos que importan: un único dominio de fallo, ningún estado compartido que mantener coherente, ningún enrutamiento que configurar mal. Nuestros datos establecen tres umbrales para decidir cuándo abandonarla.
+
+#### 9.1.1 Por debajo de 65 compilaciones concurrentes, no lo hagas
+
+El techo por instancia es una constante de software, no de hardware (§6.1). Hasta que la carga ofrecida se acerque a él, una segunda máquina añade modos de fallo y no aporta nada. El host de 64 núcleos atendió 256 compilaciones concurrentes con éxito total solo después de elevar `compileConcurrencyLimit`; un operador que aún no ha cambiado ese único valor no está limitado por el hardware y no debería estar buscando hardware.
+
+#### 9.1.2 Entre 65 y unas 500, escala primero verticalmente
+
+El escalado vertical se mantuvo lineal en todo nuestro rango y nunca entró en un régimen retrógrado. Un único host grande alcanzó 1024 compilaciones simultáneas en frío con un 100 % de éxito (§4.3); el codo de latencia apareció en 512, no antes. Dentro de esa franja, una máquina más grande es estrictamente más sencilla que varias más pequeñas y, según §4.4, una más rápida mejora la experiencia de cada usuario en lugar de limitarse a admitir más.
+
+#### 9.1.3 Pasa a la forma distribuida por disponibilidad, no por rendimiento
+
+La razón honesta para ejecutar más de una réplica de la aplicación por debajo del techo es que una máquina es una fuente de alimentación, un kernel y una ventana de actualización. Es una razón legítima y es la que nosotros daríamos; simplemente no es un argumento de capacidad, y confundir ambas cosas lleva a los operadores a comprar réplicas cuando lo que necesitaban era memoria.
+
+### 9.2 Niveles y su dimensionamiento
+
+La figura 10 muestra la topología. Tiene cuatro niveles, y cada uno escala según magnitudes distintas, que es precisamente el motivo de separarlos.
+
+#### 9.2.1 Borde
+
+Un balanceador de carga, o dos para disponibilidad. Termina TLS y no hace nada costoso; escala con el número de conexiones, no con el número de compilaciones, y una instancia pequeña basta para las cargas estudiadas aquí. Lo que importa es su configuración, no su tamaño (§9.3).
+
+#### 9.2.2 Réplicas de la aplicación
+
+Soportan la carga de compilación y son el único nivel que escala con la concurrencia. Dimensiona cada una según las reglas de §8 —memoria antes que núcleos, después frecuencia— y luego establece el número de réplicas para cubrir la concurrencia máxima dividida por el techo por réplica. Las réplicas no guardan nada persistente: su disco local contiene el espacio temporal de compilación y una caché de salida, ambos reconstruibles. Esto es lo que permite añadirlas y eliminarlas libremente con seguridad, y conviene verificarlo en lugar de suponerlo, porque una sola ruta de `filestore` mal configurada convierte silenciosamente el nivel en uno con estado.
+
+#### 9.2.3 Estado
+
+Redis, MongoDB y un almacén de objetos compatible con S3, en hosts separados. Redis es el que soporta la carga y el menos evidente: contiene el almacén de sesiones y el búfer de documentos en vivo, que es lo que permite que una compilación enrutada a cualquier réplica vea las pulsaciones de teclado realizadas contra otra réplica. Un operador que trate Redis como una caché y lo dimensione para desalojo producirá compilaciones de documentos obsoletos extremadamente difíciles de diagnosticar, porque nada falla: la salida simplemente es incorrecta. MongoDB escala con el número de proyectos y no con la tasa de compilación. El almacén de objetos es opcional con una réplica y obligatorio a partir de ahí.
+
+#### 9.2.4 La instancia única
+
+`git-bridge` mantiene los repositorios en el disco local, mantiene un índice local y no tiene ninguna vía de replicación. Debe ejecutarse exactamente como una instancia, fijada junto a una réplica designada, y es el componente que hace que el despliegue no sea del todo sin estado. Planifica su host en consecuencia: su disco es el que necesita copias de seguridad.
+
+| **Nivel**     | **Cantidad**         | **Escala con**                       |
+| ------------- | -------------------- | ------------------------------------ |
+| Balanceador de carga | 1–2           | conexiones concurrentes              |
+| Aplicación    | $\lceil N/C\rceil$ | compilaciones concurrentes máximas   |
+| Redis         | 1 (+réplica)         | sesiones de edición activas          |
+| MongoDB       | 1 (+réplica)         | proyectos almacenados                |
+| Almacén de objetos | 1 clúster       | bytes totales de proyectos           |
+| `git-bridge`  | exactamente 1        | repositorios en disco                |
+
+**Tabla 4.** Niveles de referencia. Solo el nivel de aplicación escala con la concurrencia; su dimensionamiento es el tema de §8.
+
+### 9.3 El enrutamiento es la parte fácil de configurar mal
+
+Tres clases de solicitudes deben llegar a tres lugares distintos, y la configuración predeterminada de una sola regla satisface como mucho dos de ellas.
+
+El tráfico de compilación bajo `/project/` debe distribuirse mediante hashing consistente sobre el identificador del proyecto, para que la caché de compilación de un proyecto permanezca en una réplica. Usamos `balance hash path,field(3,/)` de HAProxy con `hash-type consistent` y `hash-balance-factor 150`. La elección importa al escalar horizontalmente: con afinidad por cookie, las sesiones existentes permanecen fijadas indefinidamente a su réplica original y una réplica recién añadida solo recibe usuarios nuevos, de modo que la máquina que un operador acaba de pagar no absorbe nada de la carga que motivó su compra. En nuestra configuración, el hashing consistente redistribuyó el 35 % de los proyectos al escalar, frente al 0 % con cookies.
+
+El tráfico de sesión es distinto. Cuando falla la actualización a WebSocket y `socket.io` recurre al sondeo XHR, los sondeos sucesivos de una sesión deben llegar a una misma réplica, y no hay ningún identificador de proyecto en la ruta sobre el que aplicar el hash. Este tráfico necesita un backend separado con afinidad por cookie. Diseñamos esta separación pero no la desplegamos; la señalamos como una carencia en lugar de afirmarla.
+
+Por último, `/git/` debe llegar a la réplica junto a la que se ejecuta `git-bridge`. Se enruta a esa réplica y no directamente a `git-bridge` porque el bridge autentica sus callbacks contra los endpoints OAuth de la aplicación y resuelve las URL de blobs a través de ella; saltarse la réplica rompe la autenticación en lugar de mejorar nada.
+
+### 9.4 Reducir la escala necesita un margen de drenaje
+
+Eliminar una réplica no es simétrico a añadirla: una compilación en curso se pierde y el usuario ve un fallo que no ha provocado. La secuencia viable es detener primero el tráfico nuevo, esperar y solo entonces terminar. Lo implementamos como un hook pre-stop que retiene el pod durante un intervalo configurable mientras el balanceador marca el backend como en drenaje: lo bastante corto como para probarlo en minutos y, en producción, lo bastante largo para el final natural de una sesión, horas en lugar de segundos. El intervalo es el parámetro que decide si la elasticidad es invisible o exasperante.
+
+Una restricción adicional que descubrimos midiendo y no por diseño: el autoescalado basado en CPU no funciona para esta carga de trabajo. La utilización propia del pod de la aplicación era de 22 m de núcleo frente a un total del nodo de 3997 m de núcleo, porque el trabajo de compilación ocurre en contenedores hermanos que el pod no contabiliza. Cualquier señal usada para escalar este nivel debe contar los contenedores de compilación en ejecución, no la CPU del pod.
+
+## 10. Implicaciones más allá de Overleaf
+
+Nada de §4.2 o §4.3 es específico del código de Overleaf. Las leyes medidas se derivan de tres propiedades que comparte cualquier servicio de LaTeX alojado: la unidad de trabajo es un proceso de un solo hilo, está aislada en un contenedor y su conjunto de trabajo es un gran árbol de solo lectura que la caché de páginas debe contener. Tres consecuencias se trasladan directamente a cualquiera que construya un servicio así.
+
+### 10.1 Aprovisiona memoria, después núcleos
+
+El resultado más contundente de la matriz es negativo: por debajo de 16 GiB, el número de núcleos es casi irrelevante, y solo con 48 GiB las configuraciones de 4, 8 y 16 vCPU llegan a separarse (143, 268, 331). Un operador que interprete la regla convencional como «añadir un núcleo por cada cinco usuarios» compra el recurso equivocado. El mecanismo es la caché de páginas compartida sobre el árbol de la distribución, y es una propiedad del tamaño de TeX Live y no de ningún front-end concreto.
+
+### 10.2 La tasa de admisión es un recurso, y normalmente se olvida
+
+Con $N=1024$, nuestro servidor nunca mantuvo más de 205 sandboxes vivos (figura 7b), aunque todas las solicitudes llegaron a la vez. El limitador fue la creación de contenedores, no la compilación, lo que concuerda con estudios de medición que atribuyen el coste de arranque de los contenedores a la sobrecarga del runtime más que al tamaño de la imagen \[19, 20]. Un servicio que solo dimensione CPU y memoria descubrirá que su comportamiento ante ráfagas está determinado por una magnitud que nunca midió. La forma práctica de esto es la recomendación de §8: limita la admisión deliberadamente, porque una cola que eliges es mejor que una cola que descubres.
+
+### 10.3 Un sandbox que sobrevive a su compilación invalida el modelo
+
+Cada cifra de capacidad de este artículo supone que el contenedor se crea, realiza una compilación y termina: una vida de decenas de segundos y un ciclo de trabajo cercano a uno solo mientras se ejecuta. Dos patrones de diseño recientes rompen esa suposición, y la rompen de la misma manera.
+
+El primero es el sandbox persistente por usuario. Asignar a cada usuario un entorno privado fijo convierte un pool multiplexado estadísticamente en un conjunto de reservas: un servicio que podría atender 256 compilaciones concurrentes con 64 núcleos mediante tiempo compartido solo puede atender a 16 usuarios si a cada uno se le asignan cuatro núcleos dedicados, un orden de magnitud menos con el mismo hardware. Nuestros datos cuantifican el coste de esa elección en lugar de argumentar en su contra: las reservas compran previsibilidad, y el tipo de cambio es de aproximadamente $16\times$ en el punto de operación que recomendamos.
+
+El segundo, y más reciente, es el agente de IA que comparte el sandbox con el compilador. En las plataformas de redacción asistida por agentes, el mismo contenedor que ejecuta XeLaTeX puede alojar también un agente de programación de larga duración, por lo que está ocupado de forma continua y no a ráfagas. Los profesionales informan exactamente del síntoma que el modelo predice para estos despliegues: lentitud sostenida con un número modesto de usuarios \[15]. Conviene describir la interacción con precisión, porque no es simplemente «más carga». Tres de nuestros hallazgos se acumulan. La ocupación deja de producirse a ráfagas, de modo que la ley de tiempo compartido de §4.2 se aplica a toda la población a la vez en lugar de a la fracción que está compilando en ese momento. La caché de páginas, que es lo que proporciona el rendimiento superlineal de la memoria de §4.1, pasa a compartirse con el propio conjunto de trabajo del agente y deja de estar caliente para TeX. Y la falta de límite de memoria de los contenedores de §6.2 se vuelve mucho más peligrosa, porque un contenedor que nunca termina nunca devuelve su memoria.
+
+No medimos una plataforma de este tipo y no hacemos ninguna afirmación sobre ningún producto concreto. Lo que sí podemos decir es lo que nuestras cifras implican para el diseño: una arquitectura que da a cada usuario un sandbox multinúcleo de larga duración debe dimensionarse como un sistema de reservas, no mediante las cifras de concurrencia aquí indicadas, y la capacidad que puede esperar se acerca más a su número de núcleos dividido por los núcleos por usuario que a cualquier valor de la tabla 1.
+
+## 11. Amenazas a la validez
+
+### 11.1 Un único documento
+
+Todas las mediciones usan un único documento XeLaTeX de 63 páginas. Las capacidades absolutas serán distintas para otros documentos; las leyes de escalado, que son proporciones, no deberían serlo. Un documento con un conjunto residente sustancialmente mayor desplazaría el muro de memoria sin cambiar su carácter superlineal.
+
+### 11.2 Host virtualizado
+
+Los invitados se ejecutan bajo KVM en una única máquina física, por lo que las cifras absolutas incluyen la sobrecarga de virtualización y los invitados comparten la caché de páginas y el dispositivo NVMe del host. Mitigamos el mayor factor de confusión apagando los invitados no relacionados tras observar que la presión de memoria del host infla las cargas medias dentro del invitado en más de $3\times$ con idéntica concurrencia.
+
+### 11.3 Llegada simultánea
+
+Cada compilación se emite en un mismo instante, que es el peor caso. Los usuarios reales llegan como un proceso estocástico, así que un despliegue dimensionado con nuestras cifras tiene margen y no déficit; pero el pico al final de una fecha límite de entrega se parece más a nuestro modelo que a uno de Poisson.
+
+### 11.4 Configuraciones límite
+
+Con 2 GiB, el sistema está tan cerca del colapso que ejecuciones repetidas de la misma configuración pueden diferir en una compilación. Indicamos el valor conservador y no sacamos conclusiones de diferencias de $\pm 1$ en ese régimen.
+
+## 12. Disponibilidad
+
+El sistema evaluado, las herramientas de despliegue y el proyecto upstream del que deriva son todos públicos:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Toolkit de despliegue — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Documentación — [https://ayakaleaf-pro.ayaka.space](/es)
+* Overleaf upstream — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* Imágenes de compilación de TeX Live — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Cada ubicación de código fuente que citamos se indica como una ruta relativa al repositorio con un número de línea respecto a Ayakaleaf Pro v6.2.2, y los dos commits upstream que fechamos (`9a519f0d3d`, `5d472e9b38`) son accesibles en el historial de Overleaf.
+
+## 13. Contribuciones
+
+Musicminion diseñó el estudio, proporcionó y operó los bancos de pruebas, dirigió la línea de investigación y verificó cada medición aquí presentada. Claude Opus 5 (Anthropic) construyó y operó el arnés de benchmark, automatizó los despliegues, realizó la arqueología del código fuente, produjo las figuras y redactó el manuscrito. Ambos autores revisaron el texto final. Cuando una ejecución se indica como contaminada —el barrido de 1021 sesiones de §4.3 y el nivel anómalo $N=256$ de §4.1—, el defecto se detectó durante la revisión y la ejecución se repitió antes de la publicación en lugar de descartarse en silencio.
+
+Los lectores deben tener en cuenta que las políticas de autoría de ACM, IEEE y el ICMJE reservan actualmente la autoría a quienes pueden asumir la responsabilidad de un trabajo, y exigirían que la contribución del segundo autor se registrara como una declaración y no como una firma. Indicamos aquí explícitamente el reparto del trabajo para que el registro sea exacto bajo cualquiera de las dos convenciones.
+
+## 14. Conclusión
+
+La planificación de capacidad para Overleaf autoalojado no consiste en escalar un único recurso. Tres hallazgos deberían cambiar la forma de hacerla.
+
+En primer lugar, por debajo de 32 GiB de memoria del invitado, el número de núcleos apenas importa: con 16 GiB, las capacidades de los invitados de 4, 8 y 16 vCPU difieren en menos de un 8 %. La memoria, a través de la caché de páginas compartida sobre el árbol de TeX Live, marca el límite; los núcleos solo empiezan a importar cuando la memoria es abundante.
+
+En segundo lugar, dos parámetros de software pesan más que el hardware. Eliminar el techo codificado de 65 compilaciones de CLSI y elevar el tiempo de espera de compilación predeterminado de 180 s llevó a un invitado de 8 vCPU / 48 GiB de 64 a 268 compilaciones concurrentes: un factor de 4,2 sin hardware adicional. Ninguno de los dos puede descubrirse a partir de la documentación de configuración; uno de ellos ni siquiera es configurable.
+
+En tercer lugar, la pregunta «cuántos usuarios concurrentes admite esta máquina» está infraespecificada. La concurrencia en este sistema es tiempo compartido puro, y la capacidad es la que admita el tiempo de espera. La forma honesta de la respuesta indica ambos: _esta máquina atiende_ $N$ _compilaciones simultáneas si los usuarios están dispuestos a esperar_ $T$ _segundos_, con $N$ y $T$ relacionados mediante la ecuación (1).
+
+También informamos de un defecto latente: el límite de memoria por contenedor del Docker runner ha sido ineficaz desde 2018, tanto por su magnitud como por su ubicación. Su efecto práctico es que el agotamiento de memoria en un despliegue pequeño tumba todo el servicio en lugar de solo la compilación responsable.
+
+## Referencias
+
+\[1] Overleaf. _Hardware requirements_, documentación on-premises. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, documentación on-premises. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, documentación on-premises. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Repositorio de código fuente_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Informes de profesionales sobre latencia sostenida en plataformas de redacción asistida por agentes que ubican un agente de programación persistente junto al compilador de LaTeX en un sandbox por usuario. Lo citamos como experiencia operativa reportada, no como una medición controlada; no hemos hecho un benchmark de una plataforma de este tipo.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

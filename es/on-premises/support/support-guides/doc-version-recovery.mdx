@@ -1,0 +1,158 @@
+---
+title: (Migración v5.0.1) Recuperación de versiones de documentos
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Si nunca ejecutaste Server Pro versión 5.0.1 o Community Edition versión 5.0.1, o si iniciaste una instancia completamente nueva con la 5.0.1, no necesitas ejecutar este proceso de recuperación.
+
+</Info>
+
+**Actualizaciones de esta página:**
+
+* (2024-04-22 13:40 BST): se añadió el paso "Detener la entrada de nuevas actualizaciones en el sistema y volcar todos los cambios en MongoDB".
+* (2024-04-23 11:45 BST): se tienen en cuenta los volcados fallidos en la 5.0.1 y se omiten los volcados si se llegó a iniciar la 5.0.2.
+
+La duración de la recuperación dependerá del número y el tamaño de los proyectos de tu instancia y del backend de almacenamiento que use el almacén de historial para los chunks (según lo definido en `OVERLEAF_HISTORY_CHUNKS_BUCKET`).
+
+El proceso de recuperación retrasará el inicio de la aplicación dentro del contenedor de Server Pro. Durante ese tiempo, el sitio aparecerá fuera de línea. Solo admitimos ejecutar la recuperación desde una única instancia del contenedor de Server Pro; todos los demás workers de escalado horizontal deben estar desconectados.
+
+Puedes detener y reanudar el proceso de recuperación si es necesario.
+
+Según nuestras pruebas de rendimiento, el proceso de recuperación puede procesar aproximadamente 10 000 proyectos pequeños por minuto en hardware moderno (CPU a 3 GHz y almacenamiento NVMe local). Por ejemplo, para una instancia con 100 000 proyectos, programa una ventana de mantenimiento que permita al menos 10+2 minutos de inactividad. Usa la siguiente consulta para estimar el número de proyectos de tu instancia:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Lee por completo los siguientes pasos de recuperación antes de empezar. Los clientes de Server Pro pueden escribir a [support@overleaf.com](mailto:support@overleaf.com) con cualquier pregunta.
+
+### Proceso de recuperación
+
+<Steps>
+<Step title="Descargar las imágenes de la versión">
+Descarga las imágenes de la versión `5.0.3`.
+</Step>
+
+<Step title="Identificar algunos proyectos">
+Identifica por su id algunos proyectos a los que les falte el historial; lo ideal es que tengas permiso para modificar uno de ellos.
+</Step>
+
+<Step title="Programar el mantenimiento">
+Programa una ventana de mantenimiento para el tiempo de inactividad.
+</Step>
+
+<Step title="Detener todos los workers excepto uno">
+Detén todos los workers excepto uno si usas una configuración de escalado horizontal.
+</Step>
+
+<Step title="Detener las nuevas actualizaciones y volcar todos los cambios en MongoDB">
+Impide que entren nuevas actualizaciones en el sistema y vuelca todos los cambios en MongoDB:
+
+1. Cierra el editor y desconecta manualmente a todos los usuarios desde el panel de administración en `https://my-server-pro.example.com/admin#open-close-editor`, en la pestaña "Open/Close Editor".
+2.  Detén el servicio de Websocket/tiempo real.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Espera a que el servicio de tiempo real termine, lo que se indica con `down:`.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Detén el contenedor de git-bridge si está habilitado.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  Si nunca ejecutaste la 5.0.2: lanza un volcado manual de las actualizaciones de documentos y espera a que termine correctamente.
+
+    Puedes repetir el comando si se produce un error. Si ves un `failureCount` distinto de cero en ejecuciones sucesivas, detén la migración (restaura los servicios con `docker restart git-bridge sharelatex`) y ponte en contacto con el soporte.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  Si nunca ejecutaste la 5.0.2: asegúrate de que todos los cambios se hayan volcado fuera de redis.
+
+    Si obtienes cualquier salida de `redis-cli`, detén la migración (restaura los servicios con `docker restart git-bridge sharelatex`) y ponte en contacto con el soporte.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Intenta volcar los cambios de historial pendientes.
+
+    Este volcado se hará en la medida de lo posible, ya que algunos proyectos tienen el historial dañado debido a la migración defectuosa de la base de datos. Cualquier fallo se resolverá con una resincronización del historial al final del proceso de recuperación.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Hacer una copia de seguridad">
+Considera hacer una [copia de seguridad coherente](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) de la instancia.
+</Step>
+
+<Step title="Actualizar">
+Actualiza a la versión `5.0.3`.
+</Step>
+
+<Step title="Recuperación automática">
+El proceso de recuperación se ejecuta automáticamente al iniciar el contenedor.
+</Step>
+
+<Step title="Seguir el progreso">
+Puedes seguir el progreso del script consultando en tiempo real el archivo de registro `/var/lib/overleaf/data/history/doc-version-recovery.log`. Mostrará el número total de proyectos al principio y un resumen cada 1000 proyectos procesados.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Esperar a que termine el proceso de recuperación">
+Espera a que termine el proceso de recuperación, ya sea siguiendo el archivo de registro anterior hasta que aparezca una línea `Done.` o esperando a que se muestre `Finished recovery of doc versions.` en la salida estándar del contenedor de Server Pro.
+</Step>
+
+<Step title="Validar el proceso de recuperación">
+Valida el proceso de recuperación abriendo el panel de historial de algunos de los proyectos a los que antes les faltaba el historial.
+
+1.  Agiliza la resincronización de los proyectos que vayas a probar (se procesarán tarde o temprano, pero no queremos esperar a que les llegue el turno).
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Repite el comando con cada uno de los ids de proyecto que quieras probar, sustituyendo `000000000000000000000000` por un id de proyecto cada vez).
+2. Abre el editor de cada proyecto: `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Abre el panel "History" del proyecto y comprueba el contenido más reciente.
+4. Opcional: cierra de nuevo el panel "History". Haz un cambio en el código, por ejemplo, añade un comentario en la cabecera.
+5. Opcional: vuelve a compilar para forzar el volcado del cambio local. Abre de nuevo el panel "History" y comprueba el cambio. Cuando termines, deshaz el cambio.
+</Step>
+
+<Step title="En el escalado horizontal...">
+Vuelve a iniciar los demás workers.
+</Step>
+
+<Step title="Mantener la instancia en ejecución">
+Mantén en ejecución la instancia que ejecutó el proceso de recuperación. Resincronizará en segundo plano el historial de todos los proyectos con una concurrencia de 1. Esto provocará una carga base ligeramente elevada. (Puedes reiniciar la instancia, pero tendrá que volver a empezar las resincronizaciones).
+</Step>
+
+<Step title="Avísanos cuando hayas terminado">
+Clientes de Server Pro: informad al equipo de soporte cuando hayáis completado el proceso de recuperación.
+</Step>
+</Steps>

@@ -1,0 +1,123 @@
+---
+title: Configurar compilaciones en sandbox
+icon: box-archive
+---
+
+Hay algunas diferencias entre el entorno de desarrollo y el de producción si quieres configurar compilaciones en sandbox para desarrollo. Hay 3 cosas que debes tener en cuenta:
+
+* Problema de permisos de archivos
+* Volumen compartido entre history-v1 y filestore
+* Problema de subdirectorios
+
+### Habilitar compilaciones en sandbox
+
+Aquí solo tenemos que habilitar las compilaciones en sandbox igual que en Overleaf CE. Sin embargo, debemos prestar atención al usuario. En este caso lo establecemos en root.
+
+En el entorno de producción usamos www-data como usuario compartido entre el contenedor de Overleaf y el contenedor de compilación de TeX. Sin embargo, en el entorno de desarrollo, node es el usuario predeterminado del contenedor y no existe ningún usuario www-data con el que enlazarlo. Por eso usamos root como solución alternativa.
+
+<Warning>
+
+No uses tu propia imagen compilada; podrías encontrarte con una serie de errores.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Corregir los permisos de archivos
+
+LaTeX se ejecuta en los contenedores hermanos como el usuario especificado en la variable de entorno `TEXLIVE_IMAGE_USER`. En el ejemplo anterior está establecida en `root`, que tiene el uid `0`. Esto genera un problema con los permisos anteriores, ya que el usuario root no tiene permiso para escribir en las subcarpetas de `compiles`.
+
+Una solución rápida es dar al grupo `root` la propiedad y permisos de lectura y escritura sobre `compiles`, con `setgid` establecido para que las nuevas subcarpetas también hereden esta propiedad:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Para obtener documentación detallada, consulta `services/clsi/README.md`.
+
+### Volumen compartido entre history-v1 y filestore
+
+De forma predeterminada, filestore actúa como puente entre S3 y los demás servicios de Overleaf. Sin embargo, en Overleaf CE o Server Pro, todos los archivos se almacenan localmente de forma predeterminada. Por ello, Overleaf introdujo un método muy ingenioso.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Al mismo tiempo, `data/history` también lo usa el servicio de historial. De esta forma, pueden compartir los mismos datos entre distintos microservicios. Debes añadir este volumen `history-v1-buckets` a tu servicio filestore en desarrollo. De lo contrario, **clsi no podrá obtener los archivos blob del servicio filestore**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+También debes añadir el nombre del BUCKET a la configuración de `dev.env`:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Usar subdirectorios
+
+Filestore usa useSubdirectories con valor true de forma predeterminada; sin embargo, en desarrollo, history v1 **aplana todos los datos.** Esto provoca algunos conflictos. Para solucionarlo, debes añadir lo siguiente:&#x20;
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+En history v1, todos los archivos de `project_blobs` se almacenan originalmente así:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Debes establecer useSubdirectories en `true` para cambiar al modo de subdirectorios. Ahora, el `_` original en el blob se sustituirá por `/`.

@@ -1,0 +1,151 @@
+---
+title: 마이크로서비스
+icon: microchip
+---
+
+Overleaf Server CE 및 Overleaf Pro 인스턴스를 배포하고 관리하는 권장 방법은 Toolkit을 사용하는 것입니다.
+
+Toolkit은 필요한 마이크로서비스의 오케스트레이션을 추상화하는 몇 가지 사용자 지정 스크립트를 통해 Overleaf 인스턴스 생성을 간소화합니다. 번들로 제공되는 초기화 스크립트를 실행하고 영구 저장소 경로 같은 몇 가지 구성 옵션만 지정하면, Toolkit이 Overleaf Server CE 또는 Pro 인스턴스를 구성하는 마이크로서비스의 프로비저닝과 연결을 처리합니다.
+
+덕분에 사용자 경험을 맞춤화하고 온프레미스 인스턴스에 필요한 특정 기능을 구현하는 데 집중할 수 있습니다. Toolkit이 내부의 모든 복잡한 작업을 처리하므로 Overleaf 인스턴스를 간단하게 배포할 수 있습니다.
+
+<Info>
+
+역사적인 이유로 메인 Overleaf 컨테이너의 이름은 `sharelatex`이며, `sharelatex/sharelatex` Docker 이미지를 기반으로 합니다. 이는 이 기술이 Overleaf에 합병된 ShareLaTeX 코드베이스를 기반으로 하기 때문입니다. 자세한 내용은 [이 블로그 게시물](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf)을 참조하세요. 향후 언젠가 Overleaf 명명 체계에 맞게 이름이 변경될 예정입니다.
+
+</Info>
+
+#### 아키텍처
+
+Overleaf 컨테이너 내부에서 소프트웨어는 `runit`이 관리하는 마이크로서비스 집합으로 실행됩니다. 컨테이너 내부의 주요 파일은 다음과 같습니다.
+
+* `/etc/service/`: 마이크로서비스 초기화 파일
+* `/var/log/overleaf/`: 각 마이크로서비스의 로그
+* `/overleaf/services/`: 다양한 마이크로서비스의 코드
+* `/var/lib/overleaf/`: 영구 데이터 마운트 지점(호스트의 `OVERLEAF_DATA_PATH`가 가리키는 디렉터리에 해당)
+
+#### MongoDB 및 Redis 컨테이너
+
+Overleaf는 MongoDB와 Redis라는 두 개의 외부 데이터베이스에 의존합니다. 기본적으로 Toolkit은 Overleaf 컨테이너 외에도 각 데이터베이스용 컨테이너를 하나씩 프로비저닝하므로, 총 세 개의 Docker 컨테이너가 실행됩니다.
+
+<Info>
+
+기존 MongoDB 또는 Redis 인스턴스에 연결하려면 [overleaf.rc](/ko/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file) 구성 파일에서 해당 설정을 지정하면 됩니다.
+
+</Info>
+
+#### 에디터 및 컴파일 프로세스
+
+이 섹션에서는 문서 처리와 컴파일 프로세스의 전반적인 개요를 설명합니다.
+
+<Info>
+
+이 페이지는 Overleaf Pro에서만 사용할 수 있는 샌드박스 컴파일 기반의 컴파일 프로세스를 설명합니다. Server CE에서는 컴파일 프로세스가 단순한 하위 프로세스를 사용합니다. **컨테이너**를 언급하는 항목을 **하위 프로세스에서 컴파일 실행**이라는 단일 항목으로 바꿔 생각하면 됩니다.
+
+</Info>
+
+구성 요소 / 행위자:
+
+* `user` — 애플리케이션 사용자
+* `editor` — 브라우저에서 실행되는 클라이언트 애플리케이션
+* `clsi` — PDF 컴파일에 사용되는 마이크로서비스
+* `document-updater` — 문서 업데이트 처리에 사용되는 마이크로서비스
+* `filestore` — 바이너리 파일을 처리하는 마이크로서비스
+* `real-time` — 웹 소켓 처리에 사용되는 마이크로서비스
+* `web` — API 요청 처리에 사용되는 (그다지 마이크로하지 않은) 서비스
+
+**Redis 캐싱**
+
+* **user**: 에디터 페이지를 로드
+* **editor**: 웹 소켓을 엶
+* **editor**: 웹 소켓을 통해 문서 열기 요청을 보냄
+  * **real-time** -> **document-updater**: 문서를 MongoDB에서 Redis로 로드
+* **editor**: 웹 소켓을 통해 문서 업데이트를 보냄
+  * **real-time** -> **document-updater**: Redis에서 문서를 업데이트
+* **editor**: 추가 컴파일 요청을 보냄
+  * 마지막 플러시 이후 5분이 지나면(문서별):
+    * **document-updater**: 문서를 Redis에서 MongoDB로 플러시
+* **editor**: 추가 업데이트를 보냄
+  * 업데이트 100건마다(문서별):
+    * **document-updater**: 문서 기록을 Redis에서 MongoDB로 플러시
+* **user**: 에디터를 떠나거나 브라우저 탭을 닫음
+  * 5분 후
+    * **real-time**: 다른 공동 작업자가 있는지 확인하고, 없으면:
+      * **real-time** -> **document-updater**: 문서를 Redis에서 MongoDB로 플러시
+
+**MongoDB에서 Redis로 읽기**
+
+* **document-updater** -> **web** -> **docstore**: MongoDB에서 읽기
+
+**Redis에서 MongoDB로 플러시**
+
+* **document-updater** -> **web** -> **docstore**: MongoDB에 쓰기
+
+**컴파일 — "full" 동기화 모드**
+
+* **editor**: 동기화 모드를 "full"로 설정한 컴파일 요청을 보냄
+* **web** -> **document-updater**: 모든 문서를 Redis에서 MongoDB로 플러시
+* **web** -> **docstore**: MongoDB에서 모든 문서를 다운로드
+* **web** -> **clsi**: 다음을 포함한 컴파일 요청을 `clsi`로 전송:
+  * 동기화 모드
+  * 파일 트리의 해시 -> "프로젝트 상태"
+  * 내용을 포함한 모든 문서 -> 요청 본문 7MB 제한 적용
+  * 별도 다운로드를 위한 바이너리 파일 URL
+* **clsi**: 동기화 모드와 "프로젝트 상태"로 디스크 상태를 확인
+  * full 동기화이므로 이전 디스크 상태는 무시 가능
+* **clsi**: 컴파일 디렉터리 정리
+* **clsi**: 모든 문서를 컴파일 디렉터리에 기록
+* **clsi**: 모든 바이너리 파일을 컴파일 디렉터리에 기록
+  * `clsi`는 프로젝트별 로컬 캐시에서 파일을 복사
+  * 캐시 미스 시:
+    * **clsi** -> **filestore**: 파일 다운로드
+* **clsi**: "프로젝트 상태" 기록
+* **clsi**: 원하는 구성의 Docker 컨테이너가 존재하는지 확인
+  * texlive 버전을 포함한 컨테이너 옵션 구성
+  * 옵션 해시
+  * 컨테이너 이름: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: 컨테이너를 시작하고 stdout/stderr를 메모리로 스트리밍 -> 2MB 제한
+* **clsi**: 중지된 컨테이너를 남겨 둠 -> 24시간 후 정리
+* **clsi**: stdout/stderr를 디스크에 기록
+* **clsi**: 출력 파일을 고유한 출력 디렉터리로 복사
+  * build-id는 무작위 8바이트와 밀리초 정밀도의 타임스탬프로 구성
+  * 마지막 3개(익명 사용자) / 마지막 1개(로그인 사용자)를 제외한 모든 빌드 폴더 삭제
+* **clsi**: 컴파일 실패/시간 초과 시
+  * 컴파일 캐시 삭제 — 일부 파일만 있거나 캐시가 손상되었을 수 있음
+* **editor**: output.log 및 output.pdf 다운로드
+
+**컴파일 — "incremental" 동기화 모드**
+
+* **editor**: 동기화 모드를 "incremental"로 설정한 컴파일 요청을 보냄
+* **web** -> **document-updater**: Redis에서 모든 문서를 가져옴
+  * "프로젝트 상태" 해시도 Redis에 저장됨
+  * **web**은 파일 트리의 해시를 `document-updater`로 보내며, 불일치 시 `document-updater`는 증분 컴파일을 전체 컴파일로 전환할 수 있음
+    * 에디터가 "full" 컴파일을 요청했을 때 수행되는 컴파일 프로세스 참조
+* **web** -> **clsi**: 다음을 포함한 컴파일 요청을 `clsi`로 전송:
+  * 동기화 모드
+  * 파일 트리의 해시 -> "프로젝트 상태"
+  * Redis의 모든 문서와 그 내용 -> 요청 본문 7MB 제한 적용
+  * 바이너리 파일 없음
+* **clsi**: 동기화 모드와 "프로젝트 상태"로 디스크 상태를 확인
+  * 증분 동기화이므로 "프로젝트 상태"가 일치해야 함
+  * 불일치 시: 409로 응답하고 web이 "full" 동기화로 재시도하도록 함
+    * 에디터가 "full" 컴파일을 요청했을 때 수행되는 컴파일 프로세스 참조
+* **clsi**: 업데이트된 문서를 컴파일 디렉터리에 기록
+* **clsi**: 원하는 구성의 Docker 컨테이너가 존재하는지 확인
+  * texlive 버전을 포함한 컨테이너 옵션 구성
+  * 옵션 해시
+  * 컨테이너 이름: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: 컨테이너를 시작하고 stdout/stderr를 메모리로 스트리밍 -> 2MB 제한
+* **clsi**: 중지된 컨테이너를 남겨 둠 -> 24시간 후 정리
+* **clsi**: stdout/stderr를 디스크에 기록
+* **clsi**: 출력 파일을 고유한 출력 디렉터리로 복사
+  * build-id는 무작위 8바이트와 밀리초 정밀도의 타임스탬프로 구성
+  * 마지막 3개(익명 사용자) / 마지막 1개(로그인 사용자)를 제외한 모든 빌드 폴더 삭제
+* **clsi**: 컴파일 실패/시간 초과 시
+  * 컴파일 캐시 삭제 — 일부 파일만 있거나 캐시가 손상되었을 수 있음
+* **editor**: output.log 및 output.pdf 다운로드
+
+**컴파일 — 모드 간 전환**
+
+* **editor**: 컴파일 실패를 감지하면 다음 컴파일은 "full" 컴파일
+* **editor**: 컴파일 성공을 감지하면 다음 컴파일은 "incremental" 컴파일
