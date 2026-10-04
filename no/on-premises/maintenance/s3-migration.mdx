@@ -1,0 +1,179 @@
+---
+title: S3-migrering
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+## S3-migrering
+
+<Info>
+
+Disse instruksjonene gjelder for v5.x og nyere. Hvis du følger denne veiledningen for en tidligere versjon, bruker du `sharelatex` i stedet for `overleaf` i stinavn og prefikset `SHARELATEX_` i stedet for `OVERLEAF_` for miljøvariabler.
+
+</Info>
+
+<Check>
+
+**Vi vil gjerne høre fra deg!** Hvis du vil fortelle oss hvor mange filer du migrerte, hvor stort det samlede volumet var, og hvor lang tid migreringen tok, kan du sende en e-post til [`ayaka-notes@outlook.com`](mailto:support@overleaf.com) .
+
+</Check>
+
+Denne veiledningen tar deg gjennom migreringen fra lagring på disk til en S3-kompatibel objektlagring. Den viser til deler av introduksjonsdokumentet om [S3-oppsett](/no/on-premises/configuration/overleaf-toolkit/s3).
+
+### Krav
+
+* En S3-kompatibel objektlagring å kommunisere med, se [#s3-setup](/no/on-premises/configuration/overleaf-toolkit/s3#s3-setup  "mention") for alternativer
+* Ledig diskplass for migrering av eksisterende data, omtrent like mye som nåværende størrelse på disk
+* Et vedlikeholdsvindu for selve migreringen
+* En fullstendig sikkerhetskopi, inkludert konfigurasjonen, slik at det er mulig å gjenopprette fra den
+
+### Anslå diskplassen som trengs for migreringen
+
+Vi kan bruke `du` til å beregne nåværende diskbruk:
+
+```shell
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/user_files
+
+docker exec sharelatex \
+  du --human-readable --max-depth=0 /var/lib/overleaf/data/template_files
+```
+
+Hvis du ikke har nok ledig diskplass på den nåværende serveren, kan du prøve å koble en ekstra disk til serveren.
+
+<Info>
+
+Historikkatalogene har allerede riktig struktur. Du kan laste opp direkte fra den bind-monterte kildemappen, noe som ikke krever ekstra diskplass.
+
+</Info>
+
+### Migreringstrinn
+
+#### Trinn 0: slå av instansen
+
+Vi må sørge for at alle bruker-/malfiler blir migrert. Det er best å slå av instansen for å unngå at nylig opplastede filer går tapt.
+
+Se veiledningen vår om å ta en konsistent sikkerhetskopi for fremgangsmåten for avslutning.
+
+#### Trinn 1: skriv om katalogstrukturen
+
+Vi må skrive om katalogstrukturen for prosjektfiler for å kunne laste dem opp til S3. Katalogstrukturen for lokal lagring i filestore er `<project-id>_<file-id>`, mens katalogstrukturen i S3 er `<project-id>/<file-id>`.
+
+I det følgende brukes `/srv/overleaf-s3-migration` til å lagre filene i den nye katalogstrukturen.
+
+Vi kan bruke `tar` til å skrive om strukturen:
+
+```shell
+mkdir -p /srv/overleaf-s3-migration/user_files \
+         /srv/overleaf-s3-migration/template_files
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/user_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/user_files \
+  --transform=sx_x/x
+docker exec sharelatex \
+  tar --create --directory /var/lib/overleaf/data/template_files . \
+| tar --extract --directory /srv/overleaf-s3-migration/template_files \
+  --transform=sx_x/xg
+```
+
+#### Trinn 2: last opp filene
+
+Avhengig av hva du foretrekker, kan du bruke S3-klienten minio mc eller aws cli til å laste opp filene til den S3-kompatible objektlagringen.
+
+**aws cli**
+
+<Info>
+
+* Her bør du erstatte `overleaf-user-files`, `overleaf-template-files`, `overleaf-project-blobs` og `overleaf-chunks` med navnene på S3-bøttene dine.
+* Erstatt også `/srv/overleaf-bind-mount` med den lokale stien til bind-monteringen av `/var/lib/overleaf`. Som standard er dette `~/overleaf_data` i en docker-compose.yml-distribusjon og `<toolkit-checkout>/data/overleaf` når du bruker Toolkit.
+
+</Info>
+
+```shell wrap
+aws s3 sync /srv/overleaf-s3-migration/user_files s3://overleaf-user-files
+aws s3 sync /srv/overleaf-s3-migration/template_files s3://overleaf-template-files
+
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3://overleaf-project-blobs
+aws s3 sync /srv/overleaf-bind-mount/data/history/overleaf-chunks s3://overleaf-chunks
+```
+
+**minio mc**
+
+Vi bruker serveraliaset "s3" her; du kan ha valgt et annet navn.
+
+```shell wrap
+mc mirror /srv/overleaf-s3-migration/user_files s3/overleaf-user-files
+mc mirror /srv/overleaf-s3-migration/template_files s3/overleaf-template-files
+
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-project-blobs s3/overleaf-project-blobs
+mc mirror /srv/overleaf-bind-mount/data/history/overleaf-chunks s3/overleaf-chunks
+```
+
+#### Trinn 3: start instansen med peking mot S3
+
+Legg til alle S3-relaterte variabler i konfigurasjonen, som beskrevet i delen [Oversikt over variabler](/no/on-premises/configuration/overleaf-toolkit/s3#overview-of-variables) i oppsettsveiledningen for [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3).
+
+For Docker Compose-distribusjoner kan du også fjerne bind-monteringen for datakatalogen fra volumes-delen.
+
+<Check>
+
+Behold [bind-monteringen av en scratch-disk for flyktige filer](/no/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem).
+
+</Check>
+
+Du kan nå starte instansen og validere migreringen:
+
+* binærfiler kan forhåndsvises i editoren
+* en PDF med bilder kan kompileres
+* nye filer kan lastes opp
+
+### Tilbakerulling
+
+Du kan rulle tilbake migreringen på en kontrollert måte ved å reversere trinnene:
+
+1. Slå av instansen
+2. Speil filene tilbake ved å bytte om rekkefølgen på kilde/mål
+3. Skriv nye filer tilbake til den lokale katalogen ved hjelp av en omvendt `transform`
+4. Start instansen på nytt med den gamle konfigurasjonen
+
+```shell wrap
+# When using aws cli
+aws s3 sync s3://overleaf-user-files /srv/overleaf-s3-migration/user_files
+aws s3 sync s3://overleaf-template-files /srv/overleaf-s3-migration/template_files
+aws s3 sync s3://overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+aws s3 sync s3://overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+
+# When using minio mc
+mc mirror s3/overleaf-user-files /srv/overleaf-s3-migration/user_files
+mc mirror s3/overleaf-template-files /srv/overleaf-s3-migration/template_files
+mc mirror s3/overleaf-project-blobs /srv/overleaf-bind-mount/data/history/overleaf-project-blobs
+mc mirror s3/overleaf-chunks /srv/overleaf-bind-mount/data/history/overleaf-chunks
+```
+
+```shell
+# Write files into local Server CE/Server Pro
+tar --create --directory /srv/overleaf-s3-migration/user_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/user_files \
+      --transform=sx./xx --transform=sx/x_x \
+      --wildcards '*/*/*'
+
+tar --create --directory /srv/overleaf-s3-migration/template_files . \
+| docker exec --interactive sharelatex \
+    tar \
+      --extract \
+      --keep-old-files \
+      --directory /var/lib/overleaf/data/template_files \
+      --transform=sx./xx --transform=sx/x_xg \
+      --wildcards '*/*/*/*/pdf-converted-cache/*' \
+      --wildcards '*/*/*/*/pdf' \
+      --wildcards '*/*/*/*/zip'
+```
+
+<Info>
+
+Den første transformasjonen fjerner mappen på øverste nivå. Den andre transformasjonen endrer katalogstrukturen til en flat struktur. Jokertegnene sørger for at bare filer pakkes ut, ikke de overordnede (prosjekt)mappene deres.
+
+</Info>

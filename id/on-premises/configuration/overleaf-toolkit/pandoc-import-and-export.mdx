@@ -1,0 +1,130 @@
+---
+title: Impor dan Ekspor Pandoc
+icon: file-lines
+---
+
+### Impor / Ekspor Pandoc
+
+Overleaf dapat mengonversi dokumen dari dan ke LaTeX menggunakan [Pandoc](https://pandoc.org/). Konversi berjalan di dalam **kontainer Docker yang di-sandbox** dan dikelola oleh layanan `clsi`, sehingga fitur ini nonaktif secara default dan harus diaktifkan dengan beberapa variabel lingkungan.
+
+#### Apa yang dilakukannya
+
+| Arah  | Dari → Ke                | Format                    | Lokasi                                                                                           |
+| ---------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Impor** | dokumen → proyek LaTeX | `docx`, `markdown`         | _New Project → Import_ (mengunggah `.docx` / `.md` dan mengubahnya menjadi proyek `.tex` yang dapat disunting) |
+| **Ekspor** | proyek LaTeX → dokumen | `docx`, `markdown`, `html` | _Menu → Download / Export_ (merender proyek melalui Pandoc)                                 |
+
+***
+
+### Variabel lingkungan
+
+Ada **dua** variabel yang penting, dan satu variabel yang mirip tetapi **tidak** berpengaruh.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — sakelar utama
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* Tipe: boolean (`true` mengaktifkannya; nilai lain menonaktifkannya).
+* **Harus diatur pada layanan `web` DAN `clsi`.** Keduanya adalah proses terpisah dengan konfigurasi terpisah:
+  * `web` membacanya ke dalam `enablePandocConversions` (`services/web/config/settings.defaults.js`). Variabel ini mengendalikan rute impor, rute ekspor, dan flag `ol-ExposedSettings.enablePandocConversions` yang memberi tahu frontend apakah UI Impor/Ekspor perlu ditampilkan.
+  * `clsi` membacanya ke dalam `enablePandocConversions` (`services/clsi/config/settings.defaults.cjs`). Variabel ini mengendalikan endpoint yang menjalankan Pandoc.
+* Jika diaktifkan di `web` tetapi tidak di `clsi` (atau sebaliknya), UI akan muncul tetapi konversi akan gagal — pastikan keduanya selalu selaras.
+
+2\. `PANDOC_IMAGE` — image kontainer yang dijalankan clsi untuk konversi
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### Prasyarat
+
+Karena konversi berjalan sebagai kontainer Docker yang dijalankan oleh `clsi`:
+
+1. **`clsi` harus berjalan dalam mode sandbox dengan akses Docker.** Pada stack pengembangan, `clsi` sudah memiliki `SANDBOXED_COMPILES=true` dan socket Docker host (`/var/run/docker.sock`) sudah di-mount.
+2. **`PANDOC_IMAGE` harus tersedia** di host Docker tersebut (di-pull atau dibangun secara lokal) sebelum konversi pertama.
+
+***
+
+### Penyiapan cepat
+
+Stack pengembangan (`develop/dev.env`) sudah disertai dengan:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+Karena image resminya bersifat privat, bangun image bawaan **satu kali** sebelum menggunakan fitur ini:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Kemudian jalankan (ulang) stack agar `clsi` dan `web` membaca variabel tersebut.
+
+***
+
+### Membangun image Pandoc
+
+Image Pandoc standar sudah dapat digunakan karena clsi memanggil Pandoc secara generik (tanpa templat/filter khusus). Image ini hanya membutuhkan tiga hal penting saat runtime, yang semuanya ditangani oleh `develop/pandoc/Dockerfile`:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+Bangun dan beri tag agar tag-nya sesuai dengan `PANDOC_IMAGE`:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Untuk produksi, kunci `pandoc/core` ke versi tertentu alih-alih `latest` agar build dapat direproduksi, dan atur `PANDOC_IMAGE` ke path registry Anda.
+
+***
+
+### Pemecahan masalah
+
+| Gejala                                             | Kemungkinan penyebab                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Tombol Impor/Ekspor tidak muncul                  | `ENABLE_PANDOC_CONVERSIONS` tidak bernilai `true` di **web**                                             |
+| UI muncul tetapi konversi gagal dengan error server | `ENABLE_PANDOC_CONVERSIONS` tidak diatur di **clsi**, atau `PANDOC_IMAGE` tidak ada di host Docker |
+| `clsi` gagal menarik image (401)                | `PANDOC_IMAGE` masih menunjuk ke default yang privat; bangun/arahkan ke image Anda sendiri             |
+| Kontainer menjalankan `pandoc pandoc …` / argumen salah       | Image memiliki `ENTRYPOINT` `pandoc`; gunakan `ENTRYPOINT []`                                        |
+| Output impor kosong / langkah zip gagal             | `zip` tidak terpasang di image                                                           |
+| Error izin pada file hasil konversi                | Image tidak memiliki pengguna `tex` dengan UID 1000                                                           |

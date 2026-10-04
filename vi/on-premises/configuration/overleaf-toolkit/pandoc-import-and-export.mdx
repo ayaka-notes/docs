@@ -1,0 +1,130 @@
+---
+title: Nhập và xuất bằng Pandoc
+icon: file-lines
+---
+
+### Nhập / Xuất bằng Pandoc
+
+Overleaf có thể chuyển đổi tài liệu sang và từ LaTeX bằng [Pandoc](https://pandoc.org/). Quá trình chuyển đổi chạy bên trong một **Docker container được sandbox** do dịch vụ `clsi` quản lý, vì vậy tính năng này bị tắt theo mặc định và phải được bật bằng một vài biến môi trường.
+
+#### Tính năng này làm gì
+
+| Chiều  | Từ → Sang                | Định dạng                    | Vị trí                                                                                           |
+| ---------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Nhập** | tài liệu → dự án LaTeX | `docx`, `markdown`         | _New Project → Import_ (tải lên một tệp `.docx` / `.md` và chuyển nó thành một dự án `.tex` có thể chỉnh sửa) |
+| **Xuất** | dự án LaTeX → tài liệu | `docx`, `markdown`, `html` | _Menu → Download / Export_ (kết xuất dự án thông qua Pandoc)                                 |
+
+***
+
+### Biến môi trường
+
+Có **hai** biến quan trọng, và một biến trông giống nhưng **không** liên quan.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — công tắc chính
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* Kiểu: boolean (`true` để bật; mọi giá trị khác đều tắt).
+* **Phải được đặt trên CẢ HAI dịch vụ `web` và `clsi`.** Chúng là các tiến trình riêng biệt với cấu hình riêng biệt:
+  * `web` đọc biến này vào `enablePandocConversions` (`services/web/config/settings.defaults.js`). Nó kiểm soát các route nhập, các route xuất và cờ `ol-ExposedSettings.enablePandocConversions` cho frontend biết có hiển thị giao diện Import/Export hay không.
+  * `clsi` đọc biến này vào `enablePandocConversions` (`services/clsi/config/settings.defaults.cjs`). Nó kiểm soát các endpoint chạy Pandoc.
+* Nếu biến được bật trên `web` nhưng không bật trên `clsi` (hoặc ngược lại), giao diện sẽ xuất hiện nhưng quá trình chuyển đổi sẽ thất bại — hãy giữ chúng đồng bộ.
+
+2\. `PANDOC_IMAGE` — container image mà clsi chạy để chuyển đổi
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### Điều kiện tiên quyết
+
+Vì các lần chuyển đổi chạy dưới dạng Docker container do `clsi` khởi tạo:
+
+1. **`clsi` phải chạy ở chế độ sandbox và có quyền truy cập Docker.** Trong dev stack, `clsi` đã có `SANDBOXED_COMPILES=true` và Docker socket của máy chủ (`/var/run/docker.sock`) được mount sẵn.
+2. **`PANDOC_IMAGE` phải có sẵn** trên Docker host đó (được pull hoặc build cục bộ) trước lần chuyển đổi đầu tiên.
+
+***
+
+### Thiết lập nhanh
+
+Dev stack (`develop/dev.env`) đã có sẵn:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+Vì image chính thức là riêng tư, hãy build image đi kèm **một lần** trước khi sử dụng tính năng:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Sau đó khởi động (lại) stack để `clsi` và `web` nhận các biến.
+
+***
+
+### Build image Pandoc
+
+Một image Pandoc tiêu chuẩn là đủ dùng vì clsi gọi Pandoc theo cách chung (không có template/filter tùy chỉnh). Nó chỉ cần ba yếu tố thiết yếu khi chạy, tất cả đều được xử lý bởi `develop/pandoc/Dockerfile`:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+Build và gắn tag sao cho tag khớp với `PANDOC_IMAGE`:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Đối với production, hãy cố định `pandoc/core` ở một phiên bản cụ thể thay vì `latest` để build có thể tái lập, và đặt `PANDOC_IMAGE` thành đường dẫn registry của bạn.
+
+***
+
+### Khắc phục sự cố
+
+| Triệu chứng                                             | Nguyên nhân có thể                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Các nút Import/Export không xuất hiện                  | `ENABLE_PANDOC_CONVERSIONS` không phải `true` trên **web**                                             |
+| Giao diện xuất hiện nhưng chuyển đổi thất bại với lỗi máy chủ | `ENABLE_PANDOC_CONVERSIONS` chưa được đặt trên **clsi**, hoặc thiếu `PANDOC_IMAGE` trên Docker host |
+| `clsi` báo lỗi khi pull image (401)                | `PANDOC_IMAGE` vẫn trỏ đến image mặc định riêng tư; hãy build/trỏ đến image của riêng bạn             |
+| Container chạy `pandoc pandoc …` / sai tham số       | Image có `ENTRYPOINT` là `pandoc`; hãy dùng `ENTRYPOINT []`                                        |
+| Đầu ra khi nhập bị trống / bước zip thất bại             | `zip` chưa được cài trong image                                                           |
+| Lỗi quyền truy cập trên các tệp đã chuyển đổi                | Image không có người dùng `tex` với UID 1000                                                           |

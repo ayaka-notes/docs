@@ -1,0 +1,93 @@
+---
+title: Memperbarui Image TeX Live Full Secara Otomatis
+description: Gunakan cron untuk memperbarui image Docker TeX Live yang digunakan oleh compiler sandbox yang kompatibel dengan Overleaf.
+icon: arrows-rotate
+---
+
+Secara umum, setiap kali Anda menjalankan `bin/up`, [using-the-toolkit](/id/on-premises/installation/using-the-toolkit  "mention") akan secara otomatis memperbarui image TeX Live full kami. Agar tidak perlu memperbarui secara manual, Anda dapat mengotomatiskan pembaruan image TeX Live Sandbox menggunakan skrip berikut. Tambahkan sebagai cron job, dan pastikan pengguna cron memiliki izin untuk menjalankan `docker`. Jalankan `crontab -e` untuk menambahkan baris berikut di bagian akhir.
+
+```cron title="crontab -e"
+0 * * * * /usr/bin/flock -n /tmp/pull-texlive.lock /usr/local/bin/pull-texlive.sh
+```
+
+`flock -n` melewati eksekusi selama eksekusi sebelumnya masih memegang lock, sehingga pull yang lambat tidak akan pernah menumpuk.
+
+<Tabs>
+<Tab title="Koneksi Langsung">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+IMAGE="ghcr.io/ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) ====="
+
+if timeout 50m docker pull "$IMAGE:$tag"; then
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+
+<Tab title="Menggunakan Situs Mirror">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+MIRROR="ghcr.nju.edu.cn"
+CANONICAL="ghcr.io"
+REPO="ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) via $MIRROR ====="
+
+if timeout 50m docker pull "$MIRROR/$REPO:$tag"; then
+  # Retag to the canonical name the compiler is configured with. This only
+  # adds a second name for the same layers; nothing is copied.
+  docker tag "$MIRROR/$REPO:$tag" "$CANONICAL/$REPO:$tag"
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+</Tabs>
+
+**Mengapa rotasi per jam alih-alih menarik semuanya sekaligus**: tag ditentukan dari jam dinding (jumlah jam sejak epoch, modulo jumlah tag), sehingga job ini bersifat stateless — tidak ada yang mencatat "di mana kita terakhir berhenti", dan siklusnya akan menyesuaikan sendiri setelah reboot atau jam yang terlewat. Setiap eksekusi hanya menyentuh satu tag; jika digest registry tidak berubah, pull hanya berupa pemeriksaan manifest (`Image is up to date`) dan selesai dalam hitungan detik. Pembaruan nyata mengunduh paling banyak satu image per jam, dibatasi oleh `timeout 50m`, dan `docker image prune -f` membuang layer yang menjadi yatim akibat perpindahan tag.
+
+Untuk memeriksa apakah sinkronisasi berjalan dengan baik:
+
+```bash
+tail -20 /var/log/pull-texlive.log     # each run ends with "OK <tag>" or "FAIL <tag>"
+grep -c '^FAIL' /var/log/pull-texlive.log
+```
+
+Saat rilis TeX Live baru diterbitkan, tambahkan tag-nya ke array `TAGS` — panjang rotasi akan menyesuaikan secara otomatis. Jam-jam ketika host dimatikan akan dilewati, bukan diantrekan; tag yang terdampak cukup diperbarui pada giliran berikutnya.

@@ -1,0 +1,158 @@
+---
+title: (v5.0.1-migrering) Gendannelse af dokumentversioner
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Hvis du aldrig har kørt Server Pro version 5.0.1 eller Community Edition version 5.0.1, eller hvis du har startet en helt ny instans med 5.0.1, behøver du ikke at køre denne gendannelsesproces.
+
+</Info>
+
+**Opdateringer af denne side:**
+
+* (2024-04-22 13:40 BST): Tilføjet trinnet "Stop nye opdateringer fra at komme ind i systemet, og flush alle ændringer til MongoDB".
+* (2024-04-23 11:45 BST): Tager højde for mislykkede flushes i 5.0.1 og springer flushes over, hvis 5.0.2 er blevet startet.
+
+Varigheden af gendannelsen afhænger af antallet og størrelsen af projekterne i din instans samt af den lagringsbackend, som historiklageret bruger til chunks (som defineret i `OVERLEAF_HISTORY_CHUNKS_BUCKET`).
+
+Gendannelsesprocessen forsinker opstarten af applikationen i Server Pro-containeren. Sitet vil fremstå offline i den periode. Vi understøtter kun, at gendannelsen køres fra en enkelt instans af Server Pro-containeren; alle andre horisontalt skalerede workers skal være offline.
+
+Du kan stoppe og genoptage gendannelsesprocessen efter behov.
+
+Baseret på vores ydelsestest kan gendannelsesprocessen behandle cirka 10.000 små projekter i minuttet på moderne hardware (3 GHz CPU-clockfrekvens og lokal NVMe-lagring). For en instans med 100.000 projekter bør du f.eks. planlægge et vedligeholdelsesvindue, der giver mindst 10+2 minutters nedetid. Brug følgende forespørgsel til at anslå antallet af projekter i din instans:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Læs venligst alle de følgende gendannelsestrin igennem, før du går i gang. Server Pro-kunder er meget velkomne til at kontakte [support@overleaf.com](mailto:support@overleaf.com) med spørgsmål.
+
+### Gendannelsesproces
+
+<Steps>
+<Step title="Hent release-images">
+Hent release-imagesene for `5.0.3`.
+</Step>
+
+<Step title="Identificer nogle få projekter">
+Identificer nogle få projekter via id, som mangler historik; ideelt set har du rettigheder til at foretage en ændring i et af dem.
+</Step>
+
+<Step title="Planlæg vedligeholdelse">
+Planlæg et vedligeholdelsesvindue til nedetiden.
+</Step>
+
+<Step title="Stop alle workers undtagen én">
+Stop alle workers undtagen én, hvis du bruger en horisontalt skaleret opsætning.
+</Step>
+
+<Step title="Stop nye opdateringer, og flush alle ændringer til MongoDB">
+Stop nye opdateringer fra at komme ind i systemet, og flush alle ændringer til MongoDB:
+
+1. Luk editoren, og afbryd alle brugere manuelt via administrationspanelet på `https://my-server-pro.example.com/admin#open-close-editor` under fanen "Open/Close Editor".
+2.  Stop Websocket/real-time-tjenesten.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Vent på, at real-time-tjenesten afsluttes, hvilket angives med `down:`.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Stop git-bridge-containeren, hvis den er aktiveret.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  Hvis du aldrig har kørt 5.0.2: Udfør en manuel flush af dokumentopdateringer, og vent på, at den afsluttes med succes.
+
+    Du kan gentage kommandoen ved fejl. Hvis du ser en `failureCount` forskellig fra nul i flere kørsler i træk, skal du stoppe migreringen (gendan tjenesterne via `docker restart git-bridge sharelatex`) og kontakte support.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  Hvis du aldrig har kørt 5.0.2: Sørg for, at alle ændringer er flushet ud af redis.
+
+    Hvis du får noget output fra `redis-cli`, skal du stoppe migreringen (gendan tjenesterne via `docker restart git-bridge sharelatex`) og kontakte support.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Forsøg at flushe eventuelle ventende historikændringer.
+
+    Dette vil være en flush efter bedste evne, da nogle projekter har ødelagte historikker på grund af den fejlbehæftede databasemigrering. Eventuelle fejl håndteres med en gensynkronisering af historikken i slutningen af gendannelsesprocessen.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Tag en sikkerhedskopi">
+Overvej at tage en [konsistent sikkerhedskopi](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) af instansen.
+</Step>
+
+<Step title="Opgrader">
+Opgrader til version `5.0.3`.
+</Step>
+
+<Step title="Automatisk gendannelse">
+Gendannelsesprocessen kører automatisk, når containeren starter.
+</Step>
+
+<Step title="Følg fremskridtet">
+Du kan følge scriptets fremskridt ved at følge logfilen `/var/lib/overleaf/data/history/doc-version-recovery.log` med tail. Den udskriver det samlede antal projekter ved starten og et resumé for hver 1000 behandlede projekter.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Vent på, at gendannelsesprocessen er færdig">
+Vent på, at gendannelsesprocessen er færdig, enten ved at følge ovenstående logfil, indtil en linje med `Done.` er udskrevet, eller ved at vente på, at `Finished recovery of doc versions.` udskrives til standardoutput fra Server Pro-containeren.
+</Step>
+
+<Step title="Valider gendannelsesprocessen">
+Valider gendannelsesprocessen ved at åbne historikpanelet for nogle af de projekter, der tidligere manglede historik.
+
+1.  Fremskynd gensynkroniseringen for de projekter, der skal testes (de bliver behandlet på et tidspunkt, men vi vil ikke vente på, at det bliver deres tur.)
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Gentag med hvert af de projekt-id'er, der skal testes, og erstat `000000000000000000000000` med ét projekt-id ad gangen.)
+2. Åbn projekteditoren for projekterne `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Åbn panelet "History" for projektet, og se det seneste indhold.
+4. Valgfrit: Luk panelet "History" igen. Foretag en kodeændring, f.eks. ved at tilføje en kommentar i headeren.
+5. Valgfrit: Start en genkompilering for at udløse en flush af den lokale ændring. Åbn panelet "History" igen, og se ændringen. Fortryd ændringen, når du er færdig.
+</Step>
+
+<Step title="Ved horisontal skalering...">
+Start de andre workers igen.
+</Step>
+
+<Step title="Lad instansen køre">
+Lad den instans, der udførte gendannelsesprocessen, blive ved med at køre. Den gensynkroniserer historikken for alle projekter i baggrunden med en samtidighed på 1. Det medfører en let forhøjet grundbelastning. (Du kan genstarte instansen, men så skal den starte forfra med gensynkroniseringerne.)
+</Step>
+
+<Step title="Giv os besked, når du er færdig">
+Server Pro-kunder: Giv venligst supportteamet besked, når du har gennemført gendannelsesprocessen.
+</Step>
+</Steps>
