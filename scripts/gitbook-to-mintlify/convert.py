@@ -97,7 +97,8 @@ for key, _, d, prefix, _, _ in SECTIONS:
             title = (fm.get("title") or (m.group(1) if m else f[:-3])).strip()
             title = re.sub(r"\s*<a [^>]*></a>\s*", "", title)
             pages[os.path.normpath(p)] = {"id": route_for(prefix, rel), "title": title, "section": key, "base": base,
-                                          "published": key not in UNPUBLISHED, "icon": fm.get("icon")}
+                                          "published": key not in UNPUBLISHED, "icon": fm.get("icon"),
+                                          "hidden": bool(fm.get("hidden"))}
 
 # ---------------------------------------------------------------- output (only touch files that change)
 GENERATED = set()  # absolute paths written by this run
@@ -798,6 +799,8 @@ def node_to_nav(n, key, base=None):
         WARN.append(f"SUMMARY {key}: unresolved {n['target']}")
         return None
     listed.add(abs_t)
+    if pg["hidden"]:
+        return None  # GitBook `hidden: true`: reachable by link, never in the sidebar (children included)
     if n["label"] != pg["title"]:
         pg["sidebar"] = n["label"]
     if not n["children"]:
