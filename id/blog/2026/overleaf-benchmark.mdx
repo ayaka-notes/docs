@@ -1,0 +1,635 @@
+---
+title: 'Benchmark Overleaf: Riset Mendalam tentang Kompilasi LaTeX Konkuren di Overleaf (SaaS dan Self-host)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Abstrak
+
+Deployment Overleaf self-hosted umumnya diukur kapasitasnya dengan satu aturan praktis: satu inti CPU dan satu gigabyte memori per lima hingga sepuluh pengguna konkuren. Kami menunjukkan bahwa aturan ini bukan sekadar tidak presisi, melainkan keliru secara struktural, karena aturan tersebut mengasumsikan bahwa satu dimensi sumber daya menentukan kapasitas, padahal sebenarnya ada dua batas independen, dan karena dua parameter perangkat lunak — tidak satu pun berupa perangkat keras — mendominasi hasilnya hingga empat kali lipat.
+
+Kami mengukur deployment Ayakaleaf Pro v6.2.2 standar dengan kompilasi sandbox (TeX Live 2025) pada 21 konfigurasi CPU/memori di dalam guest QEMU/KVM yang inti host-nya dikunci pada clock 3.0 GHz. Beban kerjanya adalah tesis XeLaTeX nyata setebal 63 halaman yang dikompilasi secara bersamaan oleh hingga beberapa ratus akun pengguna yang berbeda. Kami menemukan bahwa di bawah 32 GiB memori guest, jumlah inti hampir tidak relevan — pada 16 GiB, kapasitas terukur guest 4, 8, dan 16 vCPU berbeda kurang dari 8% — dan bahwa kapasitas justru ditentukan oleh batas memori super-linear yang timbul dari page cache bersama atas pohon TeX Live.
+
+Untuk menguji apakah hukum-hukum ini tetap berlaku ketika skala berubah satu orde besaran, kami mengulang pengukuran pada satu server 64 inti dengan 995 GiB. Server ini menangani 1024 kompilasi dingin secara bersamaan dengan tingkat keberhasilan 100% — delapan kali jumlah thread-nya — dan kami tidak pernah mencapai batas atasnya. Angka yang berguna bukanlah batas atas itu, melainkan titik tekuk di bawahnya: latensi ekor bertambah 20–40% per penggandaan hingga $N=256$, lalu sebesar 190% pada $N=512$. Kapasitas yang dilaporkan sebagai "konkurensi terbesar yang tidak gagal" dengan demikian akan melebih-lebihkan titik operasi yang dapat digunakan hingga empat kali lipat. Pada mesin tersebut, memori tidak pernah menjadi sumber daya pembatas; batasnya adalah CPU bersama dengan laju daemon container dalam menerima sandbox baru, yang jenuh di sekitar 200 berapa pun jumlah kompilasi yang diminta.
+
+Kami juga mengidentifikasi dua efek tingkat implementasi yang tidak terlihat dalam perencanaan kapasitas. Pertama, CLSI menerapkan batas hard-coded sebesar 65 kompilasi simultan yang tidak diekspos melalui variabel lingkungan apa pun; di atas batas itu, pengguna langsung menerima HTTP 503 alih-alih dimasukkan ke antrean. Kedua, batas memori per container pada Docker runner tidak efektif sejak diperkenalkan pada 2018, baik dari segi besaran maupun penempatannya, sehingga kejadian kehabisan memori melumpuhkan seluruh host, bukan hanya satu kompilasi. Menghapus batas konkurensi dan menaikkan timeout kompilasi default dari 180 s menjadi 300 s meningkatkan kapasitas terukur guest 8 vCPU / 48 GiB dari 64 menjadi 268 kompilasi konkuren — peningkatan 4,2 kali tanpa biaya perangkat keras sama sekali.
+
+Terakhir, kami menunjukkan bahwa konkurensi dalam sistem ini tidak menghasilkan apa pun selain pembagian waktu (time-sharing), dan bahwa beban kerja hanya dibatasi oleh clock. Hukum degradasi hasil fitting $T(N)=T_1\max(1,N/C)^{b}$ menghasilkan $b=0.914$, mendekati perlambatan proporsional sempurna, dan pengukuran clock pada seluruh rentang 1.0–5.5 GHz mesin tersebut meringkas tiga puluh pengukuran ke dalam $T=(k/f)\max(1,N/C)$ dengan $k=27.9 GHz·s$ dan sebaran residu 5,1%. Clock 5,5× menghasilkan percepatan 5,5× tanpa penurunan hasil, dan dalam pengertian inilah clock dan inti memberikan hal yang berbeda: clock membuat kompilasi setiap pengguna lebih cepat, sedangkan inti hanya memungkinkan lebih banyak pengguna.
+
+## 1. Pendahuluan
+
+Overleaf adalah editor LaTeX kolaboratif yang dominan, dan distribusi on-premises-nya banyak di-deploy oleh universitas dan kelompok riset yang tidak dapat mengirim naskah yang belum dipublikasikan ke cloud pihak ketiga. Menentukan ukuran deployment semacam ini adalah pertanyaan praktis yang terus berulang: dengan anggaran perangkat keras tertentu, berapa banyak orang yang benar-benar dapat menekan "Recompile" pada saat yang sama?
+
+Panduan resmi berupa aturan linear — kira-kira satu inti dan satu gigabyte per lima hingga sepuluh pengguna konkuren — yang mengandaikan bahwa kapasitas berskala secara mulus dan bersamaan pada kedua sumber daya. Pengukuran kami membantah hal ini dalam tiga cara.
+
+### 1.1 Kapasitas ditentukan oleh dua batas independen, bukan satu
+
+Sebuah konfigurasi gagal karena memori habis, yang menyebabkan stack Overleaf itu sendiri mati dan mengembalikan HTTP 502, atau karena kompilasi melampaui timeout sisi server, yang menyebabkan CLSI melaporkan `timedout` sementara memori bergigabyte-gigabyte tidak terpakai. Kedua rezim ini memiliki perilaku penskalaan dan solusi yang sama sekali berbeda. Menambahkan inti ke konfigurasi yang dibatasi memori bukan hanya tidak efisien, tetapi terkadang kontraproduktif: kami mengukur konfigurasi di mana penambahan jumlah inti _mengurangi_ kapasitas, karena lebih banyak inti membuat kompilasi konkuren berjalan serempak sehingga puncak kebutuhan memorinya bertepatan alih-alih berselang-seling.
+
+### 1.2 Parameter perangkat lunak mendominasi perangkat keras
+
+Timeout kompilasi adalah field per pengguna di MongoDB yang nilai default-nya 180 s diam-diam membatasi konfigurasi yang dibatasi CPU. Menaikkannya menjadi 300 s melipatgandakan kapasitas terukur hingga 4,2 kali pada perangkat keras yang sama. Secara terpisah, CLSI menolak lebih dari 65 kompilasi simultan melalui konstanta hard-coded. Setiap studi kapasitas — dan setiap deployment — yang tidak memperhitungkan keduanya sebenarnya mengukur perangkat lunaknya, bukan mesinnya.
+
+### 1.3 Konkurensi adalah time-sharing, bukan paralelisme
+
+Karena kompilasi LaTeX bersifat single-threaded, melayani $N$ pengguna simultan pada $C$ inti tidak membuat sistem selesai lebih cepat; hal itu membuat setiap pengguna menunggu lebih lama secara proporsional. Pertanyaan "berapa banyak pengguna konkuren yang didukung" dengan demikian tidak terdefinisi dengan baik sampai kita menetapkan berapa lama pengguna bersedia menunggu. Kami membuat ketergantungan ini eksplisit dan mengukurnya.
+
+### 1.4 Kontribusi
+
+* Matriks kapasitas atas 21 konfigurasi CPU/memori yang diukur dalam kondisi clock terkunci dan terverifikasi melalui pengulangan, dengan batasan pengikat yang diidentifikasi per konfigurasi dari tanda kegagalannya.
+* Dua model hasil fitting: model kapasitas yang memisahkan batas memori super-linear dari batas atas CPU, dan model latensi yang menetapkan perilaku time-sharing murni.
+* Identifikasi dan konfirmasi eksperimental atas dua masalah implementasi dalam sistem yang di-deploy, termasuk batas memori container yang tidak berfungsi sejak 2018.
+* Kuantifikasi trade-off antara timeout kompilasi dan kapasitas, yang menurut kami harus dinyatakan bersama setiap angka konkurensi.
+
+## 2. Latar Belakang
+
+### 2.1 Jalur kompilasi
+
+Permintaan kompilasi Overleaf berjalan `web` $\rightarrow$ `clsi` $\rightarrow$ container kompilasi. Dalam deployment kompilasi sandbox (`SIBLING_CONTAINERS_ENABLED=true`), CLSI tidak menjalankan `latexmk` di dalam prosesnya sendiri; CLSI meminta Docker daemon host, yang dapat dijangkau melalui socket yang di-bind-mount, untuk memulai container baru dari image TeX Live dengan direktori proyek di-bind-mount di `/compile`. Dengan demikian, satu kompilasi adalah satu container berumur pendek yang menjalankan satu proses `latexmk`.
+
+Ada tiga konsekuensi, dan ketiganya membentuk pengukuran dalam makalah ini. Pertama, satuan kerjanya adalah proses single-threaded: XeLaTeX tidak berjalan paralel. Kedua, isolasi sumber daya per kompilasi bergantung pada apa yang diminta oleh Docker runner — kami menunjukkan di §6.2 bahwa secara efektif ia tidak meminta apa pun. Ketiga, working set didominasi bukan oleh dokumen, melainkan oleh pohon TeX Live, korpus read-only berukuran sekitar 32 GiB yang dibaca oleh setiap kompilasi konkuren sehingga dibagi bersama melalui page cache host. Pembagian inilah yang menjadi asal penskalaan memori super-linear yang kami amati.
+
+### 2.2 Mengaktifkan kompilasi sandbox
+
+Overleaf edisi komunitas menjalankan `latexmk` di dalam container aplikasi itu sendiri. Ayakaleaf Pro, seperti Overleaf Server Pro, dapat menjalankan setiap kompilasi dalam container _sibling_ — container yang dimulai oleh aplikasi pada Docker daemon milik _host_, bukan bersarang di dalam container aplikasi. Dua pengaturan toolkit mengaktifkan fitur ini:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit melakukan bind-mount socket Docker host ke dalam container aplikasi dan menerjemahkan pengaturan ini menjadi lingkungan yang dibaca CLSI: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true`, dan `SANDBOXED_COMPILES_HOST_DIR`, yang terakhir adalah path _host_ dari direktori kompilasi. Path tersebut penting: karena daemon yang memulai container kompilasi adalah milik host, bind mount yang diberikan kepadanya harus dapat di-resolve dalam namespace host, bukan namespace container aplikasi. `config/env.sh` milik Server-Pro juga memaksa `TEXLIVE_IMAGE_USER=www-data` dalam mode ini agar file yang ditulis oleh container kompilasi memiliki kepemilikan yang konsisten.
+
+Verifikasinya langsung: selama kompilasi, host menampilkan container bernama `project-{projectId}-{userId}-{hash}` yang menjalankan `latexmk` dari image TeX Live dan keluar dengan kode 0. Inilah satuan yang multiplisitasnya kami ukur di sepanjang makalah ini, dan yang ketiadaan total batas sumber dayanya kami laporkan di §6.2.
+
+**Mengapa hal ini penting bagi studi ini.**
+
+Container sibling membuat pengukuran menjadi bersih — setiap kompilasi adalah entitas OS yang dapat diamati dan dijadwalkan secara independen — tetapi itu juga berarti kernel guest, bukan Overleaf, yang membagi CPU dan memori di antara kompilasi. Dengan demikian, setiap hukum penskalaan dalam makalah ini merupakan sifat dari scheduler Linux yang diterapkan pada $N$ proses single-threaded, dan itulah sebabnya hukum-hukum tersebut begitu teratur.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Gambar 1.** Satu permintaan kompilasi, ditelusuri melalui microservice edisi komunitas. Pemisahan pada langkah-langkah tersebut penting bagi kapasitas: teks dokumen disalin ke badan permintaan, sedangkan aset biner diteruskan melalui referensi dan diambil oleh `clsi`. Tidak satu pun yang dominan — biaya kompilasi sebuah proyek ditentukan oleh pohon TeX Live 32 GiB yang dibaca oleh setiap kompilasi konkuren melalui page cache bersama.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Gambar 2.** Tiga topologi deployment dan letak batas kompilasi per instance pada masing-masing; panel bertumpuk menandakan replikasi. Konstanta 65 kompilasi menjaga _satu_ CLSI, sehingga armada SaaS mengalikannya dengan jumlah instance dan zona (a), dan penskalaan horizontal yang didukung oleh Server Pro dan Ayakaleaf Pro mengalikannya dengan jumlah instance (c) — dengan konsekuensi memerlukan MongoDB, Redis, dan penyimpanan kompatibel S3 terpusat, load balancer dengan afinitas sesi berbasis cookie (output kompilasi ditulis ke disk lokal instance, sehingga kompilasi dan unduhan PDF berikutnya harus mendarat di instance yang sama), serta `git-bridge` tunggal. Default toolkit (b), yang kami ukur, memiliki pengali satu, sehingga konstanta yang dirancang untuk satu anggota armada menjadi batas atas seluruh instalasi.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Gambar 3.** Pemilihan shard di `clsi-cache`. Sebuah proyek dipetakan dengan $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, yaitu ruang hash dipotong menjadi sektor-sektor sama besar sebanyak jumlah shard. Ini adalah hashing _modulo_, bukan consistent hashing berbasis ring: menambah armada dari tiga shard menjadi empat akan mempartisi ulang seluruh ruang dan memetakan ulang hampir setiap proyek (a, b). Itulah tepatnya mengapa implementasinya memerlukan tahapan resharding online yang eksplisit, yang memindahkan fraksi proyek yang tumbuh secara linear dari `currentShards` ke `desiredShards` selama suatu jendela waktu, alih-alih perpindahan $K/n$ yang akan diberikan oleh ring consistent hashing. Ketika circuit breaker sebuah shard terpicu, salt $i$ dinaikkan dan shard tersebut dihapus dari daftar kandidat, sehingga pencarian berlanjut ke shard berikutnya alih-alih gagal (c).
+
+### 2.3 Dua mode kegagalan
+
+Setiap konfigurasi yang kami ukur gagal dengan tepat salah satu dari dua cara, dan perbedaannya terlihat langsung dari status respons, bukan disimpulkan:
+
+* **Kehabisan memori** — stack Overleaf itu sendiri menjadi tidak responsif dan permintaan mengembalikan **HTTP 502**. Memori guest yang tersedia pada level yang gagal biasanya di bawah 500 MiB.
+* **Timeout kompilasi** — CLSI menghentikan kompilasi pada timeout per pengguna dan melaporkan status `timedout`. Memori yang tersedia pada level yang gagal sering kali masih beberapa gigabyte.
+
+Kami mengklasifikasikan setiap konfigurasi berdasarkan tanda ini, bukan berdasarkan heuristik rasio sumber daya, sehingga pertanyaan "batas mana yang kita capai" dapat dijawab dari data itu sendiri.
+
+## 3. Metodologi
+
+### 3.1 Testbed dan kontrol clock
+
+Semua guest berjalan di bawah QEMU/KVM pada satu host Intel Core i9-14900K dengan RAM 62 GiB dan penyimpanan NVMe. Guest-nya adalah Ubuntu 24.04 dengan Docker 29.7 dan Overleaf Toolkit yang men-deploy Ayakaleaf Pro v6.2.2 dengan kompilasi sandbox menggunakan `texlive-full:2025.1`.
+
+CPU desktop komoditas adalah representasi yang buruk untuk server kecuali clock-nya dikendalikan. KVM tidak menyediakan mekanisme untuk mengatur clock virtual: vCPU adalah thread host dan berjalan pada frekuensi berapa pun inti host berjalan. Karena itu, kami membatasi host secara langsung, menonaktifkan turbo dan mengunci `scaling_max_freq` pada 3.0 GHz di setiap inti, serta mem-pin vCPU guest ke P-core fisik dengan `taskset`. Perbedaan ini penting pada CPU hybrid-core: E-core pada prosesor ini memiliki base clock 2.4 GHz dan _tidak dapat_ mencapai 3.0 GHz setelah turbo dinonaktifkan, sehingga run yang tersasar ke E-core diam-diam mengukur mesin yang lebih lambat. Di bawah beban penuh, kami memverifikasi tepat 3000 MHz pada keenam belas thread yang di-pin. Sebuah skrip penjaga memastikan invarian ini sebelum setiap benchmark dan menolak untuk mulai jika tidak terpenuhi; skrip ini menangkap satu reset governor yang terjadi diam-diam selama studi.
+
+### 3.2 Testbed kedua: satu runner besar
+
+Matriks QEMU mengisolasi satu variabel pada satu waktu, tetapi terbatas pada enam belas thread yang di-pin. Untuk menguji apakah hukum yang sama masih berlaku satu orde besaran lebih tinggi, kami mengulang pengukuran konkurensi pada satu server besar: satu AMD EPYC 7773X (Milan-X, 64 inti / 128 thread, L3 768 MiB) dengan RAM 995 GiB, menjalankan image Ayakaleaf Pro v6.2.2 yang sama dengan `texlive-full:2025.1` yang sama. Tidak seperti guest QEMU, clock mesin ini tidak dikunci: ini adalah server kelas produksi dan kami mengukurnya sebagaimana adanya.
+
+Dua tindakan pencegahan operasional diperlukan dan layak disebutkan, karena tanpanya eksperimen akan mengukur harness alih-alih server. Pertama, setiap container dibatasi dalam slice `systemd` dengan `MemoryMax=940 GiB`, sehingga pengukuran yang tak terkendali hanya menghabiskan sebuah cgroup, bukan host. Kedua, kompilasi sandbox dibuat oleh daemon host dan masing-masing mengotori layer copy-on-write-nya sendiri — terukur 116 MiB per container meskipun base image 20.6 GiB dibagi bersama — sehingga data root Docker dipindahkan ke perangkat NVMe khusus. Pengukuran pada $N=1024$ menulis sekitar 119 GiB layer sementara, yang tidak muat di root filesystem standar.
+
+### 3.3 Beban kerja
+
+Dokumennya adalah tesis magister nyata setebal 63 halaman (templat SJTU) yang dikompilasi dengan XeLaTeX melalui `latexmk`, berisi gambar TikZ, pemrosesan bibliografi `biblatex`, dan aset PDF tersemat — yaitu beban yang realistis, bukan sintetis. Satu kompilasi pada guest tanpa beban membutuhkan 8.6–9.8 s di seluruh konfigurasi, yang kami gunakan sebagai baseline tanpa hambatan $T_1$.
+
+### 3.4 Pembangkitan beban
+
+Kami membuat 512 akun pengguna nyata dan memberi masing-masing salinan proyeknya sendiri, sehingga kompilasi konkuren bersaing persis seperti pengguna independen, alih-alih berbagi kunci proyek. Permintaan dikirim dari host ke port guest yang diteruskan, sehingga pembangkitan beban tidak menggunakan CPU guest.
+
+Konkurensinya bersifat _simultan_, bukan bertahap. Setiap sesi dibuat terlebih dahulu — login, token CSRF, pemilihan compiler — dan baru kemudian setiap thread tidur hingga suatu momen wall-clock bersama, yang dihitung sekali dan dibagikan, sebelum mengirim `POST /project/:id/compile`. Perbedaan ini bukan sekadar soal ketelitian. Kenaikan bertahap mengukur throughput di bawah antrean yang stabil; ledakan simultan mengukur apa yang terjadi ketika satu ruang kuliah penuh mahasiswa menekan tombol yang sama setelah pengumuman tenggat yang sama, yang merupakan kasus yang benar-benar dikhawatirkan operator. Keduanya berbeda lebih dari sekadar faktor konstan, karena yang kedua mengisi antrean kompilasi lebih cepat daripada kemampuan daemon untuk mengosongkannya.
+
+Empat kendala praktis harus dihilangkan sebelum ledakan tersebut dapat dihasilkan dengan tepat. Masing-masing layak dicatat, karena masing-masing diam-diam menurunkan eksperimen menjadi pengukuran harness alih-alih server.
+
+#### 3.4.1 Dua rate limiter, bukan satu
+
+Overleaf membatasi login per alamat sumber — 20 percobaan per menit — dan seluruh lalu lintas kami berasal dari satu host. Memberikan alamat `X-Forwarded-For` yang berbeda untuk setiap pengguna simulasi menghilangkan batas tersebut, tetapi langsung berhadapan dengan batas kedua yang lebih kasar: anggaran per subnet sekitar 200 per menit. Menyebarkan pengguna di satu blok yang berurutan karenanya gagal pada akun ke-201. Sebagai gantinya, kami menurunkan alamat sintetis dari indeks pengguna sehingga pengguna yang berurutan mendarat di `/24` yang berbeda,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+yang menjaga kedua limiter tetap longgar untuk seluruh populasi 1024.
+
+#### 3.4.2 Header yang disuntikkan dibuang secara default
+
+Menetapkan header saja tidak cukup. Express hanya menghormati `X-Forwarded-For` untuk peer yang telah dinyatakan tepercaya, dan `trustedProxyIps` Overleaf secara default bernilai `loopback`. Karena generator beban menjangkau aplikasi melalui bridge container, bukan melalui antarmuka loopback, header tersebut di-parse lalu dibuang, dan setiap pengguna simulasi kembali menyatu ke satu alamat. Gejalanya adalah gelombang `HTTP 429` tepat pada login kedua puluh, yang mudah disalahartikan sebagai server kelebihan beban. Jaringan gateway harus ditambahkan secara eksplisit ke rantai kepercayaan; dalam deployment klaster di §4.3, CIDR pod dan service juga harus ditambahkan.
+
+#### 3.4.3 Load balancer akan menimpa header yang diminta untuk dipertahankan
+
+Ketika instance berada di belakang proxy, `option forwardfor` yang konvensional _menambahkan_ alamat klien sebenarnya ke rantai, yang merupakan perilaku yang benar untuk produksi tetapi justru salah di sini: alamat sintetis tergeser oleh alamat generator beban itu sendiri. Direktif tersebut harus dikualifikasi sebagai `option forwardfor if-none`, sehingga proxy hanya menambahkan nilai ketika klien tidak menyediakannya.
+
+#### 3.4.4 Klien kehabisan file descriptor sebelum server kehabisan kapasitas
+
+Pada $N=1024$ generator memegang lebih dari seribu socket simultan, dan soft limit default sebesar 1024 descriptor tercapai saat penyiapan sesi, bukan saat pengukuran. Kegagalannya tidak kentara: tiga sesi gagal dibuat dan run melaporkan 1021 alih-alih 1024, sementara thread sampling yang memanggil shell untuk menghitung container mati dengan `EMFILE` dan diam-diam memotong telemetri. Soft limit harus dinaikkan pada generator — hard limit di host kami sudah 1048576 — dan run diulang. Kami melaporkan kedua run di §4.3: run yang diperbaiki menyelesaikan 1024 dari 1024 dengan median dalam selisih 1.2 s dari run yang terpotong, itulah sebabnya kami menganggap run pertama dapat digunakan tetapi tidak otoritatif.
+
+### 3.5 Protokol pengukuran
+
+Beberapa pilihan metodologis terbukti diperlukan demi reprodusibilitas.
+
+#### 3.5.1 Pemanasan
+
+Pada guest yang baru di-boot, page cache masih kosong dan kompilasi pertama mengukur I/O cold-start, bukan kapasitas kondisi stabil: konfigurasi 2 vCPU / 2 GiB yang sama menghasilkan 36.5 s dalam kondisi dingin dan 9.8 s dalam kondisi hangat, selisih 3,7 kali. Karena itu, setiap konfigurasi melakukan dua pemanasan kompilasi tunggal yang hasilnya dibuang setelah boot.
+
+#### 3.5.2 Kriteria lulus
+
+Suatu level konkurensi dinyatakan lulus hanya jika _setiap_ kompilasi berhasil dan level tersebut bertahan saat diulang. Ini lebih ketat daripada ambang tingkat keberhasilan, dan hal ini penting: pada 4 vCPU / 16 GiB, level 32 lulus sekali dengan median 80.2 s lalu mengalami timeout pada ke-32 kompilasi saat diulang, sehingga kami melaporkan 31.
+
+#### 3.5.3 Pencarian
+
+Level ditemukan dengan bracketing eksponensial dari seed yang diprediksi model, diikuti bisection bilangan bulat yang tepat. Karena kriterianya semua-atau-tidak-sama-sekali, suatu level ditentukan oleh kegagalan pertamanya, sehingga kami meninggalkan permintaan yang masih berjalan begitu satu permintaan gagal — kecuali pada level kecil, di mana kompilasi yang ditinggalkan membebani guest kecil sedemikian rupa sehingga guest tidak pernah pulih.
+
+#### 3.5.4 Isolasi antar level
+
+Container kompilasi dikosongkan, dan aplikasi web di-poll hingga merespons lagi, sebelum level berikutnya dimulai. Tanpa ini, level yang mengikuti sebuah crash akan mencatat kegagalan nol-sesi yang palsu.
+
+#### 3.5.5 Kebersihan host
+
+Mesin virtual lain yang tidak terkait di host dimatikan: dengan 24 GiB memori host yang digunakan di tempat lain, konfigurasi guest yang sama melaporkan load average 11.7 alih-alih 3.2 pada konkurensi yang identik. Tekanan memori host merambat ke guest dan membatalkan validitas pengukuran.
+
+## 4. Hasil
+
+### 4.1 Matriks kapasitas
+
+Tabel 1 dan Gambar 4 menunjukkan batas atas terukur untuk setiap konfigurasi. Membacanya secara mendatar pada satu baris memberikan kejutan pertama. Pada 4 GiB, guest 2, 4, dan 8 vCPU semuanya mencapai tepat 9 — melipatempatkan jumlah inti tidak mengubah apa pun. Pada 16 GiB, mereka mencapai 54, 45, dan 57: beralih dari 4 ke 16 inti hanya menambah 6%, dan guest 8 inti justru _lebih buruk_ daripada guest 4 inti (§5.2). Baru pada 48 GiB jumlah inti membedakan konfigurasi secara tegas: 143, 268, dan 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Gambar 4.** Kapasitas terukur di seluruh matriks konfigurasi. (a) Setiap konfigurasi sebagai batang, dikelompokkan berdasarkan memori dan diwarnai berdasarkan jumlah inti; batang solid dibatasi memori (guest mati karena memori habis) dan batang berarsir dibatasi CPU (kompilasi timeout dengan memori yang masih tersisa). Membaca satu kelompok dari kiri ke kanan menunjukkan betapa sedikit manfaat jumlah inti di bawah 16 GiB; membaca antar kelompok menunjukkan imbal hasil super-linear dari memori. (b) Titik-titik yang sama terhadap model hasil fitting $N_{\max}=\min(0.69R^{1.60},\,26.4C)$; garis putus-putus adalah batas memori dan garis horizontal bertitik adalah batas atas CPU per jumlah inti. Sebuah konfigurasi dibatasi oleh mana pun dari keduanya yang lebih dulu dicapai.
+
+Membaca ke bawah pada satu kolom memberikan kejutan kedua: pada jumlah inti tetap, kapasitas tumbuh secara super-linear terhadap memori, kira-kira sebesar $R^{1.6}$, karena alasan page cache yang diuraikan di §5.1.
+
+| memori | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Tabel 1.** Jumlah maksimum kompilasi simultan yang berhasil diselesaikan, diukur pada timeout kompilasi 300 s dengan batas konkurensi CLSI dihapus. **Tebal** menandai konfigurasi yang dibatasi CPU (kompilasi timeout dengan memori yang masih tersisa); sisanya dibatasi memori (stack mati dengan HTTP 502). Baris 2 GiB memuat koreksi yang dibahas di §5.2.
+
+### 4.2 Konkurensi adalah time-sharing
+
+Gambar 5 mengukur setiap level konkurensi pada guest 8 vCPU / 16 GiB yang tetap. Dua rezim dipisahkan oleh titik tekuk tajam tepat pada satu kompilasi per inti. Di bawahnya, rata-rata waktu kompilasi datar — bergerak dari 8.7 s pada $N=1$ menjadi 9.1 s pada $N=C=8$, perubahan sebesar 5%. Di atasnya, waktu tumbuh secara proporsional ketat terhadap $N/C$: pada $N=16,24$ kami mengukur 18.5 s dan 27.1 s, yaitu rasio $1:2.13:3.12$ dibandingkan nilai ideal $1:2:3$.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Gambar 5.** Latensi kompilasi terhadap konkurensi pada perangkat keras tetap. Titik tekuknya berada di $N=C$; di luar titik itu, perlambatan terukur mengikuti $N/C$ dengan selisih 5–7%. Kelima belas level berhasil sepenuhnya.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Gambar 6.** Latensi kompilasi terhadap konkurensi untuk beberapa konfigurasi. Setiap panel menjaga perangkat keras tetap dan memvariasikan beban yang diberikan; garis vertikal menandai $N=C$. Kurva datar di sebelah kirinya dan linear terhadap $N/C$ di sebelah kanannya, yang merupakan ciri time-sharing, bukan contention: pekerjaan tidak menjadi lebih mahal, ia hanya menunggu gilirannya.
+
+Fitting $T(N)=T_1\max(1,N/C)^{b}$ atas semua pengukuran yang berhasil dalam studi ini menghasilkan $b=0.914$ ($R^2_{\log}=0.904$, $n=81$). Eksponen yang tidak dapat dibedakan dari satu merupakan pernyataan kuantitatif bahwa kompilasi adalah satuan kerja single-threaded yang dibatasi CPU dan bahwa konkurensi tidak membantu maupun merugikan selain membagi inti. Konsekuensi praktisnya tidak menyenangkan bagi perencanaan kapasitas: sebuah konfigurasi dapat menampung jumlah pengguna sembarang tanpa _gagal_, sambil membuat setiap pengguna menunggu lebih lama secara proporsional. Pada $N=56$ di guest ini semua kompilasi masih berhasil, tetapi setiap pengguna menunggu 64.8 s alih-alih 8.7 s.
+
+### 4.3 Penskalaan vertikal hingga 1024 kompilasi konkuren
+
+Tabel 2 dan Gambar 7 melaporkan pengukuran pada runner besar. Setiap level adalah kompilasi _dingin_: sebelum setiap level, kami menghapus direktori kompilasi dan cache CLSI dari setiap proyek yang berpartisipasi melalui `DELETE /project/:id/output`, sehingga tidak ada level yang diuntungkan oleh pekerjaan dari level di bawahnya. Baseline kompilasi tunggal pada mesin ini adalah 28.8 s, yang merupakan angka dingin dan tidak boleh dibandingkan dengan baseline kondisi stabil 8.6–9.8 s yang digunakan sebelumnya; baseline dingin pada guest QEMU adalah 28.3 s, sehingga per thread kedua mesin berselisih kurang dari dua persen untuk beban kerja ini.
+
+| $N$ |   berhasil | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | puncak ctr |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tabel 2.** Pengukuran konkurensi pada satu EPYC 7773X (64 inti / 128 thread, 995 GiB). Semua level dingin; baseline 28.8 s. Puncak container adalah jumlah maksimum sandbox yang hidup secara bersamaan.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Gambar 7.** Penskalaan vertikal pada satu runner besar. (a) Latensi terhadap konkurensi yang diberikan; area berbayang menandai rezim setelah titik tekuk. (b) Jumlah sandbox yang benar-benar hidup tidak pernah mengikuti jumlah yang diminta — jenuh di sekitar 200 — sementara cgroup kompilasi tidak pernah menggunakan lebih dari seperlima batasnya.
+
+#### 4.3.1 Mesin tidak pernah gagal
+
+Setiap level selesai 100%, termasuk $N=1024$ — delapan kali jumlah thread. Kami tidak menemukan batas kapasitas mesin ini; kesabaran kami habis sebelum ruang kepalanya habis. Ini adalah konfigurasi pertama dalam studi di mana batasan pengikatnya bukan memori: pada $N=1024$, cgroup kompilasi memuncak di 184 GiB, seperlima dari batas 940 GiB-nya, sementara CPU berada pada utilisasi 100% dengan load average 166.
+
+#### 4.3.2 Degradasi bersifat sub-linear karena penerimaan dibatasi lajunya
+
+Time-sharing naif memprediksi bahwa $8\times$ thread berarti $8\times$ latensi. Biaya terukurnya adalah $9.7\times$ relatif terhadap satu kompilasi, tetapi hanya $3.8\times$ relatif terhadap $N=128$ — untuk peningkatan beban delapan kali lipat. Alasannya terlihat pada Gambar 7(b) dan pada kolom terakhir Tabel 2: meskipun 1024 permintaan dikirim secara bersamaan, jumlah sandbox yang benar-benar hidup tidak pernah melebihi 205. Daemon tidak dapat membuat container secepat permintaan klien, sehingga permintaan mengantre pada tahap penerimaan alih-alih bersaing di dalam CPU. Antrean inilah yang menyelamatkan latensi ekor di sini, dan hal itu terjadi secara kebetulan.
+
+#### 4.3.3 Titik tekuknya di 512, bukan di titik kegagalan
+
+Antara $N=256$ dan $N=512$, latensi $p_{95}$ naik $2.9\times$ untuk penggandaan beban; setiap penggandaan sebelumnya hanya menambah antara $1.2\times$ dan $1.4\times$. Kapasitas yang dinyatakan sebagai "$N$ terbesar yang tidak gagal" akan melaporkan 1024 dan tidak berguna bagi operator: pada titik itu waktu tunggu ekor hampir delapan menit.
+
+### 4.4 Waktu kompilasi berbanding terbalik dengan clock
+
+Karena beban kerja dibatasi CPU, biayanya seharusnya berskala sebagai $1/f$. Kami mengujinya secara langsung dengan memvariasikan clock host di seluruh rentang mesin, 1.0–5.5 GHz dalam sepuluh langkah, pada guest yang selainnya tidak berubah (Gambar 8). Waktu kompilasi tunggal bergerak dari 26.5 s menjadi 4.8 s: clock 5,5× menghasilkan percepatan 5,5× tanpa penurunan hasil di mana pun dalam rentang tersebut. Hasil kali $T\!\cdot\!f$ konstan dengan selisih 2% di seluruh sepuluh clock.
+
+Normalisasi berdasarkan bagian inti meringkas ketiga puluh pengukuran — tiga level konkurensi pada sepuluh clock — ke satu konstanta tunggal:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+dengan sebaran residu 5,1% pada rentang di mana clock itu sendiri bervariasi 5,5×. Tidak adanya kelengkungan sama sekali itu sendiri merupakan hasilnya: seandainya beban kerja dibatasi bandwidth memori atau I/O, $T$ akan mendatar pada clock tinggi karena CPU melampaui sumber daya lainnya.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Gambar 8.** Pengukuran clock. (a) $T=k/f$ dengan hiperbola hasil fitting. (b) Setelah dibagi dengan $\max(1,N/C)$ semua titik menyatu ke satu konstanta, yang mengonfirmasi Persamaan (1).
+
+Persamaan (1) memiliki konsekuensi langsung bagi pengadaan yang mudah dinyatakan dan mudah disalahpahami: _clock meningkatkan pengalaman setiap pengguna individual, jumlah inti hanya memungkinkan lebih banyak pengguna_. Mesin dengan clock 20% lebih tinggi mengompilasi 20% lebih cepat untuk semua orang, tanpa penurunan hasil; dua kali jumlah inti sama sekali tidak membuat kompilasi siapa pun lebih cepat.
+
+## 5. Analisis
+
+### 5.1 Dua batas, di-fit secara terpisah
+
+Setiap konfigurasi diklasifikasikan berdasarkan tanda kegagalannya (§2.3), lalu batas memori dan batas atas CPU di-fit hanya pada konfigurasi yang benar-benar mencapainya:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+dengan $R$ dalam gibibyte dan $C$ dalam vCPU.
+
+Eksponen batas memori secara konsisten super-linear, $p>1$: biaya memori marginal untuk satu kompilasi konkuren tambahan _turun_ seiring bertambahnya total memori, dari sekitar 312 MiB per kompilasi pada guest 3 GiB menjadi sekitar 194 MiB pada guest 32 GiB. Mekanismenya adalah page cache bersama atas pohon TeX Live yang dijelaskan di §2.1: kompilasi konkuren membaca file font dan makro yang tumpang tindih, sehingga cache yang lebih besar teramortisasi atas lebih banyak kompilasi. Inilah sebabnya aturan naif "satu gigabyte per lima pengguna" meremehkan mesin besar dan melebih-lebihkan mesin kecil.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Gambar 9.** Data yang sama sebagai dua permukaan di atas bidang $(C,R)$. (a) Kapasitas: permukaan hasil fitting berupa punggung bukit, bukan bidang datar — naik tajam terhadap memori dan hampir datar sepanjang sumbu inti hingga memori berhenti menjadi pembatas, itulah sebabnya baris 48 GiB adalah satu-satunya di mana jumlah inti membedakan konfigurasi. (b) Latensi terhadap konkurensi untuk setiap konfigurasi, dengan $T=12.6\,(N/C)^{0.91}$ hasil fitting ditampilkan putus-putus dan timeout 180 s digambar sebagai bidang. Sebuah konfigurasi gagal di titik kurva solidnya menembus bidang tersebut, yang memperlihatkan betapa langsungnya pengaturan timeout menentukan kapasitas yang dilaporkan.
+
+### 5.2 Ketika lebih banyak inti justru memperburuk keadaan
+
+Persamaan (2) adalah minimum dari dua suku sehingga monoton terhadap $C$, tetapi pengukurannya tidak. Kami mengamati dua inversi di mana penambahan inti _mengurangi_ kapasitas: pada 16 GiB (54 vs. 45) dan pada 32 GiB (145 vs. 135). Keduanya terjadi dalam rezim yang dibatasi memori, dan mekanismenya sama pada keduanya: dengan lebih banyak inti, kompilasi konkuren berjalan serempak dan mencapai ukuran resident puncaknya pada saat yang sama, sedangkan dengan lebih sedikit inti scheduler menyelang-nyelingkannya sehingga puncaknya tersebar. Pada guest yang ruang memorinya sudah tipis, penyebaran inilah yang membuatnya tetap hidup. Model kapasitas yang dibangun atas rata-rata penggunaan sumber daya tidak dapat mengekspresikan hal ini; ini adalah sifat dari _kebetulan bersamaan_ puncak-puncak tersebut.
+
+Inversi ketiga yang tampak, pada 2 GiB, kini kami abaikan. Pencarian mencatat kapasitas 2 pada 2 vCPU tetapi 1 pada 4 dan 8 vCPU, yang tampak seperti efek yang sama. Pemeriksaan ulang atas data mentah menunjukkan sesuatu yang lebih sederhana: pada 2 GiB, level $N=2$ berhasil pada percobaan pertama di ketiga jumlah inti lalu gagal pada run konfirmasi di dua dari tiga. Level tersebut bukanlah kapasitas melainkan lemparan koin, dan entri 2 vCPU adalah lemparan yang kebetulan berhasil. Karena itu kami melaporkan nilai yang dapat direproduksi, 1, pada ketiga jumlah inti dan tidak menarik kesimpulan dari perbedaan tersebut. Kami mencatat koreksi ini di sini alih-alih diam-diam mengubah tabel, karena pembacaan yang dibuang adalah jenis yang akan mendukung klaim yang menarik.
+
+## 6. Temuan implementasi
+
+### 6.1 Batas konkurensi hard-coded
+
+Pada guest yang cukup besar, kapasitas berhenti tepat pada 65 kompilasi simultan berapa pun konkurensi yang diminta: pada $N=66,80,96,128$ kami mengukur $65$ keberhasilan dan $1,15,31,63$ respons `unavailable` seketika, dengan jumlah container tertahan di 65, beberapa gigabyte memori tidak terpakai, dan median waktu kompilasi stabil di 77 s — jauh di bawah timeout mana pun.
+
+Penyebabnya adalah sebuah konstanta di CLSI:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+Perbandingannya tidak ketat, sehingga batas efektifnya adalah $64+1=65$, tepat sesuai pengukuran. Permintaan yang berlebih menerima **HTTP 503** — permintaan tersebut _ditolak_, bukan dimasukkan ke antrean, sehingga dari sisi pengguna tombol kompilasi begitu saja gagal. Tidak seperti setiap parameter lain di file yang sama, parameter ini tidak membaca variabel lingkungan apa pun; parameter ini diperkenalkan di upstream pada Agustus 2024 dan hanya dapat diubah dengan memodifikasi image. Dengan batas yang dinaikkan, guest 16 vCPU / 32 GiB yang sama yang melaporkan `success=65, unavailable=15` pada $N=80$ justru melaporkan `success=80`.
+
+### 6.2 Batas memori container yang tidak berfungsi
+
+Memeriksa container kompilasi yang sedang berjalan menunjukkan tidak ada isolasi sumber daya sama sekali:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Tidak adanya kuota CPU memang disengaja dan menjelaskan mengapa eksponen time-sharing di §4.2 begitu bersih: tidak ada yang mendistorsi persaingan antar kompilasi. Namun, tidak adanya batas _memori_ tidak disengaja. Docker runner sebenarnya meminta batas tersebut:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Ini salah dalam dua hal. Nilainya adalah $1024^4=1 tebiB$ padahal komentarnya bermaksud $1024^3$; dan field tersebut ditempatkan di tingkat atas opsi pembuatan, bukan di dalam `HostConfig` tempat Docker API mengharapkannya, sehingga field itu dibuang — sebagaimana dikonfirmasi oleh `Memory=0` yang teramati. Kedua kesalahan sudah ada dalam commit yang memperkenalkan file tersebut (`9a519f0d3d`, Maret 2018) dan bertahan melewati konversi dari CoffeeScript, pemformatan ulang seluruh repositori, serta migrasi CJS ke ESM, yang tidak satu pun meninjau ulang semantiknya. Patut dicatat bahwa `MAX_OUTPUT = 1024 * 1024 // 1MB` dalam commit yang sama sudah benar, yang menunjukkan kekeliruan kecil, bukan kesalahpahaman.
+
+Konsekuensinya terlihat pada pengukuran memori rendah kami. Karena kompilasi tidak dibatasi, kehabisan memori tidak terwujud sebagai Docker yang menghentikan satu container bermasalah; melainkan melumpuhkan seluruh guest. Pada konfigurasi 2 vCPU / 2 GiB, kami mengamati sesi SSH pemantauan terblokir selama 300 s, load average 68 pada dua inti, dan guest akhirnya me-reboot dirinya sendiri. Batas per container yang berfungsi akan menurunkan kinerja dengan jauh lebih anggun: kompilasi yang terlalu besar akan gagal dan layanan tetap bertahan.
+
+Satu-satunya batas yang benar-benar berlaku adalah `RLIMIT_CPU`, yang diatur ke $\text{timeout}+5$ detik. Batas ini membatasi waktu _CPU_, bukan waktu wall-clock, dan satu kompilasi hanya menggunakan sekitar 9 s CPU, sehingga batas ini tidak pernah mengikat pada konkurensi berapa pun; batas ini melindungi dari masukan patologis seperti makro yang tak terkendali. Namun, batas ini merupakan indikator yang berguna: melihat `Soft:305` mengonfirmasi bahwa pengaturan timeout 300 s benar-benar telah diteruskan ke container.
+
+### 6.3 Timeout kompilasi adalah parameter yang paling dominan
+
+Field per pengguna `features.compileTimeout` bernilai default 180 s. Untuk konfigurasi apa pun yang dibatasi CPU, ini bukan margin keamanan melainkan pengaturan kapasitas, karena mesin yang masih menghitung dengan benar dinyatakan gagal. Menaikkannya menjadi 300 s — satu pembaruan MongoDB — mengubah kapasitas terukur hingga 4,2 kali (Tabel 3). Batas atasnya adalah 600 s, yang ditegakkan oleh `RequestParser.MAX_TIMEOUT`, dan di atas nilai itu nilainya dipotong diam-diam.
+
+| Konfigurasi      | 180 s | 300 s |          Rasio | Batasan pengikat      |
+| ---------------- | ----: | ----: | -------------: | --------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB bebas     |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB bebas     |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                   |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                   |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                   |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | berikutnya mencapai batas memori |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | memori                |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | memori                |
+
+**Tabel 3.** Pengaruh timeout kompilasi terhadap kapasitas terukur.
+
+Dua baris terakhir adalah sisi hasil yang berlawanan dengan intuisi dan alasan kami mengukur ulang setiap konfigurasi di bawah satu timeout. Untuk konfigurasi yang dibatasi _memori_, timeout yang lebih panjang justru _mengurangi_ kapasitas, karena setiap kompilasi menahan resident set-nya lebih lama dan lebih banyak kompilasi yang tumpang tindih. Dengan demikian, angka kapasitas tidak bermakna tanpa menyebutkan timeout yang digunakan saat pengukuran, dan keduanya tidak dapat dicampur dalam satu tabel.
+
+## 7. Karya terkait
+
+### 7.1 Panduan vendor
+
+Dokumentasi perangkat keras Overleaf sendiri menyatakan fakta-fakta kualitatif yang kami kuantifikasi di sini: bahwa LaTeX bersifat single-threaded, bahwa performa single-core karenanya menentukan waktu kompilasi, dan bahwa "more cores will only help if you are trying to compile more documents than you have free CPU cores" \[1]. Dokumentasi itu kemudian memberikan aturan ukuran linear — basis 2 inti/3 GiB ditambah satu inti dan satu gigabyte per lima hingga sepuluh pengguna konkuren — yang menjadi motivasi studi ini. Kontribusi kami adalah mengubah pernyataan-pernyataan tersebut menjadi hukum terukur (Persamaan (1) dan (2)), serta menunjukkan di mana aturan linear itu runtuh: aturan tersebut tidak memiliki suku untuk page cache bersama yang membuat batas memori menjadi super-linear, dan tidak memiliki suku untuk dua parameter perangkat lunak yang mendominasi hasilnya.
+
+### 7.2 Studi kapasitas build dan CI
+
+Pengukuran sistem build di bawah konkurensi sudah mapan di luar konteks LaTeX. LightSys melaporkan bahwa sistem CI konvensional yang mengompilasi di dalam container Docker mengalami penurunan I/O seiring meningkatnya laju kedatangan pull request, dengan bottleneck muncul di sekitar sebelas permintaan konkuren \[17]; TAOS-CI mengamati bahwa kompilasi mendominasi waktu wall-clock CI, mencakup 60–67% dari total durasi pipeline pada proyek besar \[18]. Sistem kami berbeda dalam satu hal yang ternyata menentukan: kompilasi LaTeX bersifat interaktif. Job CI yang memakan waktu dua kali lebih lama hanyalah ketidaknyamanan; kompilasi yang memakan waktu dua kali lebih lama langsung dirasakan oleh pengguna yang menunggu di panel pratinjau, itulah sebabnya kami memperlakukan timeout bukan sebagai ambang kegagalan melainkan sebagai parameter kapasitas.
+
+### 7.3 Overhead container
+
+Penelitian terbaru menguraikan latensi startup container Docker di berbagai tingkat penyimpanan \[19] dan mengkarakterisasi performa container di edge \[20]. Dalam konteks kami, startup container per kompilasi teramortisasi: nilainya konstanta kecil dibandingkan kompilasi 9 s, dan waktu tanpa hambatan $T_1$ yang kami fit sudah menyerapnya. Sifat container yang benar-benar penting adalah _tidak adanya_ batas sumber daya (§6.2), yang mengubah kelebihan memori per kompilasi menjadi kegagalan seluruh host.
+
+### 7.4 LaTeX sebagai masukan tak tepercaya
+
+Kompilasi sandbox ada karena TeX adalah bahasa pemrograman dan dokumen merupakan masukan yang tidak tepercaya \[21, 22]. Pilihan desain itulah yang memungkinkan studi ini — setiap kompilasi adalah container terisolasi dengan perilaku sumber daya yang dapat diamati — dan juga yang membuat ketiadaan batas memori menjadi signifikan, karena isolasi diasumsikan oleh operator yang men-deploy-nya.
+
+### 7.5 Compiler sebagai objek studi
+
+TeX sendiri terdokumentasi dengan baik sebagai bahasa \[16], tetapi perilakunya sebagai _target build_ baru mendapat perhatian belakangan ini. Tan dan Rigger \[8] mengompilasi korpus besar sumber arXiv di berbagai engine dan versi distribusi dan menemukan bahwa pilihan engine tidak dapat saling menggantikan: hanya sebagian kecil dari satu persen dokumen yang menghasilkan output identik per byte di bawah XeTeX dan pdfTeX. Hasil itu berkaitan langsung dengan metodologi kami. Kapasitas adalah sifat dari sebuah dokumen _dan_ sebuah engine, sehingga benchmark yang tidak menetapkan keduanya tidak dapat direproduksi; karena itu kami menetapkan satu dokumen, satu engine, dan satu distribusi (`texlive-full:2025.1`) di seluruh studi, dan kami mencantumkan engine di setiap keterangan gambar. Hal ini juga membatasi keumuman angka-angka kami dengan cara yang perlu dinyatakan secara terus terang: angka-angka itu mengkarakterisasi XeLaTeX pada dokumen ini, bukan TeX secara abstrak.
+
+Penelitian tentang _sistem_ build LaTeX sebagian besar didorong oleh praktisi. `l3build` dari proyek LaTeX3 \[13] menstandarkan pengujian regresi dan pemaketan, dan benchmark independen membandingkan alat pembungkus — survei terhadap 26 sistem build menemukan bahwa preamble yang dikompilasi sebelumnya memberikan keuntungan sekitar 20% dibandingkan run biasa dan 40% dibandingkan `latexmk` \[14]. Semua ini mengoptimalkan kompilasi _tunggal_. Hal-hal tersebut ortogonal terhadap, dan dapat dikombinasikan dengan, apa yang kami ukur: cache preamble memperpendek $T_1$, dan setiap angka kapasitas dalam makalah ini berskala dengan $T_1$.
+
+### 7.6 Kontrol konkurensi di editor, bukan di compiler
+
+Sisi kolaboratif Overleaf bertumpu pada rangkaian penelitian yang sudah mapan. Operational transformation berasal dari Ellis dan Gibbs \[9] dan dibuat praktis untuk klien berlatensi tinggi oleh sistem Jupiter \[10], yang desainnya dapat dikenali di `document-updater`: server yang mengurutkan operasi dan buffer per dokumen yang disinkronkan oleh klien. Conflict-free replicated data types \[11] menyelesaikan masalah yang sama tanpa pengurut terpusat. Perbedaan inilah yang membuat topologi di §4.3 dapat berfungsi sama sekali: karena buffer pembaruan tertunda berada di Redis bersama, bukan di memori sebuah instance, kompilasi yang diarahkan ke replika mana pun akan melihat ketikan terbaru, dan afinitas kompilasi dapat dipilih demi lokalitas cache, bukan demi kebenaran.
+
+### 7.7 Model kapasitas
+
+Hukum Amdahl \[24] membatasi percepatan dari paralelisme dan hukum Little \[23] menghubungkan okupansi dengan laju kedatangan dan waktu layanan; keduanya digunakan di atas. Universal scalability law dari Gunther \[12] memperluas yang pertama dengan suku retrograde untuk penundaan koherensi, yang memprediksi bahwa throughput memuncak lalu menurun. Kami mencatat bahwa sistem kami _tidak_ menunjukkan rezim retrograde tersebut hingga $N=1024$: throughput jenuh dan latensi tumbuh, tetapi tidak ada yang runtuh. Alasannya struktural, bukan kebetulan — kompilasi tidak berbagi state yang perlu dijaga koherensinya, sehingga suku yang ditambahkan oleh hukum tersebut mendekati nol, dan plateau penerimaan di §4.3 membatasi contention sebelum hal itu menjadi penting.
+
+## 8. Rekomendasi untuk operator
+
+<Steps>
+<Step title="Perbaiki dua parameter perangkat lunak sebelum membeli perangkat keras">
+Keduanya gratis dan keduanya lebih berharga daripada upgrade perangkat keras tunggal mana pun yang kami ukur. Naikkan `features.compileTimeout` ke nilai yang benar-benar dapat ditoleransi pengguna Anda — maksimum yang diterima CLSI adalah 600 s — dan, jika Anda memperkirakan akan melampaui 65 kompilasi simultan, naikkan `compileConcurrencyLimit` dalam image turunan atau lakukan scale out. Tidak melakukan keduanya berarti membayar inti yang ditolak untuk digunakan oleh perangkat lunak.
+</Step>
+
+<Step title="Tentukan ukuran satu mesin berdasarkan titik tekuknya, bukan batas atasnya">
+Pengukuran pada runner besar (§4.3) memisahkan dua angka yang sering dicampuradukkan. _Batas atas_ — konkurensi terbesar yang masih mengembalikan setiap PDF — setidaknya 1024 pada server 64 inti, dan kami tidak pernah mencapainya. _Titik tekuk_ — titik di mana latensi ekor berhenti tumbuh perlahan dan mulai berlipat ganda — berada di 512, dan titik operasi nyaman terakhir di bawahnya adalah 256. Antara $N=256$ dan $N=512$, waktu tunggu $p_{95}$ naik dari dua menit menjadi hampir enam; antara 512 dan 1024 mencapai delapan. Operator yang menentukan ukuran berdasarkan batas atas akan menghadirkan sistem yang secara teknis berfungsi tetapi tidak ingin digunakan siapa pun.
+
+Untuk mesin ini dan dokumen ini, titik operasi yang direkomendasikan karenanya adalah **256 kompilasi konkuren**, yaitu $4\times$ jumlah inti fisik dan $2\times$ jumlah thread, dan yang menjaga $p_{95}$ di sekitar 120 s. Kami menyarankan untuk mengatur `compileConcurrencyLimit` ke nilai tersebut alih-alih membiarkannya tinggi: menerima 1024 kompilasi sekaligus membuat semua orang menunggu delapan menit, sedangkan menerima 256 dan mengantrekan sisanya melayani sebagian besar pengguna dalam dua menit. Antrean merugikan yang datang belakangan; contention merugikan semua orang.
+</Step>
+
+<Step title="Perlakukan angka-angka ini sebagai kasus terburuk">
+Setiap level di Tabel 2 adalah kompilasi dingin yang dijalankan secara bersamaan. Tidak satu pun kondisi tersebut berlaku di produksi: kompilasi hangat dari dokumen yang sama membutuhkan 8.6 s dibandingkan 28.3 s dalam kondisi dingin, faktor $3.3$, dan pengguna nyata tidak menekan tombol pada detik yang sama. Populasi kondisi stabil yang mengompilasi ulang setiap dua menit dengan tingkat cache hit yang wajar karenanya akan mampu menampung jauh lebih banyak penulis daripada yang ditunjukkan angka konkurensi saja — dalam orde seribu atau lebih penulis aktif pada titik operasi 256. Angka konkurensi adalah batas untuk lonjakan seketika, bukan jumlah kursi.
+</Step>
+
+<Step title="Tentukan anggaran latensi terlebih dahulu, lalu baca ukurannya">
+Persamaan (1) dapat dibalik secara langsung. Untuk target waktu tunggu $T$ pada clock $f$ dengan $C$ inti, konkurensi yang sesuai adalah $N \le C\,fT/k$ dengan $k\approx28 GHz·s$ untuk dokumen ini. Anggaran 60 s pada 8 inti dengan 3 GHz menghasilkan $N\le51$; anggaran 120 s menggandakannya. Memublikasikan anggaran bersama kapasitas adalah satu-satunya cara jujur untuk menyatakan keduanya.
+</Step>
+
+<Step title="Beli memori terlebih dahulu, lalu inti, dan periksa batas mana yang sedang Anda hadapi">
+Di bawah 32 GiB kami hampir tidak mengukur manfaat dari inti tambahan. Diagnosisnya murah: jika kegagalan muncul sebagai HTTP 502 dengan guest kekurangan memori, tambahkan memori; jika muncul sebagai `timedout` dengan memori yang masih tersisa, tambahkan inti atau naikkan timeout. Operator dapat membacanya dari tanda kegagalan yang sama yang kami gunakan untuk mengklasifikasikan konfigurasi.
+</Step>
+
+<Step title="Utamakan clock untuk pengalaman, inti untuk populasi">
+Karena $T\propto 1/f$ berlaku tanpa kelengkungan (2% di seluruh 1.0–5.5 GHz), clock yang lebih cepat membuat setiap kompilasi lebih cepat bagi setiap pengguna. Lebih banyak inti tidak membuat kompilasi individual mana pun lebih cepat; inti hanya memungkinkan lebih banyak kompilasi konkuren. Deployment yang keluhannya adalah "kompilasi lambat" sebaiknya membeli clock; deployment yang keluhannya adalah "kompilasi gagal menjelang tenggat" sebaiknya membeli memori dan inti.
+</Step>
+
+<Step title="Lakukan scale out alih-alih scale up setelah melewati batas atas">
+Di atas 65 kompilasi konkuren, jalur yang didukung adalah penskalaan horizontal (Gambar 2c dan 10, diuraikan di §9): beberapa instance aplikasi di belakang load balancer dengan afinitas sesi berbasis cookie, berbagi MongoDB, Redis, dan penyimpanan kompatibel S3 terpusat, dengan `git-bridge` dibiarkan sebagai instance tunggal. Ini melipatgandakan batas per instance dengan jumlah instance, persis seperti cara deployment SaaS mencapai kapasitasnya sendiri.
+</Step>
+
+<Step title="Jangan mengandalkan isolasi per kompilasi">
+Sampai batas memori Docker runner diperbaiki (§6.2), satu dokumen patologis dapat menghabiskan host alih-alih dihentikan sendirian. Operator yang membutuhkan jaminan tersebut sebaiknya menerapkannya sendiri alih-alih menunggu. Mekanisme yang kami gunakan pada host besar adalah slice systemd dengan batas keras, lalu Docker daemon diarahkan ke slice tersebut sehingga setiap container yang dibuatnya diperhitungkan di dalamnya:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Satu detail di sini dapat menghabiskan satu sore jika terlewat. Slice bernama `docker-capped.slice` tidak berada di samping `docker.slice`; ia berada _di dalamnya_, karena tanda hubung adalah pemisah hierarki, bukan bagian dari nama. Batas yang tampaknya tidak berpengaruh biasanya diterapkan satu tingkat jauhnya dari tempat container sebenarnya berada. Verifikasi dengan membaca kembali nilai puncak dari `memory.max_usage_in_bytes` setelah run alih-alih memercayai file konfigurasi — di host kami, cgroup kompilasi tidak pernah melampaui seperlima batasnya bahkan pada 1024 kompilasi simultan, yang dengan sendirinya membuktikan bahwa daemon, bukan memori, yang menjadi batasan pengikat.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Gambar 10.** Topologi referensi untuk deployment yang diskalakan secara horizontal, digambar dari konfigurasi yang kami verifikasi. Replika aplikasi dapat saling dipertukarkan dan tidak menyimpan apa pun secara permanen, sehingga dapat ditambahkan dan dihapus dengan bebas. Tiga komponen tidak demikian: Redis, yang buffer dokumennya memungkinkan kompilasi yang diarahkan ke replika mana pun melihat ketikan terbaru; object store, yang menjadi wajib alih-alih opsional jika ada lebih dari satu replika; dan `git-bridge`, yang menyimpan repositori di disk lokal tanpa jalur replikasi dan harus berjalan sebagai instance tunggal di samping satu replika yang ditentukan.
+
+## 9. Deployment multi-mesin referensi
+
+Semua hal di atas mengukur satu mesin. Bagian ini menjabarkan bentuk terdistribusi dengan cukup rinci untuk dibangun, dan — karena pertanyaan yang sebenarnya dihadapi operator bukanlah _bagaimana_ melainkan _apakah perlu_ — terlebih dahulu menyatakan titik di mana hal itu sepadan dengan kerepotannya.
+
+### 9.1 Kapan bentuk terdistribusi diperlukan
+
+Satu mesin lebih murah dioperasikan dalam setiap aspek yang penting: satu domain kegagalan, tidak ada state bersama yang harus dijaga konsistensinya, tidak ada routing yang bisa salah. Data kami menetapkan tiga ambang kapan sebaiknya meninggalkannya.
+
+#### 9.1.1 Di bawah 65 kompilasi konkuren, jangan
+
+Batas per instance adalah konstanta perangkat lunak, bukan perangkat keras (§6.1). Sampai beban yang diberikan mendekatinya, mesin kedua hanya menambah mode kegagalan dan tidak memberikan apa pun. Host 64 inti melayani 256 kompilasi konkuren dengan keberhasilan penuh hanya setelah `compileConcurrencyLimit` dinaikkan; operator yang belum mengubah satu nilai itu belum dibatasi perangkat keras dan sebaiknya tidak berbelanja perangkat keras.
+
+#### 9.1.2 Antara 65 dan sekitar 500, lakukan scale up terlebih dahulu
+
+Penskalaan vertikal tetap linear di seluruh rentang kami dan tidak pernah memasuki rezim retrograde. Satu host besar mencapai 1024 kompilasi dingin simultan dengan keberhasilan 100% (§4.3); titik tekuk latensi muncul di 512, tidak lebih awal. Dalam rentang itu, mesin yang lebih besar jelas lebih sederhana daripada beberapa mesin kecil dan, menurut §4.4, mesin yang lebih cepat meningkatkan pengalaman setiap pengguna alih-alih sekadar menerima lebih banyak pengguna.
+
+#### 9.1.3 Gunakan bentuk terdistribusi demi ketersediaan, bukan throughput
+
+Alasan jujur untuk menjalankan lebih dari satu replika aplikasi di bawah batas atas adalah bahwa satu mesin berarti satu catu daya, satu kernel, satu jendela upgrade. Itu alasan yang sah dan itulah yang akan kami berikan; hanya saja itu bukan argumen kapasitas, dan mencampuradukkan keduanya membuat operator membeli replika padahal yang mereka butuhkan adalah memori.
+
+### 9.2 Tingkatan dan ukurannya
+
+Gambar 10 menunjukkan topologinya. Topologi ini memiliki empat tingkatan, dan masing-masing berskala berdasarkan kuantitas yang berbeda — itulah inti dari pemisahannya.
+
+#### 9.2.1 Edge
+
+Satu load balancer, atau dua untuk ketersediaan. Load balancer mengakhiri TLS dan tidak melakukan apa pun yang mahal; ia berskala dengan jumlah koneksi, bukan jumlah kompilasi, dan instance kecil sudah cukup untuk beban yang dipelajari di sini. Konfigurasinya, bukan ukurannya, yang penting (§9.3).
+
+#### 9.2.2 Replika aplikasi
+
+Replika ini menanggung beban kompilasi dan merupakan satu-satunya tingkatan yang berskala dengan konkurensi. Tentukan ukuran masing-masing berdasarkan aturan §8 — memori sebelum inti, lalu clock — kemudian tetapkan jumlah replika untuk menutupi puncak konkurensi dibagi batas per replika. Replika tidak menyimpan apa pun secara permanen: disk lokalnya memuat data sementara kompilasi dan cache output, keduanya dapat direkonstruksi. Inilah yang membuatnya aman untuk ditambahkan dan dihapus dengan bebas, dan hal ini layak diverifikasi alih-alih diasumsikan, karena satu path `filestore` yang salah konfigurasi diam-diam mengubah tingkatan ini menjadi stateful.
+
+#### 9.2.3 State
+
+Redis, MongoDB, dan object store kompatibel S3, pada host terpisah. Redis adalah yang menanggung beban dan yang paling tidak kentara: ia menyimpan session store dan buffer dokumen aktif, yang memungkinkan kompilasi yang diarahkan ke replika mana pun melihat ketikan yang dibuat melalui replika lain. Operator yang memperlakukan Redis sebagai cache dan mengukurnya untuk eviction akan menghasilkan kompilasi dari dokumen usang yang sangat sulit didiagnosis, karena tidak ada yang gagal — output-nya hanya salah. MongoDB berskala dengan jumlah proyek, bukan laju kompilasi. Object store bersifat opsional untuk satu replika dan wajib jika lebih dari itu.
+
+#### 9.2.4 Instance tunggal
+
+`git-bridge` menyimpan repositori di disk lokal, memelihara indeks lokal, dan tidak memiliki jalur replikasi. Ia harus berjalan sebagai tepat satu instance, di-pin di samping satu replika yang ditentukan, dan ia adalah komponen yang membuat deployment tidak sepenuhnya stateless. Rencanakan host-nya dengan tepat: disknya adalah yang perlu dicadangkan.
+
+| **Tingkatan** | **Jumlah**           | **Berskala dengan**      |
+| ------------- | -------------------- | ------------------------ |
+| Load balancer | 1–2                  | koneksi konkuren         |
+| Aplikasi      | $\lceil N/C\rceil$ | puncak kompilasi konkuren |
+| Redis         | 1 (+replika)         | sesi penyuntingan aktif  |
+| MongoDB       | 1 (+replika)         | proyek tersimpan         |
+| Object store  | 1 klaster            | total byte proyek        |
+| `git-bridge`  | tepat 1              | repositori di disk       |
+
+**Tabel 4.** Tingkatan referensi. Hanya tingkatan aplikasi yang berskala dengan konkurensi; penentuan ukurannya adalah pokok bahasan §8.
+
+### 9.3 Routing adalah bagian yang mudah salah
+
+Tiga kelas permintaan harus mencapai tiga tempat berbeda, dan konfigurasi default dengan satu aturan paling banyak hanya memenuhi dua di antaranya.
+
+Lalu lintas kompilasi di bawah `/project/` sebaiknya didistribusikan dengan consistent hashing pada pengenal proyek, sehingga cache kompilasi sebuah proyek tetap berada di satu replika. Kami menggunakan `balance hash path,field(3,/)` HAProxy dengan `hash-type consistent` dan `hash-balance-factor 150`. Pilihan ini penting saat scale-out: dengan afinitas cookie, sesi yang ada tetap tertambat pada replika aslinya tanpa batas waktu dan replika yang baru ditambahkan hanya menerima pengguna baru, sehingga mesin yang baru saja dibayar operator tidak menyerap beban apa pun yang menjadi alasan pembeliannya. Consistent hashing mendistribusikan ulang 35% proyek saat scale-out dalam konfigurasi kami, dibandingkan 0% untuk cookie.
+
+Lalu lintas sesi berbeda. Ketika upgrade WebSocket gagal dan `socket.io` beralih ke XHR polling, polling berturut-turut dari satu sesi harus mencapai satu replika, dan tidak ada pengenal proyek di path untuk di-hash. Lalu lintas ini memerlukan backend terpisah dengan afinitas cookie. Kami merancang pemisahan ini tetapi tidak men-deploy-nya; kami menandainya sebagai celah alih-alih mengklaimnya.
+
+Terakhir, `/git/` harus mencapai replika tempat `git-bridge` berjalan di sampingnya. Lalu lintas ini diarahkan ke replika tersebut, bukan langsung ke `git-bridge`, karena bridge mengautentikasi callback-nya terhadap endpoint OAuth aplikasi dan me-resolve URL blob melaluinya; melewati replika justru merusak autentikasi alih-alih memperbaiki apa pun.
+
+### 9.4 Scale-in memerlukan buffer drain
+
+Menghapus replika tidak simetris dengan menambahkannya: kompilasi yang sedang berjalan akan hilang, dan pengguna melihat kegagalan yang bukan disebabkan olehnya. Urutan yang dapat diterapkan adalah menghentikan lalu lintas baru terlebih dahulu, menunggu, dan baru kemudian menghentikan replika. Kami mengimplementasikannya sebagai hook pre-stop yang menahan pod selama interval yang dapat dikonfigurasi sementara balancer menandai backend sebagai draining — cukup singkat untuk diuji dalam hitungan menit, dan di produksi cukup lama hingga sesi berakhir secara alami, berjam-jam alih-alih berdetik-detik. Interval inilah kenop penyetelan yang menentukan apakah elastisitas tidak terasa atau justru menjengkelkan.
+
+Satu batasan lain yang kami temukan melalui pengukuran, bukan melalui desain: autoscaling berbasis CPU tidak berfungsi untuk beban kerja ini. Utilisasi pod aplikasi itu sendiri berada di 22 m core dibandingkan total node 3997 m core, karena pekerjaan kompilasi terjadi di container sibling yang tidak diperhitungkan oleh pod. Sinyal apa pun yang digunakan untuk menskalakan tingkatan ini harus menghitung container kompilasi yang sedang berjalan, bukan CPU pod.
+
+## 10. Implikasi di luar Overleaf
+
+Tidak ada hal di §4.2 atau §4.3 yang spesifik untuk kode Overleaf. Hukum-hukum terukur tersebut berasal dari tiga sifat yang dimiliki setiap layanan LaTeX yang di-host: satuan kerjanya adalah proses single-threaded, diisolasi dalam container, dan working set-nya adalah pohon read-only besar yang harus ditampung page cache. Tiga konsekuensi berlaku langsung bagi siapa pun yang membangun layanan semacam itu.
+
+### 10.1 Sediakan memori, lalu inti
+
+Hasil terkuat dari matriks ini bersifat negatif: di bawah 16 GiB jumlah inti hampir tidak relevan, dan baru pada 48 GiB konfigurasi 4, 8, dan 16 vCPU benar-benar terpisah (143, 268, 331). Operator yang membaca aturan konvensional sebagai "tambahkan satu inti per lima pengguna" membeli sumber daya yang salah. Mekanismenya adalah page cache bersama atas pohon distribusi, dan ini adalah sifat dari ukuran TeX Live, bukan dari front-end tertentu.
+
+### 10.2 Laju penerimaan adalah sumber daya, dan biasanya terlupakan
+
+Pada $N=1024$ server kami tidak pernah menampung lebih dari 205 sandbox hidup (Gambar 7b) meskipun setiap permintaan tiba sekaligus. Pembuatan container, bukan kompilasi, yang menjadi pembatas — konsisten dengan studi pengukuran yang mengaitkan biaya startup container dengan overhead runtime, bukan ukuran image \[19, 20]. Layanan yang hanya mengukur CPU dan memori akan mendapati perilaku lonjakannya ditentukan oleh kuantitas yang tidak pernah diukurnya. Bentuk praktisnya adalah rekomendasi §8: batasi penerimaan secara sengaja, karena antrean yang Anda pilih lebih baik daripada antrean yang Anda temukan belakangan.
+
+### 10.3 Sandbox yang hidup lebih lama dari kompilasinya membatalkan model
+
+Setiap angka kapasitas di sini mengasumsikan container dibuat, melakukan satu kompilasi, lalu keluar — umur puluhan detik dan duty cycle mendekati satu hanya selama berjalan. Dua pola desain terbaru mematahkan asumsi itu, dan keduanya mematahkannya dengan cara yang sama.
+
+Yang pertama adalah sandbox persisten per pengguna. Mengalokasikan lingkungan privat tetap untuk setiap pengguna mengubah pool yang dimultipleks secara statistik menjadi sekumpulan reservasi: layanan yang dapat melayani 256 kompilasi konkuren dari 64 inti melalui time-sharing hanya dapat melayani 16 pengguna jika masing-masing diberi empat inti khusus, satu orde besaran lebih sedikit untuk perangkat keras yang sama. Data kami mengkuantifikasi biaya pilihan tersebut alih-alih menentangnya — reservasi memberikan prediktabilitas, dan nilai tukarnya kira-kira $16\times$ pada titik operasi yang kami rekomendasikan.
+
+Yang kedua, dan lebih baru, adalah agen AI yang berbagi sandbox dengan compiler. Pada platform penulisan berbantuan agen, container yang sama yang menjalankan XeLaTeX juga dapat menampung agen coding yang berjalan lama, sehingga container tersebut terus-menerus terisi alih-alih hanya sesekali. Para praktisi melaporkan gejala yang persis diprediksi model untuk deployment semacam itu — kelambanan berkelanjutan pada jumlah pengguna yang sedang \[15]. Interaksinya layak dinyatakan secara tepat, karena ini bukan sekadar "beban lebih banyak". Tiga temuan kami saling memperparah. Okupansi tidak lagi bersifat sesekali, sehingga hukum time-sharing di §4.2 berlaku pada seluruh populasi sekaligus alih-alih pada bagian yang sedang mengompilasi. Page cache, yang memberikan imbal hasil memori super-linear di §4.1, kini dibagi dengan working set agen itu sendiri dan tidak lagi hangat untuk TeX. Dan ketiadaan batas memori container di §6.2 menjadi jauh lebih berbahaya, karena container yang tidak pernah keluar tidak pernah mengembalikan memorinya.
+
+Kami tidak mengukur platform semacam itu dan tidak membuat klaim tentang produk tertentu. Yang dapat kami katakan adalah apa implikasi angka-angka kami bagi desain: arsitektur yang memberi setiap pengguna sandbox multi-inti berumur panjang sebaiknya diukur sebagai sistem reservasi, bukan berdasarkan angka konkurensi yang dilaporkan di sini, dan kapasitas yang dapat diharapkan lebih mendekati jumlah intinya dibagi inti per pengguna daripada angka apa pun di Tabel 1.
+
+## 11. Ancaman terhadap validitas
+
+### 11.1 Dokumen tunggal
+
+Semua pengukuran menggunakan satu dokumen XeLaTeX setebal 63 halaman. Kapasitas absolut akan berbeda untuk dokumen lain; hukum penskalaan, yang berupa rasio, seharusnya tidak. Dokumen dengan resident set yang jauh lebih besar akan menggeser batas memori tanpa mengubah sifat super-linearnya.
+
+### 11.2 Host tervirtualisasi
+
+Guest berjalan di bawah KVM pada satu mesin fisik, sehingga angka absolut mencakup overhead virtualisasi dan guest berbagi page cache host serta perangkat NVMe. Kami memitigasi faktor pengganggu terbesar dengan mematikan guest yang tidak terkait setelah mengamati bahwa tekanan memori host menaikkan load average di dalam guest lebih dari $3\times$ pada konkurensi yang identik.
+
+### 11.3 Kedatangan simultan
+
+Setiap kompilasi dikirim pada satu momen yang sama, yang merupakan kasus terburuk. Pengguna nyata datang sebagai proses stokastik, sehingga deployment yang diukur berdasarkan angka kami memiliki margin alih-alih kekurangan — tetapi puncak di akhir tenggat pengumpulan lebih mendekati model kami daripada model Poisson.
+
+### 11.4 Konfigurasi tepi
+
+Pada 2 GiB sistem cukup dekat dengan keruntuhan sehingga run berulang dari konfigurasi yang sama dapat berbeda satu kompilasi. Kami melaporkan nilai yang konservatif dan tidak menarik kesimpulan dari perbedaan $\pm 1$ dalam rezim tersebut.
+
+## 12. Ketersediaan
+
+Sistem yang diuji, perangkat deployment, dan proyek upstream asalnya semuanya bersifat publik:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Toolkit deployment — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Dokumentasi — [https://ayakaleaf-pro.ayaka.space](/id)
+* Upstream Overleaf — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* Image kompilasi TeX Live — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Setiap lokasi sumber yang kami kutip diberikan sebagai path relatif repositori dengan nomor baris terhadap Ayakaleaf Pro v6.2.2, dan kedua commit upstream yang kami beri tanggal (`9a519f0d3d`, `5d472e9b38`) dapat dijangkau dalam riwayat Overleaf.
+
+## 13. Kontribusi
+
+Musicminion merancang studi, menyediakan dan mengoperasikan testbed, mengarahkan jalannya penyelidikan, dan memverifikasi setiap pengukuran yang dilaporkan di sini. Claude Opus 5 (Anthropic) membangun dan mengoperasikan harness benchmark, mengotomatiskan deployment, melakukan penelusuran kode sumber, membuat gambar-gambar, dan menyusun draf naskah. Kedua penulis meninjau teks akhir. Jika sebuah run dilaporkan terkontaminasi — pengukuran 1021 sesi di §4.3 dan level $N=256$ yang anomali di §4.1 — cacat tersebut ditemukan selama peninjauan dan run tersebut diulang sebelum publikasi alih-alih dibuang diam-diam.
+
+Pembaca perlu mencatat bahwa kebijakan kepengarangan di ACM, IEEE, dan ICMJE saat ini memberikan status penulis hanya kepada pihak yang dapat bertanggung jawab atas suatu karya, dan akan mewajibkan kontribusi penulis kedua dicatat sebagai pengungkapan, bukan sebagai byline. Kami menyatakan pembagian kerja secara eksplisit di sini agar catatannya akurat menurut konvensi mana pun.
+
+## 14. Kesimpulan
+
+Perencanaan kapasitas untuk Overleaf self-hosted bukanlah soal menskalakan satu sumber daya. Tiga temuan seharusnya mengubah cara melakukannya.
+
+Pertama, di bawah 32 GiB memori guest, jumlah inti hampir tidak berpengaruh: pada 16 GiB, kapasitas guest 4, 8, dan 16 vCPU berbeda kurang dari 8%. Memori, melalui page cache bersama atas pohon TeX Live, yang menentukan batasnya; inti baru mulai berpengaruh setelah memori berlimpah.
+
+Kedua, dua parameter perangkat lunak lebih berpengaruh daripada perangkat keras. Menghapus batas hard-coded 65 kompilasi pada CLSI dan menaikkan timeout kompilasi default 180 s membawa guest 8 vCPU / 48 GiB dari 64 menjadi 268 kompilasi konkuren — peningkatan 4,2 kali tanpa perangkat keras tambahan. Tidak satu pun dapat ditemukan dari dokumentasi konfigurasi; salah satunya bahkan sama sekali tidak dapat dikonfigurasi.
+
+Ketiga, pertanyaan "berapa banyak pengguna konkuren yang didukung mesin ini" kurang terspesifikasi. Konkurensi dalam sistem ini murni time-sharing, dan kapasitas adalah apa pun yang diizinkan oleh timeout. Bentuk jawaban yang jujur menyatakan keduanya: _mesin ini melayani_ $N$ _kompilasi simultan jika pengguna bersedia menunggu_ $T$ _detik_, dengan $N$ dan $T$ dihubungkan oleh Persamaan (1).
+
+Kami juga melaporkan cacat laten: batas memori per container pada Docker runner tidak efektif sejak 2018, baik dari segi besaran maupun penempatannya. Dampak praktisnya adalah kehabisan memori pada deployment kecil melumpuhkan seluruh layanan alih-alih hanya satu kompilasi yang bertanggung jawab.
+
+## Referensi
+
+\[1] Overleaf. _Hardware requirements_, Dokumentasi on-premises. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, Dokumentasi on-premises. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, Dokumentasi on-premises. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Source repository_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Laporan praktisi tentang latensi berkelanjutan pada platform penulisan berbantuan agen yang menempatkan agen coding persisten bersama compiler LaTeX dalam sandbox per pengguna. Kami mengutip ini sebagai pengalaman operasional yang dilaporkan, bukan sebagai pengukuran terkontrol; kami tidak melakukan benchmark terhadap platform semacam itu.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Pracetak.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Pracetak.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Pracetak.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Pracetak.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Pracetak.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

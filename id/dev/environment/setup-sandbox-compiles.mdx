@@ -1,0 +1,123 @@
+---
+title: Menyiapkan Sandbox Compiles
+icon: box-archive
+---
+
+Ada sedikit perbedaan antara lingkungan pengembangan dan produksi jika Anda ingin menyiapkan kompilasi sandbox untuk pengembangan. Ada 3 hal yang perlu Anda perhatikan:
+
+* Masalah izin file
+* Berbagi volume antara history-v1 dan filestore
+* Masalah subdirektori
+
+### Mengaktifkan Sandbox Compiles
+
+Di sini, kita cukup mengaktifkan Sandbox Compiles seperti yang kita lakukan di Overleaf CE. Namun, kita perlu memperhatikan penggunanya. Di sini kita mengaturnya ke root.
+
+Di lingkungan produksi, kami menggunakan www-data sebagai pengguna bersama antara kontainer Overleaf dan kontainer kompilasi TeX. Namun, di lingkungan pengembangan, node adalah pengguna default di dalam kontainer, dan tidak ada pengguna www-data yang dapat digunakan. Jadi, kami menggunakan root sebagai solusi sementara.
+
+<Warning>
+
+Jangan gunakan image yang Anda bangun sendiri, karena Anda mungkin akan menemui serangkaian error.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Memperbaiki Izin File
+
+LaTeX berjalan di kontainer saudara (sibling container) sebagai pengguna yang ditentukan dalam variabel lingkungan `TEXLIVE_IMAGE_USER`. Pada contoh di atas, nilainya diatur ke `root`, yang memiliki uid `0`. Ini menimbulkan masalah dengan izin di atas, karena pengguna root tidak memiliki izin untuk menulis ke subfolder `compiles`.
+
+Perbaikan cepatnya adalah memberikan kepemilikan grup `root` serta izin baca-tulis pada `compiles`, dengan `setgid` diaktifkan agar subfolder baru juga mewarisi kepemilikan ini:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Untuk dokumentasi lebih rinci, Anda dapat melihat `services/clsi/README.md`.
+
+### Berbagi Volume antara history-v1 dan filestore
+
+Secara default, filestore berfungsi sebagai jembatan antara S3 dan layanan lain di Overleaf. Namun, di Overleaf CE atau Server Pro, semua file disimpan secara lokal secara default. Karena itu, Overleaf memperkenalkan metode yang cukup rumit.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Pada saat yang sama, `data/history` juga digunakan oleh layanan history. Dengan cara ini, keduanya dapat berbagi data yang sama di antara microservice yang berbeda. Anda perlu menambahkan volume `history-v1-buckets` ini ke layanan filestore di lingkungan pengembangan. Jika tidak, **clsi tidak akan dapat mengambil file blob dari layanan filestore**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+Anda juga perlu menambahkan nama BUCKET ke pengaturan `dev.env`:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Menggunakan Subdirektori
+
+Filestore menggunakan useSubdirectories bernilai true secara default. Namun, di lingkungan pengembangan, history v1 akan **meratakan (flatten) semua data.** Hal ini menimbulkan konflik. Untuk memperbaikinya, Anda perlu menambahkan baris berikut:&#x20;
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+Di history v1, semua file `project_blobs` awalnya disimpan seperti ini:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Anda perlu mengatur useSubdirectories ke `true` untuk mengubahnya ke mode subdirektori. Sekarang, karakter `_` asli dalam blob akan diganti dengan `/` .

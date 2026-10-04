@@ -1,0 +1,151 @@
+---
+title: Microservice
+icon: microchip
+---
+
+Cách được khuyến nghị để triển khai và quản lý các phiên bản Overleaf Server CE và Overleaf Pro là sử dụng Toolkit.
+
+Toolkit đơn giản hóa việc tạo phiên bản Overleaf của bạn thông qua một số script tùy chỉnh giúp ẩn đi việc điều phối các microservice cần thiết. Chỉ cần chạy script khởi tạo đi kèm, cung cấp một vài tùy chọn cấu hình như đường dẫn lưu trữ lâu dài, và Toolkit sẽ lo việc cấp phát và kết nối các microservice tạo nên phiên bản Overleaf Server CE hoặc Pro của bạn.
+
+Nhờ đó, bạn có thể tập trung vào việc tùy chỉnh trải nghiệm người dùng và triển khai các tính năng cụ thể cho phiên bản on-premise của mình. Toolkit xử lý toàn bộ sự phức tạp ở phía sau, giúp việc triển khai phiên bản Overleaf trở nên đơn giản.
+
+<Info>
+
+Vì lý do lịch sử, container chính của Overleaf được gọi là `sharelatex` và dựa trên Docker image `sharelatex/sharelatex`. Lý do là công nghệ này dựa trên mã nguồn của ShareLaTeX, vốn đã được sáp nhập vào Overleaf. Xem [bài blog này](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf) để biết thêm chi tiết. Trong tương lai, tên này sẽ được đổi để phù hợp với quy ước đặt tên của Overleaf.
+
+</Info>
+
+#### Kiến trúc
+
+Bên trong container Overleaf, phần mềm chạy dưới dạng một tập hợp các microservice được quản lý bởi `runit`. Một số tệp đáng chú ý bên trong container gồm:
+
+* `/etc/service/`: các tệp khởi tạo cho các microservice.
+* `/var/log/overleaf/`: log của từng microservice.
+* `/overleaf/services/`: mã nguồn của các microservice.
+* `/var/lib/overleaf/`: điểm mount cho dữ liệu lưu trữ lâu dài (tương ứng với thư mục được chỉ định bởi `OVERLEAF_DATA_PATH` trên máy host).
+
+#### Các container MongoDB và Redis
+
+Overleaf phụ thuộc vào hai cơ sở dữ liệu bên ngoài: MongoDB và Redis. Theo mặc định, Toolkit sẽ cấp phát một container cho mỗi cơ sở dữ liệu này, cùng với container Overleaf, tổng cộng là ba Docker container.
+
+<Info>
+
+Nếu bạn muốn kết nối đến một phiên bản MongoDB hoặc Redis sẵn có, bạn có thể làm điều đó bằng cách đặt các thiết lập phù hợp trong tệp cấu hình [overleaf.rc](/vi/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Trình soạn thảo và quá trình biên dịch
+
+Phần này cung cấp cái nhìn tổng quan về cách xử lý tài liệu và quá trình biên dịch.
+
+<Info>
+
+Trang này mô tả quá trình biên dịch với Sandboxed Compiles, vốn chỉ có trong Overleaf Pro. Trong Server CE, quá trình biên dịch sử dụng các tiến trình con đơn giản — hãy thay các mục đề cập đến **container** bằng một mục duy nhất **chạy biên dịch trong tiến trình con**.
+
+</Info>
+
+Các thành phần / tác nhân:
+
+* `user` — Người dùng ứng dụng
+* `editor` — Ứng dụng client chạy trong trình duyệt
+* `clsi` — Microservice dùng để biên dịch PDF
+* `document-updater` — Microservice dùng để xử lý các cập nhật tài liệu
+* `filestore` — Microservice xử lý các tệp nhị phân
+* `real-time` — Microservice dùng để xử lý web socket
+* `web` — Microservice (không mấy "micro") dùng để xử lý các yêu cầu API
+
+**Bộ nhớ đệm Redis**
+
+* **user**: tải trang trình soạn thảo
+* **editor**: mở web socket
+* **editor**: gửi yêu cầu mở một tài liệu qua web socket
+  * **real-time** -> **document-updater**: tài liệu được tải từ MongoDB vào Redis
+* **editor**: gửi cập nhật tài liệu qua web socket
+  * **real-time** -> **document-updater**: tài liệu được cập nhật trong Redis
+* **editor**: gửi thêm các yêu cầu biên dịch
+  * Sau 5 phút kể từ lần flush gần nhất (theo từng tài liệu):
+    * **document-updater**: flush tài liệu từ Redis vào MongoDB
+* **editor**: gửi thêm cập nhật
+  * cứ mỗi 100 cập nhật (theo từng tài liệu):
+    * **document-updater**: flush lịch sử tài liệu từ Redis vào MongoDB
+* **user**: rời trình soạn thảo/đóng tab trình duyệt
+  * 5 phút sau
+    * **real-time**: kiểm tra các cộng tác viên khác, nếu không còn ai:
+      * **real-time** -> **document-updater**: flush các tài liệu từ Redis vào MongoDB
+
+**Đọc từ MongoDB vào Redis**
+
+* **document-updater** -> **web** -> **docstore**: đọc từ MongoDB
+
+**Flush từ Redis vào MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: ghi vào MongoDB
+
+**Biên dịch — chế độ đồng bộ "full"**
+
+* **editor**: gửi yêu cầu biên dịch với sync-mode đặt là "full"
+* **web** -> **document-updater**: mọi tài liệu được flush từ Redis vào MongoDB
+* **web** -> **docstore**: tất cả tài liệu được tải xuống từ MongoDB
+* **web** -> **clsi**: yêu cầu biên dịch được gửi đến `clsi`, bao gồm:
+  * sync-mode
+  * một hash của cây tệp -> "trạng thái dự án" (project state)
+  * tất cả tài liệu kèm nội dung -> chịu giới hạn 7MB cho phần thân yêu cầu
+  * URL của các tệp nhị phân để tải xuống riêng
+* **clsi**: kiểm tra trạng thái trên đĩa với sync-mode và "trạng thái dự án"
+  * đây là đồng bộ toàn bộ, nên trạng thái trên đĩa trước đó có thể bỏ qua
+* **clsi**: dọn dẹp thư mục biên dịch
+* **clsi**: ghi tất cả tài liệu vào thư mục biên dịch
+* **clsi**: ghi tất cả tệp nhị phân vào thư mục biên dịch
+  * `clsi` sao chép các tệp từ bộ nhớ đệm cục bộ theo từng dự án
+  * khi không có trong bộ nhớ đệm (cache miss):
+    * **clsi** -> **filestore**: tải tệp xuống
+* **clsi**: ghi "trạng thái dự án"
+* **clsi**: đảm bảo docker container tồn tại với cấu hình mong muốn
+  * tạo các tùy chọn container, bao gồm phiên bản texlive
+  * hash các tùy chọn
+  * tên container: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: khởi động container và stream stdout/stderr vào bộ nhớ -> giới hạn 2MB
+* **clsi**: giữ lại container đã dừng -> được dọn dẹp sau 24 giờ
+* **clsi**: ghi stdout/stderr ra đĩa
+* **clsi**: sao chép các tệp đầu ra vào một thư mục đầu ra duy nhất
+  * build-id gồm 8 byte ngẫu nhiên cộng với dấu thời gian chính xác đến mili giây
+  * xóa tất cả trừ 3 thư mục build gần nhất (ẩn danh) / 1 thư mục build gần nhất (người dùng đã đăng nhập)
+* **clsi**: biên dịch thất bại/hết thời gian
+  * xóa bộ nhớ đệm biên dịch — nó có thể chứa tệp không đầy đủ/bộ nhớ đệm bị hỏng
+* **editor**: tải xuống output.log và output.pdf
+
+**Biên dịch — chế độ đồng bộ "incremental"**
+
+* **editor**: gửi yêu cầu biên dịch với sync-mode đặt là "incremental"
+* **web** -> **document-updater**: lấy mọi tài liệu từ Redis
+  * hash "trạng thái dự án" cũng được lưu trong Redis
+  * **web** gửi hash của cây tệp đến `document-updater`, và `document-updater` có thể chuyển biên dịch tăng dần thành biên dịch toàn bộ nếu không khớp
+    * xem quá trình biên dịch như khi editor yêu cầu biên dịch "full"
+* **web** -> **clsi**: yêu cầu biên dịch được gửi đến `clsi`, bao gồm:
+  * sync-mode
+  * một hash của cây tệp -> "trạng thái dự án"
+  * tất cả tài liệu từ Redis kèm nội dung -> chịu giới hạn 7MB cho phần thân yêu cầu
+  * không có tệp nhị phân
+* **clsi**: kiểm tra trạng thái trên đĩa với sync-mode và "trạng thái dự án"
+  * đây là đồng bộ tăng dần, nên "trạng thái dự án" phải khớp
+  * nếu không khớp: phản hồi 409, để web thử lại với đồng bộ "full"
+    * xem quá trình biên dịch như khi editor yêu cầu biên dịch "full"
+* **clsi**: ghi các tài liệu đã cập nhật vào thư mục biên dịch
+* **clsi**: đảm bảo docker container tồn tại với cấu hình mong muốn
+  * tạo các tùy chọn container, bao gồm phiên bản texlive
+  * hash các tùy chọn
+  * tên container: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: khởi động container và stream stdout/stderr vào bộ nhớ -> giới hạn 2MB
+* **clsi**: giữ lại container đã dừng -> được dọn dẹp sau 24 giờ
+* **clsi**: ghi stdout/stderr ra đĩa
+* **clsi**: sao chép các tệp đầu ra vào một thư mục đầu ra duy nhất
+  * build-id gồm 8 byte ngẫu nhiên cộng với dấu thời gian chính xác đến mili giây
+  * xóa tất cả trừ 3 thư mục build gần nhất (ẩn danh) / 1 thư mục build gần nhất (người dùng đã đăng nhập)
+* **clsi**: biên dịch thất bại/hết thời gian
+  * xóa bộ nhớ đệm biên dịch — nó có thể chứa tệp không đầy đủ/bộ nhớ đệm bị hỏng
+* **editor**: tải xuống output.log và output.pdf
+
+**Biên dịch — chuyển đổi giữa các chế độ**
+
+* **editor**: ghi nhận biên dịch thất bại, lần biên dịch tiếp theo sẽ là biên dịch "full"
+* **editor**: ghi nhận biên dịch thành công, lần biên dịch tiếp theo sẽ là biên dịch "incremental"

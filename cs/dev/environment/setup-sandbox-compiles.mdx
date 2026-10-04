@@ -1,0 +1,123 @@
+---
+title: Nastavení kompilací v sandboxu
+icon: box-archive
+---
+
+Pokud chcete nastavit kompilaci v sandboxu pro vývoj, existuje několik drobných rozdílů mezi vývojovým a produkčním prostředím. Musíte dbát na 3 věci:
+
+* Problém s oprávněními souborů
+* Sdílení svazku mezi history-v1 a filestore
+* Problém s podadresáři
+
+### Povolení kompilací v sandboxu
+
+Zde stačí povolit Sandbox Compiles stejně jako v Overleaf CE. Je však třeba dát pozor na uživatele. Zde ho nastavíme na root.
+
+V produkčním prostředí používáme www-data jako sdíleného uživatele mezi kontejnerem Overleafu a kontejnerem pro kompilaci TeXu. Ve vývojovém prostředí je však výchozím uživatelem v kontejneru node a uživatel www-data, na kterého by se to dalo navázat, neexistuje. Jako náhradní řešení proto použijeme root.
+
+<Warning>
+
+Nepoužívejte prosím vlastní sestavený image, mohli byste narazit na řadu chyb.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Oprava oprávnění souborů
+
+LaTeX běží v sousedních kontejnerech pod uživatelem zadaným v proměnné prostředí `TEXLIVE_IMAGE_USER`. Ve výše uvedeném příkladu je nastaven na `root`, který má uid `0`. To způsobuje problém s výše uvedenými oprávněními, protože uživatel root nemá oprávnění zapisovat do podsložek `compiles`.
+
+Rychlou opravou je přidělit skupině `root` vlastnictví a oprávnění ke čtení a zápisu ke `compiles` a nastavit `setgid`, aby toto vlastnictví zdědily i nové podsložky:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Podrobnou dokumentaci najdete v `services/clsi/README.md`.
+
+### Sdílení svazku mezi history-v1 a filestore
+
+Ve výchozím nastavení slouží filestore jako most mezi S3 a ostatními službami Overleafu. V Overleaf CE nebo Server Pro se však všechny soubory ve výchozím stavu ukládají lokálně. Overleaf proto zavedl velmi důmyslný postup.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Zároveň `data/history` používá také služba history. Díky tomu mohou různé mikroslužby sdílet stejná data. Ve vývojovém prostředí musíte do služby filestore přidat svazek `history-v1-buckets`. Jinak **clsi nebude moci stahovat soubory blob ze služby filestore**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+Do nastavení `dev.env` je také třeba přidat názvy BUCKETů:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Použití podadresářů
+
+Filestore ve výchozím nastavení používá useSubdirectories s hodnotou true, ve vývojovém prostředí však history v1 **ukládá všechna data naplocho.** To způsobuje konflikty. Chcete-li to opravit, musíte přidat následující:&#x20;
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+V history v1 jsou všechny soubory `project_blobs` původně uloženy takto:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Musíte nastavit useSubdirectories na `true`, aby se přepnul do režimu podadresářů. Původní `_` v názvu blobu se pak nahradí znakem `/` .

@@ -1,0 +1,151 @@
+---
+title: Mikroslužby
+icon: microchip
+---
+
+Doporučeným způsobem nasazení a správy instancí Overleaf Server CE a Overleaf Pro je použití Toolkitu.
+
+Toolkit zjednodušuje vytvoření vaší instance Overleaf pomocí několika vlastních skriptů, které odstiňují orchestraci potřebných mikroslužeb. Stačí spustit přiložený inicializační skript, zadat několik konfiguračních voleb, například cesty k trvalému úložišti, a Toolkit se postará o zřízení a propojení mikroslužeb, z nichž se vaše instance Overleaf Server CE nebo Pro skládá.
+
+Vy se tak můžete soustředit na přizpůsobení uživatelského prostředí a implementaci konkrétních funkcí vaší on-premise instance. Toolkit veškerou složitost obstarává na pozadí a umožňuje zjednodušené nasazení vaší instance Overleaf.
+
+<Info>
+
+Z historických důvodů se hlavní kontejner Overleaf jmenuje `sharelatex` a je založen na Docker image `sharelatex/sharelatex`. Je to proto, že technologie vychází z kódové základny ShareLaTeX, která byla sloučena do Overleaf. Další podrobnosti najdete v [tomto příspěvku na blogu](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf). V budoucnu bude kontejner přejmenován tak, aby odpovídal pojmenování Overleaf.
+
+</Info>
+
+#### Architektura
+
+Uvnitř kontejneru Overleaf běží software jako sada mikroslužeb spravovaných pomocí `runit`. Mezi zajímavější soubory uvnitř kontejneru patří:
+
+* `/etc/service/`: inicializační soubory mikroslužeb.
+* `/var/log/overleaf/`: logy jednotlivých mikroslužeb.
+* `/overleaf/services/`: kód jednotlivých mikroslužeb.
+* `/var/lib/overleaf/`: přípojný bod pro trvalá data (odpovídá adresáři určenému proměnnou `OVERLEAF_DATA_PATH` na hostiteli).
+
+#### Kontejnery MongoDB a Redis
+
+Overleaf závisí na dvou externích databázích: MongoDB a Redis. Ve výchozím nastavení Toolkit kromě kontejneru Overleaf zřídí pro každou z těchto databází vlastní kontejner, celkem tedy tři kontejnery Dockeru.
+
+<Info>
+
+Pokud se raději chcete připojit k existující instanci MongoDB nebo Redis, můžete tak učinit nastavením příslušných hodnot v konfiguračním souboru [overleaf.rc](/cs/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Editor a proces kompilace
+
+Tato sekce poskytuje obecný přehled o zpracování dokumentů a procesu kompilace.
+
+<Info>
+
+Tato stránka popisuje proces kompilace se Sandboxed Compiles, které jsou k dispozici pouze v Overleaf Pro. V Server CE používá proces kompilace jednoduché podprocesy — položky odkazující na **kontejner** nahraďte jedinou položkou **spuštění kompilace v podprocesu**.
+
+</Info>
+
+Komponenty / aktéři:
+
+* `user` — uživatel aplikace
+* `editor` — klientská aplikace běžící v prohlížeči
+* `clsi` — mikroslužba používaná ke kompilaci PDF
+* `document-updater` — mikroslužba používaná ke zpracování aktualizací dokumentů
+* `filestore` — mikroslužba pracující s binárními soubory
+* `real-time` — mikroslužba obsluhující web sockety
+* `web` — (ne až tak) mikroslužba obsluhující požadavky API
+
+**Cachování v Redis**
+
+* **user**: načte stránku editoru
+* **editor**: otevře web socket
+* **editor**: přes web socket odešle požadavek na otevření dokumentu
+  * **real-time** -> **document-updater**: dokument se načte z MongoDB do Redis
+* **editor**: přes web socket odešle aktualizaci dokumentu
+  * **real-time** -> **document-updater**: dokument se aktualizuje v Redis
+* **editor**: odesílá další požadavky na kompilaci
+  * Po uplynutí 5 minut od posledního uložení (pro každý dokument):
+    * **document-updater**: uloží dokument z Redis do MongoDB
+* **editor**: odesílá další aktualizace
+  * každých 100 aktualizací (pro každý dokument):
+    * **document-updater**: uloží historii dokumentu z Redis do MongoDB
+* **user**: opustí editor / zavře kartu prohlížeče
+  * o 5 minut později
+    * **real-time**: zkontroluje, zda jsou přítomni další spolupracovníci; pokud ne:
+      * **real-time** -> **document-updater**: uloží dokumenty z Redis do MongoDB
+
+**Čtení z MongoDB do Redis**
+
+* **document-updater** -> **web** -> **docstore**: čtení z MongoDB
+
+**Ukládání z Redis do MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: zápis do MongoDB
+
+**Kompilace — režim synchronizace „full“**
+
+* **editor**: odešle požadavek na kompilaci s režimem synchronizace nastaveným na „full“
+* **web** -> **document-updater**: všechny dokumenty se uloží z Redis do MongoDB
+* **web** -> **docstore**: všechny dokumenty se stáhnou z MongoDB
+* **web** -> **clsi**: požadavek na kompilaci se odešle do `clsi` a obsahuje:
+  * režim synchronizace
+  * hash stromu souborů -> „stav projektu“
+  * všechny dokumenty s jejich obsahem -> podléhá limitu 7 MB na tělo požadavku
+  * URL binárních souborů pro samostatné stažení
+* **clsi**: zkontroluje stav na disku podle režimu synchronizace a „stavu projektu“
+  * jde o úplnou synchronizaci, takže předchozí stav na disku lze ignorovat
+* **clsi**: vyčistí kompilační adresář
+* **clsi**: zapíše všechny dokumenty do kompilačního adresáře
+* **clsi**: zapíše všechny binární soubory do kompilačního adresáře
+  * `clsi` kopíruje soubory z lokální cache daného projektu
+  * při chybějící položce v cache:
+    * **clsi** -> **filestore**: stáhne soubory
+* **clsi**: zapíše „stav projektu“
+* **clsi**: zajistí, že existuje kontejner Dockeru s požadovanou konfigurací
+  * sestaví volby kontejneru, včetně verze texlive
+  * vytvoří hash voleb
+  * název kontejneru: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: spustí kontejner a streamuje stdout/stderr do paměti -> limit 2 MB
+* **clsi**: ponechá zastavený kontejner -> uklidí se po 24 hodinách
+* **clsi**: zapíše stdout/stderr na disk
+* **clsi**: zkopíruje výstupní soubory do jedinečného výstupního adresáře
+  * build-id se skládá z 8 náhodných bajtů a časového razítka s přesností na ms
+  * smaže všechny adresáře sestavení kromě posledních 3 (anonymní uživatel) / posledního 1 (přihlášený uživatel)
+* **clsi**: kompilace selhala / vypršel časový limit
+  * smaže kompilační cache — může obsahovat neúplné soubory / poškozenou cache
+* **editor**: stáhne output.log a output.pdf
+
+**Kompilace — režim synchronizace „incremental“**
+
+* **editor**: odešle požadavek na kompilaci s režimem synchronizace nastaveným na „incremental“
+* **web** -> **document-updater**: získá všechny dokumenty z Redis
+  * hash „stavu projektu“ je rovněž uložen v Redis
+  * **web** odešle hash stromu souborů do `document-updater` a `document-updater` může při neshodě změnit inkrementální kompilaci na úplnou
+    * viz proces kompilace, když editor požaduje „full“ kompilaci
+* **web** -> **clsi**: požadavek na kompilaci se odešle do `clsi` a obsahuje:
+  * režim synchronizace
+  * hash stromu souborů -> „stav projektu“
+  * všechny dokumenty z Redis s jejich obsahem -> podléhá limitu 7 MB na tělo požadavku
+  * žádné binární soubory
+* **clsi**: zkontroluje stav na disku podle režimu synchronizace a „stavu projektu“
+  * jde o inkrementální synchronizaci, takže „stav projektu“ se musí shodovat
+  * při neshodě: odpoví kódem 409 a nechá web opakovat pokus se synchronizací „full“
+    * viz proces kompilace, když editor požaduje „full“ kompilaci
+* **clsi**: zapíše aktualizované dokumenty do kompilačního adresáře
+* **clsi**: zajistí, že existuje kontejner Dockeru s požadovanou konfigurací
+  * sestaví volby kontejneru, včetně verze texlive
+  * vytvoří hash voleb
+  * název kontejneru: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: spustí kontejner a streamuje stdout/stderr do paměti -> limit 2 MB
+* **clsi**: ponechá zastavený kontejner -> uklidí se po 24 hodinách
+* **clsi**: zapíše stdout/stderr na disk
+* **clsi**: zkopíruje výstupní soubory do jedinečného výstupního adresáře
+  * build-id se skládá z 8 náhodných bajtů a časového razítka s přesností na ms
+  * smaže všechny adresáře sestavení kromě posledních 3 (anonymní uživatel) / posledního 1 (přihlášený uživatel)
+* **clsi**: kompilace selhala / vypršel časový limit
+  * smaže kompilační cache — může obsahovat neúplné soubory / poškozenou cache
+* **editor**: stáhne output.log a output.pdf
+
+**Kompilace — přepínání mezi režimy**
+
+* **editor**: zaznamená neúspěšnou kompilaci, další kompilace bude „full“
+* **editor**: zaznamená úspěšnou kompilaci, další kompilace bude „incremental“

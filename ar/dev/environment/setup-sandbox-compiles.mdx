@@ -1,0 +1,123 @@
+---
+title: إعداد Sandbox Compiles
+icon: box-archive
+---
+
+هناك بعض الاختلافات بين بيئة التطوير وبيئة الإنتاج إذا أردت إعداد Sandbox Compiles لبيئة التطوير. وهناك 3 أمور عليك الانتباه إليها:
+
+* مشكلة أذونات الملفات
+* مشاركة وحدة التخزين (Volume) بين history-v1 و filestore
+* مشكلة المجلدات الفرعية
+
+### تفعيل Sandbox Compiles
+
+هنا، نحتاج فقط إلى تفعيل Sandbox Compiles كما نفعل في overleaf ce. لكن علينا الانتباه إلى المستخدم فقط، وهنا نضبطه على root.
+
+في بيئة الإنتاج، نستخدم www-data كمستخدم مشترك بين حاوية overleaf وحاوية ترجمة tex. أما في بيئة التطوير، فإن node هو المستخدم الافتراضي في الحاوية، ولا يوجد مستخدم www-data للربط به. لذلك نستخدم root كحل بديل.
+
+<Warning>
+
+يُرجى عدم استخدام صورة قمت ببنائها بنفسك، فقد تواجه سلسلة من الأخطاء.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### إصلاح أذونات الملفات
+
+يعمل LaTeX في الحاويات الشقيقة بصلاحيات المستخدم المحدد في متغير البيئة `TEXLIVE_IMAGE_USER`. وفي المثال أعلاه، تم ضبطه على `root` الذي يملك uid `0`. ويسبب ذلك مشكلة مع الأذونات المذكورة أعلاه، إذ لا يملك المستخدم root إذن الكتابة في المجلدات الفرعية لـ `compiles`.
+
+يتمثل الحل السريع في منح المجموعة `root` ملكية `compiles` وأذونات القراءة والكتابة عليه، مع ضبط `setgid` بحيث ترث المجلدات الفرعية الجديدة هذه الملكية أيضًا:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+للاطلاع على التوثيق التفصيلي، يمكنك مراجعة `services/clsi/README.md`.
+
+### مشاركة وحدة التخزين (Volume) بين history-v1 و filestore
+
+افتراضيًا، تعمل filestore كجسر بين s3 والخدمات الأخرى في overleaf. لكن في overleaf ce أو server pro، تُخزَّن جميع الملفات محليًا بشكل افتراضي. ولذلك اعتمدت overleaf طريقة ملتوية جدًا.
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+وفي الوقت نفسه، تستخدم خدمة history أيضًا المجلد `data/history`. وبهذه الطريقة، يمكن للخدمات المصغّرة المختلفة مشاركة البيانات نفسها. عليك إضافة وحدة التخزين `history-v1-buckets` إلى خدمة filestore في بيئة التطوير. وإلا، **فلن تتمكن clsi من سحب ملفات blob من خدمة filestore**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+كما تحتاج إلى إضافة اسم BUCKET إلى إعدادات `dev.env`:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### استخدام المجلدات الفرعية
+
+تستخدم filestore الخيار useSubdirectories بقيمة true افتراضيًا، لكن في بيئة التطوير، ستقوم history v1 **بتسطيح جميع البيانات.** ويسبب ذلك بعض التعارض. ولإصلاح ذلك، عليك إضافة ما يلي:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+في history v1، تُخزَّن جميع ملفات `project_blobs` في الأصل بهذا الشكل:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+عليك ضبط useSubdirectories على `true` لتغييرها إلى وضع المجلدات الفرعية. وعندها سيُستبدل الحرف `_` الأصلي في blob بالحرف `/`.

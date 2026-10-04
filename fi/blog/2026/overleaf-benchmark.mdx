@@ -1,0 +1,635 @@
+---
+title: 'Overleaf-suorituskykytesti: syvällinen tutkimus samanaikaisesta LaTeX-käännöksestä Overleafissa (SaaS ja itse isännöity)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Tiivistelmä
+
+Itse isännöityjen Overleaf-asennusten kapasiteetti mitoitetaan yleensä yhdellä nyrkkisäännöllä: yksi prosessoriydin ja yksi gigatavu muistia viittä–kymmentä samanaikaista käyttäjää kohden. Osoitamme, että tämä sääntö ei ole pelkästään epätarkka vaan rakenteellisesti väärä, koska se olettaa kapasiteettia rajoittavan yhden resurssiulottuvuuden, vaikka todellisuudessa rajoja on kaksi toisistaan riippumatonta, ja koska kaksi ohjelmistoparametria — kumpikaan ei laitteistoon liittyvä — ratkaisee lopputuloksen jopa nelinkertaisella erolla.
+
+Mittaamme vakiomuotoista Ayakaleaf Pro v6.2.2 -asennusta hiekkalaatikoidulla käännöksellä (TeX Live 2025) 21 suoritin- ja muistikokoonpanossa QEMU/KVM-vierasjärjestelmissä, joiden isäntäytimien kellotaajuus on lukittu 3,0 GHz:iin. Kuormana on todellinen 63-sivuinen XeLaTeX-opinnäyte, jonka jopa useat sadat eri käyttäjätilit kääntävät samanaikaisesti. Havaitsemme, että alle 32 GiB:n vierasmuistilla ydinmäärällä ei ole juuri merkitystä — 16 GiB:n muistilla 4, 8 ja 16 vCPU:n vierasjärjestelmien mitattu kapasiteetti eroaa alle 8 % — ja että kapasiteettia rajoittaa sen sijaan superlineaarinen muistiraja, joka syntyy TeX Live -puun jaetusta sivuvälimuistista.
+
+Selvittääksemme, pätevätkö nämä lait myös suuruusluokkaa suuremmassa mittakaavassa, toistamme mittaussarjan yhdellä 64-ytimisellä, 995 GiB:n palvelimella. Se selviää 1024 samanaikaisesta kylmästä käännöksestä 100 %:n onnistumisasteella — kahdeksankertaisesti säikeidensä määrään nähden — emmekä koskaan saavuta sen ylärajaa. Hyödyllinen luku ei ole tuo yläraja vaan sen alapuolella oleva taitekohta: hännän viive kasvaa 20–40 % jokaista kaksinkertaistusta kohden arvoon $N=256$ asti ja sitten 190 % arvossa $N=512$. Kapasiteetti, joka ilmoitetaan "suurimpana samanaikaisuutena, joka ei epäonnistu", liioittelisi siis käyttökelpoista toimintapistettä nelinkertaisesti. Tällä koneella muisti ei koskaan ole rajoittava resurssi; rajana on suoritin yhdessä sen nopeuden kanssa, jolla konttidaemon pystyy ottamaan vastaan uusia hiekkalaatikoita, ja tämä kyllästyy noin 200:n kohdalla riippumatta siitä, kuinka monta käännöstä pyydetään.
+
+Tunnistamme lisäksi kaksi toteutustason vaikutusta, jotka eivät näy kapasiteettisuunnittelussa. Ensinnäkin CLSI pakottaa kovakoodatun 65 samanaikaisen käännöksen ylärajan, jota ei voi muuttaa minkään ympäristömuuttujan kautta; sen ylittyessä käyttäjät saavat välittömästi HTTP 503 -vastauksen sen sijaan, että heidät asetettaisiin jonoon. Toiseksi Docker-suorittimen konttikohtainen muistiraja on ollut tehoton sen käyttöönotosta vuonna 2018 lähtien sekä suuruutensa että sijoittelunsa vuoksi, joten muistin loppuminen kaataa koko isäntäkoneen yksittäisen käännöksen sijaan. Samanaikaisuusrajan poistaminen ja oletusarvoisen käännösaikakatkaisun nostaminen 180 sekunnista 300 sekuntiin kasvattaa 8 vCPU / 48 GiB -vierasjärjestelmän mitatun kapasiteetin 64:stä 268 samanaikaiseen käännökseen — 4,2-kertaisesti ilman laitteistokustannuksia.
+
+Lopuksi osoitamme, että samanaikaisuus tässä järjestelmässä tuo vain aikajakoa ja että kuormaa rajoittaa pelkästään kellotaajuus. Sovitettu heikkenemislaki $T(N)=T_1\max(1,N/C)^{b}$ antaa tulokseksi $b=0.914$, mikä on lähellä täydellistä suhteellista hidastumista, ja kellotaajuussarja koneen koko 1,0–5,5 GHz:n alueella tiivistää kolmekymmentä mittausta yhtälöön $T=(k/f)\max(1,N/C)$, jossa $k=27.9 GHz·s$ ja jäännöshajonta on 5,1 %. 5,5-kertainen kellotaajuus tuo 5,5-kertaisen nopeutuksen ilman vähenevää hyötyä, ja tässä mielessä kellotaajuus ja ytimet tuovat eri asioita: kellotaajuus nopeuttaa jokaisen käyttäjän käännöstä, ytimet vain päästävät sisään enemmän käyttäjiä.
+
+## 1. Johdanto
+
+Overleaf on hallitseva yhteiskäyttöinen LaTeX-editori, ja sen paikallisesti asennettava jakeluversio on laajalti käytössä yliopistoissa ja tutkimusryhmissä, jotka eivät voi lähettää julkaisemattomia käsikirjoituksia kolmannen osapuolen pilveen. Tällaisen asennuksen mitoittaminen on toistuva käytännön kysymys: kuinka moni ihminen voi kiinteällä laitteistobudjetilla todella painaa "Recompile"-painiketta samaan aikaan?
+
+Virallinen ohjeistus on lineaarinen sääntö — suunnilleen yksi ydin ja yksi gigatavu viittä–kymmentä samanaikaista käyttäjää kohden — joka olettaa kapasiteetin skaalautuvan tasaisesti ja yhdessä molempien resurssien mukana. Mittauksemme kumoavat tämän kolmella tavalla.
+
+### 1.1 Kapasiteettia rajoittaa kaksi toisistaan riippumatonta rajaa, ei yksi
+
+Kokoonpano epäonnistuu joko siksi, että muisti loppuu, jolloin Overleaf-pino itse kaatuu ja palauttaa HTTP 502 -vastauksen, tai siksi, että käännökset ylittävät palvelinpuolen aikakatkaisun, jolloin CLSI raportoi tilan `timedout` gigatavujen muistia ollessa käyttämättä. Näillä kahdella tilalla on täysin erilainen skaalautumiskäyttäytyminen ja erilaiset korjauskeinot. Ytimien lisääminen muistirajoitteiseen kokoonpanoon ei ole pelkästään tehotonta, vaan joskus jopa haitallista: mittasimme kokoonpanoja, joissa ydinmäärän kasvattaminen _pienentää_ kapasiteettia, koska useammat ytimet saavat samanaikaiset käännökset etenemään tahdissa, jolloin niiden muistihuiput osuvat samaan aikaan lomittumisen sijaan.
+
+### 1.2 Ohjelmistoparametrit ovat laitteistoa ratkaisevampia
+
+Käännösaikakatkaisu on MongoDB:n käyttäjäkohtainen kenttä, jonka oletusarvo 180 s rajoittaa huomaamatta suoritinrajoitteisia kokoonpanoja. Sen nostaminen 300 sekuntiin moninkertaistaa mitatun kapasiteetin jopa 4,2-kertaiseksi samalla laitteistolla. Tästä riippumatta CLSI kieltäytyy yli 65 samanaikaisesta käännöksestä kovakoodatun vakion vuoksi. Mikä tahansa kapasiteettitutkimus — ja mikä tahansa asennus — joka ei huomioi kumpaakin, mittaa ohjelmistoa eikä konetta.
+
+### 1.3 Samanaikaisuus on aikajakoa, ei rinnakkaisuutta
+
+Koska LaTeX-käännös on yksisäikeinen, $N$ samanaikaisen käyttäjän palveleminen $C$ ytimellä ei saa järjestelmää valmistumaan nopeammin; se saa jokaisen käyttäjän odottamaan suhteellisesti pidempään. Kysymys "kuinka montaa samanaikaista käyttäjää tuetaan" on siksi huonosti asetettu, kunnes päätetään, kuinka kauan käyttäjä on valmis odottamaan. Teemme tämän riippuvuuden näkyväksi ja kvantifioimme sen.
+
+### 1.4 Kontribuutiot
+
+* Kapasiteettimatriisi 21 suoritin- ja muistikokoonpanosta, mitattuna kellotaajuuslukituissa, toistolla varmennetuissa olosuhteissa, ja kunkin kokoonpanon rajoittava tekijä tunnistettuna sen virhesignatuurista.
+* Kaksi sovitettua mallia: kapasiteettimalli, joka erottaa superlineaarisen muistirajan suoritinrajasta, ja viivemalli, joka osoittaa puhtaan aikajakokäyttäytymisen.
+* Kahden käytössä olevan järjestelmän toteutusongelman tunnistaminen ja kokeellinen vahvistaminen, mukaan lukien kontin muistiraja, joka on ollut toimimaton vuodesta 2018.
+* Käännösaikakatkaisun ja kapasiteetin välisen kompromissin kvantifiointi, joka on mielestämme ilmoitettava jokaisen samanaikaisuusluvun yhteydessä.
+
+## 2. Tausta
+
+### 2.1 Käännöspolku
+
+Overleafin käännöspyyntö kulkee reittiä `web` $\rightarrow$ `clsi` $\rightarrow$ käännöskontti. Hiekkalaatikoidun käännöksen asennuksessa (`SIBLING_CONTAINERS_ENABLED=true`) CLSI ei suorita `latexmk`-ohjelmaa omassa prosessissaan; se pyytää isäntäkoneen Docker-daemonia, johon se pääsee liitetyn socketin kautta, käynnistämään uuden kontin TeX Live -kuvasta niin, että projektihakemisto on liitetty polkuun `/compile`. Yksi käännös on siis yksi lyhytikäinen kontti, jossa suoritetaan yksi `latexmk`-prosessi.
+
+Tästä seuraa kolme seurausta, ja kaikki kolme muovaavat tämän artikkelin mittauksia. Ensinnäkin työyksikkö on yksisäikeinen prosessi: XeLaTeX ei rinnakkaistu. Toiseksi käännöskohtainen resurssieristys on mitä tahansa Docker-suoritin pyytää — osoitamme luvussa §6.2, että se ei käytännössä pyydä mitään. Kolmanneksi työjoukkoa hallitsee asiakirjan sijaan TeX Live -puu, noin 32 GiB:n kokoinen vain luku -aineisto, josta jokainen samanaikainen käännös lukee ja jonka ne siksi jakavat isäntäkoneen sivuvälimuistin kautta. Tämä jakaminen on havaitsemamme superlineaarisen muistiskaalautumisen alkuperä.
+
+### 2.2 Hiekkalaatikoidun käännöksen käyttöönotto
+
+Overleafin yhteisöversio suorittaa `latexmk`-ohjelman itse sovelluskontin sisällä. Ayakaleaf Pro voi Overleaf Server Pron tavoin suorittaa sen sijaan jokaisen käännöksen _sisarkontissa_ — kontissa, jonka sovellus käynnistää _isäntäkoneen_ Docker-daemonissa sen sijaan, että se olisi sisäkkäin sovelluskontin sisällä. Kaksi Toolkit-asetusta ottaa tämän käyttöön:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit liittää isäntäkoneen Docker-socketin sovelluskonttiin ja muuntaa nämä asetukset CLSI:n lukemiksi ympäristömuuttujiksi: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` ja `SANDBOXED_COMPILES_HOST_DIR`, joista viimeinen on käännöshakemiston _isäntäkoneen_ polku. Tällä polulla on merkitystä: koska käännöskontin käynnistävä daemon on isäntäkoneen, sille annetun liitoksen on oltava selvitettävissä isäntäkoneen nimiavaruudessa, ei sovelluskontin. Server Pron `config/env.sh` pakottaa lisäksi tässä tilassa asetuksen `TEXLIVE_IMAGE_USER=www-data`, jotta käännöskontin kirjoittamien tiedostojen omistajuus on yhdenmukainen.
+
+Varmistus on suoraviivainen: käännöksen aikana isäntäkoneella näkyy kontti nimeltä `project-{projectId}-{userId}-{hash}`, joka suorittaa `latexmk`-ohjelmaa TeX Live -kuvasta ja päättyy koodiin 0. Tämä on yksikkö, jonka lukumäärää mittaamme koko artikkelin ajan ja jonka resurssirajojen täydellisestä puuttumisesta raportoimme luvussa §6.2.
+
+**Miksi tällä on merkitystä tutkimuksen kannalta.**
+
+Sisarkontit tekevät mittauksesta puhtaan — jokainen käännös on havaittava, itsenäisesti ajoitettu käyttöjärjestelmäentiteetti — mutta ne tarkoittavat myös, että suorittimen ja muistin jakamisesta käännösten välillä päättää vierasjärjestelmän ydin eikä Overleaf. Jokainen tämän artikkelin skaalautumislaki on siis Linuxin ajastimen ominaisuus, kun sitä sovelletaan $N$ yksisäikeiseen prosessiin, minkä vuoksi ne ovat niin säännönmukaisia.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Kuva 1.** Yksi käännöspyyntö jäljitettynä yhteisöversion mikropalveluiden läpi. Jako vaiheissa ja on kapasiteetin kannalta merkittävä: asiakirjan teksti kopioidaan pyynnön runkoon, kun taas binääriset resurssit välitetään viittauksina ja `clsi` noutaa ne. Kumpikaan ei ole hallitseva — projektin käännöskustannuksen määrää 32 GiB:n TeX Live -puu, josta jokainen samanaikainen käännös lukee jaetun sivuvälimuistin kautta.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Kuva 2.** Kolme asennustopologiaa ja kunkin instanssikohtaisen käännösrajan sijainti niissä; pinotut paneelit kuvaavat replikointia. 65 käännöksen vakio suojaa _yhtä_ CLSI:tä, joten SaaS-kalusto moninkertaistaa sen instanssien ja vyöhykkeiden määrällä (a), ja Server Pron ja Ayakaleaf Pron tukema horisontaalinen skaalaus moninkertaistaa sen instanssien määrällä (c) — keskitetyn MongoDB:n, Redisin ja S3-yhteensopivan tallennuksen, evästepohjaisella istuntoaffiniteetilla varustetun kuormantasaajan (käännöstulos kirjoitetaan instanssin paikalliselle levylle, joten käännöksen ja sitä seuraavan PDF-latauksen on osuttava samaan instanssiin) sekä yksittäisen `git-bridge`-palvelun kustannuksella. Toolkitin oletus (b), jota mittaamme, on kertoimeltaan yksi, joten yhdelle kaluston jäsenelle mitoitetusta vakiosta tulee koko asennuksen yläraja.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Kuva 3.** Sirpaleen valinta `clsi-cache`-palvelussa. Projekti kuvataan kaavalla $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, eli hash-avaruus jaetaan niin moneen yhtä suureen sektoriin kuin sirpaleita on. Tämä on _modulo_-hajautusta, ei rengaspohjaista johdonmukaista hajautusta: kaluston kasvattaminen kolmesta sirpaleesta neljään jakaa koko avaruuden uudelleen ja siirtää käytännössä jokaisen projektin (a, b). Juuri siksi toteutus tarvitsee eksplisiittisen verkossa tapahtuvan uudelleensirpaloinnin rampin, joka siirtää lineaarisesti kasvavan osuuden projekteista `currentShards`-joukosta `desiredShards`-joukkoon aikaikkunan kuluessa, sen sijaan että siirrettäisiin $K/n$, kuten johdonmukaisen hajautuksen renkaassa. Kun sirpaleen virrankatkaisin laukeaa, suolaa $i$ kasvatetaan ja sirpale poistetaan ehdokasluettelosta, joten haku jatkaa eteenpäin epäonnistumisen sijaan (c).
+
+### 2.3 Kaksi virhetilaa
+
+Jokainen mittaamamme kokoonpano epäonnistuu täsmälleen toisella kahdesta tavasta, ja ero näkyy vastauksen tilakoodista eikä sitä tarvitse päätellä:
+
+* **Muistin loppuminen** — Overleaf-pino itse lakkaa vastaamasta ja pyyntö palauttaa **HTTP 502** -vastauksen. Vierasjärjestelmän käytettävissä oleva muisti on epäonnistuvalla tasolla tyypillisesti alle 500 MiB.
+* **Käännöksen aikakatkaisu** — CLSI lopettaa käännöksen käyttäjäkohtaisen aikakatkaisun kohdalla ja raportoi tilan `timedout`. Käytettävissä olevaa muistia on epäonnistuvalla tasolla usein useita gigatavuja.
+
+Luokittelemme jokaisen kokoonpanon tämän signatuurin perusteella emmekä resurssisuhteisiin perustuvalla heuristiikalla, minkä ansiosta kysymykseen "mihin rajaan törmäsimme" voidaan vastata itse datan perusteella.
+
+## 3. Menetelmät
+
+### 3.1 Testiympäristö ja kellotaajuuden hallinta
+
+Kaikki vierasjärjestelmät toimivat QEMU/KVM:n alla yhdellä Intel Core i9-14900K -isäntäkoneella, jossa on 62 GiB RAM-muistia ja NVMe-tallennus. Vierasjärjestelmä on Ubuntu 24.04, jossa on Docker 29.7 ja Overleaf Toolkit, joka ottaa käyttöön Ayakaleaf Pro v6.2.2:n hiekkalaatikoidulla käännöksellä `texlive-full:2025.1`-kuvaa vasten.
+
+Tavallinen pöytäkoneen suoritin on huono palvelimen vastine, ellei sen kellotaajuutta hallita. KVM ei tarjoa keinoa asettaa virtuaalista kellotaajuutta: vCPU on isäntäkoneen säie ja toimii sillä taajuudella, jolla isäntäydin toimii. Siksi rajoitamme isäntäkonetta suoraan poistamalla turbon käytöstä ja kiinnittämällä `scaling_max_freq`-arvon 3,0 GHz:iin jokaisella ytimellä, ja kiinnitämme vierasjärjestelmän vCPU:t fyysisiin P-ytimiin `taskset`-komennolla. Erolla on merkitystä hybridiydinsuorittimessa: tämän piirin E-ytimien peruskellotaajuus on 2,4 GHz, eivätkä ne _pysty_ saavuttamaan 3,0 GHz:iä turbon ollessa pois käytöstä, joten niille eksynyt ajo mittaa huomaamatta hitaampaa konetta. Täydellä kuormalla varmistamme tasan 3000 MHz:n taajuuden kaikilla kuudellatoista kiinnitetyllä säikeellä. Valvontaskripti tarkistaa tämän invariantin ennen jokaista suorituskykytestiä ja kieltäytyy muuten käynnistymästä; se havaitsi tutkimuksen aikana yhden taajuussäätimen huomaamattoman nollautumisen.
+
+### 3.2 Toinen testiympäristö: yksi suuri ajokone
+
+QEMU-matriisi eristää yhden muuttujan kerrallaan, mutta sen yläraja on kuusitoista kiinnitettyä säiettä. Selvittääksemme, pätevätkö samat lait vielä suuruusluokkaa korkeammalla, toistimme samanaikaisuussarjan yhdellä suurella palvelimella: yksi AMD EPYC 7773X (Milan-X, 64 ydintä / 128 säiettä, 768 MiB L3-välimuistia) ja 995 GiB RAM-muistia, ajaen samaa Ayakaleaf Pro v6.2.2 -kuvaa samaa `texlive-full:2025.1`-kuvaa vasten. Toisin kuin QEMU-vierasjärjestelmissä, tämän koneen kellotaajuutta ei ole lukittu: se on tuotantotason palvelin, ja mittaamme sitä sellaisena.
+
+Kaksi operatiivista varotoimea oli välttämättömiä, ja ne kannattaa mainita, koska ilman niitä koe mittaa testivaljaita eikä palvelinta. Ensinnäkin jokainen kontti rajattiin `systemd`-osioon asetuksella `MemoryMax=940 GiB`, jotta karkuun lähtenyt mittaussarja kuluttaa loppuun cgroupin eikä isäntäkonetta. Toiseksi hiekkalaatikoidut käännökset luo isäntäkoneen daemon, ja kukin niistä kirjoittaa omaan copy-on-write-kerrokseensa — mitattuna 116 MiB konttia kohden, vaikka 20,6 GiB:n peruskuva on jaettu — joten Dockerin datahakemisto siirrettiin erilliselle NVMe-laitteelle. Mittaussarja arvolla $N=1024$ kirjoittaa noin 119 GiB väliaikaisia kerroksia, mikä ei mahdu vakiomuotoiseen juuritiedostojärjestelmään.
+
+### 3.3 Kuorma
+
+Asiakirja on todellinen 63-sivuinen pro gradu -tutkielma (SJTU-mallipohja), joka käännetään XeLaTeXilla `latexmk`-ohjelman kautta ja joka sisältää TikZ-kuvia, `biblatex`-lähdeluettelon käsittelyn ja upotettuja PDF-resursseja — eli realistinen eikä synteettinen kuorma. Yksi käännös kuormittamattomassa vierasjärjestelmässä kestää kaikissa kokoonpanoissa 8,6–9,8 s, ja käytämme tätä vapaan suorituksen perustasona $T_1$.
+
+### 3.4 Kuorman tuottaminen
+
+Luomme 512 todellista käyttäjätiliä ja annamme kullekin oman kopion projektista, jotta samanaikaiset käännökset kilpailevat täsmälleen kuten itsenäiset käyttäjät eivätkä jaa projektilukkoa. Pyynnöt lähetetään isäntäkoneelta vierasjärjestelmän välitettyyn porttiin, jotta kuorman tuottaminen ei kuluta vierasjärjestelmän suoritinaikaa.
+
+Samanaikaisuus on _yhtäaikaista_, ei porrastettua. Jokainen istunto muodostetaan ensin — kirjautuminen, CSRF-tunniste, kääntäjän valinta — ja vasta sitten jokainen säie nukkuu yhteiseen, kerran laskettuun ja jaettuun seinäkellohetkeen asti ennen kuin se lähettää `POST /project/:id/compile` -pyyntönsä. Ero ei ole saivartelua. Porrastettu ramppi mittaa suoritustehoa vakaassa jonossa; yhtäaikainen purske mittaa, mitä tapahtuu, kun luentosalillinen opiskelijoita painaa samaa painiketta saman määräaikailmoituksen jälkeen, ja juuri tätä ylläpitäjät todella pelkäävät. Nämä kaksi eroavat enemmän kuin vakiokertoimella, koska jälkimmäinen täyttää käännösjonon nopeammin kuin daemon ehtii sitä tyhjentää.
+
+Neljä käytännön estettä oli poistettava ennen kuin purske voitiin toimittaa uskollisesti. Jokainen niistä kannattaa kirjata, koska jokainen heikentää koetta huomaamatta testivaljaiden eikä palvelimen mittaukseksi.
+
+#### 3.4.1 Kaksi nopeusrajoitinta, ei yksi
+
+Overleaf rajoittaa kirjautumisia lähdeosoitetta kohden — 20 yritystä minuutissa — ja kaikki liikenteemme lähtee yhdeltä isäntäkoneelta. Kun jokaiselle simuloidulle käyttäjälle annetaan oma `X-Forwarded-For`-osoite, tämä raja poistuu, mutta vastaan tulee heti toinen, karkeampi raja: aliverkkokohtainen noin 200 yrityksen minuuttibudjetti. Käyttäjien levittäminen yhtenäiselle lohkolle epäonnistuu siksi 201. tilin kohdalla. Sen sijaan johdamme synteettisen osoitteen käyttäjän indeksistä niin, että peräkkäiset käyttäjät päätyvät eri `/24`-verkkoihin,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+mikä pitää molemmat rajoittimet väljinä koko 1024 käyttäjän joukolle.
+
+#### 3.4.2 Lisätty otsake hylätään oletuksena
+
+Otsakkeen asettaminen ei riitä. Express huomioi `X-Forwarded-For`-otsakkeen vain vertaisilta, joihin sen on käsketty luottaa, ja Overleafin `trustedProxyIps`-asetuksen oletusarvo on `loopback`. Koska kuormageneraattori tavoittaa sovelluksen kontin sillan kautta eikä loopback-rajapinnan kautta, otsake jäsennetään ja heitetään sitten pois, ja jokainen simuloitu käyttäjä romahtaa takaisin yhteen osoitteeseen. Oireena on `HTTP 429` -aalto täsmälleen kahdennenkymmenennen kirjautumisen kohdalla, mikä on helppo tulkita väärin palvelimen ylikuormitukseksi. Yhdyskäytäväverkko on lisättävä luottamusketjuun eksplisiittisesti; luvun §4.3 klusteroidussa asennuksessa myös pod- ja service-CIDR:t on lisättävä.
+
+#### 3.4.3 Kuormantasaaja korvaa otsakkeen, joka sen piti säilyttää
+
+Kun instanssi on välityspalvelimen takana, tavanomainen `option forwardfor` _lisää_ todellisen asiakkaan osoitteen ketjuun, mikä on oikea toiminta tuotannossa ja juuri väärä tässä: synteettinen osoite syrjäytyy kuormageneraattorin omalla osoitteella. Direktiivi on tarkennettava muotoon `option forwardfor if-none`, jotta välityspalvelin lisää arvon vain, jos asiakas ei antanut sitä.
+
+#### 3.4.4 Asiakkaalta loppuvat tiedostokahvat ennen kuin palvelimelta loppuu kapasiteetti
+
+Arvolla $N=1024$ generaattori pitää auki yli tuhat samanaikaista socketia, ja oletusarvoinen 1024 kahvan pehmeä raja täyttyy istuntojen muodostamisen eikä mittauksen aikana. Virhe on hiljainen: kolme istuntoa ei muodostu ja ajo raportoi 1021 eikä 1024, ja konttimääriä varten komentotulkkia kutsuva näytteenottosäie kuolee virheeseen `EMFILE` ja katkaisee telemetrian huomaamatta. Generaattorin pehmeää rajaa on nostettava — isäntäkoneemme kova raja oli jo 1048576 — ja ajo toistettava. Raportoimme molemmat ajot luvussa §4.3: korjattu ajo suorittaa 1024/1024 käännöstä mediaanin ollessa 1,2 s:n päässä katkaistusta ajosta, minkä vuoksi pidämme ensimmäistä käyttökelpoisena mutta ei määräävänä.
+
+### 3.5 Mittausprotokolla
+
+Useat menetelmälliset valinnat osoittautuivat välttämättömiksi toistettavuuden kannalta.
+
+#### 3.5.1 Lämmittely
+
+Juuri käynnistetyssä vierasjärjestelmässä sivuvälimuisti on tyhjä, ja ensimmäiset käännökset mittaavat kylmäkäynnistyksen I/O:ta eivätkä vakaan tilan kapasiteettia: sama 2 vCPU / 2 GiB -kokoonpano antaa kylmänä 36,5 s ja lämpimänä 9,8 s, eli 3,7-kertaisen eron. Jokainen kokoonpano suorittaa siksi käynnistyksen jälkeen kaksi hylättävää yksittäisen käännöksen lämmittelyä.
+
+#### 3.5.2 Hyväksymiskriteeri
+
+Samanaikaisuustaso hyväksytään vain, jos _jokainen_ käännös onnistuu ja taso kestää toiston. Tämä on tiukempi kuin onnistumisasteen kynnysarvo, ja sillä on merkitystä: 4 vCPU / 16 GiB -kokoonpanossa taso 32 meni kerran läpi 80,2 s:n mediaanilla ja aikakatkaisi sitten kaikki 32 käännöstä toistettaessa, joten raportoimme arvon 31.
+
+#### 3.5.3 Haku
+
+Tasot paikannetaan eksponentiaalisella haarukoinnilla mallin ennustamasta lähtöarvosta, minkä jälkeen tehdään tarkka kokonaislukupuolitus. Koska kriteeri on kaikki tai ei mitään, taso ratkeaa ensimmäiseen epäonnistumiseen, joten hylkäämme jäljellä olevat käynnissä olevat pyynnöt heti, kun yksi epäonnistuu — paitsi pienillä tasoilla, joilla hylätyt käännökset jumittavat pienen vierasjärjestelmän niin pahasti, ettei se koskaan toivu.
+
+#### 3.5.4 Tasojen välinen eristys
+
+Käännöskontit tyhjennetään ja verkkosovellusta kysellään, kunnes se vastaa jälleen, ennen kuin seuraava taso alkaa. Ilman tätä kaatumista seuraava taso kirjaa virheellisen nollan istunnon epäonnistumisen.
+
+#### 3.5.5 Isäntäkoneen hygienia
+
+Isäntäkoneen muut virtuaalikoneet sammutettiin: kun 24 GiB isäntäkoneen muistia oli varattuna muualle, sama vierasjärjestelmäkokoonpano raportoi kuormitukseksi 11,7 eikä 3,2 samalla samanaikaisuudella. Isäntäkoneen muistipaine välittyy vierasjärjestelmään ja mitätöi mittauksen.
+
+## 4. Tulokset
+
+### 4.1 Kapasiteettimatriisi
+
+Taulukko 1 ja kuva 4 esittävät mitatun ylärajan jokaiselle kokoonpanolle. Ensimmäinen yllätys paljastuu, kun taulukkoa lukee riveittäin. 4 GiB:n muistilla 2, 4 ja 8 vCPU:n vierasjärjestelmät saavuttavat kaikki tasan 9 — ytimien nelinkertaistaminen ei muuta mitään. 16 GiB:n muistilla ne saavuttavat 54, 45 ja 57: siirtyminen 4 ytimestä 16 ytimeen tuo 6 %, ja 8-ytiminen vierasjärjestelmä on itse asiassa _huonompi_ kuin 4-ytiminen (§5.2). Vasta 48 GiB:n muistilla ydinmäärä erottaa kokoonpanot ratkaisevasti: 143, 268 ja 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Kuva 4.** Mitattu kapasiteetti kokoonpanomatriisissa. (a) Jokainen kokoonpano pylväänä, ryhmiteltynä muistin mukaan ja väritettynä ydinmäärän mukaan; umpinaiset pylväät ovat muistirajoitteisia (vierasjärjestelmä kaatuu muistin loputtua) ja viivoitetut pylväät suoritinrajoitteisia (käännökset aikakatkaistaan muistia vielä riittäessä). Ryhmän lukeminen vasemmalta oikealle osoittaa, kuinka vähän ydinmäärä tuo alle 16 GiB:n muistilla; ryhmien välinen vertailu osoittaa muistin superlineaarisen hyödyn. (b) Samat pisteet sovitettua mallia $N_{\max}=\min(0.69R^{1.60},\,26.4C)$ vasten; katkoviiva on muistiraja ja pisteviivoitetut vaakaviivat ovat ydinmääräkohtaiset suoritinrajat. Kokoonpanoa rajoittaa se kahdesta, johon se törmää ensin.
+
+Toinen yllätys paljastuu sarakkeittain luettaessa: kiinteällä ydinmäärällä kapasiteetti kasvaa superlineaarisesti muistin mukana, suunnilleen kuten $R^{1.6}$, luvussa §5.1 käsitellystä sivuvälimuistiin liittyvästä syystä.
+
+| muisti | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Taulukko 1.** Onnistuneesti valmistuvien samanaikaisten käännösten enimmäismäärä mitattuna 300 s:n käännösaikakatkaisulla CLSI:n samanaikaisuusrajan ollessa poistettu. **Lihavoitu** tarkoittaa suoritinrajoitteista kokoonpanoa (käännökset aikakatkaistaan muistia vielä riittäessä); muut ovat muistirajoitteisia (pino kaatuu HTTP 502 -virheeseen). 2 GiB:n rivissä on luvussa §5.2 käsitelty korjaus.
+
+### 4.2 Samanaikaisuus on aikajakoa
+
+Kuva 5 käy läpi jokaisen samanaikaisuustason kiinteällä 8 vCPU / 16 GiB -vierasjärjestelmällä. Kaksi tilaa erottuu terävällä taitekohdalla täsmälleen yhden käännöksen kohdalla ydintä kohden. Sen alapuolella käännöksen keskimääräinen kesto on tasainen — se muuttuu 8,7 sekunnista arvolla $N=1$ 9,1 sekuntiin arvolla $N=C=8$, eli 5 %. Sen yläpuolella aika kasvaa tiukasti suhteessa arvoon $N/C$: arvoilla $N=16,24$ mittaamme 18,5 s ja 27,1 s, eli suhteen $1:2.13:3.12$ ihanteellisen suhteen $1:2:3$ sijaan.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Kuva 5.** Käännösviive samanaikaisuuden funktiona kiinteällä laitteistolla. Taitekohta on kohdassa $N=C$; sen jälkeen mitattu hidastuminen seuraa arvoa $N/C$ 5–7 %:n tarkkuudella. Kaikki viisitoista tasoa onnistuivat täysin.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Kuva 6.** Käännösviive samanaikaisuuden funktiona useissa kokoonpanoissa. Jokaisessa paneelissa laitteisto pidetään kiinteänä ja tarjottua kuormaa vaihdellaan; pystyviiva merkitsee kohtaa $N=C$. Käyrät ovat sen vasemmalla puolella tasaisia ja oikealla puolella lineaarisia suhteessa arvoon $N/C$, mikä on aikajaon eikä kilpailun tunnusmerkki: työ ei muutu kalliimmaksi, se vain odottaa vuoroaan.
+
+Kun $T(N)=T_1\max(1,N/C)^{b}$ sovitetaan kaikkiin tutkimuksen onnistuneisiin mittauksiin, saadaan $b=0.914$ ($R^2_{\log}=0.904$, $n=81$). Ykkösestä erottamaton eksponentti on kvantitatiivinen toteamus siitä, että käännös on yksisäikeinen, suoritinrajoitteinen työyksikkö ja että samanaikaisuus ei auta eikä haittaa muuten kuin jakamalla ytimet. Käytännön seuraus on kapasiteettisuunnittelun kannalta epämukava: kokoonpano voi ottaa vastaan mielivaltaisen määrän käyttäjiä _epäonnistumatta_ ja samalla saada jokaisen heistä odottamaan suhteellisesti pidempään. Arvolla $N=56$ tässä vierasjärjestelmässä kaikki käännökset onnistuvat yhä, mutta jokainen käyttäjä odottaa 64,8 s eikä 8,7 s.
+
+### 4.3 Vertikaalinen skaalaus 1024 samanaikaiseen käännökseen
+
+Taulukko 2 ja kuva 7 raportoivat suuren ajokoneen mittaussarjan. Jokainen taso on _kylmä_ käännös: ennen jokaista tasoa tyhjennämme jokaisen osallistuvan projektin käännöshakemiston ja CLSI-välimuistin pyynnöllä `DELETE /project/:id/output`, joten mikään taso ei hyödy alemman tason tekemästä työstä. Yksittäisen käännöksen perustaso tällä koneella on 28,8 s, mikä on kylmä luku, eikä sitä pidä verrata aiemmin käytettyyn 8,6–9,8 s:n vakaan tilan perustasoon; QEMU-vierasjärjestelmien kylmä perustaso on 28,3 s, joten säiettä kohden koneet ovat tällä kuormalla kahden prosentin päässä toisistaan.
+
+| $N$ |   onnistuneet | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | kontit (huippu) |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Taulukko 2.** Samanaikaisuussarja yhdellä EPYC 7773X -suorittimella (64 ydintä / 128 säiettä, 995 GiB). Kaikki tasot kylmiä; perustaso 28,8 s. Konttien huippumäärä on samanaikaisesti elossa olleiden hiekkalaatikoiden enimmäismäärä.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Kuva 7.** Vertikaalinen skaalaus yhdellä suurella ajokoneella. (a) Viive tarjotun samanaikaisuuden funktiona; varjostettu alue merkitsee taitekohdan jälkeistä tilaa. (b) Todellisuudessa elossa olevien hiekkalaatikoiden määrä ei koskaan seuraa pyydettyä määrää — se kyllästyy noin 200:n kohdalla — eikä käännösten cgroup koskaan käytä yli viidesosaa rajastaan.
+
+#### 4.3.1 Kone ei koskaan epäonnistu
+
+Jokainen taso valmistuu 100-prosenttisesti, mukaan lukien $N=1024$ — kahdeksankertaisesti säikeiden määrään nähden. Emme löytäneet tämän koneen kapasiteettirajaa; kärsivällisyytemme loppui ennen kuin sen liikkumavara. Tämä on tutkimuksen ensimmäinen kokoonpano, jossa rajoittava tekijä ei ole muisti: arvolla $N=1024$ käännösten cgroup on huipussaan 184 GiB, viidesosa sen 940 GiB:n rajasta, kun taas suoritin on 100 %:n käyttöasteella ja kuormitus on 166.
+
+#### 4.3.2 Heikkeneminen on alilineaarista, koska sisäänpääsyä rajoitetaan
+
+Naiivi aikajako ennustaa, että $8\times$ säikeitä maksaa $8\times$ viiveen. Mitattu kustannus on $9.7\times$ suhteessa yksittäiseen käännökseen, mutta vain $3.8\times$ suhteessa arvoon $N=128$ — kahdeksankertaisella tarjotun kuorman kasvulla. Syy näkyy kuvassa 7(b) ja taulukon 2 viimeisessä sarakkeessa: vaikka 1024 pyyntöä lähetetään samanaikaisesti, todellisuudessa elossa olevien hiekkalaatikoiden määrä ei koskaan ylitä 205:tä. Daemon ei pysty luomaan kontteja niin nopeasti kuin asiakkaat pyytävät, joten pyynnöt jonoutuvat sisäänpääsyssä sen sijaan, että ne kilpailisivat suorittimella. Jonoutuminen pelastaa tässä hännän, ja se tekee sen vahingossa.
+
+#### 4.3.3 Taitekohta on 512:ssa, ei epäonnistumispisteessä
+
+Arvojen $N=256$ ja $N=512$ välillä $p_{95}$-viive kasvaa $2.9\times$ kuorman kaksinkertaistuessa; jokainen aiempi kaksinkertaistus maksoi $1.2\times$–$1.4\times$. Kapasiteetti ilmoitettuna "suurimpana $N$:nä, joka ei epäonnistu" raportoisi arvon 1024 ja olisi ylläpitäjälle hyödytön: siinä kohdassa hännän odotus on lähes kahdeksan minuuttia.
+
+### 4.4 Käännösaika on kääntäen verrannollinen kellotaajuuteen
+
+Koska kuorma on suoritinrajoitteinen, sen kustannuksen pitäisi skaalautua kuten $1/f$. Testaamme tämän suoraan käymällä isäntäkoneen kellotaajuuden läpi koneen koko alueella, 1,0–5,5 GHz kymmenessä portaassa, muuten muuttumattomalla vierasjärjestelmällä (kuva 8). Yksittäisen käännöksen aika muuttuu 26,5 sekunnista 4,8 sekuntiin: 5,5-kertainen kellotaajuus tuo 5,5-kertaisen nopeutuksen ilman vähenevää hyötyä missään kohdassa aluetta. Tulo $T\!\cdot\!f$ on vakio 2 %:n tarkkuudella kaikilla kymmenellä kellotaajuudella.
+
+Normalisointi ydinosuudella tiivistää kaikki kolmekymmentä mittausta — kolme samanaikaisuustasoa kymmenellä kellotaajuudella — yhdeksi vakioksi:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+jäännöshajonnan ollessa 5,1 % alueella, jolla kellotaajuus itse vaihtelee 5,5-kertaisesti. Kaarevuuden puuttuminen on itsessään tulos: jos kuorma olisi ollut muistikaistan tai I/O:n rajoittama, $T$ tasaantuisi suurilla kellotaajuuksilla suorittimen ohittaessa toisen resurssin.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Kuva 8.** Kellotaajuussarja. (a) $T=k/f$ ja sovitettu hyperbeli. (b) Kun jaetaan arvolla $\max(1,N/C)$, kaikki pisteet tiivistyvät yhdeksi vakioksi, mikä vahvistaa yhtälön (1).
+
+Yhtälöllä (1) on suora hankintoja koskeva seuraus, joka on helppo sanoa ja helppo ymmärtää väärin: _kellotaajuus parantaa jokaisen yksittäisen käyttäjän kokemusta, ydinmäärä vain päästää sisään enemmän käyttäjiä_. Kone, jonka kellotaajuus on 20 % korkeampi, kääntää 20 % nopeammin kaikille ilman vähenevää hyötyä; kaksinkertainen ydinmäärä ei nopeuta kenenkään käännöstä lainkaan.
+
+## 5. Analyysi
+
+### 5.1 Kaksi rajaa erikseen sovitettuina
+
+Jokainen kokoonpano luokitellaan virhesignatuurinsa perusteella (§2.3), ja muistiraja ja suoritinraja sovitetaan sitten vain niihin kokoonpanoihin, jotka todella törmäävät niihin:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+jossa $R$ on gibitavuina ja $C$ vCPU:ina.
+
+Muistirajan eksponentti on johdonmukaisesti superlineaarinen, $p>1$: yhden lisäkäännöksen marginaalinen muistikustannus _pienenee_ kokonaismuistin kasvaessa, noin 312 MiB:stä käännöstä kohden 3 GiB:n vierasjärjestelmässä noin 194 MiB:iin 32 GiB:n vierasjärjestelmässä. Mekanismi on luvussa §2.1 kuvattu TeX Live -puun jaettu sivuvälimuisti: samanaikaiset käännökset lukevat päällekkäisiä fontti- ja makrotiedostoja, joten suurempi välimuisti jakautuu useammalle niistä. Tämän vuoksi naiivi "yksi gigatavu viittä käyttäjää kohden" -sääntö aliarvioi suuria koneita ja yliarvioi pieniä.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Kuva 9.** Sama data kahtena pintana $(C,R)$-tason yllä. (a) Kapasiteetti: sovitettu pinta on harjanne eikä taso — se nousee jyrkästi muistin mukana ja on lähes tasainen ydinakselin suuntaan, kunnes muisti lakkaa rajoittamasta, minkä vuoksi 48 GiB:n rivi on ainoa, jolla ydinmäärä erottaa kokoonpanot. (b) Viive samanaikaisuuden funktiona jokaiselle kokoonpanolle; sovitettu $T=12.6\,(N/C)^{0.91}$ on esitetty katkoviivalla ja 180 s:n aikakatkaisu tasona. Kokoonpano epäonnistuu siinä, missä sen yhtenäinen käyrä lävistää tuon tason, mikä tekee näkyväksi, kuinka suoraan aikakatkaisuasetus määrää raportoidun kapasiteetin.
+
+### 5.2 Missä useammat ytimet pahentavat tilannetta
+
+Yhtälö (2) on kahden termin minimi ja siksi monotoninen $C$:n suhteen, mutta mittaukset eivät ole. Havaitsemme kaksi käänteistä tapausta, joissa ytimien lisääminen _pienensi_ kapasiteettia: 16 GiB:n muistilla (54 vs. 45) ja 32 GiB:n muistilla (145 vs. 135). Molemmat esiintyvät muistirajoitteisessa tilassa, ja mekanismi on kummassakin sama: useammilla ytimillä samanaikaiset käännökset etenevät tahdissa ja saavuttavat suurimman muistikokonsa samalla hetkellä, kun taas vähemmillä ytimillä ajastin lomittaa ne ja huiput porrastuvat. Vierasjärjestelmässä, jonka muistivara on jo valmiiksi niukka, porrastus pitää sen hengissä. Keskimääräiseen resurssien käyttöön perustuva kapasiteettimalli ei pysty ilmaisemaan tätä; kyse on huippujen _yhteensattumisen_ ominaisuudesta.
+
+Kolmannen näennäisen käänteisen tapauksen, 2 GiB:n muistilla, jätämme nyt huomiotta. Haku kirjaa kapasiteetiksi 2 kahdella vCPU:lla mutta 1 neljällä ja kahdeksalla vCPU:lla, mikä näyttää samalta ilmiöltä. Raakamittausten uudelleentarkastelu paljastaa jotain yksinkertaisempaa: 2 GiB:n muistilla taso $N=2$ onnistui ensimmäisellä yrityksellä kaikilla kolmella ydinmäärällä ja epäonnistui sitten vahvistusajossaan kahdella kolmesta. Taso ei ole kapasiteetti vaan kolikonheitto, ja 2 vCPU:n arvo on heitto, joka sattui osumaan. Raportoimme siksi toistettavan arvon 1 kaikilla kolmella ydinmäärällä emmekä tee erosta johtopäätöksiä. Kirjaamme korjauksen tähän sen sijaan, että muuttaisimme taulukkoa hiljaa, koska hylätty lukema on juuri sellainen, joka olisi tukenut kiinnostavaa väitettä.
+
+## 6. Toteutusta koskevat havainnot
+
+### 6.1 Kovakoodattu samanaikaisuusraja
+
+Riittävän suurilla vierasjärjestelmillä kapasiteetti pysähtyi täsmälleen 65 samanaikaiseen käännökseen pyydetystä samanaikaisuudesta riippumatta: arvoilla $N=66,80,96,128$ mittasimme $65$ onnistumista ja $1,15,31,63$ välitöntä `unavailable`-vastausta konttien määrän pysyessä 65:ssä, useiden gigatavujen muistin ollessa käyttämättä ja käännöksen mediaaniajan pysyessä vakaana 77 sekunnissa — selvästi minkään aikakatkaisun alapuolella.
+
+Syy on CLSI:n vakio:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+Vertailu ei ole tiukka, joten todellinen yläraja on $64+1=65$, mikä vastaa mittausta täsmälleen. Ylimääräiset pyynnöt saavat **HTTP 503** -vastauksen — ne _hylätään_ eikä niitä aseteta jonoon, joten käyttäjän näkökulmasta käännöspainike yksinkertaisesti epäonnistuu. Toisin kuin kaikki muut saman tiedoston säädettävät arvot, tämä ei lue mitään ympäristömuuttujaa; se lisättiin upstream-versioon elokuussa 2024, ja sitä voi muuttaa vain muokkaamalla kuvaa. Rajan nostamisen jälkeen sama 16 vCPU / 32 GiB -vierasjärjestelmä, joka raportoi arvolla $N=80$ `success=65, unavailable=15`, raportoi sen sijaan `success=80`.
+
+### 6.2 Toimimaton kontin muistiraja
+
+Käynnissä olevan käännöskontin tarkastelu osoittaa, ettei resurssieristystä ole lainkaan:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Suoritinkiintiön puuttuminen on tarkoituksellista ja selittää, miksi luvun §4.2 aikajakoeksponentti on niin puhdas: mikään ei vääristä käännösten välistä kilpailua. _Muistirajan_ puuttuminen sen sijaan ei ole tarkoituksellista. Docker-suoritin kyllä pyytää sellaista:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Tämä on väärin kahdella tavalla. Arvo on $1024^4=1 tebiB$, vaikka kommentti tarkoittaa $1024^3$; ja kenttä on sijoitettu luontiasetusten ylimmälle tasolle eikä `HostConfig`-osion sisään, jossa Docker API odottaa sitä, joten se hylätään — minkä havaittu `Memory=0` vahvistaa. Molemmat virheet ovat mukana tiedoston lisänneessä commitissa (`9a519f0d3d`, maaliskuu 2018), ja ne ovat selvinneet muunnoksesta CoffeeScriptistä, koko tietovaraston uudelleenmuotoilusta ja CJS-to-ESM-siirrosta, joista mikään ei tarkastellut semantiikkaa uudelleen. Huomionarvoista on, että samassa commitissa oleva `MAX_OUTPUT = 1024 * 1024 // 1MB` on oikein, mikä viittaa lipsahdukseen eikä väärinymmärrykseen.
+
+Seuraus näkyy matalan muistin mittauksissamme. Koska käännöksiä ei rajoiteta, muistin loppuminen ei ilmene siten, että Docker lopettaa yhden ongelmallisen kontin; se kaataa koko vierasjärjestelmän. 2 vCPU / 2 GiB -kokoonpanossa havaitsimme valvontaan käytetyn SSH-istunnon jumittuvan 300 sekunniksi, kuormituksen olevan 68 kahdella ytimellä ja vierasjärjestelmän lopulta käynnistävän itsensä uudelleen. Toimiva konttikohtainen raja heikentäisi toimintaa paljon hallitummin: liian suuri käännös epäonnistuisi ja palvelu säilyisi.
+
+Ainoa raja, joka todella vaikuttaa, on `RLIMIT_CPU`, joka on asetettu arvoon $\text{timeout}+5$ sekuntia. Se rajoittaa _suoritinaikaa_, ei seinäkelloaikaa, ja yksittäinen käännös kuluttaa vain noin 9 s suoritinaikaa, joten se ei koskaan rajoita millään samanaikaisuudella; se suojaa patologisilta syötteiltä, kuten karkuun lähteneeltä makrolta. Se on kuitenkin hyödyllinen oraakkeli: arvon `Soft:305` havaitseminen vahvistaa, että 300 s:n aikakatkaisuasetus on todella välittynyt konttiin asti.
+
+### 6.3 Käännösaikakatkaisu on ratkaisevin säädettävä arvo
+
+Käyttäjäkohtaisen kentän `features.compileTimeout` oletusarvo on 180 s. Suoritinrajoitteisissa kokoonpanoissa tämä ei ole turvamarginaali vaan kapasiteettiasetus, koska kone, joka yhä laskee oikein, julistetaan epäonnistuneeksi. Sen nostaminen 300 sekuntiin — yksi MongoDB-päivitys — muuttaa mitattua kapasiteettia jopa 4,2-kertaisesti (taulukko 3). Yläraja on 600 s, jonka `RequestParser.MAX_TIMEOUT` pakottaa ja jonka ylittävä arvo katkaistaan hiljaa.
+
+| Kokoonpano       | 180 s | 300 s |          Suhde | Rajoittava tekijä     |
+| ---------------- | ----: | ----: | -------------: | --------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | suoritin, 28 GiB vapaana |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | suoritin, 30 GiB vapaana |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | suoritin              |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | suoritin              |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | suoritin              |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | törmää seuraavaksi muistirajaan |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | muisti                |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | muisti                |
+
+**Taulukko 3.** Käännösaikakatkaisun vaikutus mitattuun kapasiteettiin.
+
+Kaksi viimeistä riviä ovat tuloksen vastaintuitiivinen puolikas ja syy siihen, että mittasimme jokaisen kokoonpanon uudelleen yhdellä aikakatkaisulla. _Muistirajoitteisissa_ kokoonpanoissa pidempi aikakatkaisu _pienentää_ kapasiteettia, koska jokainen käännös pitää muistijoukkoaan pidempään ja useampi niistä on päällekkäin. Kapasiteettiluku on siksi merkityksetön, ellei kerrota, millä aikakatkaisulla se on mitattu, eikä näitä kahta voi sekoittaa samassa taulukossa.
+
+## 7. Aiempi tutkimus
+
+### 7.1 Toimittajan ohjeistus
+
+Overleafin oma laitteistodokumentaatio toteaa ne laadulliset tosiasiat, jotka tässä kvantifioimme: että LaTeX on yksisäikeinen, että yhden ytimen suorituskyky siksi määrää käännösajan ja että "useammat ytimet auttavat vain, jos yrität kääntää enemmän asiakirjoja kuin sinulla on vapaita suoritinytimiä" \[1]. Sen jälkeen se antaa lineaarisen mitoitussäännön — 2 ytimen / 3 GiB:n perustaso sekä yksi ydin ja yksi gigatavu viittä–kymmentä samanaikaista käyttäjää kohden — joka motivoi tätä tutkimusta. Kontribuutiomme on muuttaa nämä toteamukset mitatuiksi laeiksi (yhtälöt (1) ja (2)) ja osoittaa, missä lineaarinen sääntö pettää: siinä ei ole termiä jaetulle sivuvälimuistille, joka tekee muistirajasta superlineaarisen, eikä termiä kahdelle tulosta hallitsevalle ohjelmistoparametrille.
+
+### 7.2 Koonti- ja CI-kapasiteettitutkimukset
+
+Koontijärjestelmien mittaaminen samanaikaisuuden alaisena on vakiintunutta LaTeX-ympäristön ulkopuolella. LightSys raportoi, että Docker-konteissa kääntävien tavanomaisten CI-järjestelmien I/O heikkenee pull requestien saapumistahdin kasvaessa, ja pullonkaula ilmenee noin yhdentoista samanaikaisen pyynnön kohdalla \[17]; TAOS-CI havaitsee, että kääntäminen hallitsee CI:n seinäkelloaikaa ja vastaa suurissa projekteissa 60–67 % koko putken kestosta \[18]. Järjestelmämme eroaa yhdessä suhteessa, joka osoittautuu ratkaisevaksi: LaTeX-käännös on interaktiivinen. Kaksi kertaa pidempään kestävä CI-työ on haitta; kaksi kertaa pidempään kestävän käännöksen havaitsee suoraan esikatseluruutua odottava käyttäjä, minkä vuoksi käsittelemme aikakatkaisua kapasiteettiparametrina emmekä epäonnistumiskynnyksenä.
+
+### 7.3 Konttien yleiskustannukset
+
+Tuore tutkimus erittelee Docker-konttien käynnistysviiveen tallennustasoittain \[19] ja kuvaa konttien suorituskykyä reunalaskennassa \[20]. Meidän ympäristössämme käännöskohtainen kontin käynnistys jakautuu: se on pieni vakio suhteessa 9 sekunnin käännökseen, ja sovittamamme vapaan suorituksen aika $T_1$ sisältää sen. Kontin ominaisuus, jolla on merkitystä, on resurssirajojen _puuttuminen_ (§6.2), joka muuttaa käännöskohtaisen muistin ylityksen koko isäntäkoneen kaatumiseksi.
+
+### 7.4 LaTeX epäluotettavana syötteenä
+
+Hiekkalaatikoitu kääntäminen on olemassa, koska TeX on ohjelmointikieli ja asiakirjat ovat epäluotettavaa syötettä \[21, 22]. Tämä suunnitteluratkaisu tekee tästä tutkimuksesta mahdollisen — jokainen käännös on eristetty kontti, jonka resurssikäyttäytyminen on havaittavissa — ja tekee myös puuttuvasta muistirajasta merkittävän, koska sen käyttöön ottavat ylläpitäjät olettavat eristyksen.
+
+### 7.5 Kääntäjä tutkimuskohteena
+
+TeX itse on hyvin dokumentoitu kielenä \[16], mutta sen käyttäytyminen _koontikohteena_ on herättänyt huomiota vasta äskettäin. Tan ja Rigger \[8] kääntävät suuren arXiv-lähdekorpuksen eri moottoreilla ja jakeluversioilla ja havaitsevat, että moottorit eivät ole keskenään korvattavissa: vain prosentin murto-osa asiakirjoista tuottaa tavulleen identtisen tulosteen XeTeXillä ja pdfTeXillä. Tämä tulos koskee suoraan menetelmäämme. Kapasiteetti on asiakirjan _ja_ moottorin ominaisuus, joten suorituskykytesti, joka ei kiinnitä kumpaakin, ei ole toistettavissa; kiinnitämme siksi koko ajan yhden asiakirjan, yhden moottorin ja yhden jakelun (`texlive-full:2025.1`) ja ilmoitamme moottorin jokaisen kuvan kuvatekstissä. Se myös rajaa lukujemme yleistettävyyttä tavalla, joka kannattaa sanoa suoraan: ne kuvaavat XeLaTeXia tällä asiakirjalla, eivät TeXiä yleisesti.
+
+LaTeX-koonti_järjestelmiä_ koskeva työ on pitkälti käytännön toimijoiden vetämää. LaTeX3-projektin `l3build` \[13] standardoi regressiotestauksen ja paketoinnin, ja itsenäiset suorituskykytestit vertailevat käärintätyökaluja — 26 koontijärjestelmän katsaus havaitsee esikäännetyn johdanto-osan tuovan noin 20 % pelkkään ajoon ja 40 % `latexmk`-ohjelmaan verrattuna \[14]. Nämä optimoivat _yksittäistä_ käännöstä. Ne ovat ortogonaalisia mittaamallemme ja yhdistettävissä siihen: johdanto-osan välimuisti lyhentää aikaa $T_1$, ja jokainen tämän artikkelin kapasiteettiluku skaalautuu $T_1$:n mukana.
+
+### 7.6 Samanaikaisuuden hallinta editorissa, ei kääntäjässä
+
+Overleafin yhteistyöpuoli perustuu vakiintuneeseen tutkimuslinjaan. Operaatiomuunnos (operational transformation) on peräisin Ellisiltä ja Gibbsiltä \[9], ja Jupiter-järjestelmä \[10] teki siitä käytännöllisen suuren viiveen asiakkaille; sen suunnittelu on tunnistettavissa `document-updater`-palvelussa: palvelin, joka järjestää operaatiot, ja asiakirjakohtainen puskuri, jota vasten asiakkaat synkronoivat. Ristiriidattomat replikoidut tietotyypit (CRDT) \[11] ratkaisevat saman ongelman ilman keskitettyä järjestäjää. Tämä ero saa luvun §4.3 topologian ylipäätään toimimaan: koska odottavien päivitysten puskuri sijaitsee jaetussa Redisissä eikä instanssin muistissa, mihin tahansa replikaan ohjattu käännös näkee viimeisimmät näppäilyt, ja käännösaffiniteetti voidaan valita välimuistin paikallisuuden eikä oikeellisuuden perusteella.
+
+### 7.7 Kapasiteettimallit
+
+Amdahlin laki \[24] rajaa rinnakkaisuudesta saatavaa nopeutusta, ja Littlen laki \[23] yhdistää käyttöasteen saapumistahtiin ja palveluaikaan; molempia on käytetty edellä. Guntherin universaali skaalautuvuuslaki \[12] laajentaa ensimmäistä koherenssiviiveen taantumatermillä ja ennustaa, että suoritusteho saavuttaa huippunsa ja alkaa sitten laskea. Toteamme, että järjestelmämme _ei_ ilmennä tätä taantumatilaa arvoon $N=1024$ asti: suoritusteho kyllästyy ja viive kasvaa, mutta mikään ei romahda. Syy on rakenteellinen eikä onnekas — käännökset eivät jaa mitään tilaa, jota pitäisi pitää koherenttina, joten lain lisäämä termi on lähellä nollaa, ja luvun §4.3 sisäänpääsytasanne rajoittaa kilpailua ennen kuin sillä voi olla merkitystä.
+
+## 8. Suositukset ylläpitäjille
+
+<Steps>
+<Step title="Korjaa kaksi ohjelmistoparametria ennen laitteiston ostamista">
+Molemmat ovat ilmaisia, ja kumpikin on arvokkaampi kuin mikään yksittäinen mittaamamme laitteistopäivitys. Nosta `features.compileTimeout` arvoon, jota käyttäjäsi todella sietävät — CLSI:n hyväksymä enimmäisarvo on 600 s — ja jos odotat ylittäväsi 65 samanaikaista käännöstä, joko nosta `compileConcurrencyLimit`-arvoa johdetussa kuvassa tai skaalaa horisontaalisesti. Jos et tee kumpaakaan, maksat ytimistä, joita ohjelmisto kieltäytyy käyttämästä.
+</Step>
+
+<Step title="Mitoita yksi kone sen taitekohdan, ei ylärajan mukaan">
+Suuren ajokoneen mittaussarja (§4.3) erottaa kaksi lukua, jotka sekoitetaan rutiininomaisesti. _Yläraja_ — suurin samanaikaisuus, jolla jokainen PDF vielä palautuu — on 64-ytimisellä palvelimella vähintään 1024, emmekä koskaan saavuttaneet sitä. _Taitekohta_ — piste, jonka jälkeen hännän viive lakkaa kasvamasta maltillisesti ja alkaa kaksinkertaistua — on 512:ssa, ja viimeinen mukava toimintapiste sen alapuolella on 256. Arvojen $N=256$ ja $N=512$ välillä $p_{95}$-odotus kasvaa kahdesta minuutista lähes kuuteen; arvojen 512 ja 1024 välillä se saavuttaa kahdeksan. Ylläpitäjä, joka mitoittaa ylärajan mukaan, toimittaa järjestelmän, joka teknisesti toimii mutta jota kukaan ei halua käyttää.
+
+Tälle koneelle ja tälle asiakirjalle suositeltu toimintapiste on siksi **256 samanaikaista käännöstä**, mikä on $4\times$ fyysisten ytimien määrä ja $2\times$ säikeiden määrä ja pitää $p_{95}$-arvon noin 120 sekunnissa. Suosittelemme asettamaan `compileConcurrencyLimit`-arvon tähän sen sijaan, että se jätettäisiin korkeaksi: 1024 käännöksen päästäminen sisään kerralla saa kaikki odottamaan kahdeksan minuuttia, kun taas 256 käännöksen päästäminen sisään ja muiden asettaminen jonoon palvelee useimpia käyttäjiä kahdessa minuutissa. Jonoutuminen heikentää myöhään saapuvien kokemusta; kilpailu heikentää kaikkien.
+</Step>
+
+<Step title="Käsittele näitä pahimman tapauksen lukuina">
+Jokainen taulukon 2 taso on samanaikaisesti käynnistetty kylmä käännös. Kumpikaan ehto ei toteudu tuotannossa: saman asiakirjan lämmin käännös kestää 8,6 s verrattuna kylmän 28,3 sekuntiin, eli $3.3$-kertaisesti nopeammin, eivätkä todelliset käyttäjät paina painiketta samalla sekunnilla. Vakaan tilan käyttäjäjoukko, joka kääntää uudelleen kahden minuutin välein tyypillisellä välimuistin osumaprosentilla, kestää siksi huomattavasti enemmän kirjoittajia kuin pelkkä samanaikaisuusluku antaa ymmärtää — suuruusluokaltaan tuhat tai enemmän aktiivista kirjoittajaa toimintapisteessä 256. Samanaikaisuusluku on hetkellisen purskeen raja, ei paikkamäärä.
+</Step>
+
+<Step title="Päätä ensin viivebudjetti ja lue sitten koko">
+Yhtälö (1) kääntyy suoraan. Tavoiteodotukselle $T$ kellotaajuudella $f$ ja $C$ ytimellä sopiva samanaikaisuus on $N \le C\,fT/k$, jossa tälle asiakirjalle $k\approx28 GHz·s$. 60 s:n budjetti 8 ytimellä ja 3 GHz:llä antaa $N\le51$; 120 s:n budjetti kaksinkertaistaa sen. Budjetin julkaiseminen kapasiteetin rinnalla on ainoa rehellinen tapa ilmoittaa kumpikaan.
+</Step>
+
+<Step title="Osta ensin muistia, sitten ytimiä, ja tarkista, mihin rajaan törmäät">
+Alle 32 GiB:n muistilla mittasimme lisäytimistä lähes olematonta hyötyä. Diagnoosi on edullinen: jos virheet ilmenevät HTTP 502 -vastauksina vierasjärjestelmän muistin ollessa vähissä, lisää muistia; jos ne ilmenevät `timedout`-tilana muistia riittäessä, lisää ytimiä tai nosta aikakatkaisua. Ylläpitäjät voivat lukea tämän samasta virhesignatuurista, jota käytimme kokoonpanojen luokitteluun.
+</Step>
+
+<Step title="Suosi kellotaajuutta kokemuksen ja ytimiä käyttäjämäärän vuoksi">
+Koska $T\propto 1/f$ pätee ilman kaarevuutta (2 % alueella 1,0–5,5 GHz), nopeampi kellotaajuus nopeuttaa jokaista käännöstä jokaiselle käyttäjälle. Useammat ytimet eivät nopeuta yhtäkään yksittäistä käännöstä; ne vain päästävät sisään useampia samanaikaisia. Asennusten, joissa valitetaan "käännökset ovat hitaita", kannattaa ostaa kellotaajuutta; asennusten, joissa valitetaan "käännökset epäonnistuvat määräajan lähestyessä", kannattaa ostaa muistia ja ytimiä.
+</Step>
+
+<Step title="Skaalaa ylärajan jälkeen horisontaalisesti eikä vertikaalisesti">
+Yli 65 samanaikaisen käännöksen tuettu tie on horisontaalinen skaalaus (kuvat 2c ja 10, tarkemmin luvussa §9): useita sovellusinstansseja evästepohjaisella istuntoaffiniteetilla varustetun kuormantasaajan takana, jotka jakavat keskitetyn MongoDB:n, Redisin ja S3-yhteensopivan tallennuksen ja joissa `git-bridge` jätetään yksittäiseksi instanssiksi. Tämä moninkertaistaa instanssikohtaisen ylärajan instanssien määrällä, ja juuri näin SaaS-asennus saavuttaa oman kapasiteettinsa.
+</Step>
+
+<Step title="Älä luota käännöskohtaiseen eristykseen">
+Kunnes Docker-suorittimen muistiraja korjataan (§6.2), yksittäinen patologinen asiakirja voi kuluttaa loppuun isäntäkoneen sen sijaan, että vain se lopetettaisiin. Ylläpitäjien, jotka tarvitsevat tämän takuun, kannattaa asettaa se itse sen sijaan, että odottaisivat sitä. Suurella isäntäkoneella käyttämämme mekanismi on kovan ylärajan sisältävä systemd-osio, johon Docker-daemon sitten ohjataan niin, että jokainen sen luoma kontti lasketaan sen sisään:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Yksi yksityiskohta maksaa iltapäivän, jos sen ohittaa. `docker-capped.slice`-niminen osio ei sijaitse `docker.slice`-osion rinnalla vaan sen _sisällä_, koska yhdysmerkki on hierarkian erotin eikä osa nimeä. Yläraja, jolla ei näytä olevan vaikutusta, on yleensä asetettu tason päähän siitä, missä kontit todellisuudessa sijaitsevat. Varmista lukemalla huippuarvo `memory.max_usage_in_bytes`-tiedostosta ajon jälkeen äläkä luota määritystiedostoon — isäntäkoneellamme käännösten cgroup ei koskaan ylittänyt viidesosaa ylärajastaan edes 1024 samanaikaisella käännöksellä, mikä on itsessään todiste siitä, että rajoittava tekijä oli daemon eikä muisti.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Kuva 10.** Horisontaalisesti skaalatun asennuksen referenssitopologia, piirretty varmentamamme kokoonpanon pohjalta. Sovellusreplikat ovat keskenään vaihdettavissa eivätkä sisällä mitään pysyvää, joten niitä voi lisätä ja poistaa vapaasti. Kolme komponenttia ei ole: Redis, jonka asiakirjapuskurin ansiosta mihin tahansa replikaan ohjattu käännös näkee viimeisimmät näppäilyt; objektitallennus, josta tulee pakollinen eikä valinnainen useamman kuin yhden replikan kanssa; ja `git-bridge`, joka säilyttää tietovarastot paikallisella levyllä ilman replikointimahdollisuutta ja jonka on toimittava yksittäisenä instanssina yhden nimetyn replikan rinnalla.
+
+## 9. Referenssiasennus useammalla koneella
+
+Kaikki edellä mitattu koskee yhtä konetta. Tämä luku kuvaa hajautetun muodon riittävän tarkasti rakentamista varten — ja koska ylläpitäjän todellinen kysymys ei ole _miten_ vaan _kannattaako_, kuvaa ensin pisteen, jossa se tulee vaivan arvoiseksi.
+
+### 9.1 Milloin hajautettu muoto on perusteltu
+
+Yksi kone on edullisempi ylläpitää kaikilla merkityksellisillä tavoilla: yksi vikaantumisalue, ei jaettua tilaa pidettäväksi johdonmukaisena, ei reititystä, joka voisi mennä pieleen. Datamme asettaa kolme kynnystä sille, milloin siitä kannattaa luopua.
+
+#### 9.1.1 Alle 65 samanaikaista käännöstä: älä
+
+Instanssikohtainen yläraja on ohjelmiston eikä laitteiston vakio (§6.1). Kunnes tarjottu kuorma lähestyy sitä, toinen kone tuo lisää vikaantumistapoja eikä hyödytä mitään. 64-ytiminen isäntäkone palveli 256 samanaikaista käännöstä täydellä onnistumisella vasta, kun `compileConcurrencyLimit` oli nostettu; ylläpitäjä, joka ei ole vielä muuttanut tätä yhtä arvoa, ei ole laitteistorajoitteinen eikä hänen pitäisi ostaa laitteistoa.
+
+#### 9.1.2 Noin 65–500: skaalaa ensin vertikaalisesti
+
+Vertikaalinen skaalaus pysyi lineaarisena koko alueellamme eikä koskaan siirtynyt taantumatilaan. Yksi suuri isäntäkone saavutti 1024 samanaikaista kylmää käännöstä 100 %:n onnistumisella (§4.3); viiveen taitekohta ilmeni 512:ssa, ei aiemmin. Tällä alueella suurempi kone on ehdottomasti yksinkertaisempi kuin useat pienemmät, ja luvun §4.4 mukaan nopeampi kone parantaa jokaisen käyttäjän kokemusta sen sijaan, että se vain päästäisi sisään useampia.
+
+#### 9.1.3 Hajauta saatavuuden, ei suoritustehon vuoksi
+
+Rehellinen syy ajaa useampaa kuin yhtä sovellusreplikaa ylärajan alapuolella on se, että yksi kone on yksi virtalähde, yksi ydin ja yksi päivitysikkuna. Se on oikeutettu syy, ja juuri sen me antaisimme; se ei vain ole kapasiteettiperuste, ja näiden kahden sekoittaminen saa ylläpitäjät ostamaan replikoita, kun he olisivat tarvinneet muistia.
+
+### 9.2 Tasot ja niiden mitoitus
+
+Kuva 10 esittää topologian. Siinä on neljä tasoa, ja ne skaalautuvat eri suureiden mukaan — mikä on niiden erottamisen koko tarkoitus.
+
+#### 9.2.1 Reuna
+
+Yksi kuormantasaaja, tai kaksi saatavuuden vuoksi. Se päättää TLS-yhteydet eikä tee mitään raskasta; se skaalautuu yhteyksien eikä käännösten määrän mukaan, ja pieni instanssi riittää tässä tutkituille kuormille. Merkitystä on sen määrityksellä, ei sen koolla (§9.3).
+
+#### 9.2.2 Sovellusreplikat
+
+Nämä kantavat käännöskuorman ja ovat ainoa taso, joka skaalautuu samanaikaisuuden mukana. Mitoita jokainen luvun §8 sääntöjen mukaan — muisti ennen ytimiä, sitten kellotaajuus — ja aseta sitten replikoiden määrä kattamaan huippusamanaikaisuus jaettuna replikakohtaisella ylärajalla. Replikat eivät sisällä mitään pysyvää: niiden paikallisella levyllä on käännösten työtiedostot ja tulosvälimuisti, jotka molemmat voidaan rakentaa uudelleen. Tämän ansiosta niitä on turvallista lisätä ja poistaa vapaasti, ja tämä kannattaa varmistaa eikä olettaa, koska yksikin väärin määritetty `filestore`-polku muuttaa tason huomaamatta tilalliseksi.
+
+#### 9.2.3 Tila
+
+Redis, MongoDB ja S3-yhteensopiva objektitallennus erillisillä isäntäkoneilla. Redis on kantava osa ja vähiten ilmeinen: se sisältää istuntovaraston ja elävän asiakirjapuskurin, jonka ansiosta mihin tahansa replikaan ohjattu käännös näkee toiseen replikaan kirjoitetut näppäilyt. Ylläpitäjä, joka käsittelee Redisiä välimuistina ja mitoittaa sen poistoja varten, saa aikaan vanhentuneiden asiakirjojen käännöksiä, joita on äärimmäisen vaikea diagnosoida, koska mikään ei epäonnistu — tulos on vain väärä. MongoDB skaalautuu projektien määrän eikä käännöstahdin mukaan. Objektitallennus on valinnainen yhdellä replikalla ja pakollinen useammalla.
+
+#### 9.2.4 Yksittäisinstanssi
+
+`git-bridge` säilyttää tietovarastot paikallisella levyllä, ylläpitää paikallista indeksiä eikä sillä ole replikointimahdollisuutta. Sen on toimittava täsmälleen yhtenä instanssina kiinnitettynä yhden nimetyn replikan rinnalle, ja se on komponentti, joka tekee asennuksesta ei-aivan-tilattoman. Suunnittele sen isäntäkone sen mukaisesti: sen levy on se, joka on varmuuskopioitava.
+
+| **Taso**      | **Määrä**            | **Skaalautuu mukana**    |
+| ------------- | -------------------- | ------------------------ |
+| Kuormantasaaja | 1–2                 | samanaikaiset yhteydet   |
+| Sovellus      | $\lceil N/C\rceil$ | samanaikaisten käännösten huippu |
+| Redis         | 1 (+replika)         | aktiiviset muokkausistunnot |
+| MongoDB       | 1 (+replika)         | tallennetut projektit    |
+| Objektitallennus | 1 klusteri        | projektien kokonaistavumäärä |
+| `git-bridge`  | täsmälleen 1         | levyllä olevat tietovarastot |
+
+**Taulukko 4.** Referenssitasot. Vain sovellustaso skaalautuu samanaikaisuuden mukana; sen mitoitus on luvun §8 aihe.
+
+### 9.3 Reititys on se osa, joka menee helposti pieleen
+
+Kolmen pyyntöluokan on päädyttävä kolmeen eri paikkaan, ja oletusarvoinen yhden säännön määritys täyttää niistä enintään kaksi.
+
+Polun `/project/` alla oleva käännösliikenne tulisi jakaa projektitunnisteen johdonmukaisella hajautuksella, jotta projektin käännösvälimuisti pysyy yhdellä replikalla. Käytämme HAProxyn asetusta `balance hash path,field(3,/)` yhdessä asetusten `hash-type consistent` ja `hash-balance-factor 150` kanssa. Valinnalla on merkitystä skaalattaessa: evästeaffiniteetilla olemassa olevat istunnot pysyvät kiinnitettyinä alkuperäiseen replikaansa loputtomasti, ja uusi replika saa vain uusia käyttäjiä, joten kone, josta ylläpitäjä juuri maksoi, ei ota vastaan lainkaan sitä kuormaa, joka motivoi sen ostamista. Johdonmukainen hajautus jakoi kokoonpanossamme skaalattaessa uudelleen 35 % projekteista, evästeillä 0 %.
+
+Istuntoliikenne on erilaista. Kun WebSocket-päivitys epäonnistuu ja `socket.io` palaa XHR-kyselyyn, yhden istunnon peräkkäisten kyselyjen on päädyttävä yhteen replikaan, eikä polussa ole projektitunnistetta hajautettavaksi. Tämä liikenne tarvitsee erillisen taustapalvelun evästeaffiniteetilla. Suunnittelimme tämän jaon, mutta emme ottaneet sitä käyttöön; merkitsemme sen puutteeksi emmekä väitä toteuttaneemme sitä.
+
+Lopuksi polun `/git/` on päädyttävä replikaan, jonka rinnalla `git-bridge` toimii. Se reititetään tuohon replikaan eikä suoraan `git-bridge`-palveluun, koska silta todentaa takaisinkutsunsa sovelluksen OAuth-päätepisteitä vasten ja selvittää blob-URL-osoitteet sen kautta; replikan ohittaminen rikkoo todennuksen eikä paranna mitään.
+
+### 9.4 Skaalaus alaspäin tarvitsee tyhjennyspuskurin
+
+Replikan poistaminen ei ole symmetrinen sen lisäämisen kanssa: käynnissä oleva käännös menetetään, ja käyttäjä näkee virheen, jota hän ei aiheuttanut. Toimiva järjestys on pysäyttää ensin uusi liikenne, odottaa ja vasta sitten lopettaa. Toteutimme tämän pre-stop-koukkuna, joka pitää podia määritettävän ajan, kun kuormantasaaja merkitsee taustapalvelun tyhjeneväksi — riittävän lyhyen, jotta sen voi testata minuuteissa, ja tuotannossa riittävän pitkän istunnon luonnolliseen päättymiseen, tunteja eikä sekunteja. Aikaväli on säätönuppi, joka ratkaisee, onko joustavuus näkymätöntä vai raivostuttavaa.
+
+Yksi lisärajoitus löytyi mittaamalla eikä suunnittelemalla: suoritinkuormaan perustuva automaattinen skaalaus ei toimi tällä kuormalla. Sovelluspodin oma käyttöaste oli 22 m ydintä solmun kokonaismäärän ollessa 3997 m ydintä, koska käännöstyö tapahtuu sisarkonteissa, joita podi ei laske omikseen. Minkä tahansa tämän tason skaalaamiseen käytettävän signaalin on laskettava käynnissä olevia käännöskontteja, ei podin suoritinkäyttöä.
+
+## 10. Merkitys Overleafin ulkopuolella
+
+Mikään luvuissa §4.2 tai §4.3 ei ole Overleafin koodille ominaista. Mitatut lait seuraavat kolmesta ominaisuudesta, jotka ovat yhteisiä kaikille isännöidyille LaTeX-palveluille: työyksikkö on yksisäikeinen prosessi, se on eristetty konttiin, ja sen työjoukko on suuri vain luku -puu, joka sivuvälimuistin on pidettävä muistissa. Kolme seurausta siirtyy suoraan kaikille, jotka rakentavat tällaista palvelua.
+
+### 10.1 Varaa ensin muistia, sitten ytimiä
+
+Matriisin vahvin tulos on negatiivinen: alle 16 GiB:n muistilla ydinmäärällä ei ole juuri merkitystä, ja vasta 48 GiB:n muistilla 4, 8 ja 16 vCPU:n kokoonpanot ylipäätään erottuvat toisistaan (143, 268, 331). Ylläpitäjä, joka lukee tavanomaisen säännön muodossa "lisää yksi ydin viittä käyttäjää kohden", ostaa väärää resurssia. Mekanismi on jakelupuun jaettu sivuvälimuisti, ja se on TeX Liven koon eikä minkään tietyn käyttöliittymän ominaisuus.
+
+### 10.2 Sisäänpääsytahti on resurssi, ja se yleensä unohdetaan
+
+Arvolla $N=1024$ palvelimellamme ei koskaan ollut yli 205 elävää hiekkalaatikkoa (kuva 7b), vaikka jokainen pyyntö saapui kerralla. Rajoittavana tekijänä oli konttien luominen eikä kääntäminen — mikä on linjassa mittaustutkimusten kanssa, jotka katsovat konttien käynnistyskustannuksen johtuvan ajonaikaisista yleiskustannuksista eikä kuvan koosta \[19, 20]. Palvelu, joka mitoittaa vain suorittimen ja muistin, huomaa purskekäyttäytymisensä määräytyvän suureesta, jota se ei koskaan mitannut. Tämän käytännön muoto on luvun §8 suositus: rajoita sisäänpääsyä tietoisesti, koska itse valitsemasi jono on parempi kuin jono, jonka löydät.
+
+### 10.3 Käännöstään pidempään elävä hiekkalaatikko mitätöi mallin
+
+Jokainen tämän artikkelin kapasiteettiluku olettaa, että kontti luodaan, se tekee yhden käännöksen ja päättyy — elinikä on kymmeniä sekunteja ja käyttösuhde lähellä yhtä vain sen ollessa käynnissä. Kaksi tuoretta suunnittelumallia rikkoo tämän oletuksen, ja ne rikkovat sen samalla tavalla.
+
+Ensimmäinen on käyttäjäkohtainen pysyvä hiekkalaatikko. Kiinteän yksityisen ympäristön varaaminen jokaiselle käyttäjälle muuttaa tilastollisesti multipleksoidun poolin joukoksi varauksia: palvelu, joka pystyisi aikajaon avulla palvelemaan 256 samanaikaista käännöstä 64 ytimellä, pystyy palvelemaan vain 16 käyttäjää, jos kullekin annetaan neljä omaa ydintä, eli suuruusluokkaa vähemmän samalla laitteistolla. Datamme kvantifioi tämän valinnan kustannuksen sen sijaan, että vastustaisi sitä — varaukset tuovat ennustettavuutta, ja vaihtokurssi on suositellussa toimintapisteessä noin $16\times$.
+
+Toinen ja uudempi on tekoälyagentti, joka jakaa hiekkalaatikon kääntäjän kanssa. Agenttiavusteisilla kirjoitusalustoilla sama kontti, joka suorittaa XeLaTeXia, voi isännöidä myös pitkäkestoista koodausagenttia, joten se on varattuna jatkuvasti eikä purskeittain. Käytännön toimijat raportoivat juuri sitä oiretta, jonka malli ennustaa tällaisille asennuksille — jatkuvaa hitautta maltillisilla käyttäjämäärillä \[15]. Vuorovaikutus kannattaa kuvata tarkasti, koska kyse ei ole yksinkertaisesti "suuremmasta kuormasta". Kolme havaintoamme vahvistavat toisiaan. Varaus lakkaa olemasta purskeista, joten luvun §4.2 aikajakolaki koskee koko käyttäjäjoukkoa kerralla eikä vain parhaillaan kääntävää osaa. Sivuvälimuisti, joka tuo luvun §4.1 superlineaarisen muistihyödyn, jaetaan nyt agentin oman työjoukon kanssa eikä pysy lämpimänä TeXille. Ja luvun §6.2 puuttuva kontin muistiraja muuttuu paljon vaarallisemmaksi, koska kontti, joka ei koskaan päätä toimintaansa, ei koskaan palauta muistiaan.
+
+Emme mitanneet tällaista alustaa emmekä esitä väitteitä mistään tietystä tuotteesta. Voimme kuitenkin sanoa, mitä lukumme merkitsevät suunnittelulle: arkkitehtuuri, joka antaa jokaiselle käyttäjälle pitkäikäisen moniytimisen hiekkalaatikon, tulisi mitoittaa varausjärjestelmänä eikä tässä raportoitujen samanaikaisuuslukujen mukaan, ja sen odotettavissa oleva kapasiteetti on lähempänä sen ydinmäärää jaettuna käyttäjäkohtaisilla ytimillä kuin mitään taulukon 1 lukua.
+
+## 11. Validiteettia uhkaavat tekijät
+
+### 11.1 Yksi asiakirja
+
+Kaikissa mittauksissa käytetään yhtä 63-sivuista XeLaTeX-asiakirjaa. Absoluuttiset kapasiteetit poikkeavat muilla asiakirjoilla; skaalautumislakien, jotka ovat suhteita, ei pitäisi. Asiakirja, jonka muistijoukko on huomattavasti suurempi, siirtäisi muistirajaa muuttamatta sen superlineaarista luonnetta.
+
+### 11.2 Virtualisoitu isäntäkone
+
+Vierasjärjestelmät toimivat KVM:n alla yhdellä fyysisellä koneella, joten absoluuttiset luvut sisältävät virtualisoinnin yleiskustannukset, ja vierasjärjestelmät jakavat isäntäkoneen sivuvälimuistin ja NVMe-laitteen. Lievensimme suurinta sekoittavaa tekijää sammuttamalla muut vierasjärjestelmät havaittuamme, että isäntäkoneen muistipaine kasvattaa vierasjärjestelmän kuormitusta yli $3\times$ samalla samanaikaisuudella.
+
+### 11.3 Yhtäaikainen saapuminen
+
+Jokainen käännös lähetetään samalla hetkellä, mikä on pahin tapaus. Todelliset käyttäjät saapuvat stokastisena prosessina, joten lukujemme mukaan mitoitetulla asennuksella on marginaalia eikä vajetta — mutta palautusmääräajan lopun huippu on lähempänä malliamme kuin Poisson-mallia.
+
+### 11.4 Reunakokoonpanot
+
+2 GiB:n muistilla järjestelmä on niin lähellä romahdusta, että saman kokoonpanon toistetut ajot voivat erota yhdellä käännöksellä. Raportoimme varovaisen arvon emmekä tee johtopäätöksiä $\pm 1$:n eroista tällä alueella.
+
+## 12. Saatavuus
+
+Testattu järjestelmä, käyttöönottotyökalut ja upstream-projekti, josta se on johdettu, ovat kaikki julkisia:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Käyttöönottotyökalupakki — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Dokumentaatio — [https://ayakaleaf-pro.ayaka.space](/fi)
+* Upstream Overleaf — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* TeX Live -käännöskuvat — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Jokainen lainaamamme lähdekoodin sijainti on annettu tietovarastoon suhteellisena polkuna ja rivinumerona Ayakaleaf Pro v6.2.2:ta vasten, ja kaksi päivättyä upstream-commitia (`9a519f0d3d`, `5d472e9b38`) löytyvät Overleafin historiasta.
+
+## 13. Tekijöiden osuudet
+
+Musicminion suunnitteli tutkimuksen, tarjosi ja ylläpiti testiympäristöt, ohjasi tutkimuksen suuntaa ja varmensi jokaisen tässä raportoidun mittauksen. Claude Opus 5 (Anthropic) rakensi ja ajoi suorituskykytestien valjaat, automatisoi käyttöönotot, suoritti lähdekoodin arkeologian, tuotti kuvat ja laati käsikirjoituksen luonnoksen. Molemmat tekijät tarkistivat lopullisen tekstin. Kun ajo raportoidaan saastuneeksi — luvun §4.3 1021 istunnon mittaussarja ja luvun §4.1 poikkeava taso $N=256$ — vika löydettiin tarkistuksen aikana ja ajo toistettiin ennen julkaisua sen sijaan, että se olisi hiljaa jätetty pois.
+
+Lukijoiden on hyvä huomata, että ACM:n, IEEE:n ja ICMJE:n tekijyyskäytännöt varaavat tällä hetkellä tekijyyden tahoille, jotka voivat ottaa vastuun teoksesta, ja edellyttäisivät toisen tekijän osuuden kirjaamista ilmoituksena eikä tekijänimenä. Kerromme työnjaon tässä eksplisiittisesti, jotta tiedot ovat oikein kummankin käytännön mukaan.
+
+## 14. Johtopäätökset
+
+Itse isännöidyn Overleafin kapasiteettisuunnittelu ei ole yhden resurssin skaalaamista. Kolmen havainnon pitäisi muuttaa tapaa, jolla se tehdään.
+
+Ensinnäkin alle 32 GiB:n vierasmuistilla ydinmäärällä on tuskin merkitystä: 16 GiB:n muistilla 4, 8 ja 16 vCPU:n vierasjärjestelmien kapasiteetit eroavat alle 8 %. Muisti asettaa rajan TeX Live -puun jaetun sivuvälimuistin kautta; ytimillä alkaa olla merkitystä vasta, kun muistia on runsaasti.
+
+Toiseksi kaksi ohjelmistoparametria painaa enemmän kuin laitteisto. CLSI:n kovakoodatun 65 käännöksen ylärajan poistaminen ja oletusarvoisen 180 s:n käännösaikakatkaisun nostaminen veivät 8 vCPU / 48 GiB -vierasjärjestelmän 64:stä 268 samanaikaiseen käännökseen — 4,2-kertaisesti ilman lisälaitteistoa. Kumpaakaan ei voi löytää määritysdokumentaatiosta; toista ei voi määrittää lainkaan.
+
+Kolmanneksi kysymys "kuinka montaa samanaikaista käyttäjää tämä kone tukee" on alimääritelty. Samanaikaisuus tässä järjestelmässä on puhdasta aikajakoa, ja kapasiteetti on mitä tahansa aikakatkaisu sallii. Vastauksen rehellinen muoto ilmoittaa molemmat: _tämä kone palvelee_ $N$ _samanaikaista käännöstä, jos käyttäjät odottavat_ $T$ _sekuntia_, jolloin $N$ ja $T$ liittyvät toisiinsa yhtälön (1) mukaisesti.
+
+Raportoimme myös piilevän vian: Docker-suorittimen konttikohtainen muistiraja on ollut tehoton vuodesta 2018 sekä suuruutensa että sijoittelunsa vuoksi. Sen käytännön vaikutus on, että muistin loppuminen pienessä asennuksessa kaataa koko palvelun sen yhden käännöksen sijaan, joka siitä on vastuussa.
+
+## Lähteet
+
+\[1] Overleaf. _Hardware requirements_, On-premises documentation. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, On-premises documentation. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, On-premises documentation. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Source repository_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Käytännön toimijoiden raportit jatkuvasta viiveestä agenttiavusteisilla kirjoitusalustoilla, joilla pysyvä koodausagentti sijaitsee LaTeX-kääntäjän kanssa samassa käyttäjäkohtaisessa hiekkalaatikossa. Viittaamme tähän raportoituna käyttökokemuksena emmekä kontrolloituna mittauksena; emme testanneet tällaisen alustan suorituskykyä.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

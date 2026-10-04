@@ -1,0 +1,194 @@
+---
+title: Data dan cadangan
+icon: database
+---
+
+Terkadang kami perlu mengubah skema data di database seiring perkembangan Overleaf, dan skrip migrasi digunakan untuk mengotomatiskan proses ini. Skrip tersebut sudah dijalankan terlebih dahulu di [overleaf.com](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit), yang merupakan instance Overleaf terbesar di dunia, sehingga sebagian besar kemungkinan kasus sudah pernah ditemui. Namun, kami tidak memberikan jaminan apa pun atas data Anda. Pastikan Anda membuat cadangan data yang **konsisten** **sebelum** memperbarui instance Anda.
+
+<Info>
+
+Saat memperbarui ke image Docker baru, setiap migrasi yang **belum** dijalankan akan dieksekusi secara otomatis. Proses ini mungkin memakan waktu tergantung ukuran dataset Anda; memantau log akan memberi tahu Anda kemajuannya. Untuk informasi lebih lanjut, lihat dokumentasi [Logging](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging) kami.
+
+</Info>
+
+### Penyimpanan data
+
+Overleaf Community Edition dan Server Pro menyimpan datanya di tiga tempat terpisah:
+
+* **Database MongoDB:** Tempat data pengguna dan proyek disimpan.
+* **Redis:** berfungsi sebagai cache berperforma tinggi untuk data yang sedang diproses, terutama menyimpan informasi terkait penyuntingan proyek dan kolaborasi.
+* **Sistem file Overleaf:** menyimpan file proyek yang tidak dapat disunting (termasuk gambar) dan juga berfungsi sebagai cache disk sementara selama kompilasi proyek.
+
+<Info>
+
+Lokasinya mungkin `~/sharelatex_data` atau `~/overleaf_data`, tergantung kapan instance Anda disiapkan.
+
+</Info>
+
+<Check>
+
+Untuk file proyek dan data riwayat proyek lengkap, kami juga mendukung backend penyimpanan yang kompatibel dengan S3.
+
+</Check>
+
+Lihat Folder secara rinci untuk informasi lebih lanjut tentang tata letak folder di disk.
+
+### Membuat cadangan yang konsisten
+
+Ada tiga penyimpanan yang perlu disertakan saat membuat cadangan yang konsisten:
+
+* MongoDB
+* Redis
+* Data sistem file Overleaf
+
+Untuk menghasilkan cadangan yang konsisten, pengguna **wajib** dicegah menghasilkan data baru selama proses pencadangan berlangsung. Oleh karena itu, kami menyarankan untuk menjadwalkan jendela pemeliharaan, di mana pengguna tidak dapat mengakses instance atau menyunting proyek mereka.
+
+Sebelum memulai proses pencadangan, Anda perlu membuat instance Anda offline. Mulai dari Server Pro `3.5.0`, proses shutdown mengotomatiskan penutupan situs dan pemutusan koneksi pengguna.
+
+Untuk mematikan instance Anda, jalankan `bin/docker-compose stop sharelatex` jika Anda menggunakan deployment Toolkit, atau `docker compose stop sharelatex` jika Anda menggunakan Docker Compose.
+
+Setelah kontainer `sharelatex` dihentikan, Anda dapat memulai proses pencadangan.
+
+Setelah proses pencadangan **berhasil** diselesaikan, Anda perlu menjalankan kembali kontainer `sharelatex`. Untuk melakukannya, jalankan `bin/docker-compose start sharelatex` jika Anda menggunakan deployment Toolkit, atau `docker compose start sharelatex` jika Anda menggunakan Docker Compose.
+
+<Danger>
+
+* Cadangan sebaiknya disimpan di server yang terpisah dari server tempat instance Overleaf Anda berjalan, idealnya di lokasi yang sama sekali berbeda.
+* Mereplikasi database ke beberapa instance MongoDB mungkin memberikan redundansi, tetapi tidak melindungi dari kerusakan data.
+* Menguji cadangan Anda adalah cara terbaik untuk memastikan cadangan tersebut lengkap dan berfungsi.
+
+</Danger>
+
+### MongoDB
+
+MongoDB dilengkapi dengan alat baris perintah bernama [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/) yang dapat digunakan untuk membuat cadangan data pengguna dan proyek yang tersimpan di database.
+
+### Data sistem file Overleaf
+
+Untuk deployment Toolkit, path tempat file yang tidak dapat disunting disimpan ditentukan di `config/overleaf.rc` menggunakan variabel lingkungan `OVERLEAF_DATA_PATH`, tetapi tergantung kapan instance Anda dibuat, path ini mungkin `data/sharelatex`.
+
+Diperlukan alat seperti **rsync** untuk menyalin direktori ini secara rekursif guna memastikan cadangan yang lengkap.
+
+### Redis
+
+Redis menyimpan sesi pengguna dan pembaruan dokumen yang tertunda sebelum di-flush ke MongoDB.
+
+Persistensi Append Only File (AOF) adalah konfigurasi yang disarankan untuk persistensi Redis.
+
+Pengguna Toolkit memiliki persistensi AOF yang aktif secara default untuk instalasi **baru**; pengguna yang sudah ada dapat menemukan informasi lebih lanjut tentang cara mengaktifkan AOF [di sini](/id/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence).
+
+Jika Anda memutuskan untuk tetap menggunakan snapshot RDB bersama persistensi AOF, Anda dapat menyalin file RDB ke lokasi yang aman sebagai cadangan.
+
+### Memindahkan data antar server
+
+Idealnya, belum ada data berharga di instance baru. Kami tidak memiliki proses untuk menggabungkan data antar instance.
+
+Dengan asumsi instance baru belum memiliki data, berikut beberapa langkah yang dapat Anda ikuti. Secara garis besar, kita membuat tar-ball dari volume `mongo`, `redis`, dan `overleaf`, menyalinnya ke server baru, lalu mengekstraknya kembali di sana.
+
+#### Toolkit
+
+```bash
+# Gracefully shutdown the old instance
+old-server$ bin/stop
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar config/ data/
+
+# Copy the backup-old-server.tar file from the old-server to the
+# new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ bin/stop
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv config/ data/ backup-new-server/
+
+# Populate config/data dir again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ bin/up
+```
+
+#### Docker Compose
+
+```bash wrap
+# Gracefully shutdown the old instance
+old-server$ docker stop sharelatex
+old-server$ docker stop mongo redis
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar ~/OVERLEAF_data ~/mongo_data ~/redis_data
+
+# Copy the backup-old-server.tar file from the old-server to
+# the new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ docker stop sharelatex
+new-server$ docker stop mongo redis
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv ~/OVERLEAF_data ~/mongo_data ~/redis_data backup-new-server/
+
+# Populate data dirs again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ docker start mongo redis
+new-server$ docker start sharelatex
+```
+
+Bergantung pada file **docker-compose.yml** Anda, Anda mungkin perlu menyesuaikan path volume `mongo`, `redis`, dan `overleaf`.
+
+<Info>
+
+Saat dijalankan sebagai pengguna root (atau dengan sudo), tar akan mempertahankan pemilik/grup dan izin file, yang sangat penting saat memulihkan cadangan.
+
+</Info>
+
+### Folder secara rinci
+
+<Info>
+
+Folder berikut memiliki petunjuk tambahan:
+
+* (b) sertakan dalam cadangan, sebaiknya saat instance dihentikan untuk memastikan konsistensi
+* (d) dapat dihapus
+* (e) file sementara, dapat dihapus saat instance dihentikan
+
+</Info>
+
+1. `~/mongo_data` (b)
+   * datadir mongodb
+2. `~/redis_data` (b)
+   * datadir db redis
+3. `~/overleaf_data`
+   1. bin
+      1. synctex (d)
+         * tidak digunakan pada rilis terbaru; sebelumnya digunakan biner synctex khusus (synctex digunakan untuk pemetaan sumber antara file .tex dan pdf)
+   2. data
+      1. cache (e)
+         * cache file biner untuk kompilasi
+      2. compiles (e)
+         * tempat kompilasi latex berlangsung
+      3. db.sqlite (d)
+         * tidak digunakan pada rilis terbaru; sebelumnya menyimpan detail cache clsi (kini dipindahkan ke map sederhana di memori atau kami memindai disk)
+      4. db.sqlite-wal (d)
+         * tidak digunakan pada rilis terbaru, lihat db.sqlite
+      5. output (e)
+         * penyimpanan output kompilasi latex untuk disajikan ke klien
+      6. template\_files (b)
+         * pratinjau gambar dari sistem templat (hanya Server Pro)
+      7. user\_files (b)
+         * file biner proyek
+      8. history (b)
+         * file riwayat proyek lengkap
+   3. tmp
+      1. dumpFolder (e)
+         * file sementara dari penanganan file zip
+      2. uploads (e)
+         * buffer untuk unggahan file (unggahan file biner/proyek baru dari zip)
+      3. projectHistories (e)
+         * file sementara untuk migrasi riwayat proyek lengkap

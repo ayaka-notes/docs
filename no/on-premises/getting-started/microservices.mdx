@@ -1,0 +1,151 @@
+---
+title: Mikrotjenester
+icon: microchip
+---
+
+Den anbefalte måten å installere og administrere Overleaf Server CE- og Overleaf Pro-instanser på er ved å bruke Toolkit.
+
+Toolkit forenkler opprettelsen av Overleaf-instansen din gjennom noen egendefinerte skript som abstraherer bort orkestreringen av de nødvendige mikrotjenestene. Kjør ganske enkelt det medfølgende initialiseringsskriptet, oppgi noen få konfigurasjonsalternativer som stiene for persistent lagring, så tar Toolkit seg av å klargjøre og koble sammen mikrotjenestene som utgjør Overleaf Server CE- eller Pro-instansen din.
+
+Dermed kan du konsentrere deg om å tilpasse brukeropplevelsen og implementere de spesifikke funksjonene som utgjør den lokale instansen din. Toolkit håndterer all kompleksiteten i bakgrunnen og gjør det enklere å installere Overleaf-instansen din.
+
+<Info>
+
+Av historiske årsaker heter hovedcontaineren i Overleaf `sharelatex`, og den er basert på Docker-imaget `sharelatex/sharelatex`. Dette er fordi teknologien er basert på ShareLaTeX-kodebasen, som ble slått sammen med Overleaf. Se [dette blogginnlegget](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf) for flere detaljer. På et tidspunkt i fremtiden vil den få nytt navn i tråd med Overleafs navnekonvensjon.
+
+</Info>
+
+#### Arkitektur
+
+Inne i Overleaf-containeren kjører programvaren som et sett med mikrotjenester som administreres av `runit`. Noen av de mer interessante filene i containeren er:
+
+* `/etc/service/`: initialiseringsfiler for mikrotjenestene.
+* `/var/log/overleaf/`: logger for hver mikrotjeneste.
+* `/overleaf/services/`: koden for de ulike mikrotjenestene.
+* `/var/lib/overleaf/`: monteringspunktet for persistente data (tilsvarer katalogen angitt av `OVERLEAF_DATA_PATH` på verten).
+
+#### MongoDB- og Redis-containerne
+
+Overleaf er avhengig av to eksterne databaser: MongoDB og Redis. Som standard klargjør Toolkit en container for hver av disse databasene i tillegg til Overleaf-containeren, til sammen tre Docker-containere.
+
+<Info>
+
+Hvis du heller vil koble til en eksisterende MongoDB- eller Redis-instans, kan du gjøre det ved å angi de aktuelle innstillingene i konfigurasjonsfilen [overleaf.rc](/no/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Editor og kompileringsprosess
+
+Denne delen gir en overordnet oversikt over håndteringen av dokumenter og kompileringsprosessen.
+
+<Info>
+
+Denne siden beskriver kompileringsprosessen med Sandboxed Compiles, som kun er tilgjengelig i Overleaf Pro. I Server CE bruker kompileringsprosessen enkle underprosesser — erstatt punktene som refererer til en **container** med ett enkelt punkt: **kjør kompilering i en underprosess**.
+
+</Info>
+
+Komponenter / aktører:
+
+* `user` — En bruker av applikasjonen
+* `editor` — Klientapplikasjonen som kjører i nettleseren
+* `clsi` — Mikrotjenesten som brukes til å kompilere PDF-er
+* `document-updater` — Mikrotjenesten som brukes til å behandle dokumentoppdateringer
+* `filestore` — Mikrotjenesten som håndterer binærfiler
+* `real-time` — Mikrotjenesten som brukes til å håndtere websockets
+* `web` — Den (ikke så) mikro tjenesten som brukes til å håndtere API-forespørsler
+
+**Hurtigbufring i Redis**
+
+* **user**: laster inn editorsiden
+* **editor**: åpner en websocket
+* **editor**: sender en forespørsel om å åpne et dokument via websocket
+  * **real-time** -> **document-updater**: dokumentet lastes fra MongoDB inn i Redis
+* **editor**: sender dokumentoppdatering via websocket
+  * **real-time** -> **document-updater**: dokumentet oppdateres i Redis
+* **editor**: sender flere kompileringsforespørsler
+  * Når det har gått 5 minutter siden forrige flush (per dokument):
+    * **document-updater**: flusher dokumentet fra Redis til MongoDB
+* **editor**: sender flere oppdateringer
+  * for hver 100. oppdatering (per dokument):
+    * **document-updater**: flusher dokumenthistorikken fra Redis til MongoDB
+* **user**: forlater editoren/lukker nettleserfanen
+  * 5 minutter senere
+    * **real-time**: sjekker om det finnes andre samarbeidspartnere; hvis ingen:
+      * **real-time** -> **document-updater**: flusher dokumentene fra Redis til MongoDB
+
+**Lese fra MongoDB inn i Redis**
+
+* **document-updater** -> **web** -> **docstore**: leser fra MongoDB
+
+**Flushe fra Redis til MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: skriver til MongoDB
+
+**Kompilering — sync-modus "full"**
+
+* **editor**: sender kompileringsforespørsel med sync-modus satt til "full"
+* **web** -> **document-updater**: eventuelle dokumenter flushes fra Redis til MongoDB
+* **web** -> **docstore**: alle dokumenter lastes ned fra MongoDB
+* **web** -> **clsi**: kompileringsforespørselen sendes til `clsi`, inkludert:
+  * sync-modusen
+  * en hash av filtreet -> "prosjekttilstanden"
+  * alle dokumenter med innhold -> underlagt grensen på 7 MB for forespørselens innhold
+  * URL-er til binærfiler for separat nedlasting
+* **clsi**: sjekker tilstanden på disk mot sync-modus og "prosjekttilstand"
+  * dette er en full synkronisering, så tidligere tilstand på disk kan ignoreres
+* **clsi**: rydder kompileringskatalogen
+* **clsi**: skriver alle dokumenter til kompileringskatalogen
+* **clsi**: skriver alle binærfiler til kompileringskatalogen
+  * `clsi` kopierer filene fra en lokal hurtigbuffer per prosjekt
+  * ved cache-bom:
+    * **clsi** -> **filestore**: laster ned filer
+* **clsi**: skriver "prosjekttilstanden"
+* **clsi**: sørger for at Docker-containeren finnes med ønsket konfigurasjon
+  * bygger containeralternativer, inkludert TeX Live-versjon
+  * hasher alternativene
+  * containernavn: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: starter containeren og strømmer stdout/stderr til minnet -> grense 2 MB
+* **clsi**: lar den stoppede containeren bli liggende -> ryddes opp etter 24 t
+* **clsi**: skriver stdout/stderr til disk
+* **clsi**: kopierer utdatafiler til en unik utdatakatalog
+  * build-id består av 8 tilfeldige byte pluss et tidsstempel med millisekundpresisjon
+  * sletter alle unntatt de 3 siste (anonym) / den siste (innlogget bruker) byggekatalogene
+* **clsi**: kompileringen mislyktes / fikk tidsavbrudd
+  * sletter kompileringshurtigbufferen — den kan inneholde ufullstendige filer / korrupt hurtigbuffer
+* **editor**: laster ned output.log og output.pdf
+
+**Kompilering — sync-modus "incremental"**
+
+* **editor**: sender kompileringsforespørsel med sync-modus satt til "incremental"
+* **web** -> **document-updater**: henter eventuelle dokumenter fra Redis
+  * hashen for "prosjekttilstanden" lagres også i Redis
+  * **web** sender hashen av filtreet til `document-updater`, og `document-updater` kan gjøre den inkrementelle kompileringen om til en full kompilering ved avvik
+    * se kompileringsprosessen slik den utføres når editoren ba om "full" kompilering
+* **web** -> **clsi**: kompileringsforespørselen sendes til `clsi`, inkludert:
+  * sync-modusen
+  * en hash av filtreet -> "prosjekttilstanden"
+  * alle dokumenter fra Redis med innhold -> underlagt grensen på 7 MB for forespørselens innhold
+  * ingen binærfiler
+* **clsi**: sjekker tilstanden på disk mot sync-modus og "prosjekttilstand"
+  * dette er en inkrementell synkronisering, så "prosjekttilstanden" må stemme
+  * ved avvik: svarer med 409 og lar web prøve på nytt med "full" synkronisering
+    * se kompileringsprosessen slik den utføres når editoren ba om "full" kompilering
+* **clsi**: skriver oppdaterte dokumenter til kompileringskatalogen
+* **clsi**: sørger for at Docker-containeren finnes med ønsket konfigurasjon
+  * bygger containeralternativer, inkludert TeX Live-versjon
+  * hasher alternativene
+  * containernavn: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: starter containeren og strømmer stdout/stderr til minnet -> grense 2 MB
+* **clsi**: lar den stoppede containeren bli liggende -> ryddes opp etter 24 t
+* **clsi**: skriver stdout/stderr til disk
+* **clsi**: kopierer utdatafiler til en unik utdatakatalog
+  * build-id består av 8 tilfeldige byte pluss et tidsstempel med millisekundpresisjon
+  * sletter alle unntatt de 3 siste (anonym) / den siste (innlogget bruker) byggekatalogene
+* **clsi**: kompileringen mislyktes / fikk tidsavbrudd
+  * sletter kompileringshurtigbufferen — den kan inneholde ufullstendige filer / korrupt hurtigbuffer
+* **editor**: laster ned output.log og output.pdf
+
+**Kompilering — bytte mellom moduser**
+
+* **editor**: registrerer en mislykket kompilering, neste kompilering blir en "full" kompilering
+* **editor**: registrerer en vellykket kompilering, neste kompilering blir en "incremental" kompilering

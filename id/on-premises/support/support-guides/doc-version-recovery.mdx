@@ -1,0 +1,158 @@
+---
+title: (Migrasi v5.0.1) Pemulihan versi dokumen
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Jika Anda tidak pernah menjalankan Server Pro versi 5.0.1 atau Community Edition versi 5.0.1, atau Anda memulai instans yang benar-benar baru dengan 5.0.1, Anda tidak perlu menjalankan proses pemulihan ini.
+
+</Info>
+
+**Pembaruan pada halaman ini:**
+
+* (2024-04-22 13:40 BST): Menambahkan langkah "Hentikan pembaruan baru agar tidak masuk ke sistem dan flush semua perubahan ke MongoDB".
+* (2024-04-23 11:45 BST): Memperhitungkan flush yang rusak di 5.0.1 dan melewati flush jika 5.0.2 pernah dijalankan.
+
+Durasi pemulihan akan bergantung pada jumlah dan ukuran proyek di instans Anda serta backend penyimpanan yang digunakan oleh history store untuk chunk (sebagaimana didefinisikan di `OVERLEAF_HISTORY_CHUNKS_BUCKET`).
+
+Proses pemulihan akan menunda start aplikasi di dalam kontainer Server Pro. Situs akan tampak offline selama waktu tersebut. Kami hanya mendukung menjalankan pemulihan dari satu instans kontainer Server Pro; semua worker horizontal scaling lainnya harus dalam keadaan offline.
+
+Anda dapat menghentikan dan melanjutkan proses pemulihan jika diperlukan.
+
+Berdasarkan uji performa kami, proses pemulihan dapat memproses sekitar 10 ribu proyek kecil per menit pada perangkat keras modern (kecepatan clock CPU 3GHz dan penyimpanan NVMe lokal). Sebagai contoh, untuk instans dengan 100 ribu proyek, jadwalkan jendela pemeliharaan yang memungkinkan downtime setidaknya 10+2 menit. Gunakan kueri berikut untuk memperkirakan jumlah proyek di instans Anda:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Harap baca langkah-langkah pemulihan berikut secara lengkap sebelum Anda memulai. Pelanggan Server Pro dipersilakan menghubungi [support@overleaf.com](mailto:support@overleaf.com) jika ada pertanyaan.
+
+### Proses pemulihan
+
+<Steps>
+<Step title="Tarik image rilis">
+Tarik image rilis `5.0.3`.
+</Step>
+
+<Step title="Identifikasi beberapa proyek">
+Identifikasi beberapa proyek berdasarkan id yang kehilangan riwayat; idealnya Anda memiliki izin untuk melakukan perubahan pada salah satunya.
+</Step>
+
+<Step title="Jadwalkan pemeliharaan">
+Jadwalkan jendela pemeliharaan untuk downtime.
+</Step>
+
+<Step title="Hentikan semua worker kecuali satu">
+Hentikan semua worker kecuali satu jika menggunakan penyiapan horizontal scaling.
+</Step>
+
+<Step title="Hentikan pembaruan baru dan flush semua perubahan ke MongoDB">
+Hentikan pembaruan baru agar tidak masuk ke sistem dan flush semua perubahan ke MongoDB:
+
+1. Tutup editor dan putuskan koneksi semua pengguna secara manual melalui panel admin di `https://my-server-pro.example.com/admin#open-close-editor` pada tab "Open/Close Editor".
+2.  Hentikan layanan Websocket/real-time.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Tunggu hingga layanan real-time berhenti, yang ditandai dengan `down:`.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Hentikan kontainer git-bridge jika diaktifkan.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  Jika Anda tidak pernah menjalankan 5.0.2: Lakukan flush manual untuk pembaruan dokumen dan tunggu hingga selesai dengan sukses.
+
+    Anda dapat mengulangi perintah jika terjadi error. Jika Anda melihat `failureCount` yang tidak nol pada beberapa kali percobaan berturut-turut, harap hentikan migrasi (pulihkan layanan melalui `docker restart git-bridge sharelatex`) dan hubungi dukungan.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  Jika Anda tidak pernah menjalankan 5.0.2: Pastikan semua perubahan telah di-flush dari redis.
+
+    Jika Anda mendapatkan output apa pun dari `redis-cli`, harap hentikan migrasi (pulihkan layanan melalui `docker restart git-bridge sharelatex`) dan hubungi dukungan.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Coba flush semua perubahan riwayat yang tertunda.
+
+    Flush ini bersifat upaya terbaik (best effort) karena beberapa proyek memiliki riwayat yang rusak akibat migrasi database yang buruk. Setiap kegagalan akan ditangani dengan sinkronisasi ulang riwayat di akhir proses pemulihan.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Buat backup">
+Pertimbangkan untuk membuat [backup yang konsisten](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) dari instans.
+</Step>
+
+<Step title="Upgrade">
+Upgrade ke versi `5.0.3`.
+</Step>
+
+<Step title="Pemulihan otomatis">
+Proses pemulihan berjalan secara otomatis saat kontainer dimulai.
+</Step>
+
+<Step title="Pantau progres">
+Anda dapat memantau progres skrip dengan melakukan tail pada file log `/var/lib/overleaf/data/history/doc-version-recovery.log`. Skrip akan mencetak jumlah total proyek di awal dan ringkasan setiap kali 1000 proyek selesai diproses.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Tunggu hingga proses pemulihan selesai">
+Tunggu hingga proses pemulihan selesai, baik dengan melakukan tail pada file log di atas hingga baris `Done.` dicetak, atau dengan menunggu hingga `Finished recovery of doc versions.` dicetak ke standard output kontainer Server Pro.
+</Step>
+
+<Step title="Validasi proses pemulihan">
+Validasi proses pemulihan dengan membuka panel riwayat untuk beberapa proyek yang sebelumnya kehilangan riwayat.
+
+1.  Percepat resync untuk proyek yang akan diuji (Proyek-proyek tersebut pada akhirnya akan diproses, tetapi kita tidak ingin menunggu gilirannya.)
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Ulangi untuk setiap project-id yang akan diuji, ganti `000000000000000000000000` dengan satu project-id setiap kali.)
+2. Buka editor proyek untuk proyek tersebut `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Buka panel "History" untuk proyek tersebut dan lihat konten terbaru.
+4. Opsional: Tutup kembali panel "History". Lakukan perubahan kode, misalnya menambahkan komentar pada header.
+5. Opsional: Lakukan kompilasi ulang untuk memicu flush perubahan lokal. Buka kembali panel "History" dan lihat perubahannya. Setelah selesai, batalkan perubahan tersebut.
+</Step>
+
+<Step title="Untuk horizontal scaling...">
+Jalankan kembali worker lainnya.
+</Step>
+
+<Step title="Biarkan instans tetap berjalan">
+Harap biarkan instans yang menjalankan proses pemulihan tetap berjalan. Instans ini akan melakukan resync riwayat untuk semua proyek di latar belakang dengan konkurensi 1. Hal ini akan menyebabkan beban dasar sedikit meningkat. (Anda dapat memulai ulang instans, tetapi proses resync harus dimulai dari awal lagi.)
+</Step>
+
+<Step title="Beri tahu kami setelah selesai">
+Pelanggan Server Pro: Harap beri tahu tim dukungan setelah Anda menyelesaikan proses pemulihan.
+</Step>
+</Steps>

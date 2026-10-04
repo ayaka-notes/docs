@@ -1,0 +1,158 @@
+---
+title: (v5.0.1 Geçişi) Belge sürümü kurtarma
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Server Pro 5.0.1 veya Community Edition 5.0.1 sürümünü hiç çalıştırmadıysanız ya da 5.0.1 ile yepyeni bir örnek başlattıysanız, bu kurtarma sürecini çalıştırmanız gerekmez.
+
+</Info>
+
+**Bu sayfadaki güncellemeler:**
+
+* (2024-04-22 13:40 BST): "Sisteme yeni güncellemelerin girmesini durdurun ve tüm değişiklikleri MongoDB'ye aktarın (flush)" adımı eklendi.
+* (2024-04-23 11:45 BST): 5.0.1'deki bozuk flush işlemleri hesaba katıldı ve 5.0.2 başlatılmışsa flush işlemleri atlanır.
+
+Kurtarma süresi, örneğinizdeki projelerin sayısına ve boyutuna ve geçmiş deposunun parçalar (chunks) için kullandığı depolama arka ucuna (`OVERLEAF_HISTORY_CHUNKS_BUCKET` içinde tanımlandığı şekliyle) bağlıdır.
+
+Kurtarma süreci, Server Pro konteyneri içinde uygulamanın başlamasını geciktirir. Bu süre boyunca site çevrimdışı görünür. Kurtarmanın yalnızca tek bir Server Pro konteyneri örneğinden çalıştırılmasını destekliyoruz; diğer tüm yatay ölçekleme çalışanlarının (worker) çevrimdışı olması gerekir.
+
+Gerekirse kurtarma sürecini durdurup devam ettirebilirsiniz.
+
+Performans testlerimize göre kurtarma süreci, modern donanımda (3 GHz CPU saat hızı ve yerel NVMe depolama) dakikada yaklaşık 10 bin küçük projeyi işleyebilir. Örneğin 100 bin projeye sahip bir örnek için en az 10+2 dakikalık kesinti süresine izin veren bir bakım penceresi planlayın. Örneğinizdeki proje sayısını tahmin etmek için şu sorguyu kullanın:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Başlamadan önce lütfen aşağıdaki kurtarma adımlarının tamamını okuyun. Server Pro müşterileri her türlü soru için [support@overleaf.com](mailto:support@overleaf.com) adresinden bize ulaşabilir.
+
+### Kurtarma süreci
+
+<Steps>
+<Step title="Sürüm imajlarını çekin">
+`5.0.3` sürüm imajlarını çekin.
+</Step>
+
+<Step title="Birkaç proje belirleyin">
+Geçmişi eksik olan birkaç projeyi kimliğiyle belirleyin; ideal olarak bunlardan birinde değişiklik yapma izniniz olmalıdır.
+</Step>
+
+<Step title="Bakım planlayın">
+Kesinti süresi için bir bakım penceresi planlayın.
+</Step>
+
+<Step title="Biri hariç tüm çalışanları durdurun">
+Yatay ölçekleme kurulumu kullanıyorsanız biri hariç tüm çalışanları durdurun.
+</Step>
+
+<Step title="Yeni güncellemeleri durdurun ve tüm değişiklikleri MongoDB'ye aktarın">
+Sisteme yeni güncellemelerin girmesini durdurun ve tüm değişiklikleri MongoDB'ye aktarın (flush):
+
+1. "Open/Close Editor" sekmesindeki `https://my-server-pro.example.com/admin#open-close-editor` adresinde bulunan yönetici paneli üzerinden düzenleyiciyi kapatın ve tüm kullanıcıların bağlantısını el ile kesin.
+2.  Websocket/gerçek zamanlı (real-time) hizmetini durdurun.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Gerçek zamanlı hizmetin `down:` ile belirtildiği şekilde kapanmasını bekleyin.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Etkinse git-bridge konteynerini durdurun.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  5.0.2'yi hiç çalıştırmadıysanız: Belge güncellemeleri için el ile bir flush başlatın ve başarıyla tamamlanmasını bekleyin.
+
+    Hata durumunda komutu tekrarlayabilirsiniz. Ardışık çalıştırmalarda sıfırdan farklı bir `failureCount` görürseniz lütfen geçişi durdurun (hizmetleri `docker restart git-bridge sharelatex` ile geri yükleyin) ve destek ekibine ulaşın.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  5.0.2'yi hiç çalıştırmadıysanız: Tüm değişikliklerin redis'ten aktarıldığından emin olun.
+
+    `redis-cli` komutundan herhangi bir çıktı alırsanız lütfen geçişi durdurun (hizmetleri `docker restart git-bridge sharelatex` ile geri yükleyin) ve destek ekibine ulaşın.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Bekleyen geçmiş değişikliklerini aktarmayı deneyin.
+
+    Hatalı veritabanı geçişi nedeniyle bazı projelerin geçmişi bozuk olduğundan bu, en iyi çaba esaslı bir flush olacaktır. Tüm hatalar, kurtarma sürecinin sonunda geçmişin yeniden eşitlenmesiyle giderilecektir.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Yedek alın">
+Örneğin bir [tutarlı yedeğini](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) almayı düşünün.
+</Step>
+
+<Step title="Yükseltin">
+`5.0.3` sürümüne yükseltin.
+</Step>
+
+<Step title="Otomatik kurtarma">
+Kurtarma süreci, konteyner başlatıldığında otomatik olarak çalışır.
+</Step>
+
+<Step title="İlerlemeyi izleyin">
+Betiğin ilerlemesini `/var/lib/overleaf/data/history/doc-version-recovery.log` günlük dosyasını takip ederek (tail) izleyebilirsiniz. Başlangıçta toplam proje sayısını ve işlenen her 1000 projeden sonra bir özet yazdırır.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Kurtarma sürecinin tamamlanmasını bekleyin">
+Yukarıdaki günlük dosyasını `Done.` satırı yazdırılana kadar takip ederek veya Server Pro konteynerinin standart çıktısına `Finished recovery of doc versions.` yazdırılmasını bekleyerek kurtarma sürecinin tamamlanmasını bekleyin.
+</Step>
+
+<Step title="Kurtarma sürecini doğrulayın">
+Daha önce geçmişi eksik olan birkaç projenin geçmiş panelini açarak kurtarma sürecini doğrulayın.
+
+1.  Test edilecek projeler için yeniden eşitlemeyi hızlandırın (Sonunda zaten işlenecekler, ancak sıralarının gelmesini beklemek istemiyoruz.)
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Test edilecek her proje kimliği için tekrarlayın; `000000000000000000000000` değerini her seferinde bir proje kimliğiyle değiştirin.)
+2. Projeler için proje düzenleyicisini açın: `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Projenin "History" panelini açın ve en son içeriği görün.
+4. İsteğe bağlı: "History" panelini yeniden kapatın. Başlığa bir yorum eklemek gibi bir kod değişikliği yapın.
+5. İsteğe bağlı: Yerel değişikliğin aktarılmasını tetiklemek için yeniden derleme başlatın. "History" panelini yeniden açın ve değişikliği görün. İşiniz bittiğinde değişikliği geri alın.
+</Step>
+
+<Step title="Yatay ölçekleme için...">
+Diğer çalışanları yeniden başlatın.
+</Step>
+
+<Step title="Örneği çalışır durumda tutun">
+Lütfen kurtarma sürecini yürüten örneği çalışır durumda tutun. Bu örnek, arka planda 1 eşzamanlılıkla tüm projelerin geçmişini yeniden eşitler. Bu, temel yükte hafif bir artışa yol açar. (Örneği yeniden başlatabilirsiniz, ancak yeniden eşitlemelere baştan başlaması gerekir.)
+</Step>
+
+<Step title="İşiniz bittiğinde bize bildirin">
+Server Pro müşterileri: Kurtarma sürecini tamamladığınızda lütfen destek ekibine bildirin.
+</Step>
+</Steps>

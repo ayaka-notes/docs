@@ -1,0 +1,635 @@
+---
+title: 'Overleaf Benchmark: dogłębne badanie współbieżnej kompilacji LaTeX w Overleaf (SaaS i self-hosted)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Streszczenie
+
+Samodzielnie hostowane wdrożenia Overleaf są zazwyczaj wymiarowane według jednej praktycznej reguły: jeden rdzeń CPU i jeden gigabajt pamięci na pięciu do dziesięciu równoczesnych użytkowników. Pokazujemy, że reguła ta jest nie tylko nieprecyzyjna, ale strukturalnie błędna, ponieważ zakłada, że o pojemności decyduje jeden wymiar zasobów, podczas gdy w rzeczywistości decydują o niej dwie niezależne bariery, a dwa parametry programowe — żaden z nich nie jest sprzętowy — wpływają na wynik nawet czterokrotnie.
+
+Mierzymy standardowe wdrożenie Ayakaleaf Pro v6.2.2 z kompilacją w piaskownicy (TeX Live 2025) w 21 konfiguracjach CPU/pamięci wewnątrz maszyn gościa QEMU/KVM, których rdzenie hosta mają zablokowane taktowanie 3,0 GHz. Obciążeniem jest prawdziwa, 63-stronicowa praca dyplomowa w XeLaTeX, kompilowana jednocześnie przez maksymalnie kilkaset odrębnych kont użytkowników. Stwierdzamy, że poniżej 32 GiB pamięci gościa liczba rdzeni jest niemal bez znaczenia — przy 16 GiB zmierzona pojemność gości z 4, 8 i 16 vCPU różni się o mniej niż 8% — a pojemność wyznacza natomiast superliniowa bariera pamięci wynikająca ze współdzielonej pamięci podręcznej stron (page cache) obejmującej drzewo TeX Live.
+
+Aby sprawdzić, czy te prawa przetrwają zmianę skali o rząd wielkości, powtarzamy pomiary na pojedynczym serwerze z 64 rdzeniami i 995 GiB pamięci. Utrzymuje on 1024 równoczesne zimne kompilacje ze 100% skutecznością — osiem razy więcej niż liczba jego wątków — i nigdy nie osiągamy jego sufitu. Użyteczną liczbą nie jest jednak ten sufit, lecz punkt załamania (knee) poniżej niego: opóźnienie ogonowe rośnie o 20–40% przy każdym podwojeniu aż do $N=256$, a następnie o 190% przy $N=512$. Pojemność podawana jako „największa współbieżność, przy której nic nie zawodzi" zawyżałaby więc użyteczny punkt pracy czterokrotnie. Na tej maszynie pamięć nigdy nie jest zasobem ograniczającym; granicę wyznacza CPU wraz z tempem, w jakim demon kontenerów może przyjmować nowe piaskownice, które nasyca się w okolicach 200 niezależnie od liczby zleconych kompilacji.
+
+Identyfikujemy ponadto dwa efekty na poziomie implementacji, niewidoczne przy planowaniu pojemności. Po pierwsze, CLSI wymusza zakodowany na stałe limit 65 równoczesnych kompilacji, który nie jest udostępniony przez żadną zmienną środowiskową; powyżej niego użytkownicy natychmiast otrzymują HTTP 503 zamiast trafiać do kolejki. Po drugie, limit pamięci na kontener w Docker runnerze jest nieskuteczny od momentu jego wprowadzenia w 2018 roku, zarówno pod względem wartości, jak i umiejscowienia, więc zdarzenie braku pamięci (out-of-memory) kładzie cały host, a nie pojedynczą kompilację. Zniesienie limitu współbieżności i podniesienie domyślnego limitu czasu kompilacji ze 180 s do 300 s zwiększa zmierzoną pojemność gościa 8 vCPU / 48 GiB z 64 do 268 równoczesnych kompilacji — 4,2 raza przy zerowym koszcie sprzętowym.
+
+Na koniec pokazujemy, że współbieżność w tym systemie nie daje niczego poza podziałem czasu (time-sharing), a obciążenie jest ograniczone wyłącznie taktowaniem. Dopasowane prawo degradacji $T(N)=T_1\max(1,N/C)^{b}$ daje $b=0.914$, co jest bliskie idealnemu proporcjonalnemu spowolnieniu, a przegląd taktowania w pełnym zakresie maszyny 1,0–5,5 GHz sprowadza trzydzieści pomiarów do $T=(k/f)\max(1,N/C)$ z $k=27.9 GHz·s$ i rozrzutem resztowym 5,1%. Taktowanie wyższe 5,5× daje przyspieszenie 5,5× bez malejących korzyści — i właśnie w tym sensie taktowanie i rdzenie kupują różne rzeczy: taktowanie przyspiesza kompilację każdego użytkownika, rdzenie jedynie pozwalają obsłużyć więcej użytkowników.
+
+## 1. Wprowadzenie
+
+Overleaf jest dominującym edytorem LaTeX do pracy zespołowej, a jego dystrybucja on-premises jest szeroko wdrażana przez uczelnie i grupy badawcze, które nie mogą wysyłać nieopublikowanych manuskryptów do zewnętrznej chmury. Wymiarowanie takiego wdrożenia to powracające praktyczne pytanie: przy stałym budżecie sprzętowym ile osób może faktycznie nacisnąć „Recompile" w tym samym momencie?
+
+Oficjalne zalecenia to reguła liniowa — mniej więcej jeden rdzeń i jeden gigabajt na pięciu do dziesięciu równoczesnych użytkowników — która zakłada, że pojemność skaluje się płynnie i łącznie w obu zasobach. Nasze pomiary przeczą temu na trzy sposoby.
+
+### 1.1 Pojemność wyznaczają dwie niezależne bariery, a nie jedna
+
+Konfiguracja zawodzi albo dlatego, że wyczerpuje się pamięć — wtedy sam stos Overleaf pada i zwraca HTTP 502 — albo dlatego, że kompilacje przekraczają limit czasu po stronie serwera — wtedy CLSI zgłasza `timedout`, podczas gdy gigabajty pamięci pozostają niewykorzystane. Te dwa reżimy mają zupełnie inne zachowanie przy skalowaniu i wymagają innych środków zaradczych. Dodawanie rdzeni do konfiguracji ograniczonej pamięcią jest nie tylko nieefektywne, ale czasem wręcz szkodliwe: mierzymy konfiguracje, w których zwiększenie liczby rdzeni _zmniejsza_ pojemność, ponieważ więcej rdzeni sprawia, że równoczesne kompilacje postępują w jednym rytmie, przez co ich szczytowe zapotrzebowanie na pamięć pokrywa się zamiast się przeplatać.
+
+### 1.2 Parametry programowe dominują nad sprzętem
+
+Limit czasu kompilacji to pole przypisane do użytkownika w MongoDB, którego domyślna wartość 180 s po cichu ogranicza konfiguracje zależne od CPU. Podniesienie go do 300 s zwiększa zmierzoną pojemność nawet 4,2 raza na niezmienionym sprzęcie. Niezależnie od tego CLSI odrzuca więcej niż 65 równoczesnych kompilacji z powodu zakodowanej na stałe stałej. Każde badanie pojemności — i każde wdrożenie — które nie uwzględnia obu tych czynników, mierzy oprogramowanie, a nie maszynę.
+
+### 1.3 Współbieżność to podział czasu, a nie równoległość
+
+Ponieważ kompilacja LaTeX jest jednowątkowa, obsługa $N$ równoczesnych użytkowników na $C$ rdzeniach nie sprawia, że system kończy szybciej; sprawia, że każdy użytkownik czeka proporcjonalnie dłużej. Pytanie „ilu równoczesnych użytkowników jest obsługiwanych" jest zatem źle postawione, dopóki nie ustali się, jak długo użytkownik jest gotów czekać. Uwidaczniamy tę zależność i ją kwantyfikujemy.
+
+### 1.4 Wkład
+
+* Macierz pojemności dla 21 konfiguracji CPU/pamięci zmierzona w warunkach zablokowanego taktowania i z weryfikacją powtórzeń, z ograniczeniem wiążącym zidentyfikowanym dla każdej konfiguracji na podstawie sygnatury awarii.
+* Dwa dopasowane modele: model pojemności oddzielający superliniową barierę pamięci od sufitu CPU oraz model opóźnienia potwierdzający czyste zachowanie podziału czasu.
+* Identyfikacja i eksperymentalne potwierdzenie dwóch problemów implementacyjnych we wdrożonym systemie, w tym limitu pamięci kontenera, który nie działa od 2018 roku.
+* Kwantyfikacja kompromisu między limitem czasu kompilacji a pojemnością, który — jak argumentujemy — musi być podawany razem z każdą liczbą dotyczącą współbieżności.
+
+## 2. Tło
+
+### 2.1 Ścieżka kompilacji
+
+Żądanie kompilacji w Overleaf przechodzi ścieżkę `web` $\rightarrow$ `clsi` $\rightarrow$ kontener kompilacji. We wdrożeniu z kompilacją w piaskownicy (`SIBLING_CONTAINERS_ENABLED=true`) CLSI nie uruchamia `latexmk` we własnym procesie; prosi demona Docker hosta, dostępnego przez zamontowane gniazdo (bind mount), o uruchomienie nowego kontenera z obrazu TeX Live z katalogiem projektu zamontowanym w `/compile`. Jedna kompilacja to więc jeden krótkotrwały kontener z jednym procesem `latexmk`.
+
+Wynikają z tego trzy konsekwencje i wszystkie trzy kształtują pomiary w tym artykule. Po pierwsze, jednostką pracy jest proces jednowątkowy: XeLaTeX nie zrównolegla się. Po drugie, izolacja zasobów na kompilację jest taka, jakiej zażąda Docker runner — w §6.2 pokazujemy, że w praktyce nie żąda niczego. Po trzecie, w zbiorze roboczym dominuje nie dokument, lecz drzewo TeX Live — korpus tylko do odczytu o rozmiarze około 32 GiB, z którego czyta każda równoczesna kompilacja i który w związku z tym jest współdzielony przez pamięć podręczną stron hosta. To współdzielenie jest źródłem obserwowanego superliniowego skalowania pamięci.
+
+### 2.2 Włączanie kompilacji w piaskownicy
+
+Overleaf w wersji Community Edition uruchamia `latexmk` wewnątrz samego kontenera aplikacji. Ayakaleaf Pro, podobnie jak Overleaf Server Pro, może zamiast tego uruchamiać każdą kompilację w kontenerze _siostrzanym_ (sibling) — kontenerze uruchamianym przez aplikację na demonie Docker _hosta_, a nie zagnieżdżonym w kontenerze aplikacji. Włączają to dwa ustawienia toolkitu:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit montuje gniazdo Docker hosta w kontenerze aplikacji i przekłada te ustawienia na środowisko odczytywane przez CLSI: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` oraz `SANDBOXED_COMPILES_HOST_DIR`, przy czym ostatnia z nich to ścieżka katalogu kompilacji na _hoście_. Ta ścieżka ma znaczenie: ponieważ demon uruchamiający kontener kompilacji należy do hosta, przekazany mu bind mount musi być rozwiązywalny w przestrzeni nazw hosta, a nie kontenera aplikacji. Plik `config/env.sh` w Server Pro dodatkowo wymusza w tym trybie `TEXLIVE_IMAGE_USER=www-data`, aby pliki zapisywane przez kontener kompilacji miały spójnego właściciela.
+
+Weryfikacja jest bezpośrednia: podczas kompilacji host pokazuje kontener o nazwie `project-{projectId}-{userId}-{hash}` uruchamiający `latexmk` z obrazu TeX Live i kończący się kodem 0. To jest jednostka, której krotność mierzymy w całym artykule i której całkowity brak limitów zasobów opisujemy w §6.2.
+
+**Dlaczego ma to znaczenie dla badania.**
+
+Kontenery siostrzane czynią pomiar czystym — każda kompilacja jest obserwowalnym, niezależnie szeregowanym bytem systemu operacyjnego — ale oznaczają też, że to jądro gościa, a nie Overleaf, rozdziela CPU i pamięć między kompilacje. Każde prawo skalowania w tym artykule jest zatem właściwością harmonogramu Linuksa zastosowanego do $N$ jednowątkowych procesów i dlatego jest tak regularne.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Rysunek 1.** Jedno żądanie kompilacji prześledzone przez mikroserwisy Community Edition. Podział na kolejnych krokach ma znaczenie dla pojemności: tekst dokumentu jest kopiowany do treści żądania, natomiast zasoby binarne są przekazywane przez referencję i pobierane przez `clsi`. Żadne z nich nie dominuje — koszt kompilacji projektu wyznacza 32-gigabajtowe drzewo TeX Live, z którego każda równoczesna kompilacja czyta przez współdzieloną pamięć podręczną stron.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Rysunek 2.** Trzy topologie wdrożenia i miejsce, w którym w każdej z nich wypada limit kompilacji na instancję; nałożone panele oznaczają replikację. Stała 65 kompilacji chroni _jedno_ CLSI, więc flota SaaS mnoży ją przez liczbę instancji i stref (a), a skalowanie poziome obsługiwane przez Server Pro i Ayakaleaf Pro mnoży ją przez liczbę instancji (c) — kosztem centralnego MongoDB, Redis i magazynu zgodnego z S3, load balancera z powinowactwem sesji opartym na ciasteczkach (wynik kompilacji jest zapisywany na lokalnym dysku instancji, więc kompilacja i późniejsze pobranie PDF muszą trafić do tej samej instancji) oraz pojedynczej instancji `git-bridge`. Domyślna konfiguracja toolkitu (b), którą mierzymy, ma mnożnik równy jeden, więc stała dobrana dla jednego członka floty staje się sufitem całej instalacji.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Rysunek 3.** Wybór sharda w `clsi-cache`. Projekt jest mapowany przez $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, tzn. przestrzeń skrótów jest dzielona na tyle równych sektorów, ile jest shardów. To haszowanie _modulo_, a nie spójne haszowanie oparte na pierścieniu: zwiększenie floty z trzech do czterech shardów dzieli od nowa całą przestrzeń i przemapowuje praktycznie każdy projekt (a, b). Właśnie dlatego implementacja potrzebuje jawnej rampy reshardingu online, przenoszącej liniowo rosnący odsetek projektów z `currentShards` do `desiredShards` w określonym oknie czasowym, zamiast przesunięcia $K/n$, jakie dałby pierścień spójnego haszowania. Gdy wyłącznik (circuit breaker) sharda zadziała, sól $i$ jest zwiększana, a shard usuwany z listy kandydatów, więc wyszukiwanie sprawdza kolejne shardy zamiast zawieść (c).
+
+### 2.3 Dwa tryby awarii
+
+Każda zmierzona przez nas konfiguracja zawodzi dokładnie na jeden z dwóch sposobów, a rozróżnienie jest widoczne w statusie odpowiedzi, a nie wywnioskowane:
+
+* **Wyczerpanie pamięci** — sam stos Overleaf przestaje odpowiadać, a żądanie zwraca **HTTP 502**. Dostępna pamięć gościa na poziomie, na którym następuje awaria, wynosi zwykle poniżej 500 MiB.
+* **Przekroczenie limitu czasu kompilacji** — CLSI przerywa kompilację po upływie limitu czasu użytkownika i zgłasza status `timedout`. Dostępna pamięć na poziomie awarii wynosi często kilka gigabajtów.
+
+Każdą konfigurację klasyfikujemy według tej sygnatury, a nie według heurystyki opartej na proporcjach zasobów, dzięki czemu na pytanie „w którą barierę uderzyliśmy" odpowiadają same dane.
+
+## 3. Metodologia
+
+### 3.1 Środowisko testowe i kontrola taktowania
+
+Wszystkie maszyny gościa działają pod QEMU/KVM na jednym hoście z procesorem Intel Core i9-14900K, 62 GiB RAM i pamięcią masową NVMe. Systemem gościa jest Ubuntu 24.04 z Docker 29.7 i Overleaf Toolkit wdrażającym Ayakaleaf Pro v6.2.2 z kompilacją w piaskownicy na obrazie `texlive-full:2025.1`.
+
+Konsumencki procesor desktopowy jest słabym przybliżeniem serwera, o ile nie kontroluje się jego taktowania. KVM nie oferuje mechanizmu ustawiania wirtualnego taktowania: vCPU to wątek hosta i działa z taką częstotliwością, z jaką działa rdzeń hosta. Dlatego ograniczamy bezpośrednio hosta, wyłączając turbo i ustawiając `scaling_max_freq` na 3,0 GHz na każdym rdzeniu, a vCPU gościa przypinamy do fizycznych rdzeni P za pomocą `taskset`. Rozróżnienie to ma znaczenie w procesorze o hybrydowych rdzeniach: rdzenie E tego modelu mają bazowe taktowanie 2,4 GHz i _nie mogą_ osiągnąć 3,0 GHz po wyłączeniu turbo, więc przebieg, który na nie trafi, po cichu mierzy wolniejszą maszynę. Pod pełnym obciążeniem weryfikujemy dokładnie 3000 MHz na wszystkich szesnastu przypiętych wątkach. Skrypt kontrolny sprawdza ten niezmiennik przed każdym benchmarkiem i w przeciwnym razie odmawia startu; w trakcie badania wychwycił jeden cichy reset governora.
+
+### 3.2 Drugie środowisko testowe: jeden duży runner
+
+Macierz QEMU izoluje jedną zmienną naraz, ale kończy się na szesnastu przypiętych wątkach. Aby sprawdzić, czy te same prawa obowiązują o rząd wielkości wyżej, powtórzyliśmy przegląd współbieżności na pojedynczym dużym serwerze: jeden AMD EPYC 7773X (Milan-X, 64 rdzenie / 128 wątków, 768 MiB L3) z 995 GiB RAM, z tym samym obrazem Ayakaleaf Pro v6.2.2 i tym samym `texlive-full:2025.1`. W przeciwieństwie do gości QEMU ta maszyna nie ma zablokowanego taktowania: to serwer klasy produkcyjnej i tak go mierzymy.
+
+Konieczne były dwa środki ostrożności, o których warto wspomnieć, bo bez nich eksperyment mierzy narzędzie testowe, a nie serwer. Po pierwsze, każdy kontener został ograniczony do slice'a `systemd` z `MemoryMax=940 GiB`, aby niekontrolowany przebieg wyczerpał cgroup, a nie hosta. Po drugie, kompilacje w piaskownicy są tworzone przez demona hosta i każda zapisuje własną warstwę copy-on-write — zmierzoną na 116 MiB na kontener, mimo że bazowy obraz 20,6 GiB jest współdzielony — więc katalog danych Docker przeniesiono na dedykowane urządzenie NVMe. Przebieg przy $N=1024$ zapisuje około 119 GiB warstw roboczych, które nie zmieściłyby się w standardowym systemie plików root.
+
+### 3.3 Obciążenie
+
+Dokumentem jest prawdziwa, 63-stronicowa praca magisterska (szablon SJTU) kompilowana XeLaTeX-em przez `latexmk`, zawierająca rysunki TikZ, przetwarzanie bibliografii `biblatex` i osadzone zasoby PDF — czyli realistyczne, a nie syntetyczne obciążenie. Pojedyncza kompilacja na nieobciążonym gościu trwa 8,6–9,8 s we wszystkich konfiguracjach; wartość tę traktujemy jako bazowy czas swobodny $T_1$.
+
+### 3.4 Generowanie obciążenia
+
+Tworzymy 512 prawdziwych kont użytkowników i każdemu dajemy własną kopię projektu, aby równoczesne kompilacje rywalizowały dokładnie tak jak niezależni użytkownicy, zamiast współdzielić blokadę projektu. Żądania są wysyłane z hosta na przekierowany port gościa, dzięki czemu generowanie obciążenia nie zużywa CPU gościa.
+
+Współbieżność jest _jednoczesna_, a nie rozłożona w czasie. Każda sesja jest najpierw ustanawiana — logowanie, token CSRF, wybór kompilatora — i dopiero wtedy każdy wątek śpi do wspólnego momentu czasu zegarowego, obliczonego raz i współdzielonego, po czym wysyła swoje `POST /project/:id/compile`. To rozróżnienie nie jest pedanterią. Stopniowe narastanie mierzy przepustowość przy stabilnej kolejce; jednoczesny wybuch mierzy to, co dzieje się, gdy sala wykładowa pełna studentów naciska ten sam przycisk po tym samym ogłoszeniu terminu — a tego właśnie operatorzy naprawdę się obawiają. Oba przypadki różnią się o więcej niż stały czynnik, ponieważ drugi zapełnia kolejkę kompilacji szybciej, niż demon jest w stanie ją opróżnić.
+
+Zanim ten wybuch mógł zostać wiernie dostarczony, trzeba było usunąć cztery praktyczne przeszkody. Każdą warto odnotować, ponieważ każda po cichu degraduje eksperyment do pomiaru narzędzia testowego zamiast serwera.
+
+#### 3.4.1 Dwa ograniczniki częstotliwości, a nie jeden
+
+Overleaf ogranicza logowania na adres źródłowy — 20 prób na minutę — a cały nasz ruch pochodzi z jednego hosta. Przypisanie każdemu symulowanemu użytkownikowi innego adresu `X-Forwarded-For` usuwa ten limit, ale od razu natrafia na drugi, grubszy: budżet około 200 na minutę na podsieć. Rozłożenie użytkowników w ciągłym bloku zawodzi więc na 201. koncie. Zamiast tego wyprowadzamy syntetyczny adres z indeksu użytkownika tak, aby kolejni użytkownicy trafiali do różnych `/24`,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+co utrzymuje oba ograniczniki z zapasem dla pełnej populacji 1024.
+
+#### 3.4.2 Wstrzyknięty nagłówek jest domyślnie odrzucany
+
+Samo ustawienie nagłówka nie wystarcza. Express respektuje `X-Forwarded-For` tylko od partnerów, którym kazano mu ufać, a `trustedProxyIps` w Overleaf ma domyślnie wartość `loopback`. Ponieważ generator obciążenia dociera do aplikacji przez mostek kontenera, a nie przez interfejs loopback, nagłówek jest parsowany, a następnie odrzucany, i każdy symulowany użytkownik zostaje z powrotem sprowadzony do jednego adresu. Objawem jest fala `HTTP 429` dokładnie przy dwudziestym logowaniu, którą łatwo błędnie odczytać jako przeciążenie serwera. Sieć bramy musi zostać jawnie dodana do łańcucha zaufania; we wdrożeniu klastrowym z §4.3 trzeba dodać również CIDR-y podów i usług.
+
+#### 3.4.3 Load balancer nadpisze nagłówek, który miał zachować
+
+Gdy instancja znajduje się za proxy, konwencjonalne `option forwardfor` _dopisuje_ rzeczywisty adres klienta do łańcucha, co jest poprawnym zachowaniem w produkcji i dokładnie błędnym tutaj: syntetyczny adres zostaje wyparty przez własny adres generatora obciążenia. Dyrektywę trzeba doprecyzować jako `option forwardfor if-none`, aby proxy dodawało wartość tylko wtedy, gdy klient jej nie dostarczył.
+
+#### 3.4.4 Klientowi kończą się deskryptory plików, zanim serwerowi skończy się pojemność
+
+Przy $N=1024$ generator utrzymuje ponad tysiąc równoczesnych gniazd, a domyślny miękki limit 1024 deskryptorów zostaje osiągnięty podczas ustanawiania sesji, a nie podczas pomiaru. Awaria jest cicha: trzy sesje nie zostają ustanowione i przebieg raportuje 1021 zamiast 1024, a wątek próbkujący, który uruchamia polecenia powłoki w celu zliczenia kontenerów, kończy się błędem `EMFILE` i po cichu ucina telemetrię. Miękki limit trzeba podnieść na generatorze — twardy limit na naszym hoście wynosił już 1048576 — i powtórzyć przebieg. W §4.3 raportujemy oba przebiegi: poprawiony kończy 1024 z 1024 z medianą różniącą się o mniej niż 1,2 s od uciętego, dlatego pierwszy traktujemy jako użyteczny, ale nie rozstrzygający.
+
+### 3.5 Protokół pomiarowy
+
+Kilka decyzji metodologicznych okazało się niezbędnych dla powtarzalności.
+
+#### 3.5.1 Rozgrzewka
+
+Na świeżo uruchomionym gościu pamięć podręczna stron jest pusta, a pierwsze kompilacje mierzą I/O zimnego startu, a nie pojemność w stanie ustalonym: ta sama konfiguracja 2 vCPU / 2 GiB daje 36,5 s na zimno i 9,8 s na ciepło, czyli 3,7 raza więcej. Dlatego każda konfiguracja po uruchomieniu wykonuje dwie odrzucane rozgrzewkowe pojedyncze kompilacje.
+
+#### 3.5.2 Kryterium zaliczenia
+
+Poziom współbieżności zostaje zaliczony tylko wtedy, gdy _każda_ kompilacja się powiedzie, a poziom przetrwa powtórzenie. Jest to bardziej rygorystyczne niż próg skuteczności i ma znaczenie: przy 4 vCPU / 16 GiB poziom 32 zaliczono raz z medianą 80,2 s, a przy powtórzeniu wszystkie 32 kompilacje przekroczyły limit czasu, więc raportujemy 31.
+
+#### 3.5.3 Wyszukiwanie
+
+Poziomy są lokalizowane przez wykładnicze zawężanie przedziału, zaczynając od wartości przewidzianej przez model, a następnie przez dokładną bisekcję na liczbach całkowitych. Ponieważ kryterium jest typu „wszystko albo nic", poziom rozstrzyga jego pierwsza awaria, więc po pierwszym niepowodzeniu porzucamy pozostałe trwające żądania — z wyjątkiem małych poziomów, gdzie porzucone kompilacje obciążają małego gościa tak mocno, że ten nigdy się nie podnosi.
+
+#### 3.5.4 Izolacja między poziomami
+
+Przed rozpoczęciem kolejnego poziomu kontenery kompilacji są opróżniane, a aplikacja webowa odpytywana, dopóki znów nie zacznie odpowiadać. Bez tego poziom następujący po awarii rejestruje fałszywą awarię z zerową liczbą sesji.
+
+#### 3.5.5 Higiena hosta
+
+Niepowiązane maszyny wirtualne na hoście zostały wyłączone: przy 24 GiB pamięci hosta zajętej gdzie indziej ta sama konfiguracja gościa raportowała średnie obciążenie 11,7 zamiast 3,2 przy identycznej współbieżności. Presja pamięci hosta przenosi się do gościa i unieważnia pomiar.
+
+## 4. Wyniki
+
+### 4.1 Macierz pojemności
+
+Tabela 1 i Rysunek 4 podają zmierzony sufit dla każdej konfiguracji. Pierwszą niespodzianką jest odczyt wzdłuż wiersza. Przy 4 GiB goście z 2, 4 i 8 vCPU osiągają dokładnie 9 — czterokrotne zwiększenie liczby rdzeni nie zmienia absolutnie nic. Przy 16 GiB osiągają 54, 45 i 57: przejście z 4 na 16 rdzeni daje 6%, a gość z 8 rdzeniami jest wręcz _gorszy_ od gościa z 4 rdzeniami (§5.2). Dopiero przy 48 GiB liczba rdzeni wyraźnie rozróżnia konfiguracje: 143, 268 i 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Rysunek 4.** Zmierzona pojemność w macierzy konfiguracji. (a) Każda konfiguracja jako słupek, pogrupowana według pamięci i pokolorowana według liczby rdzeni; pełne słupki oznaczają ograniczenie pamięcią (gość pada z wyczerpaną pamięcią), a kreskowane — ograniczenie CPU (kompilacje przekraczają limit czasu przy zapasie pamięci). Odczyt grupy od lewej do prawej pokazuje, jak niewiele daje liczba rdzeni poniżej 16 GiB; odczyt między grupami pokazuje superliniowy zwrot z pamięci. (b) Te same punkty na tle dopasowanego modelu $N_{\max}=\min(0.69R^{1.60},\,26.4C)$; linia przerywana to bariera pamięci, a kropkowane linie poziome to sufity CPU dla poszczególnych liczb rdzeni. Konfigurację ogranicza ta z dwóch granic, którą osiągnie jako pierwszą.
+
+Drugą niespodzianką jest odczyt wzdłuż kolumny: przy stałej liczbie rdzeni pojemność rośnie superliniowo wraz z pamięcią, mniej więcej jak $R^{1.6}$, z powodu pamięci podręcznej stron omówionego w §5.1.
+
+| pamięć | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Tabela 1.** Maksymalna liczba równoczesnych kompilacji kończących się sukcesem, zmierzona przy limicie czasu kompilacji 300 s i zniesionym limicie współbieżności CLSI. **Pogrubienie** oznacza konfigurację ograniczoną przez CPU (kompilacje przekraczają limit czasu przy zapasie pamięci); pozostałe są ograniczone pamięcią (stos pada z HTTP 502). Wiersz 2 GiB zawiera korektę omówioną w §5.2.
+
+### 4.2 Współbieżność to podział czasu
+
+Rysunek 5 przedstawia przegląd wszystkich poziomów współbieżności na stałym gościu 8 vCPU / 16 GiB. Dwa reżimy są oddzielone ostrym załamaniem dokładnie przy jednej kompilacji na rdzeń. Poniżej niego średni czas kompilacji jest płaski — zmienia się z 8,7 s przy $N=1$ do 9,1 s przy $N=C=8$, czyli o 5%. Powyżej niego czas rośnie ściśle proporcjonalnie do $N/C$: przy $N=16,24$ mierzymy 18,5 s i 27,1 s, czyli stosunek $1:2.13:3.12$ wobec idealnego $1:2:3$.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Rysunek 5.** Opóźnienie kompilacji w funkcji współbieżności przy stałym sprzęcie. Załamanie występuje przy $N=C$; powyżej niego zmierzone spowolnienie odpowiada $N/C$ z dokładnością do 5–7%. Wszystkie piętnaście poziomów zakończyło się pełnym sukcesem.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Rysunek 6.** Opóźnienie kompilacji w funkcji współbieżności dla kilku konfiguracji. Każdy panel ma stały sprzęt i zmienne obciążenie; pionowa linia oznacza $N=C$. Krzywe są płaskie na lewo od niej i liniowe względem $N/C$ na prawo, co jest sygnaturą podziału czasu, a nie rywalizacji o zasoby: praca nie staje się droższa, po prostu czeka na swoją kolej.
+
+Dopasowanie $T(N)=T_1\max(1,N/C)^{b}$ do wszystkich udanych pomiarów w badaniu daje $b=0.914$ ($R^2_{\log}=0.904$, $n=81$). Wykładnik nieodróżnialny od jedności jest ilościowym stwierdzeniem, że kompilacja to jednowątkowa jednostka pracy ograniczona przez CPU, a współbieżność ani nie pomaga, ani nie szkodzi poza dzieleniem rdzeni. Praktyczny wniosek jest niewygodny dla planowania pojemności: konfiguracja może przyjąć dowolną liczbę użytkowników bez _awarii_, jednocześnie sprawiając, że każdy z nich czeka proporcjonalnie dłużej. Przy $N=56$ na tym gościu wszystkie kompilacje nadal się udają, ale każdy użytkownik czeka 64,8 s zamiast 8,7 s.
+
+### 4.3 Skalowanie pionowe do 1024 równoczesnych kompilacji
+
+Tabela 2 i Rysunek 7 przedstawiają przegląd na dużym runnerze. Każdy poziom to kompilacja _na zimno_: przed każdym poziomem czyścimy katalog kompilacji i pamięć podręczną CLSI każdego uczestniczącego projektu przez `DELETE /project/:id/output`, więc żaden poziom nie korzysta z pracy wykonanej przez poziom poniżej. Bazowy czas pojedynczej kompilacji na tej maszynie wynosi 28,8 s — jest to wartość na zimno i nie należy jej porównywać z bazowym czasem w stanie ustalonym 8,6–9,8 s używanym wcześniej; bazowy czas na zimno na gościach QEMU wynosi 28,3 s, więc w przeliczeniu na wątek obie maszyny różnią się dla tego obciążenia o mniej niż dwa procent.
+
+| $N$ |   sukces | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | szczyt kont. |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tabela 2.** Przegląd współbieżności na jednym EPYC 7773X (64 rdzenie / 128 wątków, 995 GiB). Wszystkie poziomy na zimno; czas bazowy 28,8 s. Szczyt kontenerów to maksymalna liczba piaskownic działających jednocześnie.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Rysunek 7.** Skalowanie pionowe na jednym dużym runnerze. (a) Opóźnienie w funkcji zadanej współbieżności; zacieniowany obszar oznacza reżim za punktem załamania. (b) Liczba faktycznie działających piaskownic nigdy nie nadąża za liczbą żądanych — nasyca się w okolicach 200 — a cgroup kompilacji nigdy nie wykorzystuje więcej niż jednej piątej swojego limitu.
+
+#### 4.3.1 Maszyna nigdy nie zawodzi
+
+Każdy poziom kończy się w 100%, w tym $N=1024$ — osiem razy więcej niż liczba wątków. Nie znaleźliśmy sufitu pojemności tej maszyny; prędzej skończyła się nam cierpliwość niż jej zapas. To pierwsza konfiguracja w badaniu, w której ograniczeniem wiążącym nie jest pamięć: przy $N=1024$ cgroup kompilacji osiąga szczyt 184 GiB, jedną piątą limitu 940 GiB, podczas gdy CPU pracuje w 100% przy średnim obciążeniu 166.
+
+#### 4.3.2 Degradacja jest podliniowa, bo przyjmowanie jest ograniczone tempem
+
+Naiwny podział czasu przewiduje, że $8\times$ więcej wątków kosztuje $8\times$ większe opóźnienie. Zmierzony koszt wynosi $9.7\times$ względem pojedynczej kompilacji, ale tylko $3.8\times$ względem $N=128$ — przy ośmiokrotnym wzroście zadanego obciążenia. Przyczynę widać na Rysunku 7(b) i w ostatniej kolumnie Tabeli 2: choć 1024 żądania są wysyłane jednocześnie, liczba faktycznie działających piaskownic nigdy nie przekracza 205. Demon nie jest w stanie tworzyć kontenerów tak szybko, jak żądają klienci, więc żądania czekają w kolejce przy przyjmowaniu zamiast rywalizować o CPU. To kolejkowanie ratuje tutaj ogon rozkładu — i robi to przypadkiem.
+
+#### 4.3.3 Załamanie występuje przy 512, a nie w punkcie awarii
+
+Między $N=256$ a $N=512$ opóźnienie $p_{95}$ rośnie $2.9\times$ przy podwojeniu obciążenia; każde wcześniejsze podwojenie kosztowało od $1.2\times$ do $1.4\times$. Pojemność podana jako „największe $N$, przy którym nic nie zawodzi" wyniosłaby 1024 i byłaby bezużyteczna dla operatora: w tym punkcie oczekiwanie w ogonie rozkładu trwa prawie osiem minut.
+
+### 4.4 Czas kompilacji jest odwrotnie proporcjonalny do taktowania
+
+Ponieważ obciążenie jest ograniczone przez CPU, jego koszt powinien skalować się jak $1/f$. Sprawdzamy to bezpośrednio, zmieniając taktowanie hosta w całym zakresie maszyny, 1,0–5,5 GHz w dziesięciu krokach, przy poza tym niezmienionym gościu (Rysunek 8). Czas pojedynczej kompilacji zmienia się z 26,5 s do 4,8 s: taktowanie wyższe 5,5× daje przyspieszenie 5,5× bez malejących korzyści w całym zakresie. Iloczyn $T\!\cdot\!f$ jest stały z dokładnością do 2% dla wszystkich dziesięciu taktowań.
+
+Normalizacja przez udział rdzeni sprowadza wszystkie trzydzieści pomiarów — trzy poziomy współbieżności przy dziesięciu taktowaniach — do jednej stałej:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+z rozrzutem resztowym 5,1% w zakresie, w którym samo taktowanie zmienia się 5,5×. Brak jakiejkolwiek krzywizny jest sam w sobie wynikiem: gdyby obciążenie było ograniczone przepustowością pamięci lub I/O, $T$ spłaszczyłoby się przy wysokim taktowaniu, gdy CPU wyprzedziłoby inny zasób.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Rysunek 8.** Przegląd taktowania. (a) $T=k/f$ z dopasowaną hiperbolą. (b) Po podzieleniu przez $\max(1,N/C)$ wszystkie punkty sprowadzają się do jednej stałej, co potwierdza Równanie (1).
+
+Równanie (1) ma bezpośrednią konsekwencję zakupową, którą łatwo sformułować i łatwo źle zrozumieć: _taktowanie poprawia doświadczenie każdego pojedynczego użytkownika, liczba rdzeni jedynie pozwala przyjąć ich więcej_. Maszyna z taktowaniem wyższym o 20% kompiluje o 20% szybciej dla wszystkich, bez malejących korzyści; dwa razy więcej rdzeni nie przyspiesza niczyjej kompilacji.
+
+## 5. Analiza
+
+### 5.1 Dwie bariery dopasowane osobno
+
+Każda konfiguracja jest klasyfikowana według sygnatury awarii (§2.3), a następnie bariera pamięci i sufit CPU są dopasowywane wyłącznie do konfiguracji, które faktycznie je osiągnęły:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+gdzie $R$ wyrażone jest w gibibajtach, a $C$ w vCPU.
+
+Wykładnik bariery pamięci jest konsekwentnie superliniowy, $p>1$: krańcowy koszt pamięci jednej dodatkowej równoczesnej kompilacji _maleje_ wraz ze wzrostem całkowitej pamięci, z około 312 MiB na kompilację na gościu 3 GiB do około 194 MiB na gościu 32 GiB. Mechanizmem jest współdzielona pamięć podręczna stron nad drzewem TeX Live opisana w §2.1: równoczesne kompilacje czytają pokrywające się pliki fontów i makr, więc większa pamięć podręczna jest amortyzowana na więcej z nich. Dlatego naiwna reguła „jeden gigabajt na pięciu użytkowników" niedoszacowuje duże maszyny i przeszacowuje małe.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Rysunek 9.** Te same dane jako dwie powierzchnie nad płaszczyzną $(C,R)$. (a) Pojemność: dopasowana powierzchnia to grzbiet, a nie płaszczyzna — wznosi się stromo wraz z pamięcią i jest niemal płaska wzdłuż osi rdzeni, dopóki pamięć przestanie ograniczać, dlatego wiersz 48 GiB jest jedynym, w którym liczba rdzeni rozróżnia konfiguracje. (b) Opóźnienie w funkcji współbieżności dla każdej konfiguracji, z dopasowaniem $T=12.6\,(N/C)^{0.91}$ zaznaczonym linią przerywaną i limitem czasu 180 s narysowanym jako płaszczyzna. Konfiguracja zawodzi tam, gdzie jej ciągła krzywa przebija tę płaszczyznę, co uwidacznia, jak bezpośrednio ustawienie limitu czasu determinuje raportowaną pojemność.
+
+### 5.2 Gdzie więcej rdzeni pogarsza sytuację
+
+Równanie (2) jest minimum dwóch składników, a więc jest monotoniczne względem $C$, ale pomiary już nie. Obserwujemy dwie inwersje, w których dodanie rdzeni _zmniejszyło_ pojemność: przy 16 GiB (54 vs 45) i przy 32 GiB (145 vs 135). Obie występują w reżimie ograniczonym pamięcią, a mechanizm jest w obu przypadkach ten sam: przy większej liczbie rdzeni równoczesne kompilacje postępują w jednym rytmie i osiągają szczytowy rozmiar rezydentny w tym samym momencie, natomiast przy mniejszej liczbie rdzeni harmonogram je przeplata, a szczyty są rozłożone w czasie. Na gościu, którego zapas pamięci jest już na granicy, to rozłożenie utrzymuje go przy życiu. Model pojemności oparty na średnim zużyciu zasobów nie jest w stanie tego wyrazić; jest to właściwość _zbiegu_ szczytów.
+
+Trzecią pozorną inwersję, przy 2 GiB, obecnie pomijamy. Wyszukiwanie rejestruje pojemność 2 przy 2 vCPU, ale 1 przy 4 i 8 vCPU, co wygląda na ten sam efekt. Ponowna analiza surowych przebiegów pokazuje coś prostszego: przy 2 GiB poziom $N=2$ powiódł się za pierwszym podejściem przy wszystkich trzech liczbach rdzeni, a następnie nie przeszedł przebiegu potwierdzającego w dwóch z trzech. Ten poziom nie jest pojemnością, lecz rzutem monetą, a wpis dla 2 vCPU to rzut, który akurat wypadł pomyślnie. Dlatego raportujemy powtarzalną wartość 1 dla wszystkich trzech liczb rdzeni i nie wyciągamy wniosków z tej różnicy. Odnotowujemy tę korektę tutaj, zamiast po cichu poprawiać tabelę, ponieważ odrzucony odczyt jest właśnie tego rodzaju, który poparłby interesującą tezę.
+
+## 6. Ustalenia dotyczące implementacji
+
+### 6.1 Zakodowany na stałe limit współbieżności
+
+Na odpowiednio dużych gościach pojemność zatrzymywała się dokładnie na 65 równoczesnych kompilacjach niezależnie od żądanej współbieżności: przy $N=66,80,96,128$ zmierzyliśmy $65$ sukcesów i $1,15,31,63$ natychmiastowych odpowiedzi `unavailable`, przy liczbie kontenerów stale wynoszącej 65, kilku gigabajtach niewykorzystanej pamięci i medianie czasu kompilacji stabilnej na poziomie 77 s — znacznie poniżej jakiegokolwiek limitu czasu.
+
+Przyczyną jest stała w CLSI:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+Porównanie jest nieostre, więc efektywny sufit wynosi $64+1=65$, co dokładnie zgadza się z pomiarem. Nadmiarowe żądania otrzymują **HTTP 503** — są _odrzucane_, a nie kolejkowane, więc z perspektywy użytkownika przycisk kompilacji po prostu zawodzi. W przeciwieństwie do każdego innego parametru w tym samym pliku ten nie odczytuje żadnej zmiennej środowiskowej; został wprowadzony w upstreamie w sierpniu 2024 roku i można go zmienić jedynie przez modyfikację obrazu. Po podniesieniu limitu ten sam gość 16 vCPU / 32 GiB, który przy $N=80$ raportował `success=65, unavailable=15`, raportował `success=80`.
+
+### 6.2 Niedziałający limit pamięci kontenera
+
+Inspekcja działającego kontenera kompilacji nie wykazuje żadnej izolacji zasobów:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Brak jakiegokolwiek limitu CPU jest zamierzony i wyjaśnia, dlaczego wykładnik podziału czasu z §4.2 jest tak czysty: nic nie zakłóca rywalizacji między kompilacjami. Brak limitu _pamięci_ nie jest jednak zamierzony. Docker runner faktycznie go żąda:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Jest to błędne podwójnie. Wartość wynosi $1024^4=1 tebiB$, podczas gdy komentarz zakłada $1024^3$; a pole jest umieszczone na najwyższym poziomie opcji tworzenia zamiast wewnątrz `HostConfig`, gdzie oczekuje go API Docker, więc zostaje odrzucone — co potwierdza zaobserwowane `Memory=0`. Oba błędy występują w commicie, który wprowadził ten plik (`9a519f0d3d`, marzec 2018), i przetrwały konwersję z CoffeeScript, przeformatowanie całego repozytorium oraz migrację z CJS do ESM — żadna z tych zmian nie dotykała semantyki. Co znamienne, `MAX_OUTPUT = 1024 * 1024 // 1MB` w tym samym commicie jest poprawne, co wskazuje na pomyłkę, a nie na niezrozumienie.
+
+Konsekwencje widać w naszych pomiarach przy małej ilości pamięci. Ponieważ kompilacje są nieograniczone, wyczerpanie pamięci nie objawia się zakończeniem przez Docker jednego winnego kontenera; kładzie ono cały system gościa. W konfiguracji 2 vCPU / 2 GiB zaobserwowaliśmy zablokowanie monitorującej sesji SSH na 300 s, średnie obciążenie 68 na dwóch rdzeniach i ostatecznie samoczynny restart gościa. Działający limit na kontener degradowałby system znacznie łagodniej: zbyt duża kompilacja by się nie powiodła, a usługa by przetrwała.
+
+Jedynym limitem, który faktycznie działa, jest `RLIMIT_CPU`, ustawiony na $\text{timeout}+5$ sekund. Ogranicza on czas _CPU_, a nie czas zegarowy, a pojedyncza kompilacja zużywa tylko około 9 s CPU, więc nigdy nie zadziała przy żadnej współbieżności; chroni przed patologicznymi danymi wejściowymi, takimi jak niekontrolowane makro. Jest jednak użyteczną wyrocznią: zaobserwowanie `Soft:305` potwierdza, że ustawienie limitu czasu 300 s faktycznie dotarło do kontenera.
+
+### 6.3 Limit czasu kompilacji jest dominującym parametrem
+
+Pole użytkownika `features.compileTimeout` ma domyślnie wartość 180 s. Dla każdej konfiguracji ograniczonej przez CPU nie jest to margines bezpieczeństwa, lecz ustawienie pojemności, ponieważ maszyna, która wciąż poprawnie liczy, zostaje uznana za niewydolną. Podniesienie go do 300 s — pojedyncza aktualizacja w MongoDB — zmienia zmierzoną pojemność nawet 4,2 raza (Tabela 3). Górna granica to 600 s, wymuszana przez `RequestParser.MAX_TIMEOUT`, powyżej której wartość jest po cichu obcinana.
+
+| Konfiguracja     | 180 s | 300 s |         Stosunek | Ograniczenie wiążące  |
+| ---------------- | ----: | ----: | -------------: | --------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB wolne     |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB wolne     |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                   |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                   |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                   |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | następnie bariera pamięci |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | pamięć                |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | pamięć                |
+
+**Tabela 3.** Wpływ limitu czasu kompilacji na zmierzoną pojemność.
+
+Dwa ostatnie wiersze to sprzeczna z intuicją połowa wyniku i powód, dla którego ponownie zmierzyliśmy każdą konfigurację przy jednym limicie czasu. Dla konfiguracji ograniczonych _pamięcią_ dłuższy limit czasu _zmniejsza_ pojemność, ponieważ każda kompilacja dłużej utrzymuje swój zbiór rezydentny i więcej z nich się nakłada. Liczba określająca pojemność jest więc bez znaczenia, jeśli nie poda się limitu czasu, przy którym ją zmierzono, a obu wartości nie można mieszać w jednej tabeli.
+
+## 7. Prace powiązane
+
+### 7.1 Zalecenia dostawcy
+
+Własna dokumentacja sprzętowa Overleaf przedstawia jakościowe fakty, które tutaj kwantyfikujemy: że LaTeX jest jednowątkowy, że wydajność pojedynczego rdzenia decyduje zatem o czasie kompilacji oraz że „więcej rdzeni pomoże tylko wtedy, gdy próbujesz skompilować więcej dokumentów, niż masz wolnych rdzeni CPU" \[1]. Następnie podaje liniową regułę wymiarowania — bazę 2 rdzeni/3 GiB plus jeden rdzeń i jeden gigabajt na pięciu do dziesięciu równoczesnych użytkowników — która zmotywowała to badanie. Naszym wkładem jest przekształcenie tych stwierdzeń w zmierzone prawa (Równania (1) i (2)) oraz pokazanie, gdzie reguła liniowa się załamuje: nie ma ona składnika dla współdzielonej pamięci podręcznej stron, która czyni barierę pamięci superliniową, ani składnika dla dwóch parametrów programowych, które dominują nad wynikiem.
+
+### 7.2 Badania pojemności systemów budowania i CI
+
+Pomiary systemów budowania pod obciążeniem współbieżnym są dobrze ugruntowane poza kontekstem LaTeX. LightSys raportuje, że konwencjonalne systemy CI kompilujące wewnątrz kontenerów Docker degradują się pod względem I/O wraz ze wzrostem częstotliwości napływu pull requestów, a wąskie gardło pojawia się przy około jedenastu równoczesnych żądaniach \[17]; TAOS-CI obserwuje, że kompilacja dominuje w czasie zegarowym CI, odpowiadając za 60–67% całkowitego czasu potoku w dużych projektach \[18]. Nasz system różni się pod jednym względem, który okazuje się decydujący: kompilacja LaTeX jest interaktywna. Zadanie CI, które trwa dwa razy dłużej, to niedogodność; kompilację, która trwa dwa razy dłużej, bezpośrednio obserwuje użytkownik czekający na panel podglądu — dlatego limit czasu traktujemy nie jako próg awarii, lecz jako parametr pojemności.
+
+### 7.3 Narzut kontenerów
+
+Najnowsze prace rozkładają opóźnienie uruchamiania kontenerów Docker na poszczególne warstwy pamięci masowej \[19] i charakteryzują wydajność kontenerów na brzegu sieci (edge) \[20]. W naszym kontekście uruchamianie kontenera na kompilację jest amortyzowane: to niewielka stała w porównaniu z 9-sekundową kompilacją, a dopasowany czas swobodny $T_1$ ją pochłania. Właściwością kontenera, która ma znaczenie, jest _brak_ limitów zasobów (§6.2), który zamienia przekroczenie pamięci przez pojedynczą kompilację w awarię całego hosta.
+
+### 7.4 LaTeX jako niezaufane dane wejściowe
+
+Kompilacja w piaskownicy istnieje, ponieważ TeX jest językiem programowania, a dokumenty są niezaufanymi danymi wejściowymi \[21, 22]. Ten wybór projektowy umożliwia niniejsze badanie — każda kompilacja to odizolowany kontener z obserwowalnym zachowaniem zasobów — i jednocześnie sprawia, że brakujący limit pamięci ma poważne konsekwencje, ponieważ operatorzy, którzy go wdrażają, zakładają izolację.
+
+### 7.5 Kompilator jako przedmiot badań
+
+Sam TeX jest dobrze udokumentowany jako język \[16], ale jego zachowanie jako _celu budowania_ przyciągnęło uwagę dopiero niedawno. Tan i Rigger \[8] kompilują duży korpus źródeł z arXiv przy użyciu różnych silników i wersji dystrybucji i stwierdzają, że wyboru silnika nie da się zastąpić: tylko ułamek procenta dokumentów daje identyczny bajt po bajcie wynik w XeTeX i pdfTeX. Ten wynik ma bezpośredni wpływ na naszą metodologię. Pojemność jest właściwością dokumentu _i_ silnika, więc benchmark, który nie ustala obu, nie jest powtarzalny; dlatego w całym badaniu ustalamy jeden dokument, jeden silnik i jedną dystrybucję (`texlive-full:2025.1`) i podajemy silnik w podpisie każdego rysunku. Ogranicza to również ogólność naszych liczb w sposób, który warto jasno powiedzieć: charakteryzują one XeLaTeX na tym dokumencie, a nie TeX w ogóle.
+
+Prace nad _systemami_ budowania LaTeX są w dużej mierze napędzane przez praktyków. `l3build` projektu LaTeX3 \[13] standaryzuje testy regresyjne i pakowanie, a niezależne benchmarki porównują narzędzia opakowujące — przegląd 26 systemów budowania wykazuje, że prekompilowana preambuła daje około 20% zysku względem zwykłego przebiegu i 40% względem `latexmk` \[14]. Optymalizują one _pojedynczą_ kompilację. Są ortogonalne do tego, co mierzymy, i dają się z tym łączyć: pamięć podręczna preambuły skraca $T_1$, a każda wartość pojemności w tym artykule skaluje się z $T_1$.
+
+### 7.6 Kontrola współbieżności w edytorze, a nie w kompilatorze
+
+Część Overleaf odpowiedzialna za współpracę opiera się na dobrze ugruntowanej linii badań. Transformacja operacyjna wywodzi się od Ellisa i Gibbsa \[9] i została uczyniona praktyczną dla klientów o wysokim opóźnieniu przez system Jupiter \[10], którego projekt jest rozpoznawalny w `document-updater`: serwer porządkujący operacje i bufor na dokument, z którym synchronizują się klienci. Bezkonfliktowe replikowane typy danych (CRDT) \[11] rozwiązują ten sam problem bez centralnego sekwencera. To rozróżnienie w ogóle umożliwia działanie topologii z §4.3: ponieważ bufor oczekujących aktualizacji znajduje się we współdzielonym Redis, a nie w pamięci instancji, kompilacja skierowana do dowolnej repliki widzi najnowsze naciśnięcia klawiszy, a powinowactwo kompilacji można wybierać ze względu na lokalność pamięci podręcznej, a nie poprawność.
+
+### 7.7 Modele pojemności
+
+Prawo Amdahla \[24] ogranicza przyspieszenie wynikające z równoległości, a prawo Little'a \[23] wiąże zajętość z częstotliwością napływu i czasem obsługi; oba zostały wykorzystane powyżej. Uniwersalne prawo skalowalności Gunthera \[12] rozszerza pierwsze o składnik wsteczny dla opóźnienia koherencji, przewidując, że przepustowość osiąga szczyt, a następnie spada. Zauważamy, że nasz system _nie_ wykazuje tego wstecznego reżimu aż do $N=1024$: przepustowość się nasyca, a opóźnienie rośnie, ale nic się nie załamuje. Przyczyna jest strukturalna, a nie szczęśliwa — kompilacje nie współdzielą stanu, który musiałby być spójny, więc składnik dodawany przez to prawo jest bliski zera, a plateau przyjmowania z §4.3 ogranicza rywalizację, zanim mogłaby mieć znaczenie.
+
+## 8. Zalecenia dla operatorów
+
+<Steps>
+<Step title="Popraw dwa parametry programowe przed zakupem sprzętu">
+Oba są darmowe i oba są warte więcej niż jakakolwiek pojedyncza zmierzona przez nas modernizacja sprzętu. Podnieś `features.compileTimeout` do wartości, którą Twoi użytkownicy faktycznie zaakceptują — maksimum akceptowane przez CLSI to 600 s — a jeśli spodziewasz się przekroczenia 65 równoczesnych kompilacji, albo znieś `compileConcurrencyLimit` w obrazie pochodnym, albo skaluj horyzontalnie. Niezrobienie żadnej z tych rzeczy oznacza płacenie za rdzenie, których oprogramowanie odmawia używać.
+</Step>
+
+<Step title="Wymiaruj jedną maszynę według punktu załamania, a nie sufitu">
+Przegląd na dużym runnerze (§4.3) rozdziela dwie liczby, które są rutynowo mylone. _Sufit_ — największa współbieżność, przy której wciąż zwracany jest każdy PDF — wynosi co najmniej 1024 na serwerze z 64 rdzeniami i nigdy go nie osiągnęliśmy. _Punkt załamania_ — punkt, powyżej którego opóźnienie ogonowe przestaje rosnąć łagodnie i zaczyna się podwajać — wynosi 512, a ostatni komfortowy punkt pracy poniżej niego to 256. Między $N=256$ a $N=512$ oczekiwanie $p_{95}$ rośnie z dwóch minut do prawie sześciu; między 512 a 1024 sięga ośmiu. Operator, który wymiaruje system według sufitu, dostarcza system technicznie działający, z którego nikt nie chce korzystać.
+
+Dla tej maszyny i tego dokumentu zalecany punkt pracy to zatem **256 równoczesnych kompilacji**, czyli $4\times$ liczba fizycznych rdzeni i $2\times$ liczba wątków, co utrzymuje $p_{95}$ w okolicach 120 s. Sugerujemy ustawienie `compileConcurrencyLimit` na tę wartość zamiast pozostawiania go wysoko: przyjęcie 1024 kompilacji naraz sprawia, że wszyscy czekają osiem minut, podczas gdy przyjęcie 256 i zakolejkowanie reszty obsługuje większość użytkowników w dwie minuty. Kolejkowanie pogarsza sytuację spóźnionych; rywalizacja pogarsza sytuację wszystkich.
+</Step>
+
+<Step title="Traktuj te liczby jako najgorszy przypadek">
+Każdy poziom w Tabeli 2 to kompilacja na zimno uruchomiona jednocześnie. Żaden z tych warunków nie występuje w produkcji: kompilacja na ciepło tego samego dokumentu trwa 8,6 s wobec 28,3 s na zimno, czyli $3.3$ raza krócej, a prawdziwi użytkownicy nie naciskają przycisku w tej samej sekundzie. Populacja w stanie ustalonym, która rekompiluje co dwie minuty przy typowym współczynniku trafień pamięci podręcznej, utrzyma więc znacznie więcej piszących, niż sugerowałaby sama liczba współbieżności — rzędu tysiąca lub więcej aktywnych autorów przy punkcie pracy 256. Wartość współbieżności to ograniczenie chwilowego wybuchu, a nie liczba stanowisk.
+</Step>
+
+<Step title="Najpierw ustal budżet opóźnienia, potem odczytaj rozmiar">
+Równanie (1) odwraca się bezpośrednio. Dla docelowego czasu oczekiwania $T$ przy taktowaniu $f$ na $C$ rdzeniach mieszcząca się współbieżność to $N \le C\,fT/k$ z $k\approx28 GHz·s$ dla tego dokumentu. Budżet 60 s na 8 rdzeniach przy 3 GHz daje $N\le51$; budżet 120 s go podwaja. Publikowanie budżetu razem z pojemnością to jedyny uczciwy sposób podania którejkolwiek z tych wartości.
+</Step>
+
+<Step title="Najpierw kupuj pamięć, potem rdzenie, i sprawdzaj, na której barierze jesteś">
+Poniżej 32 GiB zmierzyliśmy niemal zerową korzyść z dodatkowych rdzeni. Diagnostyka jest tania: jeśli awarie pojawiają się jako HTTP 502 przy braku pamięci gościa, dodaj pamięć; jeśli pojawiają się jako `timedout` przy zapasie pamięci, dodaj rdzenie lub podnieś limit czasu. Operatorzy mogą to odczytać z tej samej sygnatury awarii, której użyliśmy do klasyfikacji konfiguracji.
+</Step>
+
+<Step title="Wybieraj taktowanie dla komfortu, rdzenie dla liczby użytkowników">
+Ponieważ $T\propto 1/f$ obowiązuje bez krzywizny (2% w zakresie 1,0–5,5 GHz), szybsze taktowanie przyspiesza każdą kompilację dla każdego użytkownika. Więcej rdzeni nie przyspiesza żadnej pojedynczej kompilacji; pozwala jedynie przyjąć więcej równoczesnych. Wdrożenia, w których skarga brzmi „kompilacje są wolne", powinny kupić taktowanie; wdrożenia, w których skarga brzmi „kompilacje zawodzą przed terminem", powinny kupić pamięć i rdzenie.
+</Step>
+
+<Step title="Powyżej sufitu skaluj horyzontalnie zamiast wertykalnie">
+Powyżej 65 równoczesnych kompilacji obsługiwaną ścieżką jest skalowanie poziome (Rysunki 2c i 10, szerzej w §9): wiele instancji aplikacji za load balancerem z powinowactwem sesji opartym na ciasteczkach, współdzielących centralne MongoDB, Redis i magazyn zgodny z S3, przy czym `git-bridge` pozostaje pojedynczą instancją. To mnoży sufit na instancję przez liczbę instancji — dokładnie w ten sposób wdrożenie SaaS osiąga własną pojemność.
+</Step>
+
+<Step title="Nie polegaj na izolacji poszczególnych kompilacji">
+Dopóki limit pamięci Docker runnera nie zostanie poprawiony (§6.2), pojedynczy patologiczny dokument może wyczerpać zasoby hosta, zamiast zostać sam zabity. Operatorzy, którzy potrzebują takiej gwarancji, powinni ją wprowadzić samodzielnie, zamiast na nią czekać. Mechanizmem, którego użyliśmy na dużym hoście, jest slice systemd z twardym limitem, na który następnie wskazuje się demonowi Docker, aby każdy tworzony przez niego kontener był rozliczany wewnątrz niego:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Jeden szczegół kosztuje całe popołudnie, jeśli się go przeoczy. Slice o nazwie `docker-capped.slice` nie znajduje się obok `docker.slice`; znajduje się _wewnątrz_ niego, ponieważ myślnik jest separatorem hierarchii, a nie częścią nazwy. Limit, który pozornie nie działa, zwykle został zastosowany o jeden poziom obok miejsca, w którym faktycznie żyją kontenery. Weryfikuj, odczytując szczyt z `memory.max_usage_in_bytes` po przebiegu, zamiast ufać plikowi konfiguracyjnemu — na naszym hoście cgroup kompilacji nigdy nie przekroczył jednej piątej limitu nawet przy 1024 równoczesnych kompilacjach, co samo w sobie dowodzi, że ograniczeniem wiążącym był demon, a nie pamięć.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Rysunek 10.** Referencyjna topologia wdrożenia skalowanego horyzontalnie, oparta na zweryfikowanej przez nas konfiguracji. Repliki aplikacji są wymienne i nie przechowują niczego trwałego, więc można je swobodnie dodawać i usuwać. Trzy komponenty takie nie są: Redis, którego bufor dokumentów pozwala kompilacji skierowanej do dowolnej repliki zobaczyć najnowsze naciśnięcia klawiszy; magazyn obiektów, który przy więcej niż jednej replice staje się obowiązkowy, a nie opcjonalny; oraz `git-bridge`, który przechowuje repozytoria na lokalnym dysku bez ścieżki replikacji i musi działać jako pojedyncza instancja obok jednej wyznaczonej repliki.
+
+## 9. Referencyjne wdrożenie wielomaszynowe
+
+Wszystko powyżej mierzy jedną maszynę. Ta sekcja opisuje formę rozproszoną na tyle szczegółowo, aby ją zbudować, i — ponieważ pytanie, przed którym faktycznie staje operator, brzmi nie _jak_, lecz _czy_ — najpierw określa punkt, w którym staje się ona warta zachodu.
+
+### 9.1 Kiedy forma rozproszona jest uzasadniona
+
+Pojedyncza maszyna jest tańsza w utrzymaniu pod każdym istotnym względem: jedna domena awarii, brak współdzielonego stanu do utrzymywania w spójności, brak routingu, który można źle skonfigurować. Nasze dane wyznaczają trzy progi, przy których warto z niej zrezygnować.
+
+#### 9.1.1 Poniżej 65 równoczesnych kompilacji — nie warto
+
+Sufit na instancję to stała programowa, a nie sprzętowa (§6.1). Dopóki zadane obciążenie się do niego nie zbliży, druga maszyna dodaje tryby awarii i nic nie daje. Host z 64 rdzeniami obsłużył 256 równoczesnych kompilacji z pełnym sukcesem dopiero po zniesieniu `compileConcurrencyLimit`; operator, który jeszcze nie zmienił tej jednej wartości, nie jest ograniczony sprzętem i nie powinien rozglądać się za sprzętem.
+
+#### 9.1.2 Między 65 a około 500 — najpierw skaluj wertykalnie
+
+Skalowanie pionowe pozostało liniowe w całym naszym zakresie i nigdy nie weszło w reżim wsteczny. Jeden duży host osiągnął 1024 równoczesne zimne kompilacje ze 100% skutecznością (§4.3); załamanie opóźnienia pojawiło się przy 512, nie wcześniej. W tym przedziale większa maszyna jest zdecydowanie prostsza niż kilka mniejszych, a zgodnie z §4.4 szybsza poprawia doświadczenie każdego użytkownika, a nie tylko pozwala przyjąć ich więcej.
+
+#### 9.1.3 Przejdź na formę rozproszoną dla dostępności, a nie przepustowości
+
+Uczciwym powodem uruchamiania więcej niż jednej repliki aplikacji poniżej sufitu jest to, że jedna maszyna to jeden zasilacz, jedno jądro, jedno okno aktualizacji. To uzasadniony powód i taki byśmy podali; po prostu nie jest to argument dotyczący pojemności, a mieszanie tych dwóch prowadzi operatorów do kupowania replik, gdy potrzebowali pamięci.
+
+### 9.2 Warstwy i ich wymiarowanie
+
+Rysunek 10 przedstawia topologię. Ma ona cztery warstwy, które skalują się według różnych wielkości — i właśnie o to chodzi w ich rozdzieleniu.
+
+#### 9.2.1 Brzeg
+
+Jeden load balancer lub dwa dla zapewnienia dostępności. Terminuje TLS i nie robi niczego kosztownego; skaluje się z liczbą połączeń, a nie kompilacji, a mała instancja wystarcza dla badanych tu obciążeń. Liczy się jego konfiguracja, a nie rozmiar (§9.3).
+
+#### 9.2.2 Repliki aplikacji
+
+Przenoszą obciążenie kompilacjami i są jedyną warstwą skalującą się ze współbieżnością. Wymiaruj każdą według reguł z §8 — pamięć przed rdzeniami, potem taktowanie — a następnie ustal liczbę replik tak, aby pokryła szczytową współbieżność podzieloną przez sufit na replikę. Repliki nie przechowują niczego trwałego: ich lokalny dysk zawiera pliki robocze kompilacji i pamięć podręczną wyników, które można odtworzyć. Dzięki temu można je bezpiecznie dodawać i usuwać; warto to jednak zweryfikować, a nie zakładać, ponieważ jedna źle skonfigurowana ścieżka `filestore` po cichu zamienia tę warstwę w stanową.
+
+#### 9.2.3 Stan
+
+Redis, MongoDB i magazyn obiektów zgodny z S3 na osobnych hostach. Redis jest tu elementem nośnym i najmniej oczywistym: przechowuje magazyn sesji i bufor aktywnych dokumentów, co pozwala kompilacji skierowanej do dowolnej repliki widzieć naciśnięcia klawiszy wprowadzone w innej replice. Operator, który traktuje Redis jak pamięć podręczną i wymiaruje go pod kątem usuwania danych (eviction), będzie otrzymywał kompilacje nieaktualnych dokumentów, które niezwykle trudno zdiagnozować, ponieważ nic nie zawodzi — wynik jest po prostu błędny. MongoDB skaluje się z liczbą projektów, a nie z częstotliwością kompilacji. Magazyn obiektów jest opcjonalny przy jednej replice i obowiązkowy przy większej liczbie.
+
+#### 9.2.4 Pojedyncza instancja
+
+`git-bridge` przechowuje repozytoria na lokalnym dysku, utrzymuje lokalny indeks i nie ma ścieżki replikacji. Musi działać jako dokładnie jedna instancja, przypięta obok jednej wyznaczonej repliki, i to ten komponent sprawia, że wdrożenie nie jest w pełni bezstanowe. Odpowiednio zaplanuj jego hosta: to jego dysk wymaga kopii zapasowych.
+
+| **Warstwa**   | **Liczba**           | **Skaluje się z**        |
+| ------------- | -------------------- | ------------------------ |
+| Load balancer | 1–2                  | równoczesne połączenia   |
+| Aplikacja     | $\lceil N/C\rceil$ | szczytowe równoczesne kompilacje |
+| Redis         | 1 (+replika)         | aktywne sesje edycji     |
+| MongoDB       | 1 (+replika)         | przechowywane projekty   |
+| Magazyn obiektów | 1 klaster         | łączny rozmiar projektów w bajtach |
+| `git-bridge`  | dokładnie 1          | repozytoria na dysku     |
+
+**Tabela 4.** Warstwy referencyjne. Tylko warstwa aplikacji skaluje się ze współbieżnością; jej wymiarowanie jest tematem §8.
+
+### 9.3 Routing to część, którą łatwo źle skonfigurować
+
+Trzy klasy żądań muszą trafiać w trzy różne miejsca, a domyślna konfiguracja z jedną regułą spełnia co najwyżej dwa z tych wymagań.
+
+Ruch kompilacji pod `/project/` powinien być rozdzielany przez spójne haszowanie identyfikatora projektu, aby pamięć podręczna kompilacji projektu pozostawała przy jednej replice. Używamy `balance hash path,field(3,/)` w HAProxy z `hash-type consistent` i `hash-balance-factor 150`. Wybór ma znaczenie przy skalowaniu: przy powinowactwie opartym na ciasteczkach istniejące sesje pozostają przypięte do pierwotnej repliki bezterminowo, a nowo dodana replika otrzymuje tylko nowych użytkowników, więc maszyna, za którą operator właśnie zapłacił, nie przejmuje żadnej części obciążenia, które skłoniło do jej zakupu. W naszej konfiguracji spójne haszowanie przy skalowaniu w górę przeniosło 35% projektów, wobec 0% przy ciasteczkach.
+
+Ruch sesji jest inny. Gdy upgrade do WebSocket się nie powiedzie, a `socket.io` przełączy się na odpytywanie XHR, kolejne zapytania jednej sesji muszą trafiać do jednej repliki, a w ścieżce nie ma identyfikatora projektu do zahaszowania. Ten ruch wymaga osobnego backendu z powinowactwem opartym na ciasteczkach. Zaprojektowaliśmy ten podział, ale go nie wdrożyliśmy; oznaczamy go jako lukę, zamiast twierdzić, że działa.
+
+Wreszcie `/git/` musi trafiać do repliki, obok której działa `git-bridge`. Jest kierowany do tej repliki, a nie bezpośrednio do `git-bridge`, ponieważ most uwierzytelnia swoje wywołania zwrotne względem punktów końcowych OAuth aplikacji i rozwiązuje przez nią adresy URL blobów; ominięcie repliki psuje uwierzytelnianie, niczego nie poprawiając.
+
+### 9.4 Skalowanie w dół wymaga bufora opróżniania
+
+Usunięcie repliki nie jest symetryczne do jej dodania: trwająca kompilacja zostaje utracona, a użytkownik widzi awarię, której nie spowodował. Działająca sekwencja to najpierw zatrzymanie nowego ruchu, odczekanie, a dopiero potem zakończenie. Zaimplementowaliśmy to jako hook pre-stop, który utrzymuje pod przez konfigurowalny czas, podczas gdy balancer oznacza backend jako opróżniany — na tyle krótki, by przetestować to w kilka minut, a w produkcji na tyle długi, by sesja naturalnie się zakończyła, czyli godziny, a nie sekundy. Ten interwał to pokrętło decydujące o tym, czy elastyczność jest niewidoczna, czy irytująca.
+
+Jeszcze jedno ograniczenie znaleźliśmy w drodze pomiaru, a nie projektowania: autoskalowanie na podstawie CPU nie działa dla tego obciążenia. Wykorzystanie samego poda aplikacji wynosiło 22 m rdzenia przy łącznym obciążeniu węzła 3997 m rdzenia, ponieważ praca kompilacji odbywa się w kontenerach siostrzanych, których pod nie rozlicza. Każdy sygnał używany do skalowania tej warstwy musi zliczać działające kontenery kompilacji, a nie CPU poda.
+
+## 10. Implikacje wykraczające poza Overleaf
+
+Nic w §4.2 ani §4.3 nie jest specyficzne dla kodu Overleaf. Zmierzone prawa wynikają z trzech właściwości wspólnych dla każdej hostowanej usługi LaTeX: jednostką pracy jest proces jednowątkowy, jest on izolowany w kontenerze, a jego zbiorem roboczym jest duże drzewo tylko do odczytu, które musi pomieścić pamięć podręczna stron. Trzy konsekwencje przenoszą się bezpośrednio na każdego, kto buduje taką usługę.
+
+### 10.1 Zapewnij pamięć, potem rdzenie
+
+Najmocniejszy wynik macierzy jest negatywny: poniżej 16 GiB liczba rdzeni jest niemal bez znaczenia, a dopiero przy 48 GiB konfiguracje 4, 8 i 16 vCPU w ogóle się rozdzielają (143, 268, 331). Operator, który odczytuje konwencjonalną regułę jako „dodaj rdzeń na pięciu użytkowników", kupuje niewłaściwy zasób. Mechanizmem jest współdzielona pamięć podręczna stron nad drzewem dystrybucji i jest to właściwość rozmiaru TeX Live, a nie żadnego konkretnego front-endu.
+
+### 10.2 Tempo przyjmowania to zasób, o którym zwykle się zapomina
+
+Przy $N=1024$ nasz serwer nigdy nie utrzymywał więcej niż 205 działających piaskownic (Rysunek 7b), mimo że wszystkie żądania nadeszły naraz. Ograniczeniem było tworzenie kontenerów, a nie kompilacja — co jest zgodne z badaniami pomiarowymi przypisującymi koszt uruchamiania kontenerów narzutowi środowiska uruchomieniowego, a nie rozmiarowi obrazu \[19, 20]. Usługa, która wymiaruje tylko CPU i pamięć, przekona się, że jej zachowaniem przy wybuchach obciążenia rządzi wielkość, której nigdy nie mierzyła. Praktyczną formą tego jest zalecenie z §8: ograniczaj przyjmowanie świadomie, bo kolejka, którą wybierzesz, jest lepsza niż kolejka, którą odkryjesz.
+
+### 10.3 Piaskownica, która przeżywa swoją kompilację, unieważnia model
+
+Każda wartość pojemności w tym artykule zakłada, że kontener jest tworzony, wykonuje jedną kompilację i kończy działanie — czas życia rzędu kilkudziesięciu sekund i wykorzystanie bliskie jedności tylko podczas działania. Dwa niedawne wzorce projektowe łamią to założenie i łamią je w ten sam sposób.
+
+Pierwszym jest trwała piaskownica przypisana do użytkownika. Przydzielenie każdemu użytkownikowi stałego prywatnego środowiska zamienia statystycznie multipleksowaną pulę w zbiór rezerwacji: usługa, która mogłaby obsłużyć 256 równoczesnych kompilacji na 64 rdzeniach dzięki podziałowi czasu, może obsłużyć tylko 16 użytkowników, jeśli każdy dostanie cztery dedykowane rdzenie — o rząd wielkości mniej na tym samym sprzęcie. Nasze dane kwantyfikują koszt tego wyboru, zamiast przeciw niemu argumentować — rezerwacje dają przewidywalność, a kurs wymiany wynosi mniej więcej $16\times$ przy zalecanym przez nas punkcie pracy.
+
+Drugim, nowszym, jest agent AI współdzielący piaskownicę z kompilatorem. Na platformach do pisania wspomaganego przez agentów ten sam kontener, który uruchamia XeLaTeX, może również hostować długo działającego agenta programistycznego, więc jest zajęty nieprzerwanie, a nie zrywami. Praktycy zgłaszają dokładnie ten objaw, który model przewiduje dla takich wdrożeń — utrzymujące się spowolnienie przy umiarkowanej liczbie użytkowników \[15]. Interakcję warto opisać precyzyjnie, ponieważ nie jest to po prostu „większe obciążenie". Trzy z naszych ustaleń się kumulują. Zajętość przestaje mieć charakter zrywowy, więc prawo podziału czasu z §4.2 dotyczy całej populacji naraz, a nie tylko części aktualnie kompilującej. Pamięć podręczna stron, która zapewnia superliniowy zwrot z pamięci z §4.1, jest teraz współdzielona z własnym zbiorem roboczym agenta i przestaje być rozgrzana dla TeX. A brakujący limit pamięci kontenera z §6.2 staje się znacznie groźniejszy, ponieważ kontener, który nigdy nie kończy działania, nigdy nie zwalnia swojej pamięci.
+
+Nie mierzyliśmy takiej platformy i nie formułujemy żadnych twierdzeń dotyczących konkretnego produktu. Możemy natomiast powiedzieć, co nasze liczby oznaczają dla projektu: architekturę, która daje każdemu użytkownikowi długo działającą wielordzeniową piaskownicę, należy wymiarować jako system rezerwacji, a nie według podanych tu wartości współbieżności, a pojemność, jakiej może się spodziewać, jest bliższa liczbie rdzeni podzielonej przez liczbę rdzeni na użytkownika niż czemukolwiek w Tabeli 1.
+
+## 11. Zagrożenia dla trafności
+
+### 11.1 Jeden dokument
+
+Wszystkie pomiary wykorzystują jeden 63-stronicowy dokument XeLaTeX. Bezwzględne pojemności będą inne dla innych dokumentów; prawa skalowania, będące stosunkami, nie powinny. Dokument o znacznie większym zbiorze rezydentnym przesunąłby barierę pamięci bez zmiany jej superliniowego charakteru.
+
+### 11.2 Host zwirtualizowany
+
+Goście działają pod KVM na jednej fizycznej maszynie, więc bezwzględne liczby obejmują narzut wirtualizacji, a goście współdzielą pamięć podręczną stron hosta i urządzenie NVMe. Złagodziliśmy największy czynnik zakłócający, wyłączając niepowiązanych gości po zaobserwowaniu, że presja pamięci hosta zawyża średnie obciążenie wewnątrz gościa ponad $3\times$ przy identycznej współbieżności.
+
+### 11.3 Jednoczesny napływ
+
+Każda kompilacja jest wysyłana w jednym momencie, co stanowi najgorszy przypadek. Prawdziwi użytkownicy napływają jako proces stochastyczny, więc wdrożenie wymiarowane według naszych liczb ma zapas, a nie deficyt — ale szczyt przy końcu terminu składania prac jest bliższy naszemu modelowi niż modelowi Poissona.
+
+### 11.4 Konfiguracje brzegowe
+
+Przy 2 GiB system jest na tyle blisko załamania, że powtórzone przebiegi tej samej konfiguracji mogą różnić się o jedną kompilację. Raportujemy wartość konserwatywną i nie wyciągamy wniosków z różnic $\pm 1$ w tym reżimie.
+
+## 12. Dostępność
+
+Testowany system, narzędzia wdrożeniowe i projekt upstream, z którego się wywodzi, są publicznie dostępne:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Toolkit wdrożeniowy — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Dokumentacja — [https://ayakaleaf-pro.ayaka.space](/pl)
+* Upstream Overleaf — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* Obrazy kompilacji TeX Live — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Każda cytowana lokalizacja w kodzie źródłowym jest podana jako ścieżka względna w repozytorium z numerem wiersza dla Ayakaleaf Pro v6.2.2, a dwa datowane przez nas commity upstream (`9a519f0d3d`, `5d472e9b38`) są dostępne w historii Overleaf.
+
+## 13. Wkład autorów
+
+Musicminion zaprojektował badanie, zapewnił i obsługiwał środowiska testowe, kierował tokiem badań i zweryfikował każdy raportowany tu pomiar. Claude Opus 5 (Anthropic) zbudował i obsługiwał narzędzia benchmarkowe, zautomatyzował wdrożenia, przeprowadził archeologię kodu źródłowego, przygotował rysunki i napisał wstępną wersję manuskryptu. Obaj autorzy przejrzeli tekst końcowy. Tam, gdzie przebieg został zgłoszony jako skażony — przegląd z 1021 sesjami z §4.3 i anomalny poziom $N=256$ z §4.1 — usterkę wykryto podczas przeglądu, a przebieg powtórzono przed publikacją, zamiast go po cichu pominąć.
+
+Czytelnicy powinni zauważyć, że zasady autorstwa ACM, IEEE i ICMJE obecnie zastrzegają autorstwo dla podmiotów zdolnych do wzięcia odpowiedzialności za pracę i wymagałyby odnotowania wkładu drugiego autora jako ujawnienia, a nie jako autorstwa. Jawnie przedstawiamy tutaj podział pracy, aby zapis był rzetelny w ramach obu konwencji.
+
+## 14. Wnioski
+
+Planowanie pojemności dla samodzielnie hostowanego Overleaf nie sprowadza się do skalowania jednego zasobu. Trzy ustalenia powinny zmienić sposób, w jaki się je prowadzi.
+
+Po pierwsze, poniżej 32 GiB pamięci gościa liczba rdzeni ledwie ma znaczenie: przy 16 GiB pojemności gości z 4, 8 i 16 vCPU różnią się o mniej niż 8%. Granicę wyznacza pamięć, poprzez współdzieloną pamięć podręczną stron nad drzewem TeX Live; rdzenie zaczynają mieć znaczenie dopiero przy hojnej ilości pamięci.
+
+Po drugie, dwa parametry programowe przeważają nad sprzętem. Zniesienie zakodowanego na stałe w CLSI limitu 65 kompilacji i podniesienie domyślnego limitu czasu kompilacji 180 s zwiększyło możliwości gościa 8 vCPU / 48 GiB z 64 do 268 równoczesnych kompilacji — 4,2 raza bez dodatkowego sprzętu. Żadnego z nich nie da się odkryć w dokumentacji konfiguracji; jednego w ogóle nie da się skonfigurować.
+
+Po trzecie, pytanie „ilu równoczesnych użytkowników obsługuje ta maszyna" jest niedookreślone. Współbieżność w tym systemie to czysty podział czasu, a pojemność to tyle, ile dopuści limit czasu. Uczciwa forma odpowiedzi podaje obie wartości: _ta maszyna obsługuje_ $N$ _równoczesnych kompilacji, jeśli użytkownicy poczekają_ $T$ _sekund_, przy czym $N$ i $T$ są powiązane Równaniem (1).
+
+Zgłaszamy również ukrytą usterkę: limit pamięci na kontener w Docker runnerze jest nieskuteczny od 2018 roku, zarówno pod względem wartości, jak i umiejscowienia. Praktycznym skutkiem jest to, że wyczerpanie pamięci w małym wdrożeniu kładzie całą usługę zamiast jednej odpowiedzialnej za to kompilacji.
+
+## Bibliografia
+
+\[1] Overleaf. _Hardware requirements_, dokumentacja On-premises. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, dokumentacja On-premises. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, dokumentacja On-premises. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Source repository_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Relacje praktyków dotyczące utrzymujących się opóźnień na platformach do pisania wspomaganego przez agentów, które umieszczają trwałego agenta programistycznego razem z kompilatorem LaTeX w piaskownicy przypisanej do użytkownika. Cytujemy to jako zgłaszane doświadczenie operacyjne, a nie kontrolowany pomiar; nie przeprowadzaliśmy benchmarku takiej platformy.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

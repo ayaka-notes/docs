@@ -1,0 +1,123 @@
+---
+title: Thiết lập Sandbox Compiles
+icon: box-archive
+---
+
+Có một chút khác biệt giữa môi trường phát triển và môi trường production nếu bạn muốn thiết lập biên dịch trong sandbox cho môi trường dev. Có 3 điều bạn cần lưu ý:
+
+* Vấn đề quyền truy cập tệp
+* Chia sẻ volume giữa history-v1 và filestore
+* Vấn đề thư mục con
+
+### Bật Sandbox Compiles
+
+Ở đây, chúng ta chỉ cần bật Sandbox Compiles giống như cách làm trong Overleaf CE. Tuy nhiên, cần lưu ý đến người dùng. Ở đây chúng ta đặt nó thành root.
+
+Trong môi trường production, chúng tôi dùng www-data làm người dùng chung giữa container Overleaf và container biên dịch TeX. Tuy nhiên, trong môi trường dev, node là người dùng mặc định trong container và không có người dùng www-data nào để liên kết. Vì vậy, chúng ta chỉ dùng root như một giải pháp tạm thời.
+
+<Warning>
+
+Vui lòng không dùng image do bạn tự build, bạn có thể gặp phải hàng loạt lỗi.
+
+</Warning>
+
+```dotenv wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+TEXLIVE_IMAGE_USER=root
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+### Sửa quyền truy cập tệp
+
+LaTeX chạy trong các container anh em với tư cách người dùng được chỉ định trong biến môi trường `TEXLIVE_IMAGE_USER`. Trong ví dụ trên, biến này được đặt thành `root`, có uid `0`. Điều này gây ra vấn đề với các quyền ở trên, vì người dùng root không có quyền ghi vào các thư mục con của `compiles`.
+
+Một cách khắc phục nhanh là trao quyền sở hữu nhóm `root` cùng quyền đọc ghi cho `compiles`, với `setgid` được đặt để các thư mục con mới cũng kế thừa quyền sở hữu này:
+
+```bash title="bash"
+sudo chown -R 1000:root compiles
+sudo chmod -R g+w compiles
+sudo chmod g+s compiles
+```
+
+Để xem tài liệu chi tiết, bạn có thể tham khảo `services/clsi/README.md`.
+
+### Chia sẻ volume giữa history-v1 và filestore
+
+Theo mặc định, filestore đóng vai trò cầu nối giữa s3 và các dịch vụ khác trong Overleaf. Tuy nhiên, trong Overleaf CE hoặc Server Pro, tất cả các tệp đều được lưu cục bộ theo mặc định. Vì vậy, Overleaf đã đưa ra một phương pháp khá "mẹo".
+
+```javascript title="server-ce/config/settings.js" wrap
+switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
+  case 's3':
+    // s3 case...
+  default:
+    settings.filestore = {
+      backend: 'fs',
+      stores: {
+        template_files: Path.join(DATA_DIR, 'template_files'),
+
+        // NOTE: The below paths are hard-coded in server-ce/config/production.json, so hard code them here as well.
+        // We can use DATA_DIR after switching history-v1 from 'config' to '@overleaf/settings'.
+        project_blobs:
+          process.env.OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-project-blobs',
+        global_blobs:
+          process.env.OVERLEAF_HISTORY_BLOBS_BUCKET ||
+          '/var/lib/overleaf/data/history/overleaf-global-blobs',
+      },
+    }
+}
+```
+
+Đồng thời, `data/history` cũng được dịch vụ history sử dụng. Bằng cách này, chúng có thể chia sẻ cùng dữ liệu giữa các microservice khác nhau. Bạn cần thêm volume `history-v1-buckets` này vào dịch vụ filestore trong develop. Nếu không, **clsi sẽ không thể lấy các tệp blob từ dịch vụ filestore**.
+
+```yml title="develop/docker-compose.yml" wrap
+  filestore:
+    build:
+      context: ..
+      dockerfile: services/filestore/Dockerfile
+    env_file:
+      - dev.env
+#    environment:
+#      - ENABLE_CONVERSIONS=true
+    volumes:
+      - filestore-public-files:/overleaf/services/filestore/public_files
+      - filestore-template-files:/overleaf/services/filestore/template_files
+      - filestore-uploads:/overleaf/services/filestore/uploads
+      - history-v1-buckets:/buckets
+```
+
+Bạn cũng cần thêm tên BUCKET vào cấu hình `dev.env`:
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+```
+
+### Sử dụng thư mục con
+
+Filestore mặc định dùng useSubdirectories là true, tuy nhiên trong môi trường phát triển, history v1 sẽ **làm phẳng toàn bộ dữ liệu.** Điều này gây ra một số xung đột. Để khắc phục, bạn cần thêm nội dung sau:&#x20;
+
+```dotenv title="develop/dev.env"
+OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
+OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
+NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
+```
+
+Trong history v1, ban đầu tất cả các tệp `project_blobs` được lưu như sau:
+
+```bash wrap
+node@43eb5dac5b1b:/buckets/project_blobs$ ls
+169_609_71360f687c431b9796_5b_889ef3cf71c83a4c027c4e4dc3d1a106b27809  
+94e_655_88cb5cc77ab70c9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+169_609_71360f687c431b9796_a0_e21c740cf81e868f158e30e88985b5ea1d6c19
+94e_655_88cb5cc77ab70c9796_fd_3c0326302e49486d3ea86c833edf9b88320c41
+169_609_71360f687c431b9796_fd_3c0326302e49486d3ea86c833edf9b88320c41 
+
+```
+
+Bạn cần đặt useSubdirectories thành `true` để chuyển sang chế độ thư mục con. Khi đó, ký tự `_` ban đầu trong blob sẽ được thay thế bằng `/`.

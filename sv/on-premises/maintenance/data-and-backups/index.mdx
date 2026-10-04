@@ -1,0 +1,194 @@
+---
+title: Data och säkerhetskopior
+icon: database
+---
+
+Ibland behöver vi ändra dataschemat i databasen i takt med att Overleaf utvecklas, och migreringsskript används för att automatisera den processen. De har först körts på [overleaf.com](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit), som är världens största Overleaf-instans, så de flesta tänkbara situationer har redan inträffat, men vi lämnar inga garantier för dina data. Se till att skapa en **konsekvent** säkerhetskopia av dina data **innan** du uppgraderar din instans.
+
+<Info>
+
+När du uppgraderar till en ny Docker-image körs alla migreringar som **ännu inte** har körts automatiskt. Det kan ta en stund beroende på storleken på din datamängd, och genom att följa loggarna kan du se förloppet. Mer information finns i vår dokumentation om [loggning](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging).
+
+</Info>
+
+### Datalagring
+
+Overleaf Community Edition och Server Pro lagrar sina data på tre separata platser:
+
+* **MongoDB-databasen:** Här finns användar- och projektdata.
+* **Redis:** fungerar som en högpresterande cache för data under bearbetning och lagrar främst information om projektändringar och samarbete.
+* **Overleafs filsystem:** lagrar projektfiler som inte kan redigeras (inklusive bilder) och fungerar även som tillfällig diskcache vid kompilering av projekt.
+
+<Info>
+
+Det kan vara `~/sharelatex_data` eller `~/overleaf_data`, beroende på när din instans konfigurerades.
+
+</Info>
+
+<Check>
+
+För projektfiler och data för fullständig projekthistorik stöder vi även S3-kompatibla lagringsbackends.
+
+</Check>
+
+Se Mappar i detalj för mer information om mappstrukturen på disken.
+
+### Göra en konsekvent säkerhetskopia
+
+Det finns tre lagringsplatser som måste ingå när du gör en konsekvent säkerhetskopia:
+
+* MongoDB
+* Redis
+* Data i Overleafs filsystem
+
+För att få en konsekvent säkerhetskopia är det **obligatoriskt** att hindra användarna från att skapa nya data medan säkerhetskopieringen pågår. Vi rekommenderar därför att du schemalägger ett underhållsfönster då användarna inte kan komma åt instansen eller redigera sina projekt.
+
+Innan du startar säkerhetskopieringen måste du ta instansen offline. Från och med Server Pro `3.5.0` automatiserar avstängningsprocessen stängningen av webbplatsen och frånkopplingen av användare.
+
+För att stänga av instansen kör du `bin/docker-compose stop sharelatex` om du kör en Toolkit-driftsättning, eller `docker compose stop sharelatex` om du kör Docker Compose.
+
+När containern `sharelatex` har stoppats kan du starta säkerhetskopieringen.
+
+När säkerhetskopieringen har slutförts **utan fel** behöver du starta containern `sharelatex`. Det gör du genom att köra `bin/docker-compose start sharelatex` om du kör en Toolkit-driftsättning, eller `docker compose start sharelatex` om du kör Docker Compose.
+
+<Danger>
+
+* Säkerhetskopior bör lagras på en annan server än den som din Overleaf-instans körs på, helst på en helt annan plats.
+* Att replikera databaser till flera MongoDB-instanser kan ge viss redundans, men skyddar inte mot datakorruption.
+* Att testa dina säkerhetskopior är det bästa sättet att säkerställa att de är fullständiga och fungerar.
+
+</Danger>
+
+### MongoDB
+
+MongoDB levereras med ett kommandoradsverktyg som heter [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/) och som kan användas för att säkerhetskopiera användar- och projektdata som lagras i databasen.
+
+### Data i Overleafs filsystem
+
+För Toolkit-driftsättningar anges sökvägen där dina icke-redigerbara filer lagras i `config/overleaf.rc` med miljövariabeln `OVERLEAF_DATA_PATH`, men beroende på när din instans skapades kan den vara `data/sharelatex`.
+
+Du måste använda ett verktyg som **rsync** för att rekursivt kopiera den här katalogen för att säkerställa att en fullständig säkerhetskopia skapas.
+
+### Redis
+
+Redis lagrar användarsessioner och väntande dokumentuppdateringar innan de skrivs till MongoDB.
+
+Persistens med Append Only File (AOF) är den rekommenderade konfigurationen för Redis-persistens.
+
+Toolkit-användare har AOF-persistens aktiverad som standard för **nya** installationer. Befintliga användare hittar mer information om hur AOF aktiveras [här](/sv/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence).
+
+Om du väljer att fortsätta använda RDB-ögonblicksbilder tillsammans med AOF-persistens kan du kopiera RDB-filen till en säker plats som säkerhetskopia.
+
+### Migrera data mellan servrar
+
+I bästa fall har du ännu inga värdefulla data i den nya instansen. Vi har ingen process för att slå samman data från olika instanser.
+
+Om vi antar att den nya instansen ännu inte har några data finns här några steg du kan följa. Översiktligt skapar vi ett tar-arkiv av volymerna `mongo`, `redis` och `overleaf`, kopierar det till den nya servern och packar upp det där igen.
+
+#### Toolkit
+
+```bash
+# Gracefully shutdown the old instance
+old-server$ bin/stop
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar config/ data/
+
+# Copy the backup-old-server.tar file from the old-server to the
+# new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ bin/stop
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv config/ data/ backup-new-server/
+
+# Populate config/data dir again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ bin/up
+```
+
+#### Docker Compose
+
+```bash wrap
+# Gracefully shutdown the old instance
+old-server$ docker stop sharelatex
+old-server$ docker stop mongo redis
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar ~/OVERLEAF_data ~/mongo_data ~/redis_data
+
+# Copy the backup-old-server.tar file from the old-server to
+# the new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ docker stop sharelatex
+new-server$ docker stop mongo redis
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv ~/OVERLEAF_data ~/mongo_data ~/redis_data backup-new-server/
+
+# Populate data dirs again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ docker start mongo redis
+new-server$ docker start sharelatex
+```
+
+Beroende på din **docker-compose.yml**-fil kan du behöva justera sökvägarna för volymerna `mongo`, `redis` och `overleaf`.
+
+<Info>
+
+När tar körs som root-användare (eller med sudo) behåller den filernas ägare/grupp och behörigheter, vilket är avgörande när säkerhetskopian återställs.
+
+</Info>
+
+### Mappar i detalj
+
+<Info>
+
+Följande mappar har ytterligare markeringar:
+
+* (b) ta med i säkerhetskopior, helst när instansen är stoppad för att säkerställa konsekvens
+* (d) kan tas bort
+* (e) tillfälliga filer, kan tas bort när instansen är stoppad
+
+</Info>
+
+1. `~/mongo_data` (b)
+   * datakatalog för mongodb
+2. `~/redis_data` (b)
+   * datakatalog för redis-databasen
+3. `~/overleaf_data`
+   1. bin
+      1. synctex (d)
+         * används inte i senaste versionen; tidigare användes en anpassad synctex-binär (synctex används för källmappning mellan .tex-filer och pdf-filen)
+   2. data
+      1. cache (e)
+         * cache för binärfiler vid kompilering
+      2. compiles (e)
+         * här sker LaTeX-kompileringen
+      3. db.sqlite (d)
+         * används inte i senaste versionen; lagrade tidigare information om clsi-cachen (har antingen flyttats till enkla mappningar i minnet eller så söker vi igenom disken)
+      4. db.sqlite-wal (d)
+         * används inte i senaste versionen, se db.sqlite
+      5. output (e)
+         * lagring av LaTeX-kompileringens utdata för leverans till klienten
+      6. template\_files (b)
+         * förhandsvisningsbilder för mallsystemet (endast Server Pro)
+      7. user\_files (b)
+         * projektens binärfiler
+      8. history (b)
+         * filer för fullständig projekthistorik
+   3. tmp
+      1. dumpFolder (e)
+         * tillfälliga filer från hantering av zip-filer
+      2. uploads (e)
+         * buffring av filuppladdningar (uppladdning av binärfiler/nytt projekt från zip)
+      3. projectHistories (e)
+         * tillfälliga filer för migreringar av fullständig projekthistorik

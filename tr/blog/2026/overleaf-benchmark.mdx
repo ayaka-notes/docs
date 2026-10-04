@@ -1,0 +1,635 @@
+---
+title: "Overleaf Benchmark: Overleaf'te Eşzamanlı LaTeX Derlemesi Üzerine Kapsamlı Bir Araştırma (SaaS ve Kendi Sunucunuzda)"
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Özet
+
+Kendi sunucusunda barındırılan Overleaf kurulumları genellikle tek bir genel kurala göre boyutlandırılır: her beş ila on eşzamanlı kullanıcı için bir CPU çekirdeği ve bir gigabayt bellek. Bu kuralın yalnızca kesinlikten yoksun olmadığını, yapısal olarak yanlış olduğunu gösteriyoruz; çünkü kapasiteyi tek bir kaynak boyutunun belirlediğini varsayar, oysa gerçekte iki bağımsız duvar belirler ve donanımla ilgisi olmayan iki yazılım parametresi sonucu dört kata varan oranlarda domine eder.
+
+Sandbox derleme etkin (TeX Live 2025) standart bir Ayakaleaf Pro v6.2.2 kurulumunu, ana makine çekirdekleri 3.0 GHz'e sabitlenmiş QEMU/KVM konukları içinde 21 CPU/bellek yapılandırmasında ölçüyoruz. İş yükü, birkaç yüze kadar farklı kullanıcı hesabı tarafından aynı anda derlenen gerçek, 63 sayfalık bir XeLaTeX tezidir. 32 GiB konuk belleğinin altında çekirdek sayısının neredeyse önemsiz olduğunu — 16 GiB'de 4, 8 ve 16 vCPU'lu konukların ölçülen kapasitesi %8'den az farklılık gösterir — ve kapasitenin bunun yerine TeX Live ağacı üzerindeki paylaşılan sayfa önbelleğinden kaynaklanan süper doğrusal bir bellek duvarı tarafından belirlendiğini bulduk.
+
+Bu yasaların ölçekte bir mertebelik değişikliğe dayanıp dayanmadığını sormak için taramayı tek bir 64 çekirdekli, 995 GiB'lik sunucuda tekrarlıyoruz. Sunucu, %100 başarıyla 1024 eşzamanlı soğuk derlemeyi — iş parçacığı sayısının sekiz katı — kaldırıyor ve tavanına hiç ulaşmıyoruz. Asıl yararlı sayı o tavan değil, altındaki dirsek noktasıdır: kuyruk gecikmesi $N=256$'ya kadar her ikiye katlamada %20–40 artar, ardından $N=512$'de %190 artar. Bu nedenle "başarısız olmayan en büyük eşzamanlılık" olarak raporlanan kapasite, kullanılabilir çalışma noktasını dört kat abartır. O makinede bellek hiçbir zaman bağlayıcı kaynak değildir; sınır, CPU ile birlikte kapsayıcı daemon'unun yeni sandbox'ları kabul etme hızıdır ve bu hız, kaç derleme istendiğinden bağımsız olarak 200 civarında doyuma ulaşır.
+
+Ayrıca kapasite planlamasında görünmeyen, uygulama düzeyinde iki etki tespit ediyoruz. Birincisi, CLSI hiçbir ortam değişkeniyle açığa çıkarılmayan, koda gömülü 65 eşzamanlı derleme tavanı uygular; bunun ötesinde kullanıcılar kuyruğa alınmak yerine anında HTTP 503 alır. İkincisi, Docker runner'daki kapsayıcı başına bellek sınırı 2018'de eklendiğinden beri hem büyüklüğü hem de yerleşimi nedeniyle etkisizdir; bu yüzden bellek yetersizliği olayı tek bir derlemeyi değil tüm ana makineyi çökertir. Eşzamanlılık tavanını kaldırmak ve varsayılan derleme zaman aşımını 180 sn'den 300 sn'ye çıkarmak, 8 vCPU / 48 GiB'lik bir konuğun ölçülen kapasitesini 64'ten 268 eşzamanlı derlemeye yükseltir — sıfır donanım maliyetiyle 4.2 katlık bir artış.
+
+Son olarak, bu sistemde eşzamanlılığın zaman paylaşımından başka bir şey kazandırmadığını ve iş yükünün yalnızca saat hızıyla sınırlandığını gösteriyoruz. Uydurulan bir bozulma yasası $T(N)=T_1\max(1,N/C)^{b}$, mükemmel orantılı yavaşlamaya yakın olan $b=0.914$ değerini verir ve makinenin tam 1.0–5.5 GHz aralığı üzerindeki bir saat hızı taraması, otuz ölçümü $k=27.9 GHz·s$ ve %5.1'lik kalıntı yayılımla $T=(k/f)\max(1,N/C)$ üzerine toplar. 5.5 kat saat hızı, azalan getiri olmadan 5.5 kat hızlanma sağlar; saat hızı ile çekirdeklerin farklı şeyler kazandırması bu anlamdadır: saat hızı her kullanıcının derlemesini hızlandırır, çekirdekler ise yalnızca daha fazla kullanıcıyı kabul eder.
+
+## 1. Giriş
+
+Overleaf baskın ortak LaTeX editörüdür ve şirket içi dağıtımı, yayımlanmamış el yazmalarını üçüncü taraf bir buluta gönderemeyen üniversiteler ve araştırma grupları tarafından yaygın şekilde kullanılır. Böyle bir kurulumu boyutlandırmak sürekli karşılaşılan pratik bir sorudur: sabit bir donanım bütçesiyle kaç kişi aynı anda gerçekten "Recompile" düğmesine basabilir?
+
+Resmi yönerge doğrusal bir kuraldır — her beş ila on eşzamanlı kullanıcı için kabaca bir çekirdek ve bir gigabayt — ve kapasitenin her iki kaynakta düzgün ve birlikte ölçeklendiğini varsayar. Ölçümlerimiz bununla üç şekilde çelişiyor.
+
+### 1.1 Kapasiteyi bir değil, iki bağımsız duvar belirler
+
+Bir yapılandırma ya bellek tükendiği için başarısız olur — bu durumda Overleaf yığınının kendisi çöker ve HTTP 502 döndürür — ya da derlemeler sunucu tarafındaki zaman aşımını aştığı için başarısız olur — bu durumda gigabaytlarca bellek kullanılmadan dururken CLSI `timedout` bildirir. Bu iki rejimin tamamen farklı ölçeklenme davranışları ve farklı çözümleri vardır. Bellekle sınırlı bir yapılandırmaya çekirdek eklemek yalnızca verimsiz değil, zaman zaman ters etki yaratır: çekirdek sayısını artırmanın kapasiteyi _azalttığı_ yapılandırmalar ölçüyoruz; çünkü daha fazla çekirdek, eşzamanlı derlemelerin aynı adımda ilerlemesine neden olur ve bu yüzden en yüksek bellek talepleri iç içe geçmek yerine çakışır.
+
+### 1.2 Yazılım parametreleri donanımdan daha belirleyicidir
+
+Derleme zaman aşımı, MongoDB'de kullanıcı başına tutulan bir alandır ve 180 sn'lik varsayılan değeri CPU ile sınırlı yapılandırmaları sessizce kısıtlar. Bunu 300 sn'ye çıkarmak, aynı donanımda ölçülen kapasiteyi 4.2 kata kadar artırır. Bundan bağımsız olarak CLSI, koda gömülü bir sabit nedeniyle 65'ten fazla eşzamanlı derlemeyi reddeder. Her ikisini de hesaba katmayan herhangi bir kapasite çalışması — ve herhangi bir kurulum — makineyi değil yazılımı ölçmektedir.
+
+### 1.3 Eşzamanlılık paralellik değil, zaman paylaşımıdır
+
+Bir LaTeX derlemesi tek iş parçacıklı olduğundan, $C$ çekirdek üzerinde $N$ eşzamanlı kullanıcıya hizmet vermek sistemin daha erken bitirmesini sağlamaz; her kullanıcının orantılı olarak daha uzun beklemesine yol açar. Bu nedenle "kaç eşzamanlı kullanıcı destekleniyor" sorusu, bir kullanıcının ne kadar beklemeye razı olduğu belirlenene kadar kötü tanımlıdır. Bu bağımlılığı açık hâle getiriyor ve sayısallaştırıyoruz.
+
+### 1.4 Katkılar
+
+* Saat hızı sabitlenmiş, tekrarlarla doğrulanmış koşullar altında ölçülen ve her yapılandırma için bağlayıcı kısıtın hata imzasından belirlendiği, 21 CPU/bellek yapılandırmasını kapsayan bir kapasite matrisi.
+* İki uydurulmuş model: süper doğrusal bir bellek duvarını CPU tavanından ayıran bir kapasite modeli ve saf zaman paylaşımı davranışını ortaya koyan bir gecikme modeli.
+* Kullanılan sistemdeki, 2018'den beri işlevsiz olan bir kapsayıcı bellek sınırı da dahil olmak üzere iki uygulama sorununun tespiti ve deneysel olarak doğrulanması.
+* Herhangi bir eşzamanlılık rakamıyla birlikte belirtilmesi gerektiğini savunduğumuz derleme zaman aşımı/kapasite ödünleşiminin sayısallaştırılması.
+
+## 2. Arka Plan
+
+### 2.1 Derleme yolu
+
+Bir Overleaf derleme isteği `web` $\rightarrow$ `clsi` $\rightarrow$ bir derleme kapsayıcısı yolunu izler. Sandbox derlemeli bir kurulumda (`SIBLING_CONTAINERS_ENABLED=true`) CLSI `latexmk`'yi süreç içinde çalıştırmaz; bind-mount edilmiş bir soket üzerinden erişilebilen ana makinenin Docker daemon'undan, proje dizini `/compile` konumuna bind-mount edilmiş şekilde bir TeX Live imajından yeni bir kapsayıcı başlatmasını ister. Dolayısıyla bir derleme, tek bir `latexmk` sürecini çalıştıran kısa ömürlü tek bir kapsayıcıdır.
+
+Bunun üç sonucu vardır ve üçü de bu makaledeki ölçümleri şekillendirir. Birincisi, iş birimi tek iş parçacıklı bir süreçtir: XeLaTeX paralelleşmez. İkincisi, derleme başına kaynak yalıtımı Docker runner'ın talep ettiği şeydir — §6.2'de bunun fiilen hiçbir şey talep etmediğini gösteriyoruz. Üçüncüsü, çalışma kümesine belge değil, TeX Live ağacı hâkimdir; bu, her eşzamanlı derlemenin okuduğu ve dolayısıyla ana makine sayfa önbelleği aracılığıyla paylaştığı, kabaca 32 GiB'lik salt okunur bir derlemdir. Gözlemlediğimiz süper doğrusal bellek ölçeklenmesinin kaynağı bu paylaşımdır.
+
+### 2.2 Sandbox derlemelerini etkinleştirme
+
+Topluluk sürümü Overleaf, `latexmk`'yi uygulama kapsayıcısının kendisi içinde çalıştırır. Ayakaleaf Pro ise Overleaf Server Pro gibi her derlemeyi bir _kardeş_ kapsayıcıda çalıştırabilir — bu, uygulama kapsayıcısının içine yerleştirilmek yerine uygulama tarafından _ana makinenin_ Docker daemon'u üzerinde başlatılan bir kapsayıcıdır. Bunu iki toolkit ayarı etkinleştirir:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit, ana makinenin Docker soketini uygulama kapsayıcısına bind-mount eder ve bunları CLSI'nin okuduğu ortama çevirir: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` ve `SANDBOXED_COMPILES_HOST_DIR`; sonuncusu derleme dizininin _ana makinedeki_ yoludur. Bu yol önemlidir: derleme kapsayıcısını başlatan daemon ana makineye ait olduğundan, ona verilen bind mount'un uygulama kapsayıcısının değil ana makinenin ad alanında çözümlenebilir olması gerekir. Server-Pro'nun `config/env.sh` dosyası ayrıca bu modda `TEXLIVE_IMAGE_USER=www-data` ayarını zorunlu kılar; böylece derleme kapsayıcısının yazdığı dosyaların sahipliği tutarlı olur.
+
+Doğrulama doğrudandır: bir derleme sırasında ana makine, TeX Live imajından `latexmk` çalıştıran ve 0 koduyla çıkan `project-{projectId}-{userId}-{hash}` adlı bir kapsayıcı gösterir. Makale boyunca çokluğunu ölçtüğümüz ve kaynak sınırlarının tamamen yokluğunu §6.2'de raporladığımız birim budur.
+
+**Bunun çalışma açısından önemi.**
+
+Kardeş kapsayıcılar ölçümü temiz hâle getirir — her derleme gözlemlenebilir, bağımsız olarak zamanlanan bir işletim sistemi varlığıdır — ancak aynı zamanda derlemeler arasında CPU ve belleği Overleaf'in değil konuk çekirdeğin paylaştırdığı anlamına gelir. Bu nedenle bu makaledeki her ölçeklenme yasası, $N$ adet tek iş parçacıklı sürece uygulanan Linux zamanlayıcısının bir özelliğidir; bu kadar düzenli olmasının nedeni de budur.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Şekil 1.** Topluluk sürümü mikro hizmetleri üzerinden izlenen tek bir derleme isteği. Adımlardaki ayrım kapasite açısından önemlidir: belge metni istek gövdesine kopyalanırken ikili varlıklar referansla iletilir ve `clsi` tarafından çekilir. İkisi de belirleyici değildir — bir projenin derleme maliyetini, her eşzamanlı derlemenin paylaşılan sayfa önbelleği aracılığıyla okuduğu 32 GiB'lik TeX Live ağacı belirler.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Şekil 2.** Üç dağıtım topolojisi ve her birinde örnek başına derleme tavanının nereye düştüğü; üst üste yığılmış paneller replikasyonu gösterir. 65 derlemelik sabit _tek_ bir CLSI'yi korur; bu yüzden SaaS filosu bunu örnek ve bölge sayısıyla çarpar (a), Server Pro ve Ayakaleaf Pro'nun desteklediği yatay ölçekleme ise örnek sayısıyla çarpar (c) — bunun bedeli merkezi MongoDB, Redis ve S3 uyumlu depolama, çerez tabanlı oturum yakınlığına sahip bir yük dengeleyici (derleme çıktısı örneğin yerel diskine yazılır, bu yüzden bir derleme ve ardından gelen PDF indirmesi aynı örneğe düşmelidir) ve tekil bir `git-bridge`'dir. Ölçtüğümüz toolkit varsayılanının (b) çarpanı birdir; bu yüzden bir filonun tek bir üyesi için boyutlandırılmış bir sabit, tüm kurulumun tavanı hâline gelir.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Şekil 3.** `clsi-cache` içinde shard seçimi. Bir proje $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$ ile eşlenir; yani hash uzayı shard sayısı kadar eşit dilime bölünür. Bu, halka tabanlı tutarlı hashleme değil _modulo_ hashlemedir: filoyu üç shard'dan dörde büyütmek tüm uzayı yeniden bölümler ve neredeyse her projeyi yeniden eşler (a, b). Uygulamanın, tutarlı hashleme halkasının sağlayacağı $K/n$ taşıma yerine, projelerin doğrusal olarak artan bir bölümünü bir zaman penceresi boyunca `currentShards`'dan `desiredShards`'a taşıyan açık bir çevrimiçi yeniden shard'lama rampasına ihtiyaç duymasının nedeni tam olarak budur. Bir shard'ın devre kesicisi tetiklendiğinde $i$ tuzu artırılır ve shard aday listesinden çıkarılır; böylece arama başarısız olmak yerine sonrakileri yoklamaya devam eder (c).
+
+### 2.3 İki hata modu
+
+Ölçtüğümüz her yapılandırma tam olarak iki yoldan biriyle başarısız olur ve bu ayrım çıkarım yoluyla değil, yanıt durumunda doğrudan görülür:
+
+* **Bellek tükenmesi** — Overleaf yığınının kendisi yanıt vermez hâle gelir ve istek **HTTP 502** döndürür. Başarısız olunan seviyede kullanılabilir konuk belleği genellikle 500 MiB'nin altındadır.
+* **Derleme zaman aşımı** — CLSI derlemeyi kullanıcı başına zaman aşımında sonlandırır ve `timedout` durumunu bildirir. Başarısız olunan seviyede kullanılabilir bellek çoğu zaman birkaç gigabayttır.
+
+Her yapılandırmayı kaynak oranlarına dayalı bir sezgisel yöntemle değil bu imzayla sınıflandırıyoruz; bu da "hangi duvara çarptık" sorusunu doğrudan verilerden yanıtlanabilir kılar.
+
+## 3. Yöntem
+
+### 3.1 Test ortamı ve saat hızı kontrolü
+
+Tüm konuklar, 62 GiB RAM ve NVMe depolamaya sahip tek bir Intel Core i9-14900K ana makinesinde QEMU/KVM altında çalışır. Konuk, Docker 29.7 içeren Ubuntu 24.04'tür ve Overleaf Toolkit, `texlive-full:2025.1` ile sandbox derlemeli Ayakaleaf Pro v6.2.2'yi dağıtır.
+
+Sıradan bir masaüstü CPU'su, saat hızı kontrol edilmedikçe bir sunucunun yerine kötü bir vekildir. KVM sanal saat hızı ayarlamak için hiçbir mekanizma sunmaz: bir vCPU bir ana makine iş parçacığıdır ve ana makine çekirdeği hangi frekansta çalışıyorsa o frekansta çalışır. Bu nedenle ana makineyi doğrudan kısıtlıyoruz: turbo'yu devre dışı bırakıp her çekirdekte `scaling_max_freq` değerini 3.0 GHz'e sabitliyoruz ve konuğun vCPU'larını `taskset` ile fiziksel P-çekirdeklerine bağlıyoruz. Bu ayrım hibrit çekirdekli bir CPU'da önemlidir: bu modelin E-çekirdeklerinin temel saat hızı 2.4 GHz'dir ve turbo devre dışı bırakıldığında 3.0 GHz'e _ulaşamaz_; bu yüzden bunlara kayan bir çalıştırma sessizce daha yavaş bir makineyi ölçer. Tam yük altında, sabitlenmiş on altı iş parçacığının tamamında tam olarak 3000 MHz doğruluyoruz. Bir koruma betiği her kıyaslamadan önce bu değişmezi denetler, aksi hâlde başlamayı reddeder; çalışma sırasında governor'ın bir kez sessizce sıfırlanmasını yakaladı.
+
+### 3.2 İkinci test ortamı: tek bir büyük runner
+
+QEMU matrisi her seferinde bir değişkeni yalıtır, ancak sabitlenmiş on altı iş parçacığında sınırına ulaşır. Aynı yasaların bir mertebe yukarıda da geçerli olup olmadığını sormak için eşzamanlılık taramasını tek bir büyük sunucuda tekrarladık: 995 GiB RAM'e sahip, aynı `texlive-full:2025.1` ile aynı Ayakaleaf Pro v6.2.2 imajını çalıştıran bir AMD EPYC 7773X (Milan-X, 64 çekirdek / 128 iş parçacığı, 768 MiB L3). QEMU konuklarının aksine bu makinenin saat hızı sabitlenmemiştir: üretim sınıfı bir sunucudur ve onu öyle ölçüyoruz.
+
+İki operasyonel önlem gerekliydi ve belirtilmeye değer; çünkü bunlar olmadan deney sunucuyu değil test düzeneğini ölçer. Birincisi, her kapsayıcı `MemoryMax=940 GiB` içeren bir `systemd` dilimiyle sınırlandırıldı; böylece kontrolden çıkan bir tarama ana makineyi değil bir cgroup'u tüketir. İkincisi, sandbox derlemeleri ana makine daemon'u tarafından oluşturulur ve her biri kendi copy-on-write katmanını kirletir — 20.6 GiB'lik temel imaj paylaşılsa bile kapsayıcı başına 116 MiB ölçülmüştür — bu yüzden Docker veri kökü ayrılmış bir NVMe cihazına taşındı. $N=1024$'teki bir tarama yaklaşık 119 GiB geçici katman yazar; bu, standart bir kök dosya sistemine sığmaz.
+
+### 3.3 İş yükü
+
+Belge, `latexmk` aracılığıyla XeLaTeX ile derlenen, TikZ şekilleri, `biblatex` kaynakça işleme ve gömülü PDF varlıkları içeren gerçek, 63 sayfalık bir yüksek lisans tezidir (SJTU şablonu) — yani yapay değil gerçekçi bir yüktür. Yük altında olmayan bir konukta tek bir derleme tüm yapılandırmalarda 8.6–9.8 sn sürer; bunu serbest akış taban çizgisi $T_1$ olarak kullanıyoruz.
+
+### 3.4 Yük oluşturma
+
+512 gerçek kullanıcı hesabı oluşturuyor ve her birine projenin kendi kopyasını veriyoruz; böylece eşzamanlı derlemeler bir proje kilidini paylaşmak yerine tam olarak bağımsız kullanıcılar gibi rekabet eder. İstekler, ana makineden konuğun yönlendirilmiş portuna gönderilir; böylece yük oluşturma konuk CPU'su tüketmez.
+
+Eşzamanlılık kademeli değil, _aynı andadır_. Önce her oturum kurulur — giriş, CSRF belirteci, derleyici seçimi — ve ancak ondan sonra her iş parçacığı, `POST /project/:id/compile` isteğini göndermeden önce bir kez hesaplanıp paylaşılan ortak bir duvar saati anına kadar uyur. Bu ayrım bilgiçlik değildir. Kademeli bir artış, kararlı bir kuyruk altında verimi ölçer; aynı anda gelen bir patlama ise bir amfi dolusu öğrencinin aynı son teslim duyurusunun ardından aynı düğmeye bastığında ne olduğunu ölçer — operatörlerin gerçekten korktuğu durum budur. İkisi sabit bir faktörden fazlasıyla farklıdır, çünkü ikincisi derleme kuyruğunu daemon'un boşaltabileceğinden daha hızlı doldurur.
+
+Bu patlamanın sadakatle iletilebilmesi için dört pratik engelin kaldırılması gerekiyordu. Her biri kayda değerdir, çünkü her biri deneyi sessizce sunucunun değil test düzeneğinin ölçümüne dönüştürür.
+
+#### 3.4.1 Bir değil, iki hız sınırlayıcı
+
+Overleaf, girişleri kaynak adres başına sınırlar — dakikada 20 deneme — ve tüm trafiğimiz tek bir ana makineden çıkar. Her simüle kullanıcıya ayrı bir `X-Forwarded-For` adresi atamak bu sınırı kaldırır, ancak hemen ikinci, daha kaba bir sınıra takılır: dakikada kabaca 200'lük alt ağ başına bir bütçe. Bu nedenle kullanıcıları bitişik bir bloğa yaymak 201. hesapta başarısız olur. Bunun yerine sentetik adresi kullanıcı indeksinden türetiyoruz; böylece ardışık kullanıcılar farklı `/24`'lere düşer,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+bu da 1024'lük tam popülasyon için her iki sınırlayıcıyı da gevşek tutar.
+
+#### 3.4.2 Eklenen başlık varsayılan olarak yok sayılır
+
+Başlığı ayarlamak yeterli değildir. Express, `X-Forwarded-For` başlığını yalnızca güvenmesi söylenen eşler için dikkate alır ve Overleaf'in `trustedProxyIps` varsayılanı `loopback`'tir. Yük üreticisi uygulamaya loopback arayüzü yerine kapsayıcının köprüsü üzerinden ulaştığı için başlık ayrıştırılır ve ardından atılır; her simüle kullanıcı yeniden tek bir adrese çöker. Belirti, tam olarak yirminci girişte bir `HTTP 429` dalgasıdır ve bu kolayca sunucu aşırı yükü olarak yanlış yorumlanabilir. Ağ geçidi ağı güven zincirine açıkça eklenmelidir; §4.3'teki kümelenmiş kurulumda pod ve service CIDR'ları da eklenmelidir.
+
+#### 3.4.3 Bir yük dengeleyici, korumasını istediğiniz başlığın üzerine yazar
+
+Örnek bir proxy'nin arkasında olduğunda, geleneksel `option forwardfor` gerçek istemci adresini zincire _ekler_; bu üretim için doğru davranıştır ve burada tam olarak yanlıştır: sentetik adres, yük üreticisinin kendi adresiyle yer değiştirir. Yönerge `option forwardfor if-none` olarak nitelenmelidir; böylece proxy yalnızca istemci hiçbir değer sağlamadığında bir değer ekler.
+
+#### 3.4.4 İstemcinin dosya tanımlayıcıları, sunucunun kapasitesi bitmeden tükenir
+
+$N=1024$'te üretici binden fazla eşzamanlı soket tutar ve 1024 tanımlayıcılık varsayılan yumuşak sınıra ölçüm sırasında değil oturum kurulumu sırasında ulaşılır. Hata sessizdir: üç oturum kurulamaz ve çalıştırma 1024 yerine 1021 raporlar; kapsayıcı sayıları için kabuk komutu çalıştıran bir örnekleme iş parçacığı ise `EMFILE` ile ölür ve telemetriyi sessizce keser. Yumuşak sınır üreticide yükseltilmeli — ana makinemizdeki katı sınır zaten 1048576'ydı — ve çalıştırma tekrarlanmalıdır. Her iki çalıştırmayı da §4.3'te raporluyoruz: düzeltilmiş olan 1024'ün 1024'ünü, kesilmiş olanın 1.2 sn yakınında bir medyanla tamamlar; ilkini kullanılabilir ama yetkili olmayan bir sonuç olarak görmemizin nedeni budur.
+
+### 3.5 Ölçüm protokolü
+
+Tekrarlanabilirlik için birkaç yöntemsel seçimin gerekli olduğu ortaya çıktı.
+
+#### 3.5.1 Isınma
+
+Yeni başlatılmış bir konukta sayfa önbelleği boştur ve ilk derlemeler kararlı durum kapasitesini değil soğuk başlangıç G/Ç'sini ölçer: aynı 2 vCPU / 2 GiB yapılandırması soğukta 36.5 sn, sıcakta 9.8 sn verir; 3.7 katlık bir fark. Bu nedenle her yapılandırma, açılıştan sonra sonuçları atılan iki tekli derleme ısınması gerçekleştirir.
+
+#### 3.5.2 Geçme ölçütü
+
+Bir eşzamanlılık seviyesi yalnızca _her_ derleme başarılı olursa ve seviye bir tekrarda da başarılı olursa geçer. Bu, bir başarı oranı eşiğinden daha katıdır ve önemlidir: 4 vCPU / 16 GiB'de 32 seviyesi bir kez 80.2 sn medyanla geçti, ardından tekrarlandığında 32 derlemenin tamamında zaman aşımına uğradı; bu yüzden 31 raporluyoruz.
+
+#### 3.5.3 Arama
+
+Seviyeler, model tarafından tahmin edilen bir başlangıç değerinden üstel aralıklama ve ardından tam sayı ikiye bölme ile bulunur. Ölçüt ya hep ya hiç olduğundan bir seviye ilk başarısızlığıyla kesinleşir; bu yüzden biri başarısız olduğunda kalan uçuştaki istekleri bırakırız — küçük seviyeler hariç; orada bırakılan derlemeler küçük bir konuğu o kadar kötü kilitler ki konuk hiç toparlanamaz.
+
+#### 3.5.4 Seviyeler arasında yalıtım
+
+Bir sonraki seviye başlamadan önce derleme kapsayıcıları boşaltılır ve web uygulaması yeniden yanıt verene kadar yoklanır. Bu olmadan, bir çökmeyi izleyen seviye sahte bir sıfır oturumlu başarısızlık kaydeder.
+
+#### 3.5.5 Ana makine hijyeni
+
+Ana makinedeki ilgisiz sanal makineler kapatıldı: 24 GiB ana makine belleği başka yerlere ayrılmışken, aynı konuk yapılandırması aynı eşzamanlılıkta 3.2 yerine 11.7 yük ortalaması bildirdi. Ana makine bellek baskısı konuğa yayılır ve ölçümü geçersiz kılar.
+
+## 4. Sonuçlar
+
+### 4.1 Kapasite matrisi
+
+Tablo 1 ve Şekil 4 her yapılandırma için ölçülen tavanı verir. Bir satırı soldan sağa okumak ilk sürprizdir. 4 GiB'de 2, 4 ve 8 vCPU'lu konukların hepsi tam olarak 9'a ulaşır — çekirdekleri dört katına çıkarmak hiçbir şeyi değiştirmez. 16 GiB'de 54, 45 ve 57'ye ulaşırlar: 4'ten 16 çekirdeğe geçmek %6 kazandırır ve 8 çekirdekli konuk aslında 4 çekirdekli olandan _daha kötüdür_ (§5.2). Çekirdek sayısı yapılandırmaları ancak 48 GiB'de belirgin şekilde ayırır: 143, 268 ve 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Şekil 4.** Yapılandırma matrisi genelinde ölçülen kapasite. (a) Her yapılandırma, belleğe göre gruplanmış ve çekirdek sayısına göre renklendirilmiş bir çubuk olarak; dolu çubuklar bellekle sınırlıdır (konuk bellek tükenerek ölür), taralı çubuklar CPU ile sınırlıdır (derlemeler bellek artarken zaman aşımına uğrar). Bir grubu soldan sağa okumak, 16 GiB'nin altında çekirdek sayısının ne kadar az kazandırdığını gösterir; gruplar arasında okumak bellekteki süper doğrusal getiriyi gösterir. (b) Aynı noktalar uydurulmuş $N_{\max}=\min(0.69R^{1.60},\,26.4C)$ modeline karşı; kesikli çizgi bellek duvarı, noktalı yataylar ise çekirdek sayısı başına CPU tavanlarıdır. Bir yapılandırma, ikisinden hangisiyle önce karşılaşırsa onunla sınırlıdır.
+
+Bir sütunu yukarıdan aşağı okumak ikincisidir: sabit çekirdeklerde kapasite, §5.1'de açıklanan sayfa önbelleği nedeniyle bellekle birlikte süper doğrusal olarak, kabaca $R^{1.6}$ şeklinde büyür.
+
+| bellek | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Tablo 1.** Başarıyla tamamlanan en fazla eşzamanlı derleme sayısı; 300 sn derleme zaman aşımıyla ve CLSI eşzamanlılık tavanı kaldırılmış olarak ölçülmüştür. **Kalın**, CPU ile sınırlı bir yapılandırmayı işaret eder (derlemeler bellek artarken zaman aşımına uğrar); geri kalanlar bellekle sınırlıdır (yığın HTTP 502 ile ölür). 2 GiB satırı §5.2'de tartışılan düzeltmeyi içerir.
+
+### 4.2 Eşzamanlılık zaman paylaşımıdır
+
+Şekil 5, sabit bir 8 vCPU / 16 GiB konukta her eşzamanlılık seviyesini tarar. İki rejim, tam olarak çekirdek başına bir derlemede keskin bir dirsekle ayrılır. Bunun altında ortalama derleme süresi düzdür — $N=1$'de 8.7 sn'den $N=C=8$'de 9.1 sn'ye çıkar, %5'lik bir değişim. Bunun üstünde süre $N/C$ ile kesin orantılı olarak büyür: $N=16,24$'te 18.5 sn ve 27.1 sn ölçüyoruz; yani ideal $1:2:3$'e karşı $1:2.13:3.12$ oranı.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Şekil 5.** Sabit donanımda eşzamanlılığa karşı derleme gecikmesi. Dirsek $N=C$'dedir; bunun ötesinde ölçülen yavaşlama $N/C$'yi %5–7 içinde izler. On beş seviyenin tamamı eksiksiz başarılı oldu.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Şekil 6.** Çeşitli yapılandırmalar için eşzamanlılığa karşı derleme gecikmesi. Her panel donanımı sabit tutar ve sunulan yükü tarar; dikey çizgi $N=C$'yi işaretler. Eğriler bunun solunda düz, sağında $N/C$ ile doğrusaldır; bu, rekabetin değil zaman paylaşımının imzasıdır: iş daha pahalı hâle gelmez, yalnızca sırasını bekler.
+
+Çalışmadaki tüm başarılı ölçümler üzerinde $T(N)=T_1\max(1,N/C)^{b}$ uydurmak $b=0.914$ verir ($R^2_{\log}=0.904$, $n=81$). Birden ayırt edilemeyen bir üs, bir derlemenin tek iş parçacıklı, CPU ile sınırlı bir iş birimi olduğunun ve eşzamanlılığın çekirdekleri bölmenin ötesinde ne yardımcı olduğunun ne de zarar verdiğinin nicel ifadesidir. Kapasite planlaması için pratik sonuç rahatsız edicidir: bir yapılandırma, her birini orantılı olarak daha uzun bekletirken _başarısız olmadan_ keyfi sayıda kullanıcıyı kaldırabilir. Bu konukta $N=56$'da tüm derlemeler hâlâ başarılıdır, ancak her kullanıcı 8.7 sn yerine 64.8 sn bekler.
+
+### 4.3 1024 eşzamanlı derlemeye dikey ölçekleme
+
+Tablo 2 ve Şekil 7, büyük runner üzerindeki taramayı raporlar. Her seviye _soğuk_ bir derlemedir: her seviyeden önce, katılan her projenin derleme dizinini ve CLSI önbelleğini `DELETE /project/:id/output` ile temizleriz; böylece hiçbir seviye altındaki seviyenin yaptığı işten yararlanmaz. Bu makinedeki tekli derleme taban çizgisi 28.8 sn'dir; bu soğuk değerdir ve daha önce kullanılan 8.6–9.8 sn'lik kararlı durum taban çizgisiyle karşılaştırılmamalıdır. QEMU konuklarındaki soğuk taban çizgisi 28.3 sn'dir; dolayısıyla bu iş yükü için iş parçacığı başına iki makine birbirinin yüzde iki yakınındadır.
+
+| $N$ |   başarı | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | tepe kaps. |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tablo 2.** Tek bir EPYC 7773X (64 çekirdek / 128 iş parçacığı, 995 GiB) üzerinde eşzamanlılık taraması. Tüm seviyeler soğuk; taban çizgisi 28.8 sn. Tepe kapsayıcı sayısı, aynı anda canlı olan en fazla sandbox sayısıdır.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Şekil 7.** Tek bir büyük runner üzerinde dikey ölçekleme. (a) Sunulan eşzamanlılığa karşı gecikme; gölgeli bölge dirseğin ötesindeki rejimi işaretler. (b) Gerçekte canlı olan sandbox sayısı hiçbir zaman istenen sayıyı izlemez — 200 civarında doyuma ulaşır — derleme cgroup'u ise sınırının beşte birinden fazlasını hiç kullanmaz.
+
+#### 4.3.1 Makine hiç başarısız olmaz
+
+$N=1024$ — iş parçacığı sayısının sekiz katı — dahil her seviye %100 tamamlanır. Bu makinenin kapasite tavanını bulamadık; makinenin payı bitmeden bizim sabrımız bitti. Bu, çalışmada bağlayıcı kısıtın bellek olmadığı ilk yapılandırmadır: $N=1024$'te derleme cgroup'u 940 GiB'lik sınırının beşte biri olan 184 GiB'de tepe yaparken CPU 166 yük ortalamasıyla %100 kullanımda kalır.
+
+#### 4.3.2 Kabul hızı sınırlı olduğu için bozulma doğrusal altıdır
+
+Basit zaman paylaşımı, iş parçacıklarının $8\times$'inin gecikmenin $8\times$'ine mal olacağını öngörür. Ölçülen maliyet tekli derlemeye göre $9.7\times$'tir, ancak $N=128$'e göre yalnızca $3.8\times$'tir — sunulan yükte sekiz katlık bir artış için. Nedeni Şekil 7(b)'de ve Tablo 2'nin son sütununda görülür: 1024 istek aynı anda gönderilse de gerçekte canlı olan sandbox sayısı hiçbir zaman 205'i aşmaz. Daemon, istemcilerin istediği hızda kapsayıcı oluşturamaz; bu yüzden istekler CPU içinde rekabet etmek yerine kabulde kuyruğa girer. Burada kuyruğu kurtaran kuyruklamadır ve bunu tesadüfen yapar.
+
+#### 4.3.3 Dirsek başarısızlık noktasında değil, 512'dedir
+
+$N=256$ ile $N=512$ arasında $p_{95}$ gecikmesi yükün iki katına çıkması için $2.9\times$ artar; önceki her ikiye katlama $1.2\times$ ile $1.4\times$ arasında maliyet getirmişti. "Başarısız olmayan en büyük $N$" olarak ifade edilen kapasite 1024 raporlar ve bir operatör için işe yaramaz olur: o noktada kuyruk bekleme süresi yaklaşık sekiz dakikadır.
+
+### 4.4 Derleme süresi saat hızıyla ters orantılıdır
+
+İş yükü CPU ile sınırlı olduğundan maliyeti $1/f$ olarak ölçeklenmelidir. Bunu, başka hiçbir şeyi değişmemiş bir konukta ana makinenin saat hızını makinenin tüm aralığı boyunca, on adımda 1.0–5.5 GHz arasında tarayarak doğrudan test ediyoruz (Şekil 8). Tekli derleme süresi 26.5 sn'den 4.8 sn'ye iner: 5.5 kat saat hızı, aralığın hiçbir yerinde azalan getiri olmadan 5.5 kat hızlanma sağlar. $T\!\cdot\!f$ çarpımı on saat hızının tamamında %2 içinde sabittir.
+
+Çekirdek payına göre normalleştirme, otuz ölçümün tamamını — on saat hızında üç eşzamanlılık seviyesi — tek bir sabite toplar:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+saat hızının kendisinin 5.5 kat değiştiği bir aralıkta %5.1'lik kalıntı yayılımla. Herhangi bir eğriliğin olmaması başlı başına sonuçtur: iş yükü bellek bant genişliği veya G/Ç ile sınırlı olsaydı, CPU diğer kaynağı geride bıraktıkça $T$ yüksek saat hızında düzleşirdi.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Şekil 8.** Saat hızı taraması. (a) Uydurulmuş hiperbolle $T=k/f$. (b) $\max(1,N/C)$'ye bölündükten sonra tüm noktalar tek bir sabite toplanır ve Denklem (1)'i doğrular.
+
+Denklem (1)'in, ifade etmesi kolay ve yanlış anlaşılması da kolay doğrudan bir satın alma sonucu vardır: _saat hızı her bir kullanıcının deneyimini iyileştirir, çekirdek sayısı ise yalnızca daha fazlasını kabul eder_. %20 daha yüksek saat hızına sahip bir makine herkes için %20 daha hızlı derler ve azalan getiri yoktur; iki kat çekirdek ise hiç kimsenin derlemesini hızlandırmaz.
+
+## 5. Analiz
+
+### 5.1 Ayrı ayrı uydurulan iki duvar
+
+Her yapılandırma hata imzasına göre sınıflandırılır (§2.3); ardından bellek duvarı ve CPU tavanı yalnızca bunlara gerçekten çarpan yapılandırmalar üzerinde uydurulur:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+burada $R$ gibibayt, $C$ ise vCPU cinsindendir.
+
+Bellek duvarı üssü tutarlı biçimde süper doğrusaldır, $p>1$: ek bir eşzamanlı derlemenin marjinal bellek maliyeti toplam bellek büyüdükçe _düşer_; 3 GiB'lik bir konukta derleme başına kabaca 312 MiB'den 32 GiB'lik bir konukta yaklaşık 194 MiB'ye. Mekanizma, §2.1'de açıklanan TeX Live ağacı üzerindeki paylaşılan sayfa önbelleğidir: eşzamanlı derlemeler örtüşen yazı tipi ve makro dosyalarını okur; bu yüzden daha büyük bir önbellek daha fazla derlemeye yayılarak amorti edilir. Basit "beş kullanıcı başına bir gigabayt" kuralının büyük makineleri olduğundan düşük, küçük makineleri ise olduğundan yüksek tahmin etmesinin nedeni budur.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Şekil 9.** Aynı verilerin $(C,R)$ düzlemi üzerinde iki yüzey olarak gösterimi. (a) Kapasite: uydurulan yüzey bir düzlem değil, bir sırttır — bellekle dik biçimde yükselir ve bellek bağlayıcı olmayı bırakana kadar çekirdek ekseni boyunca neredeyse düzdür; çekirdek sayısının yapılandırmaları ayırdığı tek satırın 48 GiB satırı olmasının nedeni budur. (b) Her yapılandırma için eşzamanlılığa karşı gecikme; uydurulan $T=12.6\,(N/C)^{0.91}$ kesikli, 180 sn zaman aşımı ise bir düzlem olarak çizilmiştir. Bir yapılandırma, düz eğrisinin bu düzlemi deldiği yerde başarısız olur; bu da zaman aşımı ayarının raporlanan kapasiteyi ne kadar doğrudan belirlediğini görünür kılar.
+
+### 5.2 Daha fazla çekirdeğin durumu kötüleştirdiği yerler
+
+Denklem (2) iki terimin minimumudur ve bu nedenle $C$'de monotondur, ancak ölçümler öyle değildir. Çekirdek eklemenin kapasiteyi _azalttığı_ iki tersine dönme gözlemliyoruz: 16 GiB'de (54'e karşı 45) ve 32 GiB'de (145'e karşı 135). Her ikisi de bellekle sınırlı rejimde gerçekleşir ve mekanizma her birinde aynıdır: daha fazla çekirdekle eşzamanlı derlemeler aynı adımda ilerler ve en yüksek yerleşik boyutlarına aynı anda ulaşır; daha az çekirdekle ise zamanlayıcı onları iç içe geçirir ve tepeler kademelenir. Bellek payı zaten sınırda olan bir konukta onu hayatta tutan bu kademelenmedir. Ortalama kaynak kullanımı üzerine kurulu bir kapasite modeli bunu ifade edemez; bu, tepelerin _çakışmasının_ bir özelliğidir.
+
+2 GiB'deki üçüncü görünür tersine dönmeyi artık hesaba katmıyoruz. Arama 2 vCPU'da kapasiteyi 2, 4 ve 8 vCPU'da ise 1 olarak kaydeder; bu aynı etki gibi okunur. Ham taramaları yeniden incelemek daha basit bir şey gösterir: 2 GiB'de $N=2$ seviyesi üç çekirdek sayısının hepsinde ilk denemede başarılı oldu, ardından üçünün ikisinde doğrulama çalıştırmasında başarısız oldu. Seviye bir kapasite değil yazı turadır ve 2 vCPU girdisi şans eseri tutan atıştır. Bu nedenle üç çekirdek sayısının hepsinde tekrarlanabilir değer olan 1'i raporluyoruz ve farktan hiçbir sonuç çıkarmıyoruz. Tabloyu sessizce yeniden düzenlemek yerine düzeltmeyi burada kaydediyoruz; çünkü atılan okuma, ilginç bir iddiayı destekleyebilecek türdendi.
+
+## 6. Uygulama bulguları
+
+### 6.1 Koda gömülü bir eşzamanlılık tavanı
+
+Yeterince büyük konuklarda kapasite, istenen eşzamanlılıktan bağımsız olarak tam olarak 65 eşzamanlı derlemede durdu: $N=66,80,96,128$'de $65$ başarı ve $1,15,31,63$ anında `unavailable` yanıtı ölçtük; kapsayıcı sayısı 65'e sabitlenmiş, birkaç gigabayt bellek kullanılmamış ve medyan derleme süresi 77 sn'de sabitti — herhangi bir zaman aşımının çok altında.
+
+Nedeni CLSI'deki bir sabittir:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+Karşılaştırma katı değildir, bu yüzden etkin tavan $64+1=65$'tir ve ölçümle tam olarak eşleşir. Fazla istekler **HTTP 503** alır — kuyruğa alınmaz, _reddedilir_; dolayısıyla kullanıcı açısından derleme düğmesi basitçe başarısız olur. Aynı dosyadaki diğer tüm ayarlanabilir değerlerin aksine bu değer hiçbir ortam değişkenini okumaz; upstream'de Ağustos 2024'te eklenmiştir ve yalnızca imaj değiştirilerek değiştirilebilir. Sınır yükseltildiğinde, $N=80$'de `success=65, unavailable=15` bildiren aynı 16 vCPU / 32 GiB konuk bunun yerine `success=80` bildirdi.
+
+### 6.2 İşlevsiz bir kapsayıcı bellek sınırı
+
+Canlı bir derleme kapsayıcısını incelemek hiçbir kaynak yalıtımı olmadığını gösterir:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Herhangi bir CPU kotasının olmaması tasarım gereğidir ve §4.2'deki zaman paylaşımı üssünün neden bu kadar temiz olduğunu açıklar: derlemeler arasındaki rekabeti hiçbir şey bozmaz. Ancak bir _bellek_ sınırının olmaması tasarım gereği değildir. Docker runner bir sınır talep eder:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+Bu iki açıdan yanlıştır. Yorum $1024^3$'ü amaçlarken değer $1024^4=1 tebiB$'dir; ve alan, Docker API'nin beklediği `HostConfig` içine değil oluşturma seçeneklerinin en üst düzeyine yerleştirilmiştir, bu yüzden atılır — gözlemlenen `Memory=0` bunu doğrular. Her iki hata da dosyayı ekleyen commit'te (`9a519f0d3d`, Mart 2018) mevcuttur ve CoffeeScript'ten dönüştürme, depo genelinde yeniden biçimlendirme ve CJS'den ESM'ye geçişten sağ çıkmıştır; bunların hiçbiri anlamı yeniden ele almaz. Dikkat çekici şekilde aynı commit'teki `MAX_OUTPUT = 1024 * 1024 // 1MB` doğrudur; bu da bir yanlış anlamadan çok bir dikkatsizliğe işaret eder.
+
+Sonuç, düşük bellekli ölçümlerimizde görülür. Derlemeler sınırsız olduğundan bellek tükenmesi, Docker'ın sorunlu tek bir kapsayıcıyı sonlandırması şeklinde ortaya çıkmaz; tüm konuğu çökertir. 2 vCPU / 2 GiB yapılandırmasında izleme SSH oturumunun 300 sn boyunca bloke olduğunu, iki çekirdekte 68 yük ortalamasını ve konuğun sonunda kendini yeniden başlattığını gözlemledik. İşlevsel bir kapsayıcı başına sınır çok daha zarif bir bozulma sağlardı: aşırı büyük derleme başarısız olur ve hizmet ayakta kalırdı.
+
+Gerçekten etkili olan tek sınır, $\text{timeout}+5$ saniyeye ayarlanan `RLIMIT_CPU`'dur. Duvar saati süresini değil _CPU_ süresini sınırlar ve tek bir derleme yalnızca yaklaşık 9 sn CPU tüketir; bu yüzden hiçbir eşzamanlılıkta bağlayıcı olmaz; kontrolden çıkan bir makro gibi patolojik girdilere karşı koruma sağlar. Bununla birlikte yararlı bir göstergedir: `Soft:305` gözlemlemek, 300 sn'lik zaman aşımı ayarının kapsayıcıya gerçekten yayıldığını doğrular.
+
+### 6.3 Derleme zaman aşımı en belirleyici ayardır
+
+Kullanıcı başına `features.compileTimeout` alanının varsayılan değeri 180 sn'dir. CPU ile sınırlı herhangi bir yapılandırma için bu bir güvenlik payı değil bir kapasite ayarıdır; çünkü hâlâ doğru şekilde hesaplama yapan bir makine başarısız ilan edilir. Bunu 300 sn'ye çıkarmak — tek bir MongoDB güncellemesi — ölçülen kapasiteyi 4.2 kata kadar değiştirir (Tablo 3). Tavan, `RequestParser.MAX_TIMEOUT` tarafından uygulanan 600 sn'dir; bunun üzerindeki değer sessizce kesilir.
+
+| Yapılandırma     | 180 s | 300 s |          Oran | Bağlayıcı kısıt       |
+| ---------------- | ----: | ----: | -------------: | --------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB boş       |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB boş       |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                   |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                   |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                   |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | sırada bellek duvarı  |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | bellek                |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | bellek                |
+
+**Tablo 3.** Derleme zaman aşımının ölçülen kapasite üzerindeki etkisi.
+
+Son iki satır sonucun sezgiye aykırı yarısıdır ve her yapılandırmayı tek bir zaman aşımı altında yeniden ölçmemizin nedenidir. _Bellekle_ sınırlı yapılandırmalarda daha uzun bir zaman aşımı kapasiteyi _azaltır_; çünkü her derleme yerleşik kümesini daha uzun süre tutar ve daha fazlası örtüşür. Bu nedenle bir kapasite rakamı, hangi zaman aşımı altında ölçüldüğü belirtilmeden anlamsızdır ve ikisi tek bir tabloda karıştırılamaz.
+
+## 7. İlgili çalışmalar
+
+### 7.1 Üretici yönergeleri
+
+Overleaf'in kendi donanım dokümantasyonu burada sayısallaştırdığımız niteliksel olguları belirtir: LaTeX'in tek iş parçacıklı olduğunu, bu nedenle derleme süresini tek çekirdek performansının belirlediğini ve "daha fazla çekirdeğin yalnızca boş CPU çekirdeği sayınızdan daha fazla belge derlemeye çalışıyorsanız yardımcı olacağını" \[1]. Ardından bu çalışmayı motive eden doğrusal boyutlandırma kuralını verir — 2 çekirdek/3 GiB'lik bir temel ve her beş ila on eşzamanlı kullanıcı için bir çekirdek ve bir gigabayt. Katkımız bu ifadeleri ölçülmüş yasalara (Denklem (1) ve (2)) dönüştürmek ve doğrusal kuralın nerede bozulduğunu göstermektir: bellek duvarını süper doğrusal yapan paylaşılan sayfa önbelleği için bir terimi ve sonuca hâkim olan iki yazılım parametresi için bir terimi yoktur.
+
+### 7.2 Derleme ve CI kapasite çalışmaları
+
+Derleme sistemlerinin eşzamanlılık altında ölçülmesi, LaTeX bağlamı dışında köklü bir alandır. LightSys, Docker kapsayıcıları içinde derleme yapan geleneksel CI sistemlerinin pull request geliş hızı arttıkça G/Ç açısından bozulduğunu ve yaklaşık on bir eşzamanlı istek civarında bir darboğaz ortaya çıktığını bildirir \[17]; TAOS-CI, derlemenin CI duvar saati süresine hâkim olduğunu ve büyük projelerde toplam hat süresinin %60–67'sini oluşturduğunu gözlemler \[18]. Sistemimiz belirleyici olduğu ortaya çıkan bir açıdan farklıdır: bir LaTeX derlemesi etkileşimlidir. İki kat uzun süren bir CI işi bir rahatsızlıktır; iki kat uzun süren bir derleme ise önizleme panelinde bekleyen bir kullanıcı tarafından doğrudan gözlemlenir; zaman aşımını bir hata eşiği olarak değil bir kapasite parametresi olarak ele almamızın nedeni budur.
+
+### 7.3 Kapsayıcı ek yükleri
+
+Son çalışmalar Docker kapsayıcı başlatma gecikmesini depolama katmanlarına göre ayrıştırır \[19] ve uçtaki kapsayıcı performansını karakterize eder \[20]. Bizim ortamımızda derleme başına kapsayıcı başlatma amorti edilir: 9 sn'lik bir derlemeye göre küçük bir sabittir ve uydurduğumuz serbest akış süresi $T_1$ bunu içerir. Önemli olan kapsayıcı özelliği, derleme başına bellek aşımını tüm ana makinenin çökmesine dönüştüren kaynak sınırlarının _yokluğudur_ (§6.2).
+
+### 7.4 Güvenilmeyen girdi olarak LaTeX
+
+Sandbox derleme, TeX bir programlama dili olduğu ve belgeler güvenilmeyen girdi olduğu için vardır \[21, 22]. Bu tasarım tercihi hem bu çalışmayı mümkün kılan şeydir — her derleme, gözlemlenebilir kaynak davranışına sahip yalıtılmış bir kapsayıcıdır — hem de eksik bellek sınırını önemli kılan şeydir; çünkü onu dağıtan operatörler yalıtımın var olduğunu varsayar.
+
+### 7.5 İnceleme nesnesi olarak derleyici
+
+TeX'in kendisi bir dil olarak iyi belgelenmiştir \[16], ancak bir _derleme hedefi_ olarak davranışı ancak yakın zamanda ilgi görmüştür. Tan ve Rigger \[8], geniş bir arXiv kaynak derlemini farklı motorlar ve dağıtım sürümleri arasında derler ve motor seçiminin birbirinin yerine geçemeyeceğini bulur: XeTeX ve pdfTeX altında belgelerin yalnızca yüzde birin altında bir kısmı bayt düzeyinde aynı çıktı üretir. Bu sonuç doğrudan yöntemimizle ilgilidir. Kapasite bir belgenin _ve_ bir motorun özelliğidir; bu yüzden ikisini de sabitlemeyen bir kıyaslama tekrarlanabilir değildir; bu nedenle baştan sona tek bir belge, tek bir motor ve tek bir dağıtım (`texlive-full:2025.1`) sabitliyoruz ve motoru her şekil açıklamasında belirtiyoruz. Bu aynı zamanda sayılarımızın genelliğini açıkça belirtmeye değer bir şekilde sınırlar: bunlar soyut olarak TeX'i değil, bu belge üzerindeki XeLaTeX'i karakterize eder.
+
+LaTeX derleme _sistemleri_ üzerine çalışmalar büyük ölçüde uygulayıcılar tarafından yürütülür. LaTeX3 projesinin `l3build` aracı \[13] regresyon testini ve paketlemeyi standartlaştırır; bağımsız kıyaslamalar sarmalayıcı araçları karşılaştırır — 26 derleme sistemini inceleyen bir çalışma, önceden derlenmiş bir preamble'ın düz bir çalıştırmaya göre kabaca %20, `latexmk`'ye göre %40 kazandırdığını bulur \[14]. Bunlar _tekli_ derlemeyi optimize eder. Ölçtüğümüz şeye diktirler ve onunla birleşebilirler: bir preamble önbelleği $T_1$'i kısaltır ve bu makaledeki her kapasite rakamı $T_1$ ile ölçeklenir.
+
+### 7.6 Eşzamanlılık denetimi derleyicide değil, editörde
+
+Overleaf'in ortak çalışma yarısı köklü bir çalışma çizgisine dayanır. Operasyonel dönüşüm Ellis ve Gibbs'e \[9] dayanır ve yüksek gecikmeli istemciler için Jupiter sistemi \[10] tarafından pratik hâle getirilmiştir; bu sistemin tasarımı `document-updater` içinde tanınabilir: işlemleri sıralayan bir sunucu ve istemcilerin senkronize olduğu belge başına bir arabellek. Çakışmasız çoğaltılmış veri türleri \[11] aynı sorunu merkezi bir sıralayıcı olmadan çözer. §4.3'teki topolojinin işe yaramasını sağlayan bu ayrımdır: bekleyen güncelleme arabelleği bir örneğin belleğinde değil paylaşılan Redis'te yaşadığı için, herhangi bir replikaya yönlendirilen bir derleme en son tuş vuruşlarını görür ve derleme yakınlığı doğruluk için değil önbellek yerelliği için seçilebilir.
+
+### 7.7 Kapasite modelleri
+
+Amdahl yasası \[24] paralellikten elde edilen hızlanmayı sınırlar, Little yasası \[23] ise doluluğu geliş hızı ve hizmet süresiyle ilişkilendirir; her ikisi de yukarıda kullanılmıştır. Gunther'in evrensel ölçeklenebilirlik yasası \[12] ilkini tutarlılık gecikmesi için geriye dönük bir terimle genişletir ve verimin tepe yapıp ardından düştüğünü öngörür. Sistemimizin $N=1024$'e kadar bu geriye dönük rejimi _göstermediğini_ not ediyoruz: verim doyuma ulaşır ve gecikme büyür, ancak hiçbir şey çökmez. Bunun nedeni şans değil yapıdır — derlemeler tutarlı tutulması gereken hiçbir durumu paylaşmaz, bu yüzden yasanın eklediği terim sıfıra yakındır ve §4.3'teki kabul platosu rekabeti önem kazanmadan önce sınırlar.
+
+## 8. Operatörler için öneriler
+
+<Steps>
+<Step title="Donanım satın almadan önce iki yazılım parametresini düzeltin">
+Her ikisi de ücretsizdir ve her ikisi de ölçtüğümüz herhangi bir tekil donanım yükseltmesinden daha değerlidir. `features.compileTimeout` değerini kullanıcılarınızın gerçekten tolere edeceği bir değere yükseltin — CLSI'nin kabul ettiği en yüksek değer 600 sn'dir — ve 65 eşzamanlı derlemeyi aşmayı bekliyorsanız ya türetilmiş bir imajda `compileConcurrencyLimit` değerini yükseltin ya da yatay ölçekleyin. İkisini de yapmamak, yazılımın kullanmayı reddettiği çekirdekler için ödeme yapmak anlamına gelir.
+</Step>
+
+<Step title="Tek bir makineyi tavanına göre değil, dirseğine göre boyutlandırın">
+Büyük runner taraması (§4.3), rutin olarak karıştırılan iki sayıyı birbirinden ayırır. _Tavan_ — hâlâ her PDF'i döndüren en büyük eşzamanlılık — 64 çekirdekli bir sunucuda en az 1024'tür ve ona hiç ulaşmadık. _Dirsek_ — kuyruk gecikmesinin yavaşça büyümeyi bırakıp ikiye katlanmaya başladığı nokta — 512'dedir ve bunun altındaki son rahat çalışma noktası 256'dır. $N=256$ ile $N=512$ arasında $p_{95}$ bekleme süresi iki dakikadan neredeyse altı dakikaya çıkar; 512 ile 1024 arasında sekiz dakikaya ulaşır. Tavana göre boyutlandıran bir operatör, teknik olarak çalışan ama kimsenin kullanmak istemediği bir sistem sunar.
+
+Bu makine ve bu belge için önerilen çalışma noktası bu nedenle **256 eşzamanlı derlemedir**; bu, fiziksel çekirdek sayısının $4\times$'i ve iş parçacığı sayısının $2\times$'idir ve $p_{95}$'i 120 sn civarında tutar. `compileConcurrencyLimit` değerini yüksek bırakmak yerine bu değere ayarlamanızı öneririz: 1024 derlemeyi aynı anda kabul etmek herkesi sekiz dakika bekletir, 256'yı kabul edip geri kalanını kuyruğa almak ise çoğu kullanıcıya iki dakikada hizmet verir. Kuyruklama geç gelenleri kötüleştirir; rekabet ise herkesi.
+</Step>
+
+<Step title="Bunları en kötü durum sayıları olarak ele alın">
+Tablo 2'deki her seviye, aynı anda tetiklenen soğuk bir derlemedir. Üretimde bu koşulların hiçbiri geçerli değildir: aynı belgenin sıcak derlemesi soğuktaki 28.3 sn'ye karşı 8.6 sn sürer, $3.3$ katlık bir fark; ve gerçek kullanıcılar düğmeye aynı saniyede basmaz. Her iki dakikada bir yeniden derleyen ve tipik bir önbellek isabet oranına sahip kararlı durumdaki bir kullanıcı kitlesi, bu nedenle yalnızca eşzamanlılık sayısının önerdiğinden önemli ölçüde daha fazla yazarı kaldırır — 256 çalışma noktasında bin veya daha fazla aktif yazar mertebesinde. Eşzamanlılık rakamı anlık patlamaya yönelik bir sınırdır, bir koltuk sayısı değil.
+</Step>
+
+<Step title="Önce gecikme bütçesine karar verin, ardından boyutu okuyun">
+Denklem (1) doğrudan tersine çevrilebilir. $C$ çekirdekte $f$ saat hızında hedef bekleme süresi $T$ için uygun eşzamanlılık, bu belge için $k\approx28 GHz·s$ olmak üzere $N \le C\,fT/k$'dir. 3 GHz'de 8 çekirdekte 60 sn'lik bir bütçe $N\le51$ verir; 120 sn'lik bir bütçe bunu iki katına çıkarır. Bütçeyi kapasiteyle birlikte yayımlamak, ikisinden herhangi birini ifade etmenin tek dürüst yoludur.
+</Step>
+
+<Step title="Önce bellek, sonra çekirdek satın alın ve hangi duvarda olduğunuzu kontrol edin">
+32 GiB'nin altında ek çekirdeklerden neredeyse hiç fayda ölçmedik. Tanı ucuzdur: hatalar konuğun belleği yetersizken HTTP 502 olarak görünüyorsa bellek ekleyin; bellek artarken `timedout` olarak görünüyorsa çekirdek ekleyin veya zaman aşımını yükseltin. Operatörler bunu, yapılandırmaları sınıflandırmak için kullandığımız aynı hata imzasından okuyabilir.
+</Step>
+
+<Step title="Deneyim için saat hızını, kullanıcı sayısı için çekirdekleri tercih edin">
+$T\propto 1/f$ eğrilik olmadan geçerli olduğundan (1.0–5.5 GHz boyunca %2), daha hızlı bir saat hızı her kullanıcı için her derlemeyi hızlandırır. Daha fazla çekirdek hiçbir tekil derlemeyi hızlandırmaz; yalnızca daha fazla eşzamanlı derlemeyi kabul eder. Şikâyeti "derlemeler yavaş" olan kurulumlar saat hızı satın almalı; şikâyeti "derlemeler son teslim tarihinde başarısız oluyor" olan kurulumlar bellek ve çekirdek satın almalıdır.
+</Step>
+
+<Step title="Tavanın ötesinde dikey değil yatay ölçekleyin">
+65 eşzamanlı derlemenin ötesinde desteklenen yol yatay ölçeklemedir (Şekil 2c ve 10, §9'da ayrıntılandırılmıştır): çerez tabanlı oturum yakınlığına sahip bir yük dengeleyicinin arkasında, merkezi MongoDB, Redis ve S3 uyumlu depolamayı paylaşan birden fazla uygulama örneği; `git-bridge` ise tekil olarak bırakılır. Bu, örnek başına tavanı örnek sayısıyla çarpar; SaaS kurulumu kendi kapasitesine tam olarak bu şekilde ulaşır.
+</Step>
+
+<Step title="Derleme başına yalıtıma güvenmeyin">
+Docker runner'ın bellek sınırı düzeltilene kadar (§6.2), tek bir patolojik belge tek başına sonlandırılmak yerine ana makineyi tüketebilir. Bu garantiye ihtiyaç duyan operatörler onu beklemek yerine kendileri uygulamalıdır. Büyük ana makinede kullandığımız mekanizma, katı bir tavan taşıyan bir systemd dilimidir; Docker daemon'u daha sonra buna yönlendirilir, böylece oluşturduğu her kapsayıcı bu dilimin içinde hesaplanır:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Bunun bir ayrıntısı gözden kaçarsa bir öğleden sonranıza mal olur. `docker-capped.slice` adlı bir dilim `docker.slice`'ın yanında değil, _içinde_ yer alır; çünkü tire adın bir parçası değil hiyerarşi ayırıcısıdır. Hiçbir etkisi yokmuş gibi görünen bir tavan genellikle kapsayıcıların gerçekte bulunduğu yerden bir seviye uzağa uygulanmıştır. Yapılandırma dosyasına güvenmek yerine bir çalıştırmadan sonra tepe değeri `memory.max_usage_in_bytes`'tan geri okuyarak doğrulayın — ana makinemizde derleme cgroup'u 1024 eşzamanlı derlemede bile tavanının beşte birini hiç aşmadı; bu da bağlayıcı kısıtın bellek değil daemon olduğunun kanıtıdır.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Şekil 10.** Doğruladığımız yapılandırmadan çizilen, yatay ölçeklenmiş bir kurulum için referans topoloji. Uygulama replikaları birbirinin yerine geçebilir ve kalıcı hiçbir şey tutmaz; bu yüzden serbestçe eklenip kaldırılabilir. Üç bileşen öyle değildir: belge arabelleği, herhangi bir replikaya yönlendirilen derlemenin en son tuş vuruşlarını görmesini sağlayan Redis; birden fazla replikada isteğe bağlı olmaktan çıkıp zorunlu hâle gelen nesne deposu; ve depoları replikasyon yolu olmadan yerel diskte tutan ve belirlenmiş tek bir replikanın yanında tekil olarak çalışması gereken `git-bridge`.
+
+## 9. Referans çok makineli kurulum
+
+Yukarıdaki her şey tek bir makineyi ölçer. Bu bölüm dağıtık biçimi kurulabilecek kadar ayrıntılı açıklar ve — bir operatörün gerçekte karşılaştığı soru _nasıl_ değil _gerekip gerekmediği_ olduğu için — önce bunun zahmete değer hâle geldiği noktayı belirtir.
+
+### 9.1 Dağıtık biçim ne zaman gereklidir
+
+Tek bir makineyi işletmek, önemli olan her açıdan daha ucuzdur: tek bir hata alanı, tutarlı tutulacak paylaşılan durum yok, yanlış yapılacak yönlendirme yok. Verilerimiz ondan ne zaman ayrılmak gerektiğine dair üç eşik koyar.
+
+#### 9.1.1 65 eşzamanlı derlemenin altında, ayrılmayın
+
+Örnek başına tavan bir donanım sabiti değil, bir yazılım sabitidir (§6.1). Sunulan yük ona yaklaşana kadar ikinci bir makine hata modları ekler ve hiçbir şey kazandırmaz. 64 çekirdekli ana makine 256 eşzamanlı derlemeye ancak `compileConcurrencyLimit` kaldırıldıktan sonra tam başarıyla hizmet verdi; bu tek değeri henüz değiştirmemiş bir operatör donanımla sınırlı değildir ve donanım alışverişine çıkmamalıdır.
+
+#### 9.1.2 65 ile kabaca 500 arasında, önce dikey ölçekleyin
+
+Dikey ölçekleme tüm aralığımız boyunca doğrusal kaldı ve hiçbir zaman geriye dönük bir rejime girmedi. Tek bir büyük ana makine %100 başarıyla 1024 eşzamanlı soğuk derlemeye ulaştı (§4.3); gecikmedeki dirsek 512'de ortaya çıktı, daha önce değil. Bu aralıkta daha büyük bir makine birkaç küçük makineden kesinlikle daha basittir ve §4.4'e göre daha hızlı bir makine yalnızca daha fazla kullanıcıyı kabul etmekle kalmaz, her kullanıcının deneyimini iyileştirir.
+
+#### 9.1.3 Dağıtık yapıya verim için değil, erişilebilirlik için geçin
+
+Tavanın altında birden fazla uygulama replikası çalıştırmanın dürüst nedeni, tek bir makinenin tek bir güç kaynağı, tek bir çekirdek ve tek bir yükseltme penceresi olmasıdır. Bu meşru bir nedendir ve bizim vereceğimiz neden de budur; yalnızca bir kapasite argümanı değildir ve ikisini karıştırmak, operatörlerin belleğe ihtiyaç duyduklarında replika satın almalarına yol açar.
+
+### 9.2 Katmanlar ve boyutlandırılmaları
+
+Şekil 10 topolojiyi gösterir. Dört katmanı vardır ve bunlar farklı niceliklere göre ölçeklenir — onları ayırmanın bütün amacı da budur.
+
+#### 9.2.1 Uç
+
+Bir yük dengeleyici veya erişilebilirlik için iki tane. TLS'yi sonlandırır ve pahalı hiçbir şey yapmaz; derleme sayısıyla değil bağlantı sayısıyla ölçeklenir ve burada incelenen yükler için küçük bir örnek yeterlidir. Önemli olan boyutu değil yapılandırmasıdır (§9.3).
+
+#### 9.2.2 Uygulama replikaları
+
+Derleme yükünü bunlar taşır ve eşzamanlılıkla ölçeklenen tek katman bunlardır. Her birini §8'deki kurallara göre boyutlandırın — çekirdekten önce bellek, ardından saat hızı — ve ardından replika sayısını en yüksek eşzamanlılığın replika başına tavana bölümünü karşılayacak şekilde ayarlayın. Replikalar kalıcı hiçbir şey tutmaz: yerel diskleri derleme geçici dosyalarını ve bir çıktı önbelleğini taşır; ikisi de yeniden oluşturulabilir. Onları serbestçe eklemeyi ve kaldırmayı güvenli kılan budur ve bunu varsaymak yerine doğrulamaya değer; çünkü yanlış yapılandırılmış tek bir `filestore` yolu katmanı sessizce durum tutan bir katmana dönüştürür.
+
+#### 9.2.3 Durum
+
+Ayrı ana makinelerde Redis, MongoDB ve S3 uyumlu bir nesne deposu. Yükü taşıyan ve en az belirgin olan Redis'tir: oturum deposunu ve canlı belge arabelleğini tutar; herhangi bir replikaya yönlendirilen bir derlemenin farklı bir replikaya karşı yazılan tuş vuruşlarını görmesini sağlayan budur. Redis'i bir önbellek olarak ele alıp tahliyeye göre boyutlandıran bir operatör, teşhis edilmesi son derece zor olan eski belge derlemeleri üretir; çünkü hiçbir şey başarısız olmaz — çıktı yalnızca yanlıştır. MongoDB derleme hızıyla değil proje sayısıyla ölçeklenir. Nesne deposu tek replikada isteğe bağlı, ötesinde zorunludur.
+
+#### 9.2.4 Tekil bileşen
+
+`git-bridge` depoları yerel diskte tutar, yerel bir indeks sürdürür ve replikasyon yolu yoktur. Belirlenmiş tek bir replikanın yanına sabitlenmiş olarak tam olarak bir örnek şeklinde çalışmalıdır ve kurulumu tamamen durumsuz olmaktan alıkoyan bileşen budur. Ana makinesini buna göre planlayın: yedeklenmesi gereken disk onunkidir.
+
+| **Katman**    | **Sayı**             | **Ölçeklendiği nicelik** |
+| ------------- | -------------------- | ------------------------ |
+| Yük dengeleyici | 1–2                | eşzamanlı bağlantılar    |
+| Uygulama      | $\lceil N/C\rceil$ | en yüksek eşzamanlı derleme |
+| Redis         | 1 (+replika)         | aktif düzenleme oturumları |
+| MongoDB       | 1 (+replika)         | depolanan projeler       |
+| Nesne deposu  | 1 küme               | toplam proje baytı       |
+| `git-bridge`  | tam olarak 1         | diskteki depolar         |
+
+**Tablo 4.** Referans katmanlar. Yalnızca uygulama katmanı eşzamanlılıkla ölçeklenir; onu boyutlandırmak §8'in konusudur.
+
+### 9.3 Yönlendirme, yanlış yapılması kolay olan kısımdır
+
+Üç sınıf isteğin üç farklı yere ulaşması gerekir ve varsayılan tek kurallı yapılandırma bunlardan en fazla ikisini karşılar.
+
+`/project/` altındaki derleme trafiği, bir projenin derleme önbelleği tek bir replikada kalsın diye proje tanımlayıcısı üzerinde tutarlı hashleme ile dağıtılmalıdır. HAProxy'nin `balance hash path,field(3,/)` ayarını `hash-type consistent` ve `hash-balance-factor 150` ile kullanıyoruz. Bu seçim yatay ölçeklemede önemlidir: çerez yakınlığıyla mevcut oturumlar süresiz olarak özgün replikalarına sabit kalır ve yeni eklenen bir replika yalnızca yeni kullanıcıları alır; böylece operatörün az önce parasını ödediği makine, satın alınmasına neden olan yükün hiçbirini üstlenmez. Yapılandırmamızda tutarlı hashleme, yatay ölçeklemede projelerin %35'ini yeniden dağıttı; çerezlerde bu oran %0'dı.
+
+Oturum trafiği farklıdır. WebSocket yükseltmesi başarısız olup `socket.io` XHR yoklamaya geri döndüğünde, bir oturumun ardışık yoklamaları tek bir replikaya ulaşmalıdır ve yolda hashlenecek bir proje tanımlayıcısı yoktur. Bu trafik, çerez yakınlığına sahip ayrı bir backend gerektirir. Bu ayrımı tasarladık ancak dağıtmadık; bunu iddia etmek yerine bir eksiklik olarak işaretliyoruz.
+
+Son olarak `/git/`, `git-bridge`'in yanında çalıştığı replikaya ulaşmalıdır. Doğrudan `git-bridge`'e değil o replikaya yönlendirilir; çünkü köprü geri çağrılarını uygulamanın OAuth uç noktalarına karşı doğrular ve blob URL'lerini onun üzerinden çözümler; replikayı atlamak hiçbir şeyi iyileştirmez, kimlik doğrulamayı bozar.
+
+### 9.4 Ölçeği küçültmek bir boşaltma tamponu gerektirir
+
+Bir replikayı kaldırmak, bir replika eklemekle simetrik değildir: uçuştaki bir derleme kaybolur ve kullanıcı kendisinin neden olmadığı bir hata görür. Uygulanabilir sıra önce yeni trafiği durdurmak, beklemek ve ancak ondan sonra sonlandırmaktır. Bunu, dengeleyici backend'i boşaltılıyor olarak işaretlerken pod'u yapılandırılabilir bir süre tutan bir pre-stop kancası olarak uyguladık — dakikalar içinde test edilecek kadar kısa, üretimde ise bir oturumun doğal sonu için yeterince uzun; saniyeler değil saatler. Bu süre, esnekliğin görünmez mi yoksa çileden çıkarıcı mı olacağına karar veren ayardır.
+
+Tasarımla değil ölçümle bulduğumuz bir kısıt daha: CPU'ya dayalı otomatik ölçekleme bu iş yükü için çalışmaz. Uygulama pod'unun kendi kullanımı 3997 m çekirdeklik düğüm toplamına karşı 22 m çekirdekte kaldı; çünkü derleme işi pod'un hesaba katmadığı kardeş kapsayıcılarda gerçekleşir. Bu katmanı ölçeklemek için kullanılan herhangi bir sinyal pod CPU'sunu değil çalışan derleme kapsayıcılarını saymalıdır.
+
+## 10. Overleaf'in ötesindeki çıkarımlar
+
+§4.2 veya §4.3'teki hiçbir şey Overleaf'in koduna özgü değildir. Ölçülen yasalar, barındırılan her LaTeX hizmetinin paylaştığı üç özellikten kaynaklanır: iş birimi tek iş parçacıklı bir süreçtir, bir kapsayıcıda yalıtılmıştır ve çalışma kümesi sayfa önbelleğinin tutması gereken büyük, salt okunur bir ağaçtır. Bunun üç sonucu böyle bir hizmet geliştiren herkese doğrudan aktarılabilir.
+
+### 10.1 Önce bellek, sonra çekirdek sağlayın
+
+Matrisin en güçlü sonucu olumsuzdur: 16 GiB'nin altında çekirdek sayısı neredeyse önemsizdir ve 4, 8 ve 16 vCPU yapılandırmaları ancak 48 GiB'de birbirinden ayrılır (143, 268, 331). Geleneksel kuralı "her beş kullanıcı için bir çekirdek ekle" olarak okuyan bir operatör yanlış kaynağı satın alır. Mekanizma, dağıtım ağacı üzerindeki paylaşılan sayfa önbelleğidir ve herhangi bir ön yüzün değil TeX Live'ın boyutunun bir özelliğidir.
+
+### 10.2 Kabul hızı bir kaynaktır ve genellikle unutulur
+
+$N=1024$'te sunucumuz, her istek aynı anda gelmesine rağmen hiçbir zaman 205'ten fazla canlı sandbox tutmadı (Şekil 7b). Sınırlayıcı derleme değil kapsayıcı oluşturmaydı — bu, kapsayıcı başlatma maliyetini imaj boyutuna değil çalışma zamanı ek yüküne bağlayan ölçüm çalışmalarıyla tutarlıdır \[19, 20]. Yalnızca CPU ve belleği boyutlandıran bir hizmet, patlama davranışının hiç ölçmediği bir nicelik tarafından belirlendiğini görecektir. Bunun pratik biçimi §8'deki öneridir: kabulü bilinçli olarak sınırlayın, çünkü seçtiğiniz bir kuyruk keşfettiğiniz bir kuyruktan iyidir.
+
+### 10.3 Derlemesinden uzun yaşayan bir sandbox modeli geçersiz kılar
+
+Buradaki her kapasite rakamı, kapsayıcının oluşturulduğunu, bir derleme yaptığını ve çıktığını varsayar — onlarca saniyelik bir ömür ve yalnızca çalışırken bire yakın bir görev döngüsü. Son zamanlardaki iki tasarım kalıbı bu varsayımı bozar ve aynı şekilde bozar.
+
+Birincisi kullanıcı başına kalıcı sandbox'tır. Her kullanıcıya sabit, özel bir ortam ayırmak, istatistiksel olarak çoğullanmış bir havuzu bir rezervasyonlar kümesine dönüştürür: zaman paylaşımıyla 64 çekirdekten 256 eşzamanlı derlemeye hizmet verebilen bir hizmet, her birine dört ayrılmış çekirdek verilirse yalnızca 16 kullanıcıya hizmet verebilir; aynı donanım için bir mertebe daha az. Verilerimiz bu tercihe karşı çıkmak yerine maliyetini sayısallaştırır — rezervasyonlar öngörülebilirlik satın alır ve önerdiğimiz çalışma noktasında takas oranı kabaca $16\times$'tir.
+
+İkincisi ve daha yenisi, sandbox'ı derleyiciyle paylaşan AI ajanıdır. Ajan destekli yazım platformlarında XeLaTeX'i çalıştıran aynı kapsayıcı, uzun süre çalışan bir kodlama ajanına da ev sahipliği yapabilir; bu yüzden patlamalar hâlinde değil sürekli olarak meşguldür. Uygulayıcılar, modelin bu tür kurulumlar için öngördüğü belirtiyi tam olarak bildirir — mütevazı kullanıcı sayılarında sürekli yavaşlık \[15]. Etkileşimi kesin olarak belirtmeye değer, çünkü bu basitçe "daha fazla yük" değildir. Bulgularımızdan üçü birbirini katlar. Doluluk patlamalı olmaktan çıkar; bu yüzden §4.2'deki zaman paylaşımı yasası o anda derleme yapan kesime değil tüm kullanıcı kitlesine aynı anda uygulanır. §4.1'deki süper doğrusal bellek getirisini sağlayan sayfa önbelleği artık bir ajanın kendi çalışma kümesiyle paylaşılır ve TeX için sıcak kalmayı bırakır. Ve §6.2'deki eksik kapsayıcı bellek sınırı çok daha tehlikeli hâle gelir; çünkü hiç çıkmayan bir kapsayıcı belleğini asla geri vermez.
+
+Böyle bir platformu ölçmedik ve belirli bir ürün hakkında hiçbir iddiada bulunmuyoruz. Söyleyebileceğimiz şey, sayılarımızın tasarım açısından ne ima ettiğidir: her kullanıcıya uzun ömürlü, çok çekirdekli bir sandbox veren bir mimari, burada raporlanan eşzamanlılık rakamlarına göre değil bir rezervasyon sistemi olarak boyutlandırılmalıdır ve bekleyebileceği kapasite, Tablo 1'deki herhangi bir değerden çok çekirdek sayısının kullanıcı başına çekirdeğe bölümüne yakındır.
+
+## 11. Geçerliliğe yönelik tehditler
+
+### 11.1 Tek belge
+
+Tüm ölçümler 63 sayfalık tek bir XeLaTeX belgesi kullanır. Mutlak kapasiteler diğer belgeler için farklı olacaktır; oran oldukları için ölçeklenme yasaları farklı olmamalıdır. Önemli ölçüde daha büyük bir yerleşik kümeye sahip bir belge, süper doğrusal karakterini değiştirmeden bellek duvarını kaydırır.
+
+### 11.2 Sanallaştırılmış ana makine
+
+Konuklar tek bir fiziksel makinede KVM altında çalışır; bu yüzden mutlak sayılar sanallaştırma ek yükünü içerir ve konuklar bir ana makine sayfa önbelleğini ve NVMe cihazını paylaşır. Ana makine bellek baskısının aynı eşzamanlılıkta konuk içi yük ortalamalarını $3\times$'ten fazla şişirdiğini gözlemledikten sonra ilgisiz konukları kapatarak en büyük karıştırıcı etkeni azalttık.
+
+### 11.3 Eşzamanlı varış
+
+Her derleme tek bir anda gönderilir; bu en kötü durumdur. Gerçek kullanıcılar stokastik bir süreç olarak gelir; bu yüzden sayılarımıza göre boyutlandırılmış bir kurulumun açığı değil payı vardır — ancak bir teslim tarihinin sonundaki tepe, Poisson modelinden çok bizim modelimize yakındır.
+
+### 11.4 Uç yapılandırmalar
+
+2 GiB'de sistem çökmeye o kadar yakındır ki aynı yapılandırmanın tekrarlanan çalıştırmaları bir derleme farklılık gösterebilir. Muhafazakâr değeri raporluyoruz ve bu rejimde $\pm 1$'lik farklardan sonuç çıkarmıyoruz.
+
+## 12. Erişilebilirlik
+
+Test edilen sistem, dağıtım araçları ve türetildiği upstream proje herkese açıktır:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Dağıtım toolkit'i — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Dokümantasyon — [https://ayakaleaf-pro.ayaka.space](/tr)
+* Upstream Overleaf — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* TeX Live derleme imajları — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Atıfta bulunduğumuz her kaynak konumu, Ayakaleaf Pro v6.2.2'ye göre depoya göreli bir yol ve satır numarası olarak verilmiştir; tarihlendirdiğimiz iki upstream commit (`9a519f0d3d`, `5d472e9b38`) Overleaf geçmişinde erişilebilirdir.
+
+## 13. Katkılar
+
+Musicminion çalışmayı tasarladı, test ortamlarını sağladı ve işletti, araştırmanın yönünü belirledi ve burada raporlanan her ölçümü doğruladı. Claude Opus 5 (Anthropic) kıyaslama düzeneğini kurdu ve işletti, kurulumları otomatikleştirdi, kaynak kod arkeolojisini gerçekleştirdi, şekilleri üretti ve el yazmasının taslağını hazırladı. Her iki yazar da son metni gözden geçirdi. Bir çalıştırmanın kirlenmiş olarak raporlandığı yerlerde — §4.3'teki 1021 oturumluk tarama ve §4.1'deki anormal $N=256$ seviyesi — kusur gözden geçirme sırasında bulundu ve çalıştırma sessizce atılmak yerine yayından önce tekrarlandı.
+
+Okuyucular, ACM, IEEE ve ICMJE'nin yazarlık politikalarının yazarlığı şu anda bir çalışmanın hesabını verebilecek taraflara ayırdığını ve ikinci yazarın katkısının bir yazar satırı olarak değil bir açıklama olarak kaydedilmesini gerektireceğini not etmelidir. Kaydın her iki kurala göre de doğru olması için iş bölümünü burada açıkça belirtiyoruz.
+
+## 14. Sonuç
+
+Kendi sunucusunda barındırılan Overleaf için kapasite planlaması tek bir kaynağı ölçeklendirme meselesi değildir. Üç bulgu bunun nasıl yapıldığını değiştirmelidir.
+
+Birincisi, 32 GiB konuk belleğinin altında çekirdek sayısı neredeyse hiç önemli değildir: 16 GiB'de 4, 8 ve 16 vCPU'lu konukların kapasiteleri %8'den az farklılık gösterir. Sınırı, TeX Live ağacı üzerindeki paylaşılan sayfa önbelleği aracılığıyla bellek belirler; çekirdekler ancak bellek bol olduğunda önem kazanmaya başlar.
+
+İkincisi, iki yazılım parametresi donanımdan ağır basar. CLSI'nin koda gömülü 65 derlemelik tavanını kaldırmak ve varsayılan 180 sn'lik derleme zaman aşımını yükseltmek, 8 vCPU / 48 GiB'lik bir konuğu 64'ten 268 eşzamanlı derlemeye çıkardı — ek donanım olmadan 4.2 katlık bir artış. Hiçbiri yapılandırma dokümantasyonundan keşfedilebilir değildir; biri hiç yapılandırılamaz.
+
+Üçüncüsü, "bu makine kaç eşzamanlı kullanıcıyı destekler" sorusu yetersiz tanımlanmıştır. Bu sistemde eşzamanlılık saf zaman paylaşımıdır ve kapasite, zaman aşımının izin verdiği her neyse odur. Yanıtın dürüst biçimi ikisini de belirtir: _bu makine, kullanıcılar_ $T$ _saniye beklemeye razıysa_ $N$ _eşzamanlı derlemeye hizmet verir_; burada $N$ ve $T$ Denklem (1) ile ilişkilidir.
+
+Ayrıca gizli bir kusuru da raporluyoruz: Docker runner'daki kapsayıcı başına bellek sınırı 2018'den beri hem büyüklük hem de yerleşim açısından etkisizdir. Pratik etkisi, küçük bir kurulumda bellek tükenmesinin sorumlu tek derlemeyi değil tüm hizmeti çökertmesidir.
+
+## Kaynaklar
+
+\[1] Overleaf. _Hardware requirements_, Şirket içi kurulum dokümantasyonu. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, Şirket içi kurulum dokümantasyonu. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, Şirket içi kurulum dokümantasyonu. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Source repository_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Kullanıcı başına bir sandbox içinde kalıcı bir kodlama ajanını LaTeX derleyicisiyle aynı yerde barındıran ajan destekli yazım platformlarında sürekli gecikmeye ilişkin uygulayıcı raporları. Bunu kontrollü bir ölçüm olarak değil, bildirilen operasyonel deneyim olarak aktarıyoruz; böyle bir platformu kıyaslamadık.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

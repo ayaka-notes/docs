@@ -1,0 +1,151 @@
+---
+title: Microservices
+icon: microchip
+---
+
+De aanbevolen manier om Overleaf Server CE- en Overleaf Pro-instanties te implementeren en te beheren is met de Toolkit.
+
+De Toolkit vereenvoudigt het aanmaken van je Overleaf-instantie met behulp van enkele eigen scripts die de orkestratie van de benodigde microservices voor je afhandelen. Voer gewoon het meegeleverde initialisatiescript uit, geef een paar configuratieopties op, zoals je paden voor persistente opslag, en de Toolkit zorgt voor het inrichten en verbinden van de microservices waaruit je Overleaf Server CE- of Pro-instantie bestaat.
+
+Zo kun je je richten op het aanpassen van de gebruikerservaring en het implementeren van de specifieke functies van je on-premises-instantie. De Toolkit handelt alle complexiteit achter de schermen af, wat de implementatie van je Overleaf-instantie vereenvoudigt.
+
+<Info>
+
+Om historische redenen heet de hoofdcontainer van Overleaf `sharelatex` en is deze gebaseerd op de Docker-image `sharelatex/sharelatex`. Dat komt doordat de technologie is gebaseerd op de codebase van ShareLaTeX, die is samengevoegd met Overleaf. Zie [deze blogpostarrow-up-right](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf) voor meer details. Op een bepaald moment in de toekomst wordt deze hernoemd zodat de naam aansluit bij de naamgeving van Overleaf.
+
+</Info>
+
+#### Architectuur
+
+Binnen de Overleaf-container draait de software als een verzameling microservices, beheerd door `runit`. Enkele van de interessantere bestanden in de container zijn:
+
+* `/etc/service/`: initialisatiebestanden voor de microservices.
+* `/var/log/overleaf/`: logs voor elke microservice.
+* `/overleaf/services/`: code voor de verschillende microservices.
+* `/var/lib/overleaf/`: het mountpoint voor persistente gegevens (komt overeen met de map die op de host is opgegeven met `OVERLEAF_DATA_PATH`).
+
+#### De MongoDB- en Redis-containers
+
+Overleaf is afhankelijk van twee externe databases: MongoDB en Redis. Standaard richt de Toolkit naast de Overleaf-container voor elk van deze databases een container in, wat neerkomt op in totaal drie Docker-containers.
+
+<Info>
+
+Als je liever verbinding maakt met een bestaande MongoDB- of Redis-instantie, kun je dat doen door de juiste instellingen op te geven in het configuratiebestand [overleaf.rc](/nl/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Editor en compilatieproces
+
+Deze sectie geeft een globaal overzicht van de verwerking van documenten en het compilatieproces.
+
+<Info>
+
+Deze pagina beschrijft het compilatieproces met Sandboxed Compiles, zoals alleen beschikbaar in Overleaf Pro. In Server CE gebruikt het compilatieproces eenvoudige subprocessen: vervang de onderdelen die naar een **container** verwijzen door één onderdeel **compilatie uitvoeren in subproces**.
+
+</Info>
+
+Componenten / actoren:
+
+* `user` — Een gebruiker van de applicatie
+* `editor` — De clientapplicatie die in de browser draait
+* `clsi` — De microservice die wordt gebruikt voor het compileren van PDF's
+* `document-updater` — De microservice die wordt gebruikt voor het verwerken van documentupdates
+* `filestore` — De microservice die binaire bestanden afhandelt
+* `real-time` — De microservice die wordt gebruikt voor het afhandelen van websockets
+* `web` — De (niet zo) micro service die wordt gebruikt voor het afhandelen van API-verzoeken
+
+**Caching in Redis**
+
+* **user**: laadt de editorpagina
+* **editor**: opent een websocket
+* **editor**: stuurt via de websocket een verzoek om een document te openen
+  * **real-time** -> **document-updater**: document wordt uit MongoDB in Redis geladen
+* **editor**: stuurt een documentupdate via de websocket
+  * **real-time** -> **document-updater**: document wordt bijgewerkt in Redis
+* **editor**: stuurt meer compilatieverzoeken
+  * Nadat er 5 minuten zijn verstreken sinds de laatste flush (per document):
+    * **document-updater**: flusht document van Redis naar MongoDB
+* **editor**: stuurt meer updates
+  * elke 100 updates (per document):
+    * **document-updater**: flusht documentgeschiedenis van Redis naar MongoDB
+* **user**: verlaat de editor/sluit het browsertabblad
+  * 5 minuten later
+    * **real-time**: controleert op andere medewerkers; als die er niet zijn:
+      * **real-time** -> **document-updater**: flusht documenten van Redis naar MongoDB
+
+**Lezen uit MongoDB naar Redis**
+
+* **document-updater** -> **web** -> **docstore**: lezen uit MongoDB
+
+**Flushen van Redis naar MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: schrijven naar MongoDB
+
+**Compileren — sync-modus "full"**
+
+* **editor**: stuurt compilatieverzoek met sync-modus ingesteld op "full"
+* **web** -> **document-updater**: alle documenten worden van Redis naar MongoDB geflusht
+* **web** -> **docstore**: alle documenten worden uit MongoDB gedownload
+* **web** -> **clsi**: compilatieverzoek wordt naar `clsi` gestuurd, met daarin:
+  * de sync-modus
+  * een hash van de bestandsboom -> de "projectstatus"
+  * alle documenten met hun inhoud -> onderhevig aan een limiet van 7MB voor de request body
+  * URL's van binaire bestanden om afzonderlijk te downloaden
+* **clsi**: controleert de status op schijf met de sync-modus en de "projectstatus"
+  * dit is een volledige sync, dus de eerdere status op schijf kan worden genegeerd
+* **clsi**: ruimt de compilatiemap op
+* **clsi**: schrijft alle documenten naar de compilatiemap
+* **clsi**: schrijft alle binaire bestanden naar de compilatiemap
+  * `clsi` kopieert de bestanden uit een lokale cache per project
+  * bij een cache miss:
+    * **clsi** -> **filestore**: bestanden downloaden
+* **clsi**: schrijft de "projectstatus"
+* **clsi**: zorgt dat er een Docker-container met de gewenste configuratie bestaat
+  * stelt containeropties samen, inclusief TeX Live-versie
+  * hasht de opties
+  * containernaam: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: start de container en streamt stdout/stderr naar het geheugen -> limiet 2MB
+* **clsi**: laat de gestopte container staan -> wordt na 24 uur opgeruimd
+* **clsi**: schrijft stdout/stderr naar schijf
+* **clsi**: kopieert uitvoerbestanden naar een unieke uitvoermap
+  * build-id bestaande uit 8 willekeurige bytes plus een tijdstempel met precisie in ms
+  * verwijdert alle buildmappen behalve de laatste 3 (anoniem) / de laatste 1 (aangemelde gebruiker)
+* **clsi**: compilatie is mislukt/time-out
+  * verwijdert de compilatiecache — deze kan onvolledige bestanden/een beschadigde cache bevatten
+* **editor**: downloadt output.log en output.pdf
+
+**Compileren — sync-modus "incremental"**
+
+* **editor**: stuurt compilatieverzoek met sync-modus ingesteld op "incremental"
+* **web** -> **document-updater**: haalt alle documenten uit Redis op
+  * de hash van de "projectstatus" wordt ook in Redis opgeslagen
+  * **web** stuurt de hash van de bestandsboom naar `document-updater`, en `document-updater` kan de incrementele compilatie bij een mismatch omzetten in een volledige compilatie
+    * zie het compilatieproces zoals uitgevoerd wanneer de editor een "full"-compilatie aanvraagt
+* **web** -> **clsi**: compilatieverzoek wordt naar `clsi` gestuurd, met daarin:
+  * de sync-modus
+  * een hash van de bestandsboom -> de "projectstatus"
+  * alle documenten uit Redis met hun inhoud -> onderhevig aan een limiet van 7MB voor de request body
+  * geen binaire bestanden
+* **clsi**: controleert de status op schijf met de sync-modus en de "projectstatus"
+  * dit is een incrementele sync, dus de "projectstatus" moet overeenkomen
+  * bij een mismatch: antwoordt met 409 en laat web het opnieuw proberen met een "full"-sync
+    * zie het compilatieproces zoals uitgevoerd wanneer de editor een "full"-compilatie aanvraagt
+* **clsi**: schrijft bijgewerkte documenten naar de compilatiemap
+* **clsi**: zorgt dat er een Docker-container met de gewenste configuratie bestaat
+  * stelt containeropties samen, inclusief TeX Live-versie
+  * hasht de opties
+  * containernaam: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: start de container en streamt stdout/stderr naar het geheugen -> limiet 2MB
+* **clsi**: laat de gestopte container staan -> wordt na 24 uur opgeruimd
+* **clsi**: schrijft stdout/stderr naar schijf
+* **clsi**: kopieert uitvoerbestanden naar een unieke uitvoermap
+  * build-id bestaande uit 8 willekeurige bytes plus een tijdstempel met precisie in ms
+  * verwijdert alle buildmappen behalve de laatste 3 (anoniem) / de laatste 1 (aangemelde gebruiker)
+* **clsi**: compilatie is mislukt/time-out
+  * verwijdert de compilatiecache — deze kan onvolledige bestanden/een beschadigde cache bevatten
+* **editor**: downloadt output.log en output.pdf
+
+**Compileren — wisselen tussen modi**
+
+* **editor**: constateert een mislukte compilatie; de volgende compilatie is een "full"-compilatie
+* **editor**: constateert een geslaagde compilatie; de volgende compilatie is een "incremental"-compilatie

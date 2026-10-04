@@ -1,0 +1,151 @@
+---
+title: Microservice
+icon: microchip
+---
+
+Cara yang direkomendasikan untuk men-deploy dan mengelola instans Overleaf Server CE dan Overleaf Pro adalah dengan menggunakan Toolkit.
+
+Toolkit menyederhanakan pembuatan instans Overleaf Anda melalui penggunaan beberapa skrip kustom yang mengabstraksi orkestrasi microservice yang diperlukan. Cukup jalankan skrip inisialisasi yang disertakan, berikan beberapa opsi konfigurasi seperti path penyimpanan persisten Anda, dan Toolkit akan menangani penyediaan serta penghubungan microservice yang membentuk instans Overleaf Server CE atau Pro Anda.
+
+Dengan begitu, Anda dapat fokus menyesuaikan pengalaman pengguna dan mengimplementasikan fitur-fitur spesifik yang membentuk instans on-premise Anda. Toolkit menangani semua kerumitan di balik layar, sehingga memungkinkan deployment instans Overleaf Anda yang lebih sederhana.
+
+<Info>
+
+Karena alasan historis, container utama Overleaf bernama `sharelatex`, dan didasarkan pada image Docker `sharelatex/sharelatex`. Hal ini karena teknologinya didasarkan pada basis kode ShareLaTeX, yang telah digabungkan ke dalam Overleaf. Lihat [postingan blog ini](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf) untuk detail lebih lanjut. Suatu saat nanti, nama ini akan diganti agar sesuai dengan skema penamaan Overleaf.
+
+</Info>
+
+#### Arsitektur
+
+Di dalam container Overleaf, perangkat lunak berjalan sebagai sekumpulan microservice yang dikelola oleh `runit`. Beberapa file yang lebih menarik di dalam container adalah:
+
+* `/etc/service/`: file inisialisasi untuk microservice.
+* `/var/log/overleaf/`: log untuk setiap microservice.
+* `/overleaf/services/`: kode untuk berbagai microservice.
+* `/var/lib/overleaf/`: titik mount untuk data persisten (sesuai dengan direktori yang ditunjukkan oleh `OVERLEAF_DATA_PATH` di host).
+
+#### Container MongoDB dan Redis
+
+Overleaf bergantung pada dua database eksternal: MongoDB dan Redis. Secara default, Toolkit akan menyediakan sebuah container untuk masing-masing database ini, selain container Overleaf, sehingga totalnya ada tiga container Docker.
+
+<Info>
+
+Jika Anda lebih suka terhubung ke instans MongoDB atau Redis yang sudah ada, Anda dapat melakukannya dengan mengatur pengaturan yang sesuai di file konfigurasi [overleaf.rc](/id/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file).
+
+</Info>
+
+#### Editor dan proses kompilasi
+
+Bagian ini memberikan gambaran umum tentang penanganan dokumen dan proses kompilasi.
+
+<Info>
+
+Halaman ini menjelaskan proses kompilasi dengan Sandboxed Compiles yang hanya tersedia di Overleaf Pro. Di Server CE, proses kompilasi menggunakan sub-proses sederhana — ganti item yang merujuk ke **container** dengan satu item **jalankan kompilasi dalam sub-proses**.
+
+</Info>
+
+Komponen / Aktor:
+
+* `user` — Pengguna aplikasi
+* `editor` — Aplikasi klien yang berjalan di browser
+* `clsi` — Microservice yang digunakan untuk mengompilasi PDF
+* `document-updater` — Microservice yang digunakan untuk memproses pembaruan dokumen
+* `filestore` — Microservice yang menangani file biner
+* `real-time` — Microservice yang digunakan untuk menangani web socket
+* `web` — Microservice (yang tidak terlalu mikro) yang digunakan untuk menangani permintaan API
+
+**Caching Redis**
+
+* **user**: memuat halaman editor
+* **editor**: membuka web socket
+* **editor**: mengirim permintaan untuk membuka dokumen melalui web socket
+  * **real-time** -> **document-updater**: dokumen dimuat dari MongoDB ke Redis
+* **editor**: mengirim pembaruan dokumen melalui web socket
+  * **real-time** -> **document-updater**: dokumen diperbarui di Redis
+* **editor**: mengirim lebih banyak permintaan kompilasi
+  * Setelah 5 menit berlalu sejak flush terakhir (per dokumen):
+    * **document-updater**: flush dokumen dari Redis ke MongoDB
+* **editor**: mengirim lebih banyak pembaruan
+  * setiap 100 pembaruan (per dokumen):
+    * **document-updater**: flush riwayat dokumen dari Redis ke MongoDB
+* **user**: meninggalkan editor/menutup tab browser
+  * 5 menit kemudian
+    * **real-time**: memeriksa kolaborator lain, jika tidak ada:
+      * **real-time** -> **document-updater**: flush dokumen dari Redis ke MongoDB
+
+**Membaca dari MongoDB ke Redis**
+
+* **document-updater** -> **web** -> **docstore**: membaca dari MongoDB
+
+**Flush dari Redis ke MongoDB**
+
+* **document-updater** -> **web** -> **docstore**: menulis ke MongoDB
+
+**Kompilasi — sync-mode "full"**
+
+* **editor**: mengirim permintaan kompilasi dengan sync-mode diatur ke "full"
+* **web** -> **document-updater**: semua dokumen di-flush dari Redis ke MongoDB
+* **web** -> **docstore**: semua dokumen diunduh dari MongoDB
+* **web** -> **clsi**: permintaan kompilasi dikirim ke `clsi`, termasuk:
+  * sync-mode
+  * hash dari pohon file -> "project state"
+  * semua dokumen beserta isinya -> dibatasi oleh batas body permintaan 7MB
+  * URL file biner untuk diunduh secara terpisah
+* **clsi**: memeriksa state di disk dengan sync-mode dan "project state"
+  * ini adalah sinkronisasi penuh, sehingga state sebelumnya di disk dapat diabaikan
+* **clsi**: membersihkan direktori kompilasi
+* **clsi**: menulis semua dokumen ke direktori kompilasi
+* **clsi**: menulis semua file biner ke direktori kompilasi
+  * `clsi` menyalin file dari cache lokal per proyek
+  * jika cache tidak ditemukan (cache miss):
+    * **clsi** -> **filestore**: mengunduh file
+* **clsi**: menulis "project state"
+* **clsi**: memastikan container docker ada dengan konfigurasi yang diinginkan
+  * membangun opsi container, termasuk versi texlive
+  * melakukan hash pada opsi
+  * nama container: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: menjalankan container dan mengalirkan stdout/stderr ke memori -> batas 2MB
+* **clsi**: membiarkan container yang telah berhenti -> dibersihkan setelah 24 jam
+* **clsi**: menulis stdout/stderr ke disk
+* **clsi**: menyalin file output ke direktori output yang unik
+  * build-id terdiri dari 8 byte acak ditambah timestamp dengan presisi ms
+  * menghapus semua folder build kecuali 3 terakhir (anonim) / 1 terakhir (pengguna yang login)
+* **clsi**: kompilasi gagal/timeout
+  * menghapus cache kompilasi — cache mungkin berisi file parsial/rusak
+* **editor**: mengunduh output.log dan output.pdf
+
+**Kompilasi — sync-mode "incremental"**
+
+* **editor**: mengirim permintaan kompilasi dengan sync-mode diatur ke "incremental"
+* **web** -> **document-updater**: mengambil semua dokumen dari Redis
+  * hash "project state" juga disimpan di Redis
+  * **web** mengirim hash pohon file ke `document-updater` dan `document-updater` dapat mengubah kompilasi inkremental menjadi kompilasi penuh jika tidak cocok
+    * lihat proses kompilasi seperti yang dilakukan saat editor meminta kompilasi "full"
+* **web** -> **clsi**: permintaan kompilasi dikirim ke `clsi`, termasuk:
+  * sync-mode
+  * hash dari pohon file -> "project state"
+  * semua dokumen dari Redis beserta isinya -> dibatasi oleh batas body permintaan 7MB
+  * tanpa file biner
+* **clsi**: memeriksa state di disk dengan sync-mode dan "project state"
+  * ini adalah sinkronisasi inkremental, sehingga "project state" harus cocok
+  * jika tidak cocok: merespons dengan 409, membiarkan web mencoba ulang dengan sinkronisasi "full"
+    * lihat proses kompilasi seperti yang dilakukan saat editor meminta kompilasi "full"
+* **clsi**: menulis dokumen yang diperbarui ke direktori kompilasi
+* **clsi**: memastikan container docker ada dengan konfigurasi yang diinginkan
+  * membangun opsi container, termasuk versi texlive
+  * melakukan hash pada opsi
+  * nama container: `project-<project-id>-<user-id>-<hash>`
+* **clsi**: menjalankan container dan mengalirkan stdout/stderr ke memori -> batas 2MB
+* **clsi**: membiarkan container yang telah berhenti -> dibersihkan setelah 24 jam
+* **clsi**: menulis stdout/stderr ke disk
+* **clsi**: menyalin file output ke direktori output yang unik
+  * build-id terdiri dari 8 byte acak ditambah timestamp dengan presisi ms
+  * menghapus semua folder build kecuali 3 terakhir (anonim) / 1 terakhir (pengguna yang login)
+* **clsi**: kompilasi gagal/timeout
+  * menghapus cache kompilasi — cache mungkin berisi file parsial/rusak
+* **editor**: mengunduh output.log dan output.pdf
+
+**Kompilasi — beralih antar mode**
+
+* **editor**: mendeteksi kompilasi gagal, kompilasi berikutnya adalah kompilasi "full"
+* **editor**: mendeteksi kompilasi berhasil, kompilasi berikutnya adalah kompilasi "incremental"

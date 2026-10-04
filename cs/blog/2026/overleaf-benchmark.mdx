@@ -1,0 +1,636 @@
+---
+title: 'Overleaf Benchmark: Hloubkový výzkum souběžné kompilace LaTeXu v Overleafu (SaaS a self-hosting)'
+mode: center
+keywords:
+- performance
+- benchmark
+- latex
+- overleaf
+- scale
+- research
+---
+
+<Card title="Overleaf-Benchmark.pdf" icon="file-arrow-down" href="/images/blog/overleaf-benchmark.pdf" horizontal />
+
+## Abstrakt
+
+Self-hosted nasazení Overleafu se obvykle dimenzují podle jediného orientačního pravidla: jedno jádro CPU a jeden gigabajt paměti na pět až deset souběžných uživatelů. Ukazujeme, že toto pravidlo není pouze nepřesné, ale strukturálně chybné, protože předpokládá, že kapacitu určuje jediná dimenze zdrojů, ačkoli ve skutečnosti ji určují dvě nezávislé stěny, a protože dva softwarové parametry — ani jeden z nich hardwarový — ovlivňují výsledek až čtyřnásobně.
+
+Měříme standardní nasazení Ayakaleaf Pro v6.2.2 se sandboxovanou kompilací (TeX Live 2025) ve 21 konfiguracích CPU/paměti uvnitř hostů QEMU/KVM, jejichž jádra hostitele mají takt uzamčený na 3,0 GHz. Zátěží je skutečná 63stránková diplomová práce v XeLaTeXu, kterou současně kompiluje až několik set různých uživatelských účtů. Zjišťujeme, že pod 32 GiB paměti hosta je počet jader téměř irelevantní — při 16 GiB se naměřená kapacita hostů se 4, 8 a 16 vCPU liší o méně než 8 % — a že kapacitu místo toho určuje superlineární paměťová stěna vznikající ze sdílené page cache nad stromem TeX Live.
+
+Abychom zjistili, zda tyto zákonitosti platí i při změně měřítka o řád, opakujeme měření na jediném serveru s 64 jádry a 995 GiB. Ten zvládne 1024 současných studených kompilací se 100% úspěšností — osminásobek počtu jeho vláken — a jeho strop nikdy nedosáhneme. Užitečným číslem není tento strop, ale koleno pod ním: latence chvostu roste o 20–40 % při každém zdvojnásobení až do $N=256$, poté o 190 % při $N=512$. Kapacita uváděná jako „největší souběžnost, která neselže“ by tak nadhodnotila použitelný pracovní bod čtyřnásobně. Na tomto stroji paměť nikdy není omezujícím zdrojem; limitem je CPU spolu s rychlostí, jakou kontejnerový démon dokáže přijímat nové sandboxy, která se saturuje kolem 200 bez ohledu na to, kolik kompilací je požadováno.
+
+Dále identifikujeme dva efekty na úrovni implementace, které jsou při plánování kapacity neviditelné. Zaprvé CLSI vynucuje napevno zakódovaný strop 65 současných kompilací, který není dostupný přes žádnou proměnnou prostředí; nad ním uživatelé okamžitě dostávají HTTP 503, místo aby byli zařazeni do fronty. Zadruhé limit paměti pro jednotlivé kontejnery v Docker runneru je od svého zavedení v roce 2018 neúčinný, a to jak velikostí, tak umístěním, takže událost nedostatku paměti (out-of-memory) shodí celého hostitele místo jediné kompilace. Zrušení stropu souběžnosti a zvýšení výchozího časového limitu kompilace ze 180 s na 300 s zvyšuje naměřenou kapacitu hosta s 8 vCPU / 48 GiB ze 64 na 268 souběžných kompilací — 4,2násobek s nulovými náklady na hardware.
+
+Nakonec ukazujeme, že souběžnost v tomto systému nepřináší nic jiného než sdílení času a že zátěž je omezena pouze taktem. Proložený zákon degradace $T(N)=T_1\max(1,N/C)^{b}$ dává $b=0.914$, což se blíží dokonale proporcionálnímu zpomalení, a měření napříč celým rozsahem taktu stroje 1,0–5,5 GHz sjednocuje třicet měření na $T=(k/f)\max(1,N/C)$ s $k=27.9 GHz·s$ a zbytkovým rozptylem 5,1 %. 5,5násobný takt přináší 5,5násobné zrychlení bez klesajících výnosů, a právě v tomto smyslu takt a jádra kupují různé věci: takt zrychluje kompilaci každého uživatele, jádra pouze umožňují přijmout více uživatelů.
+
+## 1. Úvod
+
+Overleaf je dominantní kolaborativní editor LaTeXu a jeho on-premises distribuce je široce nasazována univerzitami a výzkumnými skupinami, které nemohou posílat nepublikované rukopisy do cloudu třetí strany. Dimenzování takového nasazení je opakující se praktickou otázkou: kolik lidí může při pevném rozpočtu na hardware skutečně stisknout „Recompile“ ve stejnou chvíli?
+
+Oficiální doporučení je lineární pravidlo — zhruba jedno jádro a jeden gigabajt na pět až deset souběžných uživatelů — které předpokládá, že kapacita škáluje plynule a společně v obou zdrojích. Naše měření tomu odporují třemi způsoby.
+
+### 1.1 Kapacitu určují dvě nezávislé stěny, nikoli jedna
+
+Konfigurace selže buď proto, že dojde paměť, v kterémžto případě zhavaruje samotný stack Overleafu a vrací HTTP 502, nebo proto, že kompilace překročí časový limit na straně serveru, v kterémžto případě CLSI hlásí `timedout`, zatímco gigabajty paměti zůstávají nevyužité. Tyto dva režimy mají zcela odlišné škálovací chování i odlišná řešení. Přidávání jader do konfigurace omezené pamětí není jen neefektivní, občas je dokonce kontraproduktivní: měříme konfigurace, kde zvýšení počtu jader kapacitu _snižuje_, protože více jader způsobí, že souběžné kompilace postupují synchronně, a jejich špičkové nároky na paměť se tak sejdou, místo aby se prokládaly.
+
+### 1.2 Softwarové parametry převažují nad hardwarem
+
+Časový limit kompilace je pole jednotlivého uživatele v MongoDB, jehož výchozí hodnota 180 s tiše omezuje konfigurace vázané na CPU. Jeho zvýšení na 300 s znásobí naměřenou kapacitu až 4,2krát na nezměněném hardwaru. Nezávisle na tom CLSI odmítá více než 65 současných kompilací kvůli napevno zakódované konstantě. Jakákoli studie kapacity — a jakékoli nasazení — které nezohlední obojí, měří software, nikoli stroj.
+
+### 1.3 Souběžnost je sdílení času, nikoli paralelismus
+
+Protože kompilace LaTeXu je jednovláknová, obsluha $N$ současných uživatelů na $C$ jádrech nezpůsobí, že systém skončí dříve; způsobí, že každý uživatel čeká úměrně déle. Otázka „kolik souběžných uživatelů je podporováno“ je proto špatně položená, dokud neurčíme, jak dlouho je uživatel ochoten čekat. Tuto závislost činíme explicitní a kvantifikujeme ji.
+
+### 1.4 Přínosy
+
+* Kapacitní matice pro 21 konfigurací CPU/paměti změřená za podmínek se zamčeným taktem a ověřená opakováním, s omezujícím faktorem určeným pro každou konfiguraci podle její signatury selhání.
+* Dva proložené modely: kapacitní model oddělující superlineární paměťovou stěnu od stropu CPU a model latence prokazující chování čistého sdílení času.
+* Identifikace a experimentální potvrzení dvou implementačních problémů v nasazeném systému, včetně limitu paměti kontejneru, který je od roku 2018 nefunkční.
+* Kvantifikace kompromisu mezi časovým limitem kompilace a kapacitou, který by podle nás měl být uváděn spolu s jakýmkoli údajem o souběžnosti.
+
+## 2. Pozadí
+
+### 2.1 Cesta kompilace
+
+Požadavek na kompilaci v Overleafu putuje `web` $\rightarrow$ `clsi` $\rightarrow$ kompilační kontejner. V nasazení se sandboxovanými kompilacemi (`SIBLING_CONTAINERS_ENABLED=true`) CLSI nespouští `latexmk` ve vlastním procesu; požádá Docker démona hostitele, dostupného přes socket připojený bind-mountem, aby spustil nový kontejner z image TeX Live s adresářem projektu připojeným v `/compile`. Jedna kompilace je tedy jeden krátce žijící kontejner s jedním procesem `latexmk`.
+
+Z toho plynou tři důsledky a všechny tři ovlivňují měření v tomto článku. Zaprvé jednotkou práce je jednovláknový proces: XeLaTeX se neparalelizuje. Zadruhé izolace zdrojů pro jednotlivé kompilace je taková, jakou požaduje Docker runner — v §6.2 ukazujeme, že fakticky nepožaduje nic. Zatřetí pracovní sadě nedominuje dokument, ale strom TeX Live, korpus pouze pro čtení o velikosti zhruba 32 GiB, ze kterého čte každá souběžná kompilace, a který proto sdílí prostřednictvím page cache hostitele. Toto sdílení je zdrojem superlineárního škálování paměti, které pozorujeme.
+
+### 2.2 Povolení sandboxovaných kompilací
+
+Overleaf Community Edition spouští `latexmk` přímo uvnitř aplikačního kontejneru. Ayakaleaf Pro, stejně jako Overleaf Server Pro, může místo toho spouštět každou kompilaci v _sourozeneckém_ (sibling) kontejneru — kontejneru, který aplikace spouští na Docker démonovi _hostitele_, nikoli vnořeně uvnitř aplikačního kontejneru. Zapínají to dvě nastavení Toolkitu:
+
+```ini
+# config/overleaf.rc
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+DOCKER_SOCKET_PATH=/var/run/docker.sock
+
+# config/variables.env
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit připojí Docker socket hostitele do aplikačního kontejneru a převede tato nastavení na prostředí, které čte CLSI: `SANDBOXED_COMPILES=true`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` a `SANDBOXED_COMPILES_HOST_DIR`, přičemž poslední z nich je cesta ke kompilačnímu adresáři na _hostiteli_. Na této cestě záleží: protože démon spouštějící kompilační kontejner patří hostiteli, musí být bind-mount, který dostane, přeložitelný ve jmenném prostoru hostitele, nikoli aplikačního kontejneru. Soubor `config/env.sh` v Server Pro navíc v tomto režimu vynucuje `TEXLIVE_IMAGE_USER=www-data`, aby soubory zapsané kompilačním kontejnerem měly konzistentního vlastníka.
+
+Ověření je přímé: během kompilace hostitel zobrazuje kontejner s názvem `project-{projectId}-{userId}-{hash}`, který spouští `latexmk` z image TeX Live a končí s kódem 0. To je jednotka, jejíž násobnost měříme v celém článku a o jejíž úplné absenci limitů zdrojů referujeme v §6.2.
+
+**Proč je to pro studii důležité.**
+
+Sourozenecké kontejnery činí měření čistým — každá kompilace je pozorovatelná, nezávisle plánovaná entita operačního systému — ale zároveň znamenají, že o CPU a paměti mezi kompilacemi rozhoduje jádro hosta, nikoli Overleaf. Každý škálovací zákon v tomto článku je proto vlastností linuxového plánovače aplikovaného na $N$ jednovláknových procesů, a proto je tak pravidelný.
+
+<Frame>
+  <img src="/images/blog/fig_flow.png" alt="" />
+</Frame>
+
+**Obrázek 1.** Jeden požadavek na kompilaci sledovaný napříč mikroslužbami Community Edition. Rozdělení v jednotlivých krocích je pro kapacitu důležité: text dokumentu se kopíruje do těla požadavku, zatímco binární soubory se předávají odkazem a `clsi` si je stahuje. Ani jedno nedominuje — náklady na kompilaci projektu určuje 32GiB strom TeX Live, který každá souběžná kompilace čte přes sdílenou page cache.
+
+<Frame>
+  <img src="/images/blog/fig_arch.png" alt="" />
+</Frame>
+
+**Obrázek 2.** Tři topologie nasazení a kde v každé z nich leží strop kompilací na instanci; vrstvené panely označují replikaci. Konstanta 65 kompilací chrání _jedno_ CLSI, takže flotila SaaS ji násobí počtem instancí a zón (a) a horizontální škálování podporované Server Pro a Ayakaleaf Pro ji násobí počtem instancí (c) — za cenu centrální MongoDB, Redisu a úložiště kompatibilního s S3, load balanceru s afinitou relací přes cookie (výstup kompilace se zapisuje na lokální disk instance, takže kompilace i následné stažení PDF musí skončit na stejné instanci) a jediné instance `git-bridge`. Výchozí nastavení Toolkitu (b), které měříme, má násobitel jedna, takže konstanta dimenzovaná pro jednoho člena flotily se stává stropem celé instalace.
+
+<Frame>
+  <img src="/images/blog/fig_ring.png" alt="" />
+</Frame>
+
+**Obrázek 3.** Výběr shardu v `clsi-cache`. Projekt se mapuje pomocí $\operatorname{crc32}(\text{projectId}\text{-}i)\bmod|\text{shards}|$, tj. prostor hashů se rozdělí na tolik stejných sektorů, kolik je shardů. Jde o hashování _modulo_, nikoli konzistentní hashování založené na kruhu: rozšíření flotily ze tří shardů na čtyři přerozdělí celý prostor a přemapuje prakticky každý projekt (a, b). Právě proto implementace potřebuje explicitní online rampu pro resharding, která v časovém okně přesouvá lineárně rostoucí podíl projektů z `currentShards` do `desiredShards`, místo přesunu $K/n$, který by poskytl kruh konzistentního hashování. Když je jistič (circuit breaker) shardu vypnut, sůl $i$ se zvýší a shard se odstraní ze seznamu kandidátů, takže vyhledávání pokračuje dál, místo aby selhalo (c).
+
+### 2.3 Dva režimy selhání
+
+Každá konfigurace, kterou jsme měřili, selhává právě jedním ze dvou způsobů a rozdíl je viditelný ve stavu odpovědi, nikoli odvozený:
+
+* **Vyčerpání paměti** — samotný stack Overleafu přestane reagovat a požadavek vrátí **HTTP 502**. Dostupná paměť hosta na úrovni selhání je obvykle pod 500 MiB.
+* **Vypršení časového limitu kompilace** — CLSI ukončí kompilaci po uplynutí časového limitu uživatele a hlásí stav `timedout`. Dostupná paměť na úrovni selhání často činí několik gigabajtů.
+
+Každou konfiguraci klasifikujeme podle této signatury, nikoli podle heuristiky nad poměry zdrojů, díky čemuž lze otázku „na kterou stěnu jsme narazili“ zodpovědět přímo z dat.
+
+## 3. Metodika
+
+### 3.1 Testovací prostředí a řízení taktu
+
+Všichni hosté běží pod QEMU/KVM na jediném hostiteli Intel Core i9-14900K s 62 GiB RAM a úložištěm NVMe. Hostem je Ubuntu 24.04 s Dockerem 29.7 a Overleaf Toolkitem nasazujícím Ayakaleaf Pro v6.2.2 se sandboxovanými kompilacemi nad `texlive-full:2025.1`.
+
+Běžný desktopový procesor je špatnou náhradou serveru, pokud není řízen jeho takt. KVM nenabízí žádný mechanismus pro nastavení virtuálního taktu: vCPU je vlákno hostitele a běží na takové frekvenci, na jaké běží jádro hostitele. Omezujeme proto přímo hostitele: vypínáme turbo, na každém jádře fixujeme `scaling_max_freq` na 3,0 GHz a vCPU hosta pomocí `taskset` přišpendlujeme k fyzickým P-jádrům. Na procesoru s hybridními jádry na tom záleží: E-jádra tohoto čipu mají základní takt 2,4 GHz a po vypnutí turba 3,0 GHz _nemohou_ dosáhnout, takže běh, který na ně zabloudí, tiše měří pomalejší stroj. Při plné zátěži ověřujeme přesně 3000 MHz na všech šestnácti přišpendlených vláknech. Kontrolní skript tento invariant ověřuje před každým benchmarkem a jinak odmítne začít; během studie zachytil jedno tiché resetování governoru.
+
+### 3.2 Druhé testovací prostředí: jeden velký runner
+
+Matice QEMU izoluje vždy jednu proměnnou, ale končí na šestnácti přišpendlených vláknech. Abychom zjistili, zda tytéž zákonitosti platí i o řád výše, zopakovali jsme měření souběžnosti na jediném velkém serveru: jeden AMD EPYC 7773X (Milan-X, 64 jader / 128 vláken, 768 MiB L3) s 995 GiB RAM, se stejným image Ayakaleaf Pro v6.2.2 a stejným `texlive-full:2025.1`. Na rozdíl od hostů QEMU tento stroj nemá zafixovaný takt: je to server produkční třídy a tak jej také měříme.
+
+Byla nutná dvě provozní opatření, která stojí za zmínku, protože bez nich experiment měří testovací nástroj, nikoli server. Zaprvé každý kontejner byl omezen do `systemd` slice s `MemoryMax=940 GiB`, takže nekontrolované měření vyčerpá cgroup, nikoli hostitele. Zadruhé sandboxované kompilace vytváří démon hostitele a každá z nich zapisuje do vlastní copy-on-write vrstvy — naměřeno 116 MiB na kontejner, přestože základní image o velikosti 20,6 GiB je sdílený — proto byl datový kořen Dockeru přesunut na vyhrazené zařízení NVMe. Měření při $N=1024$ zapíše zhruba 119 GiB pomocných vrstev, což se na standardní kořenový souborový systém nevejde.
+
+### 3.3 Zátěž
+
+Dokumentem je skutečná 63stránková diplomová práce (šablona SJTU) kompilovaná XeLaTeXem přes `latexmk`, obsahující obrázky TikZ, zpracování bibliografie `biblatex` a vložené PDF soubory — tedy realistická, nikoli syntetická zátěž. Jedna kompilace na nezatíženém hostu trvá ve všech konfiguracích 8,6–9,8 s, což používáme jako výchozí hodnotu volného běhu $T_1$.
+
+### 3.4 Generování zátěže
+
+Vytváříme 512 skutečných uživatelských účtů a každému dáváme vlastní kopii projektu, aby souběžné kompilace soupeřily přesně tak, jak by soupeřili nezávislí uživatelé, místo aby sdílely zámek projektu. Požadavky jsou odesílány z hostitele na přesměrovaný port hosta, takže generování zátěže nespotřebovává CPU hosta.
+
+Souběžnost je _současná_, nikoli rozložená v čase. Nejprve se ustaví každá relace — přihlášení, CSRF token, výběr kompilátoru — a teprve poté každé vlákno spí až do společného okamžiku reálného času, vypočteného jednou a sdíleného, než odešle svůj `POST /project/:id/compile`. Tento rozdíl není puntičkářský. Postupná rampa měří propustnost při stabilní frontě; současný nápor měří, co se stane, když posluchárna studentů stiskne stejné tlačítko po stejném oznámení termínu, což je případ, kterého se provozovatelé skutečně obávají. Tyto dva případy se liší o více než konstantní faktor, protože druhý plní kompilační frontu rychleji, než ji démon dokáže vyprázdnit.
+
+Než bylo možné takový nápor věrně doručit, bylo nutné odstranit čtyři praktické překážky. Každou z nich stojí za to zaznamenat, protože každá tiše degraduje experiment na měření testovacího nástroje namísto serveru.
+
+#### 3.4.1 Dva omezovače rychlosti, nikoli jeden
+
+Overleaf omezuje přihlášení podle zdrojové adresy — 20 pokusů za minutu — a veškerý náš provoz pochází z jediného hostitele. Přidělení odlišné adresy `X-Forwarded-For` každému simulovanému uživateli tento limit odstraní, ale okamžitě narazí na druhý, hrubší: rozpočet zhruba 200 za minutu na podsíť. Rozložení uživatelů do souvislého bloku proto selže na 201. účtu. Místo toho odvozujeme syntetickou adresu z indexu uživatele tak, aby po sobě jdoucí uživatelé spadali do různých `/24`,
+
+$$
+\texttt{203.}\;\big\lfloor i/250 \big\rfloor \bmod 100 + 1\texttt{.}\;
+  i \bmod 250 + 1\texttt{.}\; i \bmod 200 + 10 ,
+$$
+
+což udržuje oba omezovače s rezervou pro celou populaci 1024 uživatelů.
+
+#### 3.4.2 Vložená hlavička je ve výchozím nastavení zahozena
+
+Nastavení hlavičky nestačí. Express respektuje `X-Forwarded-For` pouze u protějšků, kterým bylo nařízeno důvěřovat, a výchozí hodnota `trustedProxyIps` v Overleafu je `loopback`. Protože generátor zátěže přistupuje k aplikaci přes bridge kontejneru, nikoli přes rozhraní loopback, hlavička se zpracuje a poté zahodí a každý simulovaný uživatel se znovu sloučí do jediné adresy. Projevem je vlna `HTTP 429` přesně při dvacátém přihlášení, kterou lze snadno mylně vyložit jako přetížení serveru. Síť brány musí být explicitně přidána do řetězce důvěry; v clusterovém nasazení z §4.3 je nutné přidat i CIDR podů a služeb.
+
+#### 3.4.3 Load balancer přepíše hlavičku, kterou měl zachovat
+
+Pokud instance stojí za proxy, konvenční `option forwardfor` _připojí_ skutečnou adresu klienta do řetězce, což je správné chování pro produkci a zde přesně nesprávné: syntetická adresa je nahrazena adresou samotného generátoru zátěže. Direktivu je nutné upřesnit jako `option forwardfor if-none`, aby proxy přidala hodnotu pouze tehdy, když ji klient nedodal.
+
+#### 3.4.4 Klientovi dojdou souborové deskriptory dříve, než serveru dojde kapacita
+
+Při $N=1024$ drží generátor více než tisíc současných socketů a výchozí měkký limit 1024 deskriptorů je dosažen již během ustavování relací, nikoli během měření. Selhání je tiché: tři relace se nepodaří ustavit a běh hlásí 1021 místo 1024, zatímco vzorkovací vlákno, které spouští shell kvůli počtu kontejnerů, zhyne s `EMFILE` a tiše ořízne telemetrii. Měkký limit je nutné na generátoru zvýšit — tvrdý limit na našem hostiteli již byl 1048576 — a běh zopakovat. V §4.3 uvádíme oba běhy: opravený dokončí 1024 z 1024 s mediánem do 1,2 s od oříznutého, a proto první považujeme za použitelný, ale nikoli směrodatný.
+
+### 3.5 Protokol měření
+
+Pro reprodukovatelnost se ukázalo nezbytných několik metodických rozhodnutí.
+
+#### 3.5.1 Zahřátí
+
+Na čerstvě nabootovaném hostu je page cache prázdná a první kompilace měří I/O studeného startu namísto kapacity v ustáleném stavu: stejná konfigurace 2 vCPU / 2 GiB dává 36,5 s za studena a 9,8 s za tepla, tedy 3,7násobek. Každá konfigurace proto po startu provede dvě zahřívací jednotlivé kompilace, jejichž výsledky se zahazují.
+
+#### 3.5.2 Kritérium úspěchu
+
+Úroveň souběžnosti projde pouze tehdy, pokud uspěje _každá_ kompilace a úroveň obstojí i při opakování. To je přísnější než práh míry úspěšnosti a má to význam: při 4 vCPU / 16 GiB úroveň 32 jednou prošla s mediánem 80,2 s a při opakování pak vypršel časový limit u všech 32 kompilací, takže uvádíme 31.
+
+#### 3.5.3 Vyhledávání
+
+Úrovně se hledají exponenciálním ohraničováním z výchozí hodnoty předpovězené modelem, po němž následuje přesná celočíselná bisekce. Protože kritérium je typu vše-nebo-nic, úroveň je rozhodnuta svým prvním selháním, takže jakmile jeden požadavek selže, zbývající rozpracované požadavky opouštíme — s výjimkou malých úrovní, kde opuštěné kompilace zatíží malého hosta natolik, že se nikdy nezotaví.
+
+#### 3.5.4 Izolace mezi úrovněmi
+
+Před zahájením další úrovně se kompilační kontejnery vyprázdní a webová aplikace se dotazuje, dokud znovu neodpoví. Bez toho by úroveň následující po pádu zaznamenala falešné selhání s nulovým počtem relací.
+
+#### 3.5.5 Hygiena hostitele
+
+Nesouvisející virtuální stroje na hostiteli byly vypnuty: s 24 GiB paměti hostitele přidělenými jinde vykazovala stejná konfigurace hosta při identické souběžnosti průměrnou zátěž 11,7 místo 3,2. Tlak na paměť hostitele se šíří do hosta a znehodnocuje měření.
+
+## 4. Výsledky
+
+### 4.1 Kapacitní matice
+
+Tabulka 1 a obrázek 4 uvádějí naměřený strop pro každou konfiguraci. Čtení po řádcích je prvním překvapením. Při 4 GiB dosahují hosté se 2, 4 i 8 vCPU přesně 9 — zčtyřnásobení počtu jader nezmění vůbec nic. Při 16 GiB dosahují 54, 45 a 57: přechod ze 4 na 16 jader přinese 6 % a host s 8 jádry je dokonce _horší_ než host se 4 jádry (§5.2). Teprve při 48 GiB počet jader konfigurace rozhodujícím způsobem odlišuje: 143, 268 a 331.
+
+<Frame>
+  <img src="/images/blog/fig1_capacity.png" alt="" />
+</Frame>
+
+**Obrázek 4.** Naměřená kapacita napříč konfigurační maticí. (a) Každá konfigurace jako sloupec, seskupené podle paměti a barevně odlišené podle počtu jader; plné sloupce jsou omezené pamětí (host zhavaruje po vyčerpání paměti) a šrafované sloupce jsou omezené CPU (kompilacím vyprší časový limit, ačkoli paměti je dost). Čtení skupiny zleva doprava ukazuje, jak málo počet jader přináší pod 16 GiB; čtení napříč skupinami ukazuje superlineární návratnost paměti. (b) Tytéž body vůči proloženému modelu $N_{\max}=\min(0.69R^{1.60},\,26.4C)$; čárkovaná čára je paměťová stěna a tečkované vodorovné čáry jsou stropy CPU pro jednotlivé počty jader. Konfigurace je omezena tím z obou, na co narazí dříve.
+
+Čtení po sloupcích je druhým: při pevném počtu jader roste kapacita s pamětí superlineárně, zhruba jako $R^{1.6}$, z důvodu souvisejícího s page cache, který rozvádíme v §5.1.
+
+| paměť  | 2 vCPU |  4 vCPU |  8 vCPU | 16 vCPU |
+| -----: | -----: | ------: | ------: | ------: |
+|  2 GiB |      1 |       1 |       1 |       — |
+|  3 GiB |      4 |       5 |       6 |       — |
+|  4 GiB |      9 |       9 |       9 |       — |
+|  8 GiB |     21 |      22 |      26 |       — |
+| 16 GiB |      — |      54 |  **45** |      57 |
+| 32 GiB |      — | **145** |     135 |     141 |
+| 48 GiB |      — | **143** | **268** | **331** |
+
+**Tabulka 1.** Maximální počet současných kompilací, které úspěšně proběhnou, změřený při časovém limitu kompilace 300 s a se zrušeným stropem souběžnosti CLSI. **Tučně** jsou označeny konfigurace omezené CPU (kompilacím vyprší časový limit, ačkoli paměti je dost); ostatní jsou omezené pamětí (stack zhavaruje s HTTP 502). Řádek 2 GiB obsahuje korekci diskutovanou v §5.2.
+
+### 4.2 Souběžnost je sdílení času
+
+Obrázek 5 prochází všechny úrovně souběžnosti na pevném hostu s 8 vCPU / 16 GiB. Dva režimy odděluje ostré koleno přesně při jedné kompilaci na jádro. Pod ním je průměrná doba kompilace plochá — posune se z 8,7 s při $N=1$ na 9,1 s při $N=C=8$, což je změna o 5 %. Nad ním roste doba přesně úměrně $N/C$: při $N=16,24$ měříme 18,5 s a 27,1 s, tj. poměr $1:2.13:3.12$ oproti ideálnímu $1:2:3$.
+
+<Frame>
+  <img src="/images/blog/fig4_scaling.png" alt="" />
+</Frame>
+
+**Obrázek 5.** Latence kompilace v závislosti na souběžnosti při pevném hardwaru. Koleno je při $N=C$; za ním naměřené zpomalení sleduje $N/C$ s odchylkou 5–7 %. Všech patnáct úrovní uspělo kompletně.
+
+<Frame>
+  <img src="/images/blog/fig2_latency.png" alt="" />
+</Frame>
+
+**Obrázek 6.** Latence kompilace v závislosti na souběžnosti pro několik konfigurací. Každý panel drží hardware pevný a prochází nabízenou zátěž; svislá čára označuje $N=C$. Křivky jsou nalevo od ní ploché a napravo lineární v $N/C$, což je signatura sdílení času, nikoli soupeření o zdroje: práce se nestává dražší, pouze čeká, až na ni přijde řada.
+
+Proložení $T(N)=T_1\max(1,N/C)^{b}$ přes všechna úspěšná měření ve studii dává $b=0.914$ ($R^2_{\log}=0.904$, $n=81$). Exponent nerozlišitelný od jedničky je kvantitativním vyjádřením toho, že kompilace je jednovláknová jednotka práce vázaná na CPU a že souběžnost nad rámec rozdělení jader nepomáhá ani neškodí. Praktický důsledek je pro plánování kapacity nepříjemný: konfigurace může pojmout libovolný počet uživatelů, aniž by _selhala_, a přitom nechat každého z nich čekat úměrně déle. Při $N=56$ na tomto hostu všechny kompilace stále uspějí, ale každý uživatel čeká 64,8 s místo 8,7 s.
+
+### 4.3 Vertikální škálování na 1024 souběžných kompilací
+
+Tabulka 2 a obrázek 7 uvádějí měření na velkém runneru. Každá úroveň je _studená_ kompilace: před každou úrovní mažeme kompilační adresář a cache CLSI každého zúčastněného projektu pomocí `DELETE /project/:id/output`, takže žádná úroveň nemá prospěch z práce vykonané úrovní pod ní. Výchozí hodnota jedné kompilace na tomto stroji je 28,8 s, což je hodnota za studena a neměla by se srovnávat s dříve použitou výchozí hodnotou 8,6–9,8 s v ustáleném stavu; výchozí hodnota za studena na hostech QEMU je 28,3 s, takže v přepočtu na vlákno se oba stroje pro tuto zátěž liší o méně než dvě procenta.
+
+| $N$ |  úspěch   | $p_{50}$ | $p_{95}$ | $p_{50}/T_1$ | max. kont. |
+| ----: | --------: | ---------: | ---------: | -------------: | --------: |
+|    64 |     64/64 |     55.0 s |     55.1 s |           1.9× |         — |
+|   128 |   128/128 |     73.6 s |     74.4 s |           2.6× |         — |
+|   192 |   192/192 |     80.2 s |     87.3 s |           2.8× |         — |
+|   256 |   256/256 |     69.8 s |    121.2 s |           2.4× |       151 |
+|   512 |   512/512 |    179.2 s |    344.6 s |           6.2× |       205 |
+|  1024 | 1024/1024 |    280.2 s |    468.9 s |           9.7× |       179 |
+
+**Tabulka 2.** Měření souběžnosti na jednom EPYC 7773X (64 jader / 128 vláken, 995 GiB). Všechny úrovně za studena; výchozí hodnota 28,8 s. Maximum kontejnerů je největší počet sandboxů, které běží současně.
+
+<Frame>
+  <img src="/images/blog/fig6_large_runner.png" alt="" />
+</Frame>
+
+**Obrázek 7.** Vertikální škálování na jednom velkém runneru. (a) Latence v závislosti na nabízené souběžnosti; stínovaná oblast označuje režim za kolenem. (b) Počet skutečně běžících sandboxů nikdy nesleduje požadovaný počet — saturuje se kolem 200 — zatímco kompilační cgroup nikdy nevyužije více než pětinu svého limitu.
+
+#### 4.3.1 Stroj nikdy neselže
+
+Každá úroveň proběhne na 100 %, včetně $N=1024$ — osminásobku počtu vláken. Strop kapacity tohoto stroje jsme nenašli; došla nám trpělivost dříve, než jemu došla rezerva. Toto je první konfigurace ve studii, kde omezujícím faktorem není paměť: při $N=1024$ dosahuje kompilační cgroup maxima 184 GiB, tedy pětiny svého limitu 940 GiB, zatímco CPU je vytíženo na 100 % s průměrnou zátěží 166.
+
+#### 4.3.2 Degradace je sublineární, protože přijímání je omezeno rychlostí
+
+Naivní sdílení času předpovídá, že $8\times$ více vláken stojí $8\times$ vyšší latenci. Naměřené náklady jsou $9.7\times$ oproti jediné kompilaci, ale jen $3.8\times$ oproti $N=128$ — při osminásobném nárůstu nabízené zátěže. Důvod je vidět na obrázku 7(b) a v posledním sloupci tabulky 2: ačkoli je současně odesláno 1024 požadavků, počet skutečně běžících sandboxů nikdy nepřekročí 205. Démon nedokáže vytvářet kontejnery tak rychle, jak o ně klienti žádají, takže požadavky čekají ve frontě při přijímání, místo aby soupeřily uvnitř CPU. Chvost zde zachraňuje právě fronta, a to náhodou.
+
+#### 4.3.3 Koleno je na 512, nikoli v bodě selhání
+
+Mezi $N=256$ a $N=512$ vzroste latence $p_{95}$ o $2.9\times$ při zdvojnásobení zátěže; každé předchozí zdvojnásobení stálo mezi $1.2\times$ a $1.4\times$. Kapacita uváděná jako „největší $N$, které neselže“ by udávala 1024 a byla by pro provozovatele k ničemu: v tomto bodě je čekání v chvostu téměř osm minut.
+
+### 4.4 Doba kompilace je nepřímo úměrná taktu
+
+Protože je zátěž vázaná na CPU, její náklady by měly škálovat jako $1/f$. Testujeme to přímo procházením taktu hostitele přes celý rozsah stroje, 1,0–5,5 GHz v deseti krocích, na jinak nezměněném hostu (obrázek 8). Doba jedné kompilace se posune z 26,5 s na 4,8 s: 5,5násobný takt přináší 5,5násobné zrychlení bez klesajících výnosů kdekoli v rozsahu. Součin $T\!\cdot\!f$ je napříč všemi deseti takty konstantní s odchylkou do 2 %.
+
+Normalizace podílem jader sjednotí všech třicet měření — tři úrovně souběžnosti při deseti taktech — na jedinou konstantu:
+
+$$
+T(N,f) \;=\; \frac{k}{f}\,\max\!\left(1,\frac{N}{C}\right),
+  \qquad k = 27.9\ \mathrm{GHz\cdot s}
+$$
+
+se zbytkovým rozptylem 5,1 % v rozsahu, ve kterém se samotný takt mění 5,5krát. Absence jakéhokoli zakřivení je sama o sobě výsledkem: kdyby byla zátěž omezena propustností paměti nebo I/O, $T$ by se při vysokém taktu zplošťovalo, jakmile by CPU předběhlo druhý zdroj.
+
+<Frame>
+  <img src="/images/blog/fig5_frequency.png" alt="" />
+</Frame>
+
+**Obrázek 8.** Měření napříč takty. (a) $T=k/f$ s proloženou hyperbolou. (b) Po vydělení $\max(1,N/C)$ se všechny body sjednotí na jednu konstantu, což potvrzuje rovnici (1).
+
+Rovnice (1) má přímý důsledek pro nákup hardwaru, který se snadno formuluje a snadno pokazí: _takt zlepšuje zážitek každého jednotlivého uživatele, počet jader jen umožňuje přijmout jich více_. Stroj s o 20 % vyšším taktem kompiluje o 20 % rychleji pro všechny, bez klesajících výnosů; dvojnásobek jader nezrychlí kompilaci nikomu.
+
+
+## 5. Analýza
+
+### 5.1 Dvě stěny, proložené samostatně
+
+Každá konfigurace je klasifikována podle své signatury selhání (§2.3) a paměťová stěna a strop CPU jsou poté proloženy pouze na konfiguracích, které na ně skutečně narazí:
+
+$$
+N_{\max} = \min\left(A R^{p},\; k_c C\right)
+$$
+
+kde $R$ je v gibibajtech a $C$ ve vCPU.
+
+Exponent paměťové stěny je konzistentně superlineární, $p>1$: mezní paměťové náklady jedné další souběžné kompilace s rostoucí celkovou pamětí _klesají_, zhruba z 312 MiB na kompilaci u hosta se 3 GiB na přibližně 194 MiB u hosta se 32 GiB. Mechanismem je sdílená page cache nad stromem TeX Live popsaná v §2.1: souběžné kompilace čtou překrývající se soubory fontů a maker, takže větší cache se amortizuje přes více z nich. Proto naivní pravidlo „jeden gigabajt na pět uživatelů“ podhodnocuje velké stroje a nadhodnocuje malé.
+
+<Frame>
+  <img src="/images/blog/fig3_3d.png" alt="" />
+</Frame>
+
+**Obrázek 9.** Tatáž data jako dvě plochy nad rovinou $(C,R)$. (a) Kapacita: proložená plocha je hřeben, nikoli rovina — strmě stoupá s pamětí a podél osy jader je téměř plochá, dokud paměť nepřestane být omezením, a proto je řádek 48 GiB jediným, kde počet jader konfigurace odlišuje. (b) Latence v závislosti na souběžnosti pro každou konfiguraci, s proloženým $T=12.6\,(N/C)^{0.91}$ zobrazeným čárkovaně a časovým limitem 180 s vykresleným jako rovina. Konfigurace selže tam, kde její plná křivka protne tuto rovinu, což zviditelňuje, jak přímo nastavení časového limitu určuje uváděnou kapacitu.
+
+### 5.2 Kde více jader věci zhoršuje
+
+Rovnice (2) je minimem dvou členů, a proto je v $C$ monotónní, měření však nikoli. Pozorujeme dvě inverze, při nichž přidání jader kapacitu _snížilo_: při 16 GiB (54 vs. 45) a při 32 GiB (145 vs. 135). Obě nastávají v režimu omezeném pamětí a mechanismus je v obou případech stejný: s více jádry postupují souběžné kompilace synchronně a dosáhnou své špičkové rezidentní velikosti ve stejném okamžiku, zatímco s méně jádry je plánovač prokládá a špičky jsou rozloženy. U hosta, jehož paměťová rezerva je již tak hraniční, je právě toto rozložení tím, co jej udrží při životě. Kapacitní model postavený na průměrném využití zdrojů to nedokáže vyjádřit; jde o vlastnost _souběhu_ špiček.
+
+Třetí zdánlivou inverzi, při 2 GiB, nyní nezapočítáváme. Vyhledávání zaznamenává kapacitu 2 při 2 vCPU, ale 1 při 4 a 8 vCPU, což se jeví jako tentýž efekt. Opětovné prozkoumání surových měření však ukazuje něco jednoduššího: při 2 GiB uspěla úroveň $N=2$ napoprvé u všech tří počtů jader a poté selhala při potvrzovacím běhu u dvou ze tří. Tato úroveň není kapacitou, ale hodem mincí, a hodnota pro 2 vCPU je hod, který náhodou padl. Proto u všech tří počtů jader uvádíme reprodukovatelnou hodnotu 1 a z rozdílu nevyvozujeme žádný závěr. Korekci zaznamenáváme zde, místo abychom tabulku tiše upravili, protože zahozené čtení je přesně ten druh, který by podpořil zajímavé tvrzení.
+
+## 6. Zjištění týkající se implementace
+
+### 6.1 Napevno zakódovaný strop souběžnosti
+
+Na dostatečně velkých hostech se kapacita zastavila přesně na 65 současných kompilacích bez ohledu na požadovanou souběžnost: při $N=66,80,96,128$ jsme naměřili $65$ úspěchů a $1,15,31,63$ okamžitých odpovědí `unavailable`, přičemž počet kontejnerů zůstával na 65, několik gigabajtů paměti bylo nevyužito a mediánová doba kompilace se stabilně držela na 77 s — hluboko pod jakýmkoli časovým limitem.
+
+Příčinou je konstanta v CLSI:
+
+```javascript
+// services/clsi/config/settings.defaults.cjs:110
+compileConcurrencyLimit: isSpotInstance ? 32 : 64,
+
+// services/clsi/app/js/LockManager.js
+if (LOCKS.size <= Settings.compileConcurrencyLimit) return   // <= admits 64+1
+throw new Errors.TooManyCompileRequestsError(...)
+```
+
+Porovnání není ostré, takže efektivní strop je $64+1=65$, což přesně odpovídá měření. Nadbytečné požadavky dostanou **HTTP 503** — jsou _odmítnuty_, nikoli zařazeny do fronty, takže z pohledu uživatele tlačítko kompilace prostě selže. Na rozdíl od všech ostatních nastavitelných hodnot ve stejném souboru tato nečte žádnou proměnnou prostředí; byla zavedena v upstreamu v srpnu 2024 a lze ji změnit pouze úpravou image. Se zvýšeným limitem hlásil tentýž host s 16 vCPU / 32 GiB, který při $N=80$ hlásil `success=65, unavailable=15`, místo toho `success=80`.
+
+### 6.2 Nefunkční limit paměti kontejneru
+
+Prozkoumání běžícího kompilačního kontejneru neukazuje vůbec žádnou izolaci zdrojů:
+
+```text
+Memory=0  NanoCpus=0  CpuShares=0  CpuQuota=0  CpusetCpus=[]
+Ulimits=[{Name:cpu Soft:305 Hard:310}]
+```
+
+Absence jakékoli kvóty CPU je záměrná a vysvětluje, proč je exponent sdílení času z §4.2 tak čistý: nic nezkresluje soutěž mezi kompilacemi. Absence limitu _paměti_ však záměrná není. Docker runner jej skutečně požaduje:
+
+```javascript
+// services/clsi/app/js/DockerRunner.mjs:262
+Memory: 1024 * 1024 * 1024 * 1024, // 1 Gb
+```
+
+To je chybně dvakrát. Hodnota je $1024^4=1 tebiB$, zatímco komentář zamýšlí $1024^3$; a pole je umístěno na nejvyšší úrovni možností vytvoření, nikoli uvnitř `HostConfig`, kde jej Docker API očekává, takže je zahozeno — což pozorované `Memory=0` potvrzuje. Obě chyby jsou přítomny v commitu, který soubor zavedl (`9a519f0d3d`, březen 2018), a přežily převod z CoffeeScriptu, přeformátování celého repozitáře i migraci z CJS na ESM, z nichž žádná se sémantikou nezabývala. Je příznačné, že `MAX_OUTPUT = 1024 * 1024 // 1MB` ve stejném commitu je správně, což ukazuje spíše na přehlédnutí než na nepochopení.
+
+Důsledek je patrný v našich měřeních s nízkou pamětí. Protože kompilace nejsou omezeny, vyčerpání paměti se neprojeví tak, že Docker ukončí jeden problematický kontejner; shodí celého hosta. U konfigurace 2 vCPU / 2 GiB jsme pozorovali, že monitorovací relace SSH byla zablokována na 300 s, průměrná zátěž dosáhla 68 na dvou jádrech a host se nakonec sám restartoval. Funkční limit pro jednotlivé kontejnery by degradoval mnohem elegantněji: příliš velká kompilace by selhala a služba by přežila.
+
+Jediný limit, který se skutečně uplatní, je `RLIMIT_CPU`, nastavený na $\text{timeout}+5$ sekund. Omezuje čas _CPU_, nikoli reálný čas, a jedna kompilace spotřebuje jen asi 9 s CPU, takže se při žádné souběžnosti neuplatní; chrání před patologickým vstupem, jako je nekontrolovaně běžící makro. Je však užitečným indikátorem: pozorování `Soft:305` potvrzuje, že nastavení časového limitu 300 s se skutečně propsalo až do kontejneru.
+
+### 6.3 Časový limit kompilace je nejdůležitějším nastavitelným parametrem
+
+Pole uživatele `features.compileTimeout` má výchozí hodnotu 180 s. Pro jakoukoli konfiguraci omezenou CPU to není bezpečnostní rezerva, ale nastavení kapacity, protože stroj, který stále správně počítá, je prohlášen za selhaný. Zvýšení na 300 s — jediná aktualizace v MongoDB — změní naměřenou kapacitu až 4,2násobně (tabulka 3). Horní mez je 600 s, vynucená pomocí `RequestParser.MAX_TIMEOUT`; vyšší hodnota je tiše oříznuta.
+
+| Konfigurace      | 180 s | 300 s |         Poměr | Omezující faktor          |
+| ---------------- | ----: | ----: | -------------: | ------------------------- |
+| 8 vCPU / 48 GiB  |    64 |   268 | $4.19\times$ | CPU, 28 GiB volných       |
+| 4 vCPU / 32 GiB  |    47 |   145 | $3.09\times$ | CPU, 30 GiB volných       |
+| 4 vCPU / 48 GiB  |    63 |   143 | $2.27\times$ | CPU                       |
+| 4 vCPU / 16 GiB  |    31 |    54 | $1.74\times$ | CPU                       |
+| 2 vCPU / 8 GiB   |    15 |    21 | $1.40\times$ | CPU                       |
+| 8 vCPU / 32 GiB  |   127 |   135 | $1.06\times$ | dále narazí na stěnu paměti |
+| 8 vCPU / 16 GiB  |    56 |    45 | $0.80\times$ | paměť                     |
+| 16 vCPU / 32 GiB |   159 |   141 | $0.89\times$ | paměť                     |
+
+**Tabulka 3.** Vliv časového limitu kompilace na naměřenou kapacitu.
+
+Poslední dva řádky představují neintuitivní polovinu výsledku a důvod, proč jsme každou konfiguraci znovu změřili při jediném časovém limitu. U konfigurací omezených _pamětí_ delší časový limit kapacitu _snižuje_, protože každá kompilace drží svou rezidentní sadu déle a více z nich se překrývá. Údaj o kapacitě je proto bez uvedení časového limitu, při kterém byl změřen, bezvýznamný a obojí nelze v jedné tabulce míchat.
+
+## 7. Související práce
+
+### 7.1 Doporučení dodavatele
+
+Vlastní dokumentace Overleafu k hardwaru uvádí kvalitativní fakta, která zde kvantifikujeme: že LaTeX je jednovláknový, že tedy dobu kompilace určuje výkon jednoho jádra a že „více jader pomůže pouze tehdy, pokud se snažíte kompilovat více dokumentů, než máte volných jader CPU“ \[1]. Poté uvádí lineární pravidlo dimenzování — základ 2 jádra / 3 GiB plus jedno jádro a jeden gigabajt na pět až deset souběžných uživatelů — které bylo motivací této studie. Naším přínosem je převést tato tvrzení na naměřené zákonitosti (rovnice (1) a (2)) a ukázat, kde lineární pravidlo selhává: nemá žádný člen pro sdílenou page cache, která činí paměťovou stěnu superlineární, a žádný člen pro dva softwarové parametry, které výsledku dominují.
+
+### 7.2 Studie kapacity sestavování a CI
+
+Měření sestavovacích systémů při souběžnosti je mimo oblast LaTeXu dobře zavedené. LightSys uvádí, že konvenční systémy CI kompilující uvnitř kontejnerů Dockeru degradují v I/O s rostoucí frekvencí příchodu pull requestů, přičemž úzké hrdlo se objevuje kolem jedenácti souběžných požadavků \[17]; TAOS-CI pozoruje, že kompilace dominuje reálné době běhu CI a u velkých projektů tvoří 60–67 % celkové doby pipeline \[18]. Náš systém se liší v jednom ohledu, který se ukazuje jako rozhodující: kompilace LaTeXu je interaktivní. Úloha CI, která trvá dvakrát déle, je nepříjemností; kompilaci, která trvá dvakrát déle, přímo pozoruje uživatel čekající na panel náhledu, a proto časový limit nepovažujeme za práh selhání, ale za parametr kapacity.
+
+### 7.3 Režie kontejnerů
+
+Nedávné práce rozkládají latenci spouštění kontejnerů Dockeru napříč úrovněmi úložiště \[19] a charakterizují výkon kontejnerů na edge zařízeních \[20]. V našem prostředí je spouštění kontejneru pro každou kompilaci amortizováno: je malou konstantou vzhledem k 9s kompilaci a proložený čas volného běhu $T_1$ ji absorbuje. Vlastností kontejnerů, na které skutečně záleží, je _absence_ limitů zdrojů (§6.2), která mění překročení paměti jednou kompilací v selhání celého hostitele.
+
+### 7.4 LaTeX jako nedůvěryhodný vstup
+
+Sandboxovaná kompilace existuje, protože TeX je programovací jazyk a dokumenty jsou nedůvěryhodným vstupem \[21, 22]. Právě tato návrhová volba umožňuje tuto studii — každá kompilace je izolovaný kontejner s pozorovatelným chováním zdrojů — a zároveň činí chybějící limit paměti závažným, protože provozovatelé, kteří jej nasazují, izolaci předpokládají.
+
+### 7.5 Kompilátor jako předmět studia
+
+TeX samotný je jako jazyk dobře zdokumentován \[16], ale jeho chování jako _cíle sestavení_ přitahuje pozornost teprve v poslední době. Tan a Rigger \[8] kompilují velký korpus zdrojů z arXivu napříč enginy a verzemi distribucí a zjišťují, že volba enginu není zaměnitelná: jen zlomek procenta dokumentů vytvoří pod XeTeXem a pdfTeXem bajtově identický výstup. Tento výsledek se přímo dotýká naší metodiky. Kapacita je vlastností dokumentu _a_ enginu, takže benchmark, který nefixuje obojí, není reprodukovatelný; proto po celou dobu fixujeme jeden dokument, jeden engine a jednu distribuci (`texlive-full:2025.1`) a engine uvádíme v popisku každého obrázku. To také omezuje obecnost našich čísel způsobem, který stojí za to říci otevřeně: charakterizují XeLaTeX na tomto dokumentu, nikoli TeX v abstraktním smyslu.
+
+Práce o sestavovacích _systémech_ pro LaTeX jsou z velké části vedeny praktiky. `l3build` projektu LaTeX3 \[13] standardizuje regresní testování a balení a nezávislé benchmarky porovnávají obalovací nástroje — průzkum 26 sestavovacích systémů zjišťuje, že předkompilovaná preambule přináší zhruba 20 % oproti prostému běhu a 40 % oproti `latexmk` \[14]. Ty optimalizují _jednotlivou_ kompilaci. Jsou ortogonální k tomu, co měříme, a lze je s tím kombinovat: cache preambule zkracuje $T_1$ a každý údaj o kapacitě v tomto článku škáluje s $T_1$.
+
+### 7.6 Řízení souběžnosti v editoru, nikoli v kompilátoru
+
+Kolaborativní polovina Overleafu stojí na dobře zavedené linii výzkumu. Operační transformace pochází od Ellise a Gibbse \[9] a pro klienty s vysokou latencí ji prakticky použitelnou učinil systém Jupiter \[10], jehož návrh je rozpoznatelný v `document-updater`: server, který řadí operace, a buffer pro každý dokument, vůči kterému se klienti synchronizují. Bezkonfliktní replikované datové typy (CRDT) \[11] řeší tentýž problém bez centrálního sekvenceru. Toto rozlišení je důvodem, proč topologie z §4.3 vůbec funguje: protože buffer čekajících aktualizací žije ve sdíleném Redisu, nikoli v paměti instance, kompilace směrovaná na jakoukoli repliku vidí nejnovější stisky kláves a afinitu kompilace lze volit podle lokality cache, nikoli kvůli správnosti.
+
+### 7.7 Kapacitní modely
+
+Amdahlův zákon \[24] omezuje zrychlení z paralelismu a Littleův zákon \[23] dává do vztahu obsazenost s frekvencí příchodů a dobou obsluhy; oba jsou použity výše. Guntherův univerzální zákon škálovatelnosti \[12] rozšiřuje první z nich o retrográdní člen pro zpoždění koherence a předpovídá, že propustnost dosáhne maxima a poté klesá. Upozorňujeme, že náš systém tento retrográdní režim až do $N=1024$ _nevykazuje_: propustnost se saturuje a latence roste, ale nic se nezhroutí. Důvod je strukturální, nikoli šťastná náhoda — kompilace nesdílejí žádný stav, který by bylo nutné udržovat koherentní, takže člen, který zákon přidává, je blízký nule, a plató přijímání z §4.3 omezí soupeření dříve, než by mohlo hrát roli.
+
+## 8. Doporučení pro provozovatele
+
+<Steps>
+<Step title="Opravte oba softwarové parametry dříve, než koupíte hardware">
+Oba jsou zdarma a oba mají větší hodnotu než jakýkoli jednotlivý upgrade hardwaru, který jsme měřili. Zvyšte `features.compileTimeout` na hodnotu, kterou vaši uživatelé skutečně snesou — maximum, které CLSI přijme, je 600 s — a pokud očekáváte více než 65 současných kompilací, buď zvyšte `compileConcurrencyLimit` v odvozeném image, nebo škálujte horizontálně. Neudělat ani jedno znamená platit za jádra, která software odmítá používat.
+</Step>
+
+<Step title="Dimenzujte jeden stroj podle kolena, nikoli podle stropu">
+Měření na velkém runneru (§4.3) odděluje dvě čísla, která se běžně zaměňují. _Strop_ — největší souběžnost, která stále vrátí každé PDF — je na 64jádrovém serveru alespoň 1024 a nikdy jsme jej nedosáhli. _Koleno_ — bod, za kterým latence chvostu přestává mírně růst a začíná se zdvojnásobovat — je na 512 a posledním pohodlným pracovním bodem pod ním je 256. Mezi $N=256$ a $N=512$ se čekání $p_{95}$ prodlouží ze dvou minut na téměř šest; mezi 512 a 1024 dosáhne osmi. Provozovatel, který dimenzuje podle stropu, dodá systém, který technicky funguje a který nikdo nechce používat.
+
+Pro tento stroj a tento dokument je proto doporučeným pracovním bodem **256 souběžných kompilací**, což je $4\times$ počet fyzických jader a $2\times$ počet vláken a co drží $p_{95}$ kolem 120 s. Doporučujeme nastavit `compileConcurrencyLimit` na tuto hodnotu, místo aby zůstávala vysoká: přijetí 1024 kompilací najednou nechá všechny čekat osm minut, zatímco přijetí 256 a zařazení zbytku do fronty obslouží většinu uživatelů za dvě. Fronta zhoršuje situaci pozdě příchozím; soupeření o zdroje zhoršuje situaci všem.
+</Step>
+
+<Step title="Berte tato čísla jako nejhorší případ">
+Každá úroveň v tabulce 2 je studená kompilace spuštěná současně. Ani jedna z podmínek v produkci neplatí: teplá kompilace téhož dokumentu trvá 8,6 s oproti 28,3 s za studena, tedy $3.3$násobek, a skuteční uživatelé nemačkají tlačítko ve stejné sekundě. Ustálená populace, která překompilovává každé dvě minuty s typickou mírou zásahů cache, proto udrží výrazně více pisatelů, než napovídá samotné číslo souběžnosti — v řádu tisíce či více aktivních autorů při pracovním bodu 256. Údaj o souběžnosti je mezí okamžitého náporu, nikoli počtem míst.
+</Step>
+
+<Step title="Nejprve stanovte rozpočet latence, pak odečtěte velikost">
+Rovnici (1) lze přímo invertovat. Pro cílové čekání $T$ při taktu $f$ na $C$ jádrech je vyhovující souběžnost $N \le C\,fT/k$ s $k\approx28 GHz·s$ pro tento dokument. Rozpočet 60 s na 8 jádrech při 3 GHz dává $N\le51$; rozpočet 120 s jej zdvojnásobí. Zveřejnění rozpočtu spolu s kapacitou je jediným poctivým způsobem, jak uvádět kterýkoli z nich.
+</Step>
+
+<Step title="Kupujte nejprve paměť, pak jádra, a ověřte si, na které stěně jste">
+Pod 32 GiB jsme z dalších jader nenaměřili téměř žádný přínos. Diagnostika je levná: pokud se selhání projevují jako HTTP 502 a hostu chybí paměť, přidejte paměť; pokud se projevují jako `timedout` a paměti je dost, přidejte jádra nebo zvyšte časový limit. Provozovatelé to mohou vyčíst ze stejné signatury selhání, kterou jsme použili ke klasifikaci konfigurací.
+</Step>
+
+<Step title="Takt pro zážitek, jádra pro počet uživatelů">
+Protože $T\propto 1/f$ platí bez zakřivení (2 % napříč 1,0–5,5 GHz), rychlejší takt zrychlí každou kompilaci pro každého uživatele. Více jader nezrychlí žádnou jednotlivou kompilaci; pouze umožní přijmout více souběžných. Nasazení, jejichž stížností je „kompilace jsou pomalé“, by měla kupovat takt; nasazení, jejichž stížností je „kompilace selhávají před termínem odevzdání“, by měla kupovat paměť a jádra.
+</Step>
+
+<Step title="Za stropem škálujte horizontálně, ne vertikálně">
+Nad 65 souběžných kompilací je podporovanou cestou horizontální škálování (obrázky 2c a 10, podrobněji v §9): více instancí aplikace za load balancerem s afinitou relací přes cookie, sdílejících centrální MongoDB, Redis a úložiště kompatibilní s S3, přičemž `git-bridge` zůstává jedinou instancí. To násobí strop na instanci počtem instancí, což je přesně způsob, jakým nasazení SaaS dosahuje své vlastní kapacity.
+</Step>
+
+<Step title="Nespoléhejte na izolaci jednotlivých kompilací">
+Dokud nebude limit paměti v Docker runneru opraven (§6.2), může jediný patologický dokument vyčerpat celého hostitele, místo aby byl ukončen sám. Provozovatelé, kteří tuto záruku potřebují, by si ji měli vynutit sami, místo aby na ni čekali. Mechanismem, který jsme použili na velkém hostiteli, je systemd slice s pevným stropem, na který se poté nasměruje Docker démon, aby se každý kontejner, který vytvoří, započítával do něj:
+
+```ini
+[Slice]
+MemoryMax=940G
+```
+
+Jeden detail vás při přehlédnutí stojí celé odpoledne. Slice pojmenovaný `docker-capped.slice` neleží vedle `docker.slice`; leží _uvnitř_ něj, protože pomlčka je oddělovač hierarchie, nikoli součást názvu. Strop, který zdánlivě nemá žádný účinek, byl obvykle uplatněn o úroveň vedle místa, kde kontejnery skutečně žijí. Ověřte to zpětným přečtením maxima z `memory.max_usage_in_bytes` po běhu, místo abyste důvěřovali konfiguračnímu souboru — na našem hostiteli kompilační cgroup nikdy nepřekročila pětinu svého stropu ani při 1024 současných kompilacích, což je samo o sobě důkazem, že omezujícím faktorem byl démon, nikoli paměť.
+</Step>
+</Steps>
+
+<Frame>
+  <img src="/images/blog/arch_ha.png" alt="" />
+</Frame>
+
+**Obrázek 10.** Referenční topologie horizontálně škálovaného nasazení, vycházející z konfigurace, kterou jsme ověřili. Repliky aplikace jsou zaměnitelné a neuchovávají nic trvalého, takže je lze volně přidávat i odebírat. Tři komponenty takové nejsou: Redis, jehož buffer dokumentů umožňuje, aby kompilace směrovaná na jakoukoli repliku viděla nejnovější stisky kláves; objektové úložiště, které se při více než jedné replice stává povinným, nikoli volitelným; a `git-bridge`, který uchovává repozitáře na lokálním disku bez možnosti replikace a musí běžet jako jediná instance vedle jedné určené repliky.
+
+## 9. Referenční nasazení na více strojích
+
+Vše výše uvedené měří jeden stroj. Tato část popisuje distribuovanou podobu dostatečně podrobně, aby ji bylo možné sestavit, a — protože otázka, které provozovatel skutečně čelí, nezní _jak_, ale _zda vůbec_ — nejprve uvádí bod, od kterého se to vyplatí.
+
+### 9.1 Kdy je distribuovaná podoba opodstatněná
+
+Jeden stroj je levnější na provoz ve všech podstatných ohledech: jedna doména selhání, žádný sdílený stav, který je nutné udržovat konzistentní, žádné směrování, které lze nastavit špatně. Naše data stanovují tři prahy pro to, kdy jej opustit.
+
+#### 9.1.1 Pod 65 souběžných kompilací ne
+
+Strop na instanci je softwarová konstanta, nikoli hardwarová (§6.1). Dokud se k němu nabízená zátěž nepřiblíží, druhý stroj přidává režimy selhání a nepřináší nic. 64jádrový hostitel obsloužil 256 souběžných kompilací s plnou úspěšností teprve po zvýšení `compileConcurrencyLimit`; provozovatel, který tuto jedinou hodnotu ještě nezměnil, není omezen hardwarem a neměl by hardware nakupovat.
+
+#### 9.1.2 Mezi 65 a zhruba 500 nejprve škálujte vertikálně
+
+Vertikální škálování zůstalo lineární v celém našem rozsahu a nikdy nevstoupilo do retrográdního režimu. Jeden velký hostitel dosáhl 1024 současných studených kompilací se 100% úspěšností (§4.3); koleno latence se objevilo na 512, ne dříve. V tomto pásmu je větší stroj jednoznačně jednodušší než několik menších a podle §4.4 rychlejší stroj zlepšuje zážitek každého uživatele, místo aby jen umožnil přijmout jich více.
+
+#### 9.1.3 Distribuujte kvůli dostupnosti, ne kvůli propustnosti
+
+Upřímným důvodem, proč pod stropem provozovat více než jednu repliku aplikace, je to, že jeden stroj znamená jeden zdroj napájení, jedno jádro OS a jedno okno pro upgrade. To je legitimní důvod a je to ten, který bychom uvedli; jen to prostě není argument kapacity a směšování obojího vede provozovatele k nákupu replik tam, kde potřebovali paměť.
+
+### 9.2 Vrstvy a jejich dimenzování
+
+Obrázek 10 ukazuje topologii. Má čtyři vrstvy a ty škálují podle různých veličin — což je celý smysl jejich oddělení.
+
+#### 9.2.1 Okraj (edge)
+
+Jeden load balancer, nebo dva kvůli dostupnosti. Ukončuje TLS a nedělá nic náročného; škáluje s počtem spojení, nikoli s počtem kompilací, a pro zátěže studované zde stačí malá instance. Záleží na jeho konfiguraci, nikoli na velikosti (§9.3).
+
+#### 9.2.2 Repliky aplikace
+
+Ty nesou zátěž kompilací a jsou jedinou vrstvou, která škáluje se souběžností. Každou dimenzujte podle pravidel z §8 — paměť před jádry, pak takt — a poté nastavte počet replik tak, aby pokryl špičkovou souběžnost vydělenou stropem na repliku. Repliky neuchovávají nic trvalého: jejich lokální disk nese pomocná data kompilací a cache výstupů, obojí lze znovu vytvořit. Díky tomu je bezpečné je volně přidávat a odebírat, a stojí za to to ověřit, nikoli předpokládat, protože jediná chybně nakonfigurovaná cesta `filestore` tiše změní tuto vrstvu ve stavovou.
+
+#### 9.2.3 Stav
+
+Redis, MongoDB a objektové úložiště kompatibilní s S3 na samostatných hostitelích. Redis je nosný a zároveň nejméně zřejmý: uchovává úložiště relací a živý buffer dokumentů, což umožňuje, aby kompilace směrovaná na jakoukoli repliku viděla stisky kláves zadané vůči jiné replice. Provozovatel, který Redis považuje za cache a dimenzuje jej s ohledem na vyřazování (eviction), bude produkovat kompilace zastaralých dokumentů, které se extrémně obtížně diagnostikují, protože nic neselže — výstup je pouze chybný. MongoDB škáluje s počtem projektů, nikoli s frekvencí kompilací. Objektové úložiště je při jedné replice volitelné a nad ní povinné.
+
+#### 9.2.4 Jediná instance
+
+`git-bridge` uchovává repozitáře na lokálním disku, udržuje lokální index a nemá žádnou možnost replikace. Musí běžet jako právě jedna instance, přišpendlená vedle jedné určené repliky, a je to komponenta, kvůli které nasazení není úplně bezstavové. Podle toho naplánujte jeho hostitele: jeho disk je ten, který je třeba zálohovat.
+
+| **Vrstva**    | **Počet**            | **Škáluje s**              |
+| ------------- | -------------------- | -------------------------- |
+| Load balancer | 1–2                  | souběžnými spojeními       |
+| Aplikace      | $\lceil N/C\rceil$ | špičkovými souběžnými kompilacemi |
+| Redis         | 1 (+replika)         | aktivními relacemi úprav   |
+| MongoDB       | 1 (+replika)         | uloženými projekty         |
+| Objektové úložiště | 1 cluster       | celkovou velikostí projektů v bajtech |
+| `git-bridge`  | právě 1              | repozitáři na disku        |
+
+**Tabulka 4.** Referenční vrstvy. Se souběžností škáluje pouze aplikační vrstva; jejímu dimenzování se věnuje §8.
+
+### 9.3 Směrování je část, kterou lze snadno pokazit
+
+Tři třídy požadavků musí dorazit na tři různá místa a výchozí konfigurace s jediným pravidlem splňuje nejvýše dvě z nich.
+
+Provoz kompilací pod `/project/` by měl být rozdělován konzistentním hashováním podle identifikátoru projektu, aby cache kompilací projektu zůstávala u jedné repliky. Používáme HAProxy `balance hash path,field(3,/)` s `hash-type consistent` a `hash-balance-factor 150`. Volba je důležitá při horizontálním rozšíření: s afinitou přes cookie zůstávají existující relace natrvalo přišpendlené ke své původní replice a nově přidaná replika dostává pouze nové uživatele, takže stroj, za který provozovatel právě zaplatil, nepřevezme nic ze zátěže, kvůli které jej koupil. Konzistentní hashování v naší konfiguraci při rozšíření přerozdělilo 35 % projektů, oproti 0 % u cookies.
+
+Provoz relací je jiný. Když selže upgrade na WebSocket a `socket.io` přejde na XHR polling, po sobě jdoucí dotazy jedné relace musí dorazit na jednu repliku a v cestě není žádný identifikátor projektu, který by bylo možné hashovat. Tento provoz potřebuje samostatný backend s afinitou přes cookie. Toto rozdělení jsme navrhli, ale nenasadili; označujeme ho jako mezeru, místo abychom tvrdili opak.
+
+Nakonec `/git/` musí dorazit na repliku, vedle které běží `git-bridge`. Směruje se na tuto repliku, nikoli přímo na `git-bridge`, protože bridge ověřuje své zpětné volání vůči OAuth endpointům aplikace a přes ni překládá URL blobů; obejití repliky naruší ověřování, místo aby cokoli zlepšilo.
+
+### 9.4 Zmenšování potřebuje vyprazdňovací rezervu
+
+Odebrání repliky není symetrické s jejím přidáním: rozpracovaná kompilace je ztracena a uživatel vidí selhání, které nezpůsobil. Funkční postup je nejprve zastavit nový provoz, počkat a teprve poté ukončit. Implementovali jsme to jako pre-stop hook, který drží pod po nastavitelný interval, zatímco balancer označí backend jako vyprazdňovaný — dost krátký na to, aby se dal otestovat během minut, a v produkci dost dlouhý na přirozený konec relace, tedy spíše hodiny než sekundy. Tento interval je ladicím parametrem, který rozhoduje, zda bude elasticita neviditelná, nebo k vzteku.
+
+Jedno další omezení jsme zjistili měřením, nikoli návrhem: automatické škálování podle CPU pro tuto zátěž nefunguje. Vlastní využití podu aplikace se pohybovalo na 22 m jádra oproti celkovým 3997 m jádra uzlu, protože kompilační práce probíhá v sourozeneckých kontejnerech, které pod nezapočítává. Jakýkoli signál použitý ke škálování této vrstvy musí počítat běžící kompilační kontejnery, nikoli CPU podu.
+
+## 10. Důsledky přesahující Overleaf
+
+Nic v §4.2 ani §4.3 není specifické pro kód Overleafu. Naměřené zákonitosti plynou ze tří vlastností, které sdílí jakákoli hostovaná služba LaTeXu: jednotkou práce je jednovláknový proces, je izolován v kontejneru a jeho pracovní sadou je velký strom pouze pro čtení, který musí udržet page cache. Tři důsledky se přímo přenášejí na kohokoli, kdo takovou službu buduje.
+
+### 10.1 Zajistěte paměť, pak jádra
+
+Nejsilnější výsledek matice je negativní: pod 16 GiB je počet jader téměř irelevantní a teprve při 48 GiB se konfigurace se 4, 8 a 16 vCPU vůbec odliší (143, 268, 331). Provozovatel, který konvenční pravidlo čte jako „přidej jádro na pět uživatelů“, kupuje nesprávný zdroj. Mechanismem je sdílená page cache nad stromem distribuce a je to vlastnost velikosti TeX Live, nikoli konkrétního frontendu.
+
+### 10.2 Rychlost přijímání je zdroj a obvykle se na ni zapomíná
+
+Při $N=1024$ náš server nikdy nedržel více než 205 živých sandboxů (obrázek 7b), přestože všechny požadavky dorazily najednou. Omezením bylo vytváření kontejnerů, nikoli kompilace — v souladu se studiemi měření, které připisují náklady na spuštění kontejneru režii běhového prostředí, nikoli velikosti image \[19, 20]. Služba, která dimenzuje pouze CPU a paměť, zjistí, že její chování při náporu určuje veličina, kterou nikdy neměřila. Praktickou podobou toho je doporučení z §8: omezte přijímání záměrně, protože fronta, kterou si zvolíte, je lepší než fronta, kterou objevíte.
+
+### 10.3 Sandbox, který přežije svou kompilaci, model znehodnocuje
+
+Každý údaj o kapacitě zde předpokládá, že kontejner je vytvořen, provede jednu kompilaci a skončí — životnost v řádu desítek sekund a pracovní cyklus blízký jedné pouze po dobu běhu. Dva nedávné návrhové vzory tento předpoklad porušují, a to stejným způsobem.
+
+Prvním je trvalý sandbox pro každého uživatele. Přidělení pevného soukromého prostředí každému uživateli mění statisticky multiplexovaný fond v sadu rezervací: služba, která by sdílením času mohla obsloužit 256 souběžných kompilací na 64 jádrech, může obsloužit jen 16 uživatelů, pokud každý dostane čtyři vyhrazená jádra, tedy o řád méně na stejném hardwaru. Naše data kvantifikují cenu této volby, nikoli argumentují proti ní — rezervace kupují předvídatelnost a směnný kurz je při námi doporučeném pracovním bodu zhruba $16\times$.
+
+Druhým, novějším, je AI agent, který sdílí sandbox s kompilátorem. Na platformách pro psaní s asistencí agentů může tentýž kontejner, který spouští XeLaTeX, hostovat i dlouhodobě běžícího programovacího agenta, takže je obsazen nepřetržitě, nikoli v nárazech. Praktici hlásí přesně ten symptom, který model pro taková nasazení předpovídá — trvalou pomalost při skromném počtu uživatelů \[15]. Tuto interakci stojí za to popsat přesně, protože nejde jednoduše o „větší zátěž“. Tři z našich zjištění se sčítají. Obsazenost přestává být nárazová, takže zákon sdílení času z §4.2 platí pro celou populaci najednou, nikoli jen pro podíl, který právě kompiluje. Page cache, která přináší superlineární návratnost paměti z §4.1, je nyní sdílena s pracovní sadou agenta a přestává být pro TeX zahřátá. A chybějící limit paměti kontejneru z §6.2 se stává mnohem nebezpečnějším, protože kontejner, který nikdy neskončí, nikdy nevrátí svou paměť.
+
+Žádnou takovou platformu jsme neměřili a o žádném konkrétním produktu nic netvrdíme. Co říci můžeme, je to, co naše čísla znamenají pro návrh: architektura, která dává každému uživateli dlouho žijící vícejádrový sandbox, by měla být dimenzována jako rezervační systém, nikoli podle údajů o souběžnosti uvedených zde, a kapacita, kterou může očekávat, se blíží spíše počtu jejích jader vydělenému počtem jader na uživatele než čemukoli v tabulce 1.
+
+## 11. Ohrožení validity
+
+### 11.1 Jediný dokument
+
+Všechna měření používají jeden 63stránkový dokument v XeLaTeXu. Absolutní kapacity se budou u jiných dokumentů lišit; škálovací zákony, které jsou poměry, by neměly. Dokument s podstatně větší rezidentní sadou by posunul paměťovou stěnu, aniž by změnil její superlineární charakter.
+
+### 11.2 Virtualizovaný hostitel
+
+Hosté běží pod KVM na jednom fyzickém stroji, takže absolutní čísla zahrnují režii virtualizace a hosté sdílejí page cache hostitele a zařízení NVMe. Největší rušivý vliv jsme zmírnili vypnutím nesouvisejících hostů poté, co jsme zjistili, že tlak na paměť hostitele zvyšuje průměrnou zátěž uvnitř hosta více než $3\times$ při identické souběžnosti.
+
+### 11.3 Současný příchod
+
+Každá kompilace je odeslána v jediném okamžiku, což je nejhorší případ. Skuteční uživatelé přicházejí jako stochastický proces, takže nasazení dimenzované podle našich čísel má rezervu, nikoli deficit — ale špička na konci termínu odevzdání se blíží spíše našemu modelu než Poissonovu.
+
+### 11.4 Hraniční konfigurace
+
+Při 2 GiB je systém natolik blízko kolapsu, že se opakované běhy stejné konfigurace mohou lišit o jednu kompilaci. Uvádíme konzervativní hodnotu a z rozdílů $\pm 1$ v tomto režimu nevyvozujeme závěry.
+
+## 12. Dostupnost
+
+Testovaný systém, nástroje pro nasazení i upstreamový projekt, ze kterého vychází, jsou veřejně dostupné:
+
+* Ayakaleaf Pro — [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+* Nástroje pro nasazení (toolkit) — [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+* Dokumentace — [https://ayakaleaf-pro.ayaka.space](/cs)
+* Upstream Overleaf — [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+* Kompilační image TeX Live — `ghcr.io/ayaka-notes/texlive-full:2025.1`
+
+Každé citované místo ve zdrojovém kódu je uvedeno jako cesta relativní k repozitáři s číslem řádku vůči Ayakaleaf Pro v6.2.2 a oba upstreamové commity, které datujeme (`9a519f0d3d`, `5d472e9b38`), jsou dohledatelné v historii Overleafu.
+
+## 13. Příspěvky autorů
+
+Musicminion navrhl studii, poskytl a provozoval testovací prostředí, řídil směr výzkumu a ověřil každé zde uvedené měření. Claude Opus 5 (Anthropic) vytvořil a provozoval testovací nástroj pro benchmark, automatizoval nasazení, provedl archeologii zdrojového kódu, vytvořil obrázky a připravil koncept rukopisu. Oba autoři zkontrolovali finální text. Tam, kde je běh uveden jako kontaminovaný — měření s 1021 relacemi v §4.3 a anomální úroveň $N=256$ v §4.1 — byla vada nalezena během revize a běh byl před publikací zopakován, místo aby byl tiše vynechán.
+
+Čtenáři by měli vzít na vědomí, že zásady autorství ACM, IEEE a ICMJE v současnosti vyhrazují autorství stranám, které jsou schopny za dílo nést odpovědnost, a vyžadovaly by, aby byl příspěvek druhého autora zaznamenán jako prohlášení, nikoli jako autorský údaj. Rozdělení práce zde uvádíme explicitně, aby byl záznam přesný podle kterékoli z konvencí.
+
+## 14. Závěr
+
+Plánování kapacity pro self-hosted Overleaf není otázkou škálování jednoho zdroje. Tři zjištění by měla změnit způsob, jakým se provádí.
+
+Zaprvé pod 32 GiB paměti hosta na počtu jader téměř nezáleží: při 16 GiB se kapacity hostů se 4, 8 a 16 vCPU liší o méně než 8 %. Limit určuje paměť prostřednictvím sdílené page cache nad stromem TeX Live; jádra začínají hrát roli teprve tehdy, když je paměti dostatek.
+
+Zadruhé dva softwarové parametry převažují nad hardwarem. Zrušení napevno zakódovaného stropu 65 kompilací v CLSI a zvýšení výchozího časového limitu kompilace 180 s posunulo hosta s 8 vCPU / 48 GiB ze 64 na 268 souběžných kompilací — 4,2násobek bez dalšího hardwaru. Ani jeden z nich nelze zjistit z dokumentace konfigurace; jeden z nich není vůbec konfigurovatelný.
+
+Zatřetí otázka „kolik souběžných uživatelů tento stroj podporuje“ je nedostatečně specifikovaná. Souběžnost je v tomto systému čistým sdílením času a kapacita je taková, jakou připustí časový limit. Poctivá podoba odpovědi uvádí obojí: _tento stroj obslouží_ $N$ _současných kompilací, pokud jsou uživatelé ochotni čekat_ $T$ _sekund_, přičemž $N$ a $T$ jsou svázány rovnicí (1).
+
+Uvádíme také skrytou vadu: limit paměti pro jednotlivé kontejnery v Docker runneru je od roku 2018 neúčinný, a to jak velikostí, tak umístěním. Jeho praktickým důsledkem je, že vyčerpání paměti v malém nasazení shodí celou službu, místo jediné kompilace, která za to může.
+
+## Reference
+
+\[1] Overleaf. _Hardware requirements_, dokumentace On-premises. [https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements](https://docs.overleaf.com/on-premises/getting-started/requirements/hardware-requirements)
+
+\[2] Overleaf. _Horizontal scaling_, dokumentace On-premises. [https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling](https://docs.overleaf.com/on-premises/maintenance/horizontal-scaling)
+
+\[3] Overleaf. _Microservices_, dokumentace On-premises. [https://docs.overleaf.com/on-premises/getting-started/microservices](https://docs.overleaf.com/on-premises/getting-started/microservices)
+
+\[4] Overleaf. _Source repository_. [https://github.com/overleaf/overleaf](https://github.com/overleaf/overleaf)
+
+\[5] Ayaka-notes. _Ayakaleaf Pro_. [https://github.com/ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro)
+
+\[6] Ayaka-notes. _Overleaf Toolkit_. [https://github.com/ayaka-notes/toolkit](https://github.com/ayaka-notes/toolkit)
+
+\[7] D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine and D. Lewin. _Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web_. STOC, 1997.
+
+\[8] J. Tan and M. Rigger. _Inconsistencies in TeX-Produced Documents_. In _Proc. 33rd ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA)_, Vienna, 2024. doi: [https://doi.org/10.1145/3650212.3680370](https://doi.org/10.1145/3650212.3680370)
+
+\[9] C. A. Ellis and S. J. Gibbs. _Concurrency Control in Groupware Systems_. In _Proc. ACM SIGMOD_, pp. 399–407, 1989.
+
+\[10] D. A. Nichols, P. Curtis, M. Dixon and J. Lamping. _High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System_. In _Proc. ACM UIST_, pp. 111–120, 1995.
+
+\[11] M. Shapiro, N. Preguiça, C. Baquero and M. Zawirski. _Conflict-Free Replicated Data Types_. In _Proc. SSS_, pp. 386–400, 2011.
+
+\[12] N. J. Gunther. _Guerrilla Capacity Planning: A Tactical Approach to Planning for Highly Scalable Applications and Services_. Springer, 2007.
+
+\[13] The LaTeX3 Project. _l3build — A Testing and Building System for (La)TeX_. CTAN.
+
+\[14] M. Isaksson. _Which LaTeX Build System Is Fastest? A Benchmark_. [https://blog.martisak.se/latex-build-systems-comparison/](https://blog.martisak.se/latex-build-systems-comparison/)
+
+\[15] Zprávy z praxe o trvalé latenci na platformách pro psaní s asistencí agentů, které umisťují trvalého programovacího agenta společně s kompilátorem LaTeXu do sandboxu jednotlivého uživatele. Citujeme to jako hlášenou provozní zkušenost, nikoli jako kontrolované měření; žádnou takovou platformu jsme netestovali.
+
+\[16] D. E. Knuth. _The TeXbook_. Addison-Wesley, 1984.
+
+\[17] G. Lim, M. Ham, J. Moon and W. Song. _LightSys: Lightweight and Efficient CI System for Improving Integration Speed of Software_. arXiv:2101.07961 \[cs.SE], 2021. Preprint.
+
+\[18] G. Lim, M. Ham, J. Moon, W. Song, S. Woo and S. Oh. _TAOS-CI: Lightweight & Modular Continuous Integration System for Edge Computing_. arXiv:2101.08889 \[cs.SE], 2021. Preprint.
+
+\[19] S. Khan. _Decomposing Docker Container Startup Performance: A Three-Tier Measurement Study on Heterogeneous Infrastructure_. arXiv:2602.15214, 2026. Preprint.
+
+\[20] R. Gupta and K. Nahrstedt. _Performance Characterization of Containers in Edge Computing_. arXiv:2505.02082, 2025. Preprint.
+
+\[21] S. Checkoway, H. Shacham and E. Rescorla. _Are Text-Only Data Formats Safe? Or, Use This LaTeX Class File to Pwn Your Computer_. In _Proc. USENIX Workshop on Large-Scale Exploits and Emergent Threats (LEET)_, 2010.
+
+\[22] G. Lacombe, K. Masalygina, A. Tahiri, C. Adam and C. Lauradoux. _Can You Accept LaTeX Files from Strangers? Ten Years Later_. arXiv:2102.00856 \[cs.CR], 2021. Preprint.
+
+\[23] J. D. C. Little. _A Proof for the Queuing Formula_ $L=\lambda W$. Operations Research, 9(3):383–387, 1961.
+
+\[24] G. M. Amdahl. _Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities_. AFIPS, 1967.

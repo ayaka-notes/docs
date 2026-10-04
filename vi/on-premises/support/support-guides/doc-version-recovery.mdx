@@ -1,0 +1,158 @@
+---
+title: (Di chuyển v5.0.1) Khôi phục phiên bản tài liệu
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Nếu bạn chưa từng chạy Server Pro phiên bản 5.0.1 hoặc Community Edition phiên bản 5.0.1, hoặc bạn đã khởi tạo một phiên bản hoàn toàn mới với 5.0.1, thì bạn không cần chạy quy trình khôi phục này.
+
+</Info>
+
+**Các cập nhật cho trang này:**
+
+* (2024-04-22 13:40 BST): Bổ sung bước "Ngăn các cập nhật mới đi vào hệ thống và đẩy (flush) toàn bộ thay đổi vào MongoDB".
+* (2024-04-23 11:45 BST): Xử lý các lần flush bị lỗi trong 5.0.1 và bỏ qua flush khi 5.0.2 đã được khởi động.
+
+Thời gian khôi phục sẽ phụ thuộc vào số lượng và kích thước dự án trong phiên bản của bạn cũng như backend lưu trữ được history store sử dụng cho các chunk (được xác định trong `OVERLEAF_HISTORY_CHUNKS_BUCKET`).
+
+Quy trình khôi phục sẽ làm chậm việc khởi động ứng dụng bên trong container Server Pro. Trang web sẽ hiển thị là ngoại tuyến trong suốt thời gian đó. Chúng tôi chỉ hỗ trợ chạy khôi phục từ một phiên bản duy nhất của container Server Pro, tất cả các worker mở rộng theo chiều ngang khác cần được tắt.
+
+Bạn có thể dừng và tiếp tục quy trình khôi phục nếu cần.
+
+Dựa trên các thử nghiệm hiệu năng của chúng tôi, quy trình khôi phục có thể xử lý khoảng 10 nghìn dự án nhỏ mỗi phút trên phần cứng hiện đại (CPU xung nhịp 3GHz và lưu trữ NVMe cục bộ). Ví dụ, với một phiên bản có 100 nghìn dự án, hãy lên lịch một khoảng thời gian bảo trì cho phép ít nhất 10+2 phút ngừng hoạt động. Sử dụng truy vấn sau để ước tính số lượng dự án trong phiên bản của bạn:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Vui lòng đọc toàn bộ các bước khôi phục sau trước khi bắt đầu. Khách hàng Server Pro luôn được hoan nghênh liên hệ [support@overleaf.com](mailto:support@overleaf.com) nếu có bất kỳ câu hỏi nào.
+
+### Quy trình khôi phục
+
+<Steps>
+<Step title="Tải image bản phát hành">
+Tải các image của bản phát hành `5.0.3`.
+</Step>
+
+<Step title="Xác định một vài dự án">
+Xác định theo id một vài dự án bị thiếu lịch sử; lý tưởng nhất là bạn có quyền thực hiện thay đổi trên một trong số đó.
+</Step>
+
+<Step title="Lên lịch bảo trì">
+Lên lịch một khoảng thời gian bảo trì cho thời gian ngừng hoạt động.
+</Step>
+
+<Step title="Dừng tất cả worker trừ một">
+Dừng tất cả worker trừ một khi sử dụng thiết lập mở rộng theo chiều ngang.
+</Step>
+
+<Step title="Ngăn cập nhật mới và flush toàn bộ thay đổi vào MongoDB">
+Ngăn các cập nhật mới đi vào hệ thống và flush toàn bộ thay đổi vào MongoDB:
+
+1. Đóng trình soạn thảo và ngắt kết nối thủ công tất cả người dùng qua bảng quản trị tại `https://my-server-pro.example.com/admin#open-close-editor` trong tab "Open/Close Editor".
+2.  Dừng dịch vụ Websocket/real-time.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Đợi dịch vụ real-time thoát, được biểu thị bằng `down:`.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Dừng container git-bridge nếu đã bật.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  Nếu bạn chưa từng chạy 5.0.2: Thực hiện flush thủ công cho các cập nhật tài liệu và đợi đến khi hoàn tất thành công.
+
+    Bạn có thể lặp lại lệnh khi gặp lỗi. Nếu bạn thấy `failureCount` khác 0 trong các lần chạy liên tiếp, vui lòng dừng việc di chuyển (khôi phục các dịch vụ bằng `docker restart git-bridge sharelatex`) và liên hệ bộ phận hỗ trợ.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  Nếu bạn chưa từng chạy 5.0.2: Đảm bảo rằng tất cả thay đổi đã được flush ra khỏi redis.
+
+    Nếu bạn nhận được bất kỳ đầu ra nào từ `redis-cli`, vui lòng dừng việc di chuyển (khôi phục các dịch vụ bằng `docker restart git-bridge sharelatex`) và liên hệ bộ phận hỗ trợ.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Thử flush mọi thay đổi lịch sử đang chờ xử lý.
+
+    Đây chỉ là flush theo khả năng tốt nhất, vì một số dự án có lịch sử bị hỏng do việc di chuyển cơ sở dữ liệu lỗi. Mọi lỗi sẽ được xử lý bằng cách đồng bộ lại (re-sync) lịch sử ở cuối quy trình khôi phục.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Tạo bản sao lưu">
+Cân nhắc tạo một [bản sao lưu nhất quán](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) của phiên bản.
+</Step>
+
+<Step title="Nâng cấp">
+Nâng cấp lên phiên bản `5.0.3`.
+</Step>
+
+<Step title="Khôi phục tự động">
+Quy trình khôi phục tự động chạy khi container khởi động.
+</Step>
+
+<Step title="Theo dõi tiến trình">
+Bạn có thể theo dõi tiến trình của script bằng cách tail tệp log `/var/lib/overleaf/data/history/doc-version-recovery.log`. Script sẽ in tổng số dự án khi bắt đầu và một bản tóm tắt sau mỗi 1000 dự án được xử lý.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Đợi quy trình khôi phục hoàn tất">
+Đợi quy trình khôi phục hoàn tất bằng cách tail tệp log ở trên cho đến khi dòng `Done.` được in ra, hoặc đợi đến khi `Finished recovery of doc versions.` được in ra đầu ra chuẩn của container Server Pro.
+</Step>
+
+<Step title="Xác minh quy trình khôi phục">
+Xác minh quy trình khôi phục bằng cách mở bảng lịch sử của một vài dự án trước đây bị thiếu lịch sử.
+
+1.  Đẩy nhanh việc đồng bộ lại cho các dự án cần kiểm tra (Cuối cùng chúng cũng sẽ được xử lý, nhưng chúng ta không muốn đợi đến lượt của chúng.)
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Lặp lại với từng project-id cần kiểm tra, thay `000000000000000000000000` bằng từng project-id một.)
+2. Mở trình soạn thảo dự án cho các dự án `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Mở bảng "History" của dự án và xem nội dung mới nhất.
+4. Tùy chọn: Đóng lại bảng "History". Thực hiện một thay đổi mã, chẳng hạn thêm một chú thích vào phần đầu.
+5. Tùy chọn: Biên dịch lại để kích hoạt flush thay đổi cục bộ. Mở lại bảng "History" và xem thay đổi. Khi xong, hãy hoàn tác thay đổi.
+</Step>
+
+<Step title="Đối với mở rộng theo chiều ngang...">
+Khởi động lại các worker khác.
+</Step>
+
+<Step title="Giữ phiên bản tiếp tục chạy">
+Vui lòng giữ cho phiên bản đã thực thi quy trình khôi phục tiếp tục chạy. Nó sẽ đồng bộ lại lịch sử cho tất cả dự án ở chế độ nền với mức đồng thời là 1. Điều này sẽ làm tải nền tăng nhẹ. (Bạn có thể khởi động lại phiên bản, nhưng nó sẽ phải bắt đầu lại các lần đồng bộ lại từ đầu.)
+</Step>
+
+<Step title="Thông báo cho chúng tôi khi bạn hoàn tất">
+Khách hàng Server Pro: Vui lòng thông báo cho đội ngũ hỗ trợ khi bạn đã hoàn tất quy trình khôi phục.
+</Step>
+</Steps>

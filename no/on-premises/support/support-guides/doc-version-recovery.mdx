@@ -1,0 +1,158 @@
+---
+title: (v5.0.1-migrering) Gjenoppretting av dokumentversjoner
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Hvis du aldri har kjørt Server Pro versjon 5.0.1 eller Community Edition versjon 5.0.1, eller hvis du startet en helt ny instans med 5.0.1, trenger du ikke å kjøre denne gjenopprettingsprosessen.
+
+</Info>
+
+**Oppdateringer av denne siden:**
+
+* (2024-04-22 13:40 BST): La til trinnet "Stopp nye oppdateringer fra å komme inn i systemet og skyll alle endringer til MongoDB".
+* (2024-04-23 11:45 BST): Tar hensyn til mislykkede skyllinger i 5.0.1 og hopper over skyllinger når 5.0.2 har vært startet.
+
+Hvor lang tid gjenopprettingen tar, avhenger av antallet og størrelsen på prosjektene i instansen din og lagringsbackenden som historikklageret bruker for chunks (som definert i `OVERLEAF_HISTORY_CHUNKS_BUCKET`).
+
+Gjenopprettingsprosessen forsinker oppstarten av applikasjonen inne i Server Pro-containeren. Nettstedet vil fremstå som frakoblet i denne perioden. Vi støtter bare at gjenopprettingen kjøres fra én enkelt instans av Server Pro-containeren; alle andre horisontalt skalerte arbeidere må være frakoblet.
+
+Du kan stoppe og gjenoppta gjenopprettingsprosessen ved behov.
+
+Basert på ytelsestestene våre kan gjenopprettingsprosessen behandle omtrent 10 000 små prosjekter per minutt på moderne maskinvare (3 GHz CPU-klokkefrekvens og lokal NVMe-lagring). For en instans med for eksempel 100 000 prosjekter bør du planlegge et vedlikeholdsvindu som gir rom for minst 10+2 minutters nedetid. Bruk følgende spørring for å anslå antall prosjekter i instansen din:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Les gjennom alle gjenopprettingstrinnene nedenfor før du starter. Server Pro-kunder er hjertelig velkomne til å kontakte [support@overleaf.com](mailto:support@overleaf.com) med eventuelle spørsmål.
+
+### Gjenopprettingsprosess
+
+<Steps>
+<Step title="Hent release-imager">
+Hent release-imagene for `5.0.3`.
+</Step>
+
+<Step title="Identifiser noen prosjekter">
+Identifiser noen prosjekter etter ID som mangler historikk; ideelt sett har du tillatelse til å gjøre en endring i ett av dem.
+</Step>
+
+<Step title="Planlegg vedlikehold">
+Planlegg et vedlikeholdsvindu for nedetiden.
+</Step>
+
+<Step title="Stopp alle arbeidere unntatt én">
+Stopp alle arbeidere unntatt én når du bruker et oppsett med horisontal skalering.
+</Step>
+
+<Step title="Stopp nye oppdateringer og skyll alle endringer til MongoDB">
+Stopp nye oppdateringer fra å komme inn i systemet og skyll alle endringer til MongoDB:
+
+1. Lukk editoren og koble fra alle brukere manuelt via administrasjonspanelet på `https://my-server-pro.example.com/admin#open-close-editor` i fanen "Open/Close Editor".
+2.  Stopp Websocket-/sanntidstjenesten.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Vent til sanntidstjenesten har avsluttet, noe som angis med `down:`.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Stopp git-bridge-containeren hvis den er aktivert.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  Hvis du aldri har kjørt 5.0.2: Utfør en manuell skylling av dokumentoppdateringer og vent til den er fullført uten feil.
+
+    Du kan gjenta kommandoen ved feil. Hvis du ser en `failureCount` som ikke er null i påfølgende kjøringer, må du stoppe migreringen (gjenopprett tjenestene med `docker restart git-bridge sharelatex`) og kontakte support.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  Hvis du aldri har kjørt 5.0.2: Kontroller at alle endringer er skylt ut av Redis.
+
+    Hvis du får noe utdata fra `redis-cli`, må du stoppe migreringen (gjenopprett tjenestene med `docker restart git-bridge sharelatex`) og kontakte support.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Prøv å skylle eventuelle ventende historikkendringer.
+
+    Dette blir en skylling etter beste evne, siden noen prosjekter har ødelagt historikk på grunn av den feilaktige databasemigreringen. Eventuelle feil vil bli rettet med en ny synkronisering av historikken på slutten av gjenopprettingsprosessen.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Ta en sikkerhetskopi">
+Vurder å ta en [konsistent sikkerhetskopi](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) av instansen.
+</Step>
+
+<Step title="Oppgrader">
+Oppgrader til versjon `5.0.3`.
+</Step>
+
+<Step title="Automatisk gjenoppretting">
+Gjenopprettingsprosessen kjøres automatisk når containeren starter.
+</Step>
+
+<Step title="Følg fremdriften">
+Du kan følge skriptets fremdrift ved å følge med på loggfilen `/var/lib/overleaf/data/history/doc-version-recovery.log`. Den skriver ut totalt antall prosjekter ved start og et sammendrag for hvert 1000. behandlede prosjekt.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Vent til gjenopprettingsprosessen er fullført">
+Vent til gjenopprettingsprosessen er fullført, enten ved å følge loggfilen ovenfor til en `Done.`-linje er skrevet ut, eller ved å vente til `Finished recovery of doc versions.` skrives til standard utdata fra Server Pro-containeren.
+</Step>
+
+<Step title="Valider gjenopprettingsprosessen">
+Valider gjenopprettingsprosessen ved å åpne historikkpanelet for noen av prosjektene som tidligere manglet historikk.
+
+1.  Fremskynd resynkroniseringen for prosjektene du vil teste (de blir behandlet etter hvert, men vi vil ikke vente til det blir deres tur.)
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Gjenta for hver av prosjekt-ID-ene du vil teste, og erstatt `000000000000000000000000` med én prosjekt-ID om gangen.)
+2. Åpne prosjekteditoren for prosjektene `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Åpne "History"-panelet for prosjektet og se det nyeste innholdet.
+4. Valgfritt: Lukk "History"-panelet igjen. Gjør en kodeendring, for eksempel ved å legge til en kommentar i headeren.
+5. Valgfritt: Start en ny kompilering for å utløse en skylling av den lokale endringen. Åpne "History"-panelet igjen og se endringen. Når du er ferdig, angrer du endringen.
+</Step>
+
+<Step title="For horisontal skalering...">
+Start de andre arbeiderne igjen.
+</Step>
+
+<Step title="La instansen fortsette å kjøre">
+La instansen som kjørte gjenopprettingsprosessen, fortsette å kjøre. Den vil resynkronisere historikken for alle prosjekter i bakgrunnen med en samtidighet på 1. Dette gir en litt forhøyet grunnlast. (Du kan starte instansen på nytt, men da må resynkroniseringene starte forfra.)
+</Step>
+
+<Step title="Gi oss beskjed når du er ferdig">
+Server Pro-kunder: Gi supportteamet beskjed når du har fullført gjenopprettingsprosessen.
+</Step>
+</Steps>

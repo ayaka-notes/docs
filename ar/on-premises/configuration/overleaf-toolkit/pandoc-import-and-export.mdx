@@ -1,0 +1,130 @@
+---
+title: الاستيراد والتصدير باستخدام Pandoc
+icon: file-lines
+---
+
+### الاستيراد / التصدير باستخدام Pandoc
+
+يمكن لـ Overleaf تحويل المستندات من LaTeX وإليها باستخدام [Pandoc](https://pandoc.org/). ويجري التحويل داخل **حاوية Docker معزولة (sandboxed)** تديرها خدمة `clsi`، ولذلك تكون هذه الميزة معطّلة افتراضيًا ويجب تفعيلها عبر بضعة متغيرات بيئة.
+
+#### ما الذي تفعله
+
+| الاتجاه  | من ← إلى                | الصيغ                    | المكان                                                                                           |
+| ---------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| **الاستيراد** | مستند ← مشروع LaTeX | `docx`، `markdown`         | _New Project → Import_ (يرفع ملف `.docx` / `.md` ويحوّله إلى مشروع `.tex` قابل للتحرير) |
+| **التصدير** | مشروع LaTeX ← مستند | `docx`، `markdown`، `html` | _Menu → Download / Export_ (يعالج المشروع عبر Pandoc)                                 |
+
+***
+
+### متغيرات البيئة
+
+هناك **متغيران** مهمان، ومتغير ثالث مشابه لهما في الاسم لكنه **ليس** ذا صلة.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — المفتاح الرئيسي
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* النوع: قيمة منطقية (`true` تفعّل الميزة؛ وأي قيمة أخرى تعطّلها).
+* **يجب ضبطه على كلتا الخدمتين `web` و `clsi`.** فهما عمليتان منفصلتان لكل منهما إعداداتها الخاصة:
+  * تقرأه `web` في `enablePandocConversions` (`services/web/config/settings.defaults.js`). وهو يتحكم في مسارات الاستيراد ومسارات التصدير والعلامة `ol-ExposedSettings.enablePandocConversions` التي تخبر الواجهة الأمامية بما إذا كان يجب إظهار واجهة الاستيراد/التصدير.
+  * تقرأه `clsi` في `enablePandocConversions` (`services/clsi/config/settings.defaults.cjs`). وهو يتحكم في نقاط النهاية التي تشغّل Pandoc.
+* إذا كان مفعّلًا على `web` وليس على `clsi` (أو العكس)، فستظهر الواجهة لكن التحويل سيفشل — احرص على إبقائهما متزامنين.
+
+2\. `PANDOC_IMAGE` — صورة الحاوية التي تشغّلها clsi لإجراء التحويل
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### المتطلبات المسبقة
+
+نظرًا لأن عمليات التحويل تعمل كحاويات Docker تنشئها `clsi`:
+
+1. **يجب أن تعمل `clsi` في الوضع المعزول مع إمكانية الوصول إلى Docker.** في حزمة التطوير، تملك `clsi` بالفعل `SANDBOXED_COMPILES=true` ويكون Docker socket الخاص بالمضيف (`/var/run/docker.sock`) مركّبًا.
+2. **يجب أن تكون الصورة `PANDOC_IMAGE` موجودة** على مضيف Docker ذلك (مسحوبة أو مبنية محليًا) قبل أول عملية تحويل.
+
+***
+
+### الإعداد السريع
+
+تأتي حزمة التطوير (`develop/dev.env`) مزوّدة مسبقًا بما يلي:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+نظرًا لأن الصورة الرسمية خاصة، قم ببناء الصورة المرفقة **مرة واحدة** قبل استخدام الميزة:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+ثم شغّل الحزمة (أو أعد تشغيلها) حتى تلتقط `clsi` و `web` المتغيرات.
+
+***
+
+### بناء صورة Pandoc
+
+تعمل صورة Pandoc القياسية لأن clsi تستدعي Pandoc بشكل عام (دون قوالب/مرشحات مخصصة). وهي لا تحتاج إلا إلى ثلاثة أساسيات وقت التشغيل، يتولاها جميعًا الملف `develop/pandoc/Dockerfile`:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+قم ببنائها ووسمها بحيث يطابق الوسم قيمة `PANDOC_IMAGE`:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+في بيئة الإنتاج، ثبّت `pandoc/core` على إصدار محدد بدلًا من `latest` للحصول على عمليات بناء قابلة للتكرار، واضبط `PANDOC_IMAGE` على مسار السجل الخاص بك.
+
+***
+
+### استكشاف الأخطاء وإصلاحها
+
+| العَرَض                                             | السبب المحتمل                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| أزرار الاستيراد/التصدير لا تظهر                  | `ENABLE_PANDOC_CONVERSIONS` ليس `true` على **web**                                             |
+| تظهر الواجهة لكن التحويل يفشل بخطأ في الخادم | `ENABLE_PANDOC_CONVERSIONS` غير مضبوط على **clsi**، أو `PANDOC_IMAGE` غير موجودة على مضيف Docker |
+| خطأ في `clsi` أثناء سحب الصورة (401)                | لا يزال `PANDOC_IMAGE` يشير إلى الصورة الافتراضية الخاصة؛ قم ببناء صورتك الخاصة أو وجّهه إليها             |
+| الحاوية تشغّل `pandoc pandoc …` / وسائط خاطئة       | تحتوي الصورة على `ENTRYPOINT` يشغّل `pandoc`؛ استخدم `ENTRYPOINT []`                                        |
+| مخرجات الاستيراد فارغة / خطوة zip تفشل             | الأداة `zip` غير مثبتة في الصورة                                                           |
+| أخطاء في الأذونات على الملفات المحوّلة                | لا تحتوي الصورة على المستخدم `tex` بالمعرّف UID 1000                                                           |

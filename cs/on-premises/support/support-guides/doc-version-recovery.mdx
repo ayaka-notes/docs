@@ -1,0 +1,158 @@
+---
+title: (Migrace v5.0.1) Obnova verzí dokumentů
+icon: arrow-rotate-left
+---
+
+<Info>
+
+Pokud jste nikdy neprovozovali Server Pro verze 5.0.1 ani Community Edition verze 5.0.1, nebo jste spustili zcela novou instanci s verzí 5.0.1, nemusíte tento proces obnovy spouštět.
+
+</Info>
+
+**Aktualizace této stránky:**
+
+* (2024-04-22 13:40 BST): Přidán krok „Zastavení přísunu nových aktualizací do systému a vyprázdnění všech změn do MongoDB“.
+* (2024-04-23 11:45 BST): Zohlednění nefunkčních vyprázdnění ve verzi 5.0.1 a přeskočení vyprázdnění, pokud byla spuštěna verze 5.0.2.
+
+Doba trvání obnovy bude záviset na počtu a velikosti projektů ve vaší instanci a na úložném backendu, který úložiště historie používá pro chunky (definovaném v `OVERLEAF_HISTORY_CHUNKS_BUCKET`).
+
+Proces obnovy zpozdí spuštění aplikace uvnitř kontejneru Server Pro. Po tuto dobu se bude web jevit jako offline. Podporujeme spuštění obnovy pouze z jediné instance kontejneru Server Pro; všechny ostatní workery horizontálního škálování musí být offline.
+
+V případě potřeby můžete proces obnovy zastavit a znovu obnovit.
+
+Podle našich výkonnostních testů dokáže proces obnovy na moderním hardwaru (taktovací frekvence CPU 3 GHz a lokální úložiště NVMe) zpracovat přibližně 10 tisíc malých projektů za minutu. Například pro instanci se 100 tisíci projekty naplánujte okno údržby, které umožní alespoň 10+2 minuty výpadku. Pro odhad počtu projektů ve vaší instanci použijte následující dotaz:
+
+```bash wrap
+$ docker exec mongo mongosh sharelatex --quiet --eval 'db.projects.estimatedDocumentCount() + db.deletedProjects.estimatedDocumentCount()'
+```
+
+Než začnete, přečtěte si prosím celý následující postup obnovy. Zákazníci Server Pro se s jakýmikoli dotazy mohou obrátit na [support@overleaf.com](mailto:support@overleaf.com).
+
+### Proces obnovy
+
+<Steps>
+<Step title="Stažení release images">
+Stáhněte release images verze `5.0.3`.
+</Step>
+
+<Step title="Určení několika projektů">
+Určete podle ID několik projektů, kterým chybí historie; ideálně máte oprávnění v jednom z nich provést změnu.
+</Step>
+
+<Step title="Naplánování údržby">
+Naplánujte okno údržby pro výpadek.
+</Step>
+
+<Step title="Zastavení všech workerů kromě jednoho">
+Při použití horizontálního škálování zastavte všechny workery kromě jednoho.
+</Step>
+
+<Step title="Zastavení nových aktualizací a vyprázdnění všech změn do MongoDB">
+Zastavte přísun nových aktualizací do systému a vyprázdněte všechny změny do MongoDB:
+
+1. Zavřete editor a ručně odpojte všechny uživatele prostřednictvím administrátorského panelu na `https://my-server-pro.example.com/admin#open-close-editor` na kartě „Open/Close Editor“.
+2.  Zastavte službu Websocket/real-time.
+
+    ```bash
+    $ docker exec sharelatex sv stop real-time-overleaf
+    ```
+3.  Počkejte, až se služba real-time ukončí, což signalizuje `down:`.
+
+    ```bash
+    $ docker exec sharelatex sv status real-time-overleaf
+    run: real-time-sharelatex: (pid 394) 50s, want down, got TERM
+    # wait a little longer...
+
+    $ docker exec sharelatex sv status real-time-overleaf
+    down: real-time-sharelatex: 7s, normally up
+    ```
+4.  Pokud je povolen, zastavte kontejner git-bridge.
+
+    ```bash
+    $ docker stop git-bridge
+    ```
+5.  Pokud jste nikdy nespustili verzi 5.0.2: Spusťte ruční vyprázdnění aktualizací dokumentů a počkejte, až úspěšně skončí.
+
+    Při chybě můžete příkaz zopakovat. Pokud při opakovaných bězích uvidíte nenulový `failureCount`, migraci prosím zastavte (obnovte služby pomocí `docker restart git-bridge sharelatex`) a kontaktujte podporu.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /etc/overleaf/env.sh && cd services/document-updater && LOG_LEVEL=info node scripts/flush_all.js'
+        ...
+        {"name":"default","hostname":"...","pid":324,"level":30,"successCount":...,"failureCount":0,"msg":"finished flushing all projects","time":"...","v":0}
+        Done flushing all projects
+        
+    ```
+6.  Pokud jste nikdy nespustili verzi 5.0.2: Ujistěte se, že všechny změny byly vyprázdněny z redisu.
+
+    Pokud `redis-cli` vrátí jakýkoli výstup, migraci prosím zastavte (obnovte služby pomocí `docker restart git-bridge sharelatex`) a kontaktujte podporu.
+
+    ```bash wrap
+    $ docker exec redis redis-cli --scan --pattern 'DocVersion:*'
+        # no output from redis-cli indicates success, check exit code of redis-cli next, it should be zero
+        $ echo $?
+        0
+        
+    ```
+7.  Pokuste se vyprázdnit všechny čekající změny historie.
+
+    Půjde o vyprázdnění v rámci možností (best effort), protože některé projekty mají kvůli chybné migraci databáze poškozenou historii. Jakékoli chyby budou vyřešeny opětovnou synchronizací historie na konci procesu obnovy.
+
+    ```bash wrap
+    $ docker exec sharelatex bash -c 'source /etc/container_environment.sh && source /
+        
+    ```
+</Step>
+
+<Step title="Vytvoření zálohy">
+Zvažte vytvoření [konzistentní zálohy](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) instance.
+</Step>
+
+<Step title="Upgrade">
+Proveďte upgrade na verzi `5.0.3`.
+</Step>
+
+<Step title="Automatická obnova">
+Proces obnovy se spustí automaticky při startu kontejneru.
+</Step>
+
+<Step title="Sledování průběhu">
+Průběh skriptu můžete sledovat pomocí tail na log souboru `/var/lib/overleaf/data/history/doc-version-recovery.log`. Na začátku vypíše celkový počet projektů a po každých 1000 zpracovaných projektech souhrn.
+
+```bash wrap
+$ docker exec sharelatex tail --retry --follow /var/lib/overleaf/data/history/doc-vers
+```
+</Step>
+
+<Step title="Počkejte na dokončení procesu obnovy">
+Počkejte na dokončení procesu obnovy – buď sledujte výše uvedený log soubor, dokud se nevypíše řádek `Done.`, nebo počkejte, až se na standardní výstup kontejneru Server Pro vypíše `Finished recovery of doc versions.`.
+</Step>
+
+<Step title="Ověření procesu obnovy">
+Ověřte proces obnovy otevřením panelu historie u několika projektů, kterým dříve historie chyběla.
+
+1.  Urychlete opětovnou synchronizaci testovaných projektů (nakonec budou zpracovány i tak, ale nechceme čekat, až na ně přijde řada.)
+
+    ```bash wrap
+    $ docker exec sharelatex curl -X POST --silent "http://127.0.0.1:3054/project/000000000000000000000000/resync?force=true"
+        
+    ```
+
+    (Opakujte pro každé ID projektu, které chcete otestovat; `000000000000000000000000` pokaždé nahraďte jedním ID projektu.)
+2. Otevřete editor projektu `https://my-server-pro.example.com/project/000000000000000000000000`
+3. Otevřete u projektu panel „History“ a zkontrolujte nejnovější obsah.
+4. Volitelné: Panel „History“ opět zavřete. Proveďte změnu v kódu, například přidejte komentář do hlavičky.
+5. Volitelné: Spusťte novou kompilaci, aby se vyvolalo vyprázdnění lokální změny. Znovu otevřete panel „History“ a zkontrolujte změnu. Poté změnu vraťte zpět.
+</Step>
+
+<Step title="Při horizontálním škálování...">
+Znovu spusťte ostatní workery.
+</Step>
+
+<Step title="Ponechte instanci běžet">
+Instanci, která provedla proces obnovy, prosím ponechte běžet. Na pozadí bude znovu synchronizovat historii všech projektů se souběžností 1. To povede k mírně zvýšené základní zátěži. (Instanci můžete restartovat, ale opětovné synchronizace pak bude muset začít od začátku.)
+</Step>
+
+<Step title="Dejte nám vědět, až budete hotovi">
+Zákazníci Server Pro: Po dokončení procesu obnovy prosím informujte tým podpory.
+</Step>
+</Steps>

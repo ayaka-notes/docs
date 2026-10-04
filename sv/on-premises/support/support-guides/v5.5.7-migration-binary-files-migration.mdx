@@ -1,0 +1,288 @@
+---
+title: (Migrering v5.5.7) Migrering av binärfiler
+icon: arrows-rotate
+---
+
+## Migrering av binärfiler
+
+Den kommande huvudversionen `6.0` av Server Pro och Community Edition halverar lagringsanvändningen för binärfiler. En onlinemigrering ingår i version `5.5.7`, vilket ger minimal driftstopp i samband med uppgraderingen.
+
+Sedan Server Pro `4.x` lagras binärfiler två gånger: i lagringen för aktiva filer i "filestore" och i systemet för fullständig projekthistorik. Framöver lagras en enda kopia av varje fil i systemet för fullständig projekthistorik.
+
+Migreringen till det konsoliderade lagringssystemet består av två delar: en ny flagga för att styra migreringens fas och ett skript som bearbetar alla aktiva och mjukt borttagna projekt.
+
+Faser:
+
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=0` (standard): filer läses från och skrivs till filestore. Filer skrivs asynkront till historiken.
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1`: filer läses från historiken med filestore som reserv och skrivs till både filestore och historiken. Nedgradering till `OVERLEAF_FILESTORE_MIGRATION_LEVEL=0` är möjlig.
+* `OVERLEAF_FILESTORE_MIGRATION_LEVEL=2`: filer läses från och skrivs endast till historiken. Nedgradering till `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1` är inte möjlig, såvida den inte utfördes "offline".
+
+När data lagras i [S3](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/s3) och separata tjänstekonton används för filestore (`OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID`) och historik (`OVERLEAF_HISTORY_S3_ACCESS_KEY_ID`): ge filestore-användaren läsbehörighet till historikens bucket för blobbar, `OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET`. Framöver kommer filestore-tjänsten att hantera läsningar från kompileringstjänsten.
+
+<Warning>
+
+Det rekommenderas starkt att du först utför migreringen av binärfiler i en miljö som inte är produktion, eller i en sandlådemiljö.
+
+</Warning>
+
+<Check>
+
+Standardlicensen för Server Pro tillåter att du kör applikationen både i en produktionsmiljö och i en miljö som inte är produktion (sandlåda); det rekommenderas starkt att du sätter upp en miljö utanför produktion för tester.
+
+</Check>
+
+<Info>
+
+Om du uppgraderar till Server Pro/CE version `6.0` och senare bestämmer dig för att nedgradera till en tidigare version bör du återställa från en fullständig säkerhetskopia av systemet.
+
+</Info>
+
+### Migreringsprocedur
+
+<Steps>
+<Step title="Skapa en säkerhetskopia">
+Skapa en fullständig [säkerhetskopia](https://docs.overleaf.com/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) av din instans med en konsekvent ögonblicksbild av katalogerna **mongo**, **redis** och **sharelatex**.
+</Step>
+
+<Step title="Uppdatera">
+**Toolkit:** Använd skriptet `$ bin/upgrade` för att uppgradera **toolkit** till den senaste versionen. När du tillfrågas ska du **inte** bekräfta frågan **Upgrade** image? — redigera i stället filen **config/version** manuellt och sätt värdet till `5.5.7`.
+
+**Äldre docker-compose.yml:** Uppdatera versionen av tjänsten `sharelatex` till `5.5.7`.
+</Step>
+
+<Step title="Uppskatta antalet berörda projekt">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --report"
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --report"
+```
+
+Exempel på utdata:
+
+```text
+Current status:
+- Total number of projects: 10
+- Total number of deleted projects: 5
+Sampling 1000 projects to estimate progress...
+Sampled stats for projects:
+- Sampled projects: 9 (90% of all projects)
+- Sampled projects with all hashes present: 5
+- Percentage of projects that need back-filling hashes: 44% (estimated)
+- Sampled projects have 11 files that need to be checked against the full project history system.
+- Sampled projects have 3 files that need to be uploaded to the full project history system (estimating 27% of all files).
+Sampled stats for deleted projects:
+- Sampled deleted projects: 4 (80% of all deleted projects)
+- Sampled deleted projects with all hashes present: 3
+- Percentage of deleted projects that need back-filling hashes: 25% (estimated)
+- Sampled deleted projects have 2 files that need to be checked against the full project history system.
+- Sampled deleted projects have 1 files that need to be uploaded to the full project history system (estimating 50% of all files).
+```
+</Step>
+
+<Step title="Töm köerna för projekthistorik">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /overleaf/bin/flush-history-queues
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /overleaf/bin/flush-history-queues
+```
+
+Upprepa tömningen tills alla projekt har tömts (`"project_ids":0`).
+
+```text
+found projects {"project_ids":0,"limit":100000,"ts":"2025-09-01T10:35:33.353Z"}
+total {"succeededProjects":0,"failedProjects":0}
+```
+
+<Danger>
+
+Om "failedProjects" inte är noll ska du kontakta supporten och inte fortsätta med migreringen av binärfiler.
+
+</Danger>
+</Step>
+
+<Step title="Flytta fram migreringsfasen till 1">
+Toolkit: Sätt `OVERLEAF_FILESTORE_MIGRATION_LEVEL=1` i `config/variables.env`.
+
+Äldre docker-compose.yml: Sätt `OVERLEAF_FILESTORE_MIGRATION_LEVEL: '1'` i avsnittet `environment` för tjänsten `sharelatex`.
+</Step>
+
+<Step title="Tillämpa konfigurationsändringen och starta instansen">
+Toolkit: `bin/up -d`
+
+Äldre docker-compose.yml: `docker compose up -d`
+</Step>
+
+<Step title="Verifiera åtkomsten till binärfiler">
+Öppna ett projekt i Overleaf-editorn i webbläsaren och välj en binärfil, till exempel en bild.
+</Step>
+
+<Step title="Kör migreringsskriptet">
+```bash wrap
+# Overleaf Toolkit users:
+$ bin/docker-compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --all"
+
+# Legacy docker-compose.yml users:
+$ docker compose exec sharelatex /bin/bash -c "source /etc/overleaf/env.sh && source /etc/container_environment.sh && cd /overleaf/services/history-v1 && /sbin/setuser www-data node storage/scripts/back_fill_file_hash.mjs --all"
+```
+
+<Danger>
+
+Om du [sparar loggfiler](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging#persisting-logs) utanför containern **sharelatex** ska du se till att loggkatalogens ägare är användaren `www-data` (uid=33) så att loggfilen kan skrivas.
+
+</Danger>
+
+Utdatan bör se ut så här:
+
+```bash
+Set UV_THREADPOOL_SIZE=16
+{"name":"default","hostname":"c25e9faaeb53","pid":971,"level":30,"backend":"fs","msg":"Loading backend","time":"2025-07-25T15:00:58.166Z","v":0}
+Writing logs into /var/log/overleaf/file-migration-2025-07-25T15_00_58_199Z.log
+Starting project file backup...
+Loaded global blobs: 0
+Processing non-deleted projects...
+Processed 1 projects, elapsed time 0s
+Done updating live projects
+Processing deleted projects...
+The collection deletedProjects appears to be empty.
+
+Done updating deleted projects
+Done.
+
+```
+
+Om migreringen lyckas får du avslutningskoden `0`, och de sista raderna visar att inga fel uppstod:
+
+```bash
+Done.
+```
+
+Loggfilen ser ut så här (använd sökvägen som skriptet skriver ut):
+
+```bash wrap
+$ docker cp sharelatex:/var/log/overleaf/file-migration-2025-07-25T15_00_58_199Z.log .
+$ cat file-migration-2025-07-25T15_00_58_199Z.log
+{"name":"file-migration","hostname":"c25e9faaeb53","pid":971,"level":30,"end":"68839a8f577b9f009d947b27 (2025-07-25T14:54:07.000Z)","msg":"actually completed batch","time":"2025-07-25T15:00:58.379Z","v":0}
+{"name":"file-migration","hostname":"c25e9faaeb53","pid":971,"level":30,"time":"2025-07-25T15:00:58.383Z","LOGGING_IDENTIFIER":"4effa2000000000000000000","projects":1,"blobs":6,"filesWithHash":5,"filesWithoutHash":2,"filesDuplicated":0,"filesRetries":0,"filesFailed":0,"fileTreeUpdated":0,"badFileTrees":0,"globalBlobsCount":0,"globalBlobsEgress":0,"projectDeleted":0,"projectHardDeleted":0,"fileHardDeleted":0,"mongoUpdates":1,"readFromGCSCount":7,"readFromGCSIngress":28532,"writeToGCSCount":5,"writeToGCSEgress":300,"readFromGCSThroughputMiBPerSecond":0.14925639825786063,"eventLoop":{"idle":48.277844,"active":381.53244699971054,"utilization":0.8876763888372498},"diff":{"eventLoop":{"idle":48.223536,"active":134.04030200059555,"utilization":0.7354190687027976},"projects":1,"blobs":6,"filesWithHash":5,"filesWithoutHash":2,"filesDuplicated":0,"filesRetries":0,"filesFailed":0,"fileTreeUpdated":0,"badFileTrees":0,"globalBlobsCount":0,"globalBlobsEgress":0,"projectDeleted":0,"projectHardDeleted":0,"fileHardDeleted":0,"mongoUpdates":1,"readFromGCSCount":7,"readFromGCSIngress":28532,"writeToGCSCount":5,"writeToGCSEgress":300,"readFromGCSThroughputMiBPerSecond":0.14925639825786063},"deferredBatches":[],"msg":"file-migration stats","v":0}
+```
+</Step>
+
+<Step title="Stoppa instansen">
+Toolkit: `bin/stop sharelatex`
+
+Äldre docker-compose.yml: `docker compose stop sharelatex`
+</Step>
+
+<Step title="Gör gamla filer oåtkomliga för applikationen">
+Nu kan du flytta de gamla filerna till sekundär lagring. Vi rekommenderar att du behåller filerna ett tag ifall problem skulle uppstå senare.
+
+```bash wrap
+# Toolkit users:
+$ bin/docker-compose run --rm --entrypoint mv sharelatex --no-clobber --verbose /var/lib/overleaf/data/user_files /var/lib/overleaf/data/old_user_files
+
+# Legacy docker-compose.yml users:
+# We are assuming that you are using the default bind-mount in /var/lib/overleaf
+$ docker compose run --rm --entrypoint mv sharelatex --no-clobber --verbose /var/lib/overleaf/data/user_files /var/lib/overleaf/data/old_user_files
+# In case you are using selective bind-mounts, you can simply remove the bind-mount for /var/lib/overleaf/data/user_files inside the container.
+```
+</Step>
+
+<Step title="Flytta fram migreringsfasen till 2">
+Toolkit: Sätt `OVERLEAF_FILESTORE_MIGRATION_LEVEL=2` i `config/variables.env`.
+
+Äldre docker-compose.yml: Sätt `OVERLEAF_FILESTORE_MIGRATION_LEVEL: '2'` i avsnittet `environment` för tjänsten `sharelatex`.
+</Step>
+
+<Step title="Tillämpa konfigurationsändringen och starta instansen">
+Toolkit: `bin/up -d`
+
+Äldre docker-compose.yml: `docker compose up -d`
+</Step>
+
+<Step title="Verifiera åtkomsten till binärfiler">
+Öppna ett projekt i Overleaf-editorn i webbläsaren och välj en binärfil, till exempel en bild.
+</Step>
+</Steps>
+
+#### Offlinemigrering
+
+Om du vill förhindra att användare kan logga in medan migreringsskriptet för binärfiler körs följer du dessa steg:
+
+* Logga in på din Overleaf-instans med ett administratörskonto
+* Klicka på knappen **Admin** och välj **Manage Site**
+* Klicka på fliken **Open/Close Editor**
+* Klicka på knappen **Close Editor**
+* Klicka på knappen **Disconnect all users**
+
+När detta är gjort omdirigeras eventuella inloggade användare till underhållssidan, och nya användare som besöker inloggningssidan ser underhållssidan och kan **inte** logga in.
+
+Du måste upprepa dessa steg när instansen startas om. För att öppna webbplatsen igen startar du helt enkelt om instansen.
+
+#### Onlinemigrering
+
+Det går att köra migreringsskripten medan applikationen fortfarande körs. Det finns några saker att ta hänsyn till:
+
+* Migreringsprocessen är I/O-intensiv, så du bör övervaka resursanvändningen medan skriptet körs.
+* Med hög samtidighet i bearbetningen kan händelseloopen i tjänsten `filestore` blockeras i viss mån, vilket försämrar användarupplevelsen. Vi rekommenderar att du börjar med standardvärdena `--concurrency=10` och `--concurrent-batches=1`.
+* Du kan stoppa skriptet när som helst. När det startas igen valideras tidigare projekt och filer som redan har bearbetats hoppas över. Det är användbart om du föredrar att köra migreringen under lugnare timmar (t.ex. på natten).
+
+Vår rekommendation är att stänga webbplatsen och köra migreringen offline under ett underhållsfönster om du har färre än 1000 projekt (se utdatan från migreringsskriptet när det körs med `--report`). Om antalet projekt är stort kan du köra skriptet och övervaka förloppet, och sedan avgöra om du ska fortsätta köra det online eller offline utifrån din situation.
+
+#### Rensa äldre binärfilsdata
+
+När du är klar med migreringen och har verifierat att projekten fortfarande kan komma åt alla sina filer kan du ta bort den gamla fillagringen i `/var/lib/overleaf/data/user_files`. Vi rekommenderar starkt att du behåller filerna ett tag – du kan göra dem oåtkomliga för applikationen genom att först byta namn på mappen.
+
+### Felsökning
+
+Vi kommer att lägga till felsökningsråd här. Observera att även om vi normalt bara erbjuder support till Server Pro-kunder kommer vi, med tanke på den här migreringens natur, att göra vårt bästa för att även hjälpa CE-kunder som får problem som är specifika för migreringen av binärfiler.
+
+Om migreringsskriptet för binärfiler misslyckas (dvs. avslutas med ett fel eller skriver ut ett antal misslyckade projekt som inte är noll) skickar du följande uppgifter till vårt supportteam via e-post till [support+filestoremigration@overleaf.com](mailto:support+filestoremigration@overleaf.com?subject=Binary%20file%20migration%20problem&body=Instance%20Type%3A%20CE%20or%20Server%20Pro%20%28delete%20as%20appropriate%29%0A%0AInstallation%20Type%3A%20Overleaf%20toolkit%20or%20docker-compose.yml%20or%20other%20%28delete%20as%20appropriate%29%0A%0AScript%20output%3A%0A%0Abin%2Fdoctor%20output%20%28if%20using%20toolkit%29%3A%0A), med följande:
+
+Ämne: Binary file migration problem
+
+Brödtext:
+
+* Instance Type: CE eller Server Pro (stryk det som inte gäller)
+* Installation Type: Overleaf toolkit eller `docker-compose.yml` eller annat (stryk det som inte gäller)
+* Version: 5.5.x (toolkit: `$ cat config/version`)
+* Utdata från migreringsskriptet (som bör finnas i containern under `/var/log/overleaf`)
+* Rapport: (kör migreringsskriptet med `--report`)
+* Bearbetade projekt: (enligt skriptets senaste körning)
+* Migreringens varaktighet:
+* Utdata från `bin/doctor` (vid användning av toolkit)
+* Toolkit-version: `$ git rev-parse HEAD` (vid användning av Toolkit)
+
+Överväg att bifoga loggfilerna för tjänsten `filestore` i e-postmeddelandet. Du hittar dem på `/var/log/overleaf/filestore.log` i containern `sharelatex` och kan exportera dem så här:
+
+```bash
+$ docker cp sharelatex:/var/log/overleaf/filestore.log .
+# replace <timestamp> with the timestamp as printed by the script
+$ docker cp sharelatex:/var/log/overleaf/file-migration-<timestamp>.log .
+```
+
+Ta bort all känslig information från loggfilerna innan du bifogar dem.
+
+#### Saknade filer
+
+Äldre versioner av Server Pro/CE skapade poster i filträdet innan användarnas uppladdningar var klara, vilket kunde göra att filer såg ut att saknas när en uppladdning misslyckades. Du kan hitta några sådana fall rapporterade som fel när alla filträd bearbetas.
+
+Om antalet saknade filer är litet kan du överväga att granska dessa fall manuellt och ta bort dem från editorn i webbläsaren.
+
+Om antalet saknade filer är stort kan du överväga att kontakta supporten, se e-postmallen ovan.
+
+#### Hitta trasiga filträd
+
+Migreringen kan misslyckas för projekt som har ett felaktigt filträd (till exempel där filnamn är tomma). Du kan få en lista över sådana problem med skriptet `find_malformed_filetrees`, som kontrollerar alla projekt i databasen:
+
+```bash wrap
+$ bin/docker-compose exec sharelatex /bin/bash -c "cd /overleaf/services/web && /sbin/setuser www-data node scripts/find_malformed_filetrees.mjs > /tmp/malformed-file-trees.json"
+```
+
+För att åtgärda de ogiltiga sökvägarna använder du skriptet `fix_malformed_filetree` och kör kommandot en gång för varje felaktig sökväg:
+
+```bash wrap
+$ bin/docker-compose exec sharelatex /bin/bash -c "cd /overleaf/services/web && /sbin/setuser www-data node scripts/fix_malformed_filetree.mjs --logs=/tmp/malformed-file-trees.json"
+```

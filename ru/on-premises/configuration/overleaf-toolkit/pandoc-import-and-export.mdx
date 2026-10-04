@@ -1,0 +1,130 @@
+---
+title: Импорт и экспорт через Pandoc
+icon: file-lines
+---
+
+### Импорт и экспорт через Pandoc
+
+Overleaf может конвертировать документы в LaTeX и обратно с помощью [Pandoc](https://pandoc.org/). Конвертация выполняется внутри **изолированного Docker-контейнера**, которым управляет сервис `clsi`, поэтому по умолчанию эта функция отключена и её нужно включить с помощью пары переменных окружения.
+
+#### Что она делает
+
+| Направление | Откуда → куда            | Форматы                    | Где                                                                                                   |
+| ----------- | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **Импорт**  | документ → проект LaTeX  | `docx`, `markdown`         | _New Project → Import_ (загружает `.docx` / `.md` и превращает его в редактируемый проект `.tex`)     |
+| **Экспорт** | проект LaTeX → документ  | `docx`, `markdown`, `html` | _Menu → Download / Export_ (обрабатывает проект через Pandoc)                                         |
+
+***
+
+### Переменные окружения
+
+Значение имеют **две** переменные, а одна похожая на них — **нет**.
+
+1\. `ENABLE_PANDOC_CONVERSIONS` — главный переключатель
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+```
+
+* Тип: логический (`true` включает функцию; любое другое значение отключает её).
+* **Должна быть задана для ОБОИХ сервисов — `web` и `clsi`.** Это отдельные процессы с отдельной конфигурацией:
+  * `web` считывает её в `enablePandocConversions` (`services/web/config/settings.defaults.js`). Она управляет маршрутами импорта, маршрутами экспорта и флагом `ol-ExposedSettings.enablePandocConversions`, который сообщает фронтенду, нужно ли показывать интерфейс импорта/экспорта.
+  * `clsi` считывает её в `enablePandocConversions` (`services/clsi/config/settings.defaults.cjs`). Она управляет конечными точками, которые запускают Pandoc.
+* Если переменная включена для `web`, но не для `clsi` (или наоборот), интерфейс появится, но конвертация завершится ошибкой — поддерживайте их согласованность.
+
+2\. `PANDOC_IMAGE` — образ контейнера, который clsi запускает для конвертации
+
+```bash
+PANDOC_IMAGE=your-repo/pandoc:3.9
+```
+
+### Предварительные требования
+
+Поскольку конвертации выполняются в Docker-контейнерах, запускаемых `clsi`:
+
+1. **`clsi` должен работать в изолированном режиме с доступом к Docker.** В стеке разработки для `clsi` уже задано `SANDBOXED_COMPILES=true` и смонтирован Docker-сокет хоста (`/var/run/docker.sock`).
+2. **Образ `PANDOC_IMAGE` должен присутствовать** на этом Docker-хосте (загружен или собран локально) до первой конвертации.
+
+***
+
+### Быстрая настройка
+
+Стек разработки (`develop/dev.env`) уже содержит:
+
+```bash
+ENABLE_PANDOC_CONVERSIONS=true
+PANDOC_IMAGE=overleaf-pandoc:local
+```
+
+Поскольку официальный образ является закрытым, перед использованием функции **один раз** соберите входящий в комплект образ:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+Затем (пере)запустите стек, чтобы `clsi` и `web` подхватили переменные.
+
+***
+
+### Сборка образа Pandoc
+
+Подойдёт стандартный образ Pandoc, поскольку clsi вызывает Pandoc в общем виде (без собственных шаблонов и фильтров). Ему нужны лишь три обязательных компонента среды выполнения, и все они предусмотрены в `develop/pandoc/Dockerfile`:
+
+```dockerfile
+# Custom Pandoc image for clsi sandboxed conversions
+# (import/export: docx / markdown / html, via ENABLE_PANDOC_CONVERSIONS).
+#
+# Why this exists:
+#   The official quay.io/sharelatex/pandoc:3.9 image is private (401, can't pull).
+#   clsi invokes pandoc generically (no custom templates/filters/reference-doc), so a
+#   stock pandoc image works — it just needs three runtime essentials that clsi assumes:
+#
+#   1. No `pandoc` ENTRYPOINT — clsi runs Cmd ["pandoc", ...]; with the default
+#      entrypoint that would become `pandoc pandoc ...`.
+#   2. `zip` — the import conversion's second step runs `zip -r` to package the output.
+#   3. Users matching how clsi runs the conversion container (User=$TEXLIVE_IMAGE_USER):
+#        - `tex` at UID 1000 — dev / microservices default.
+#        - `www-data` at UID 33 — Server Pro sandboxed *sibling* containers set
+#          TEXLIVE_IMAGE_USER=www-data (see /etc/overleaf/env.sh). clsi (running as
+#          www-data) creates the conversion dir owned by 33:33, so the container must run
+#          as www-data(33) to write into it — otherwise pandoc fails with either
+#          "unable to find user www-data" or "permission denied".
+#      Alpine already ships a `www-data` group at GID 82, so we move it to GID 33 to
+#      match the host/texlive image.
+#
+# Build (tag must match PANDOC_IMAGE in develop/dev.env):
+#   docker build -t overleaf-pandoc:local develop/pandoc
+#
+# Note: pinned to `latest` (pandoc 3.10 at time of writing). Pin to a specific
+# pandoc/core tag for fully reproducible builds.
+FROM pandoc/core:latest
+
+ENTRYPOINT []
+
+RUN apk add --no-cache zip \
+ && adduser -D -u 1000 tex \
+ && (delgroup www-data 2>/dev/null || true) \
+ && addgroup -g 33 www-data \
+ && adduser -D -u 33 -G www-data www-data
+```
+
+Соберите образ и присвойте ему тег, совпадающий с `PANDOC_IMAGE`:
+
+```bash
+docker build -t overleaf-pandoc:local develop/pandoc
+```
+
+В рабочей среде для воспроизводимых сборок закрепите `pandoc/core` на конкретной версии вместо `latest` и укажите в `PANDOC_IMAGE` путь к вашему реестру.
+
+***
+
+### Устранение неполадок
+
+| Симптом                                                    | Вероятная причина                                                                                         |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Кнопки импорта/экспорта не отображаются                    | `ENABLE_PANDOC_CONVERSIONS` не равна `true` для **web**                                                   |
+| Интерфейс отображается, но конвертация падает с ошибкой сервера | `ENABLE_PANDOC_CONVERSIONS` не задана для **clsi**, или `PANDOC_IMAGE` отсутствует на Docker-хосте   |
+| Ошибка `clsi` при загрузке образа (401)                    | `PANDOC_IMAGE` по-прежнему указывает на закрытый образ по умолчанию; соберите свой образ и укажите его    |
+| Контейнер выполняет `pandoc pandoc …` / неверные аргументы | В образе задан `ENTRYPOINT` `pandoc`; используйте `ENTRYPOINT []`                                         |
+| Результат импорта пуст / шаг zip завершается ошибкой       | В образе не установлен `zip`                                                                              |
+| Ошибки прав доступа к сконвертированным файлам             | В образе нет пользователя `tex` с UID 1000                                                                |
