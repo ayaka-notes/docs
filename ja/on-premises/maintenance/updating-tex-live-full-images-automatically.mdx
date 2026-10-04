@@ -1,0 +1,93 @@
+---
+title: TeX Live Full イメージの自動更新
+description: cron を使用して、Overleaf 互換のサンドボックスコンパイラーが使用する TeX Live Docker イメージを更新します。
+icon: arrows-rotate
+---
+
+通常、`bin/up` を実行するたびに、[using-the-toolkit](/ja/on-premises/installation/using-the-toolkit  "mention") が TeX Live full イメージを自動的に更新します。手動での更新を避けたい場合は、次のスクリプトを使って TeX Live サンドボックスイメージの更新を自動化できます。cron ジョブとして追加し、cron ユーザーに `docker` を実行する権限があることを確認してください。`crontab -e` を実行し、末尾に次の行を追加します。
+
+```cron title="crontab -e"
+0 * * * * /usr/bin/flock -n /tmp/pull-texlive.lock /usr/local/bin/pull-texlive.sh
+```
+
+`flock -n` は、前回の実行がまだロックを保持している間は実行をスキップするため、遅い pull が積み重なることはありません。
+
+<Tabs>
+<Tab title="直接接続">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+IMAGE="ghcr.io/ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) ====="
+
+if timeout 50m docker pull "$IMAGE:$tag"; then
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+
+<Tab title="ミラーサイトを使用">
+
+```bash title="/usr/local/bin/pull-texlive.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+
+MIRROR="ghcr.nju.edu.cn"
+CANONICAL="ghcr.io"
+REPO="ayaka-notes/texlive-full"
+TAGS=(2020.1 2021.1 2022.1 2023.1 2024.1 2025.1 2026.1)
+LOG=/var/log/pull-texlive.log
+
+exec >>"$LOG" 2>&1
+
+# Hours since the epoch, modulo the tag count: one tag per hour,
+# so all 7 tags are refreshed every 7 hours.
+idx=$(( $(date +%s) / 3600 % ${#TAGS[@]} ))
+tag="${TAGS[$idx]}"
+
+echo "===== $(date -Is) pulling $tag (idx=$idx) via $MIRROR ====="
+
+if timeout 50m docker pull "$MIRROR/$REPO:$tag"; then
+  # Retag to the canonical name the compiler is configured with. This only
+  # adds a second name for the same layers; nothing is copied.
+  docker tag "$MIRROR/$REPO:$tag" "$CANONICAL/$REPO:$tag"
+  echo "OK   $tag"
+else
+  echo "FAIL $tag (exit $?)"
+fi
+
+docker image prune -f
+docker system df | tail -n +2
+```
+
+</Tab>
+</Tabs>
+
+**すべてを一度に pull せず、1 時間ごとにローテーションする理由**：タグは現在時刻（エポックからの経過時間をタグ数で割った余り）から決まるため、このジョブはステートレスです。「どこまで進んだか」を記録する必要がなく、再起動や実行漏れがあってもサイクルは自動的に元に戻ります。各実行で扱うタグは 1 つだけです。レジストリのダイジェストが変わっていなければ、pull はマニフェストの確認（`Image is up to date`）だけで数秒で終わります。実際に更新がある場合でもダウンロードは 1 時間に最大 1 イメージで、`timeout 50m` で上限が設けられています。また、`docker image prune -f` がタグの移動によって不要になったレイヤーを削除します。
+
+同期が正常に行われているか確認するには：
+
+```bash
+tail -20 /var/log/pull-texlive.log     # each run ends with "OK <tag>" or "FAIL <tag>"
+grep -c '^FAIL' /var/log/pull-texlive.log
+```
+
+新しい TeX Live リリースが公開されたら、そのタグを `TAGS` 配列に追加してください。ローテーションの長さは自動的に調整されます。ホストの電源が切れていた時間帯はキューに積まれずスキップされ、該当するタグは次の順番が来たときに更新されます。
