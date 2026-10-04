@@ -100,6 +100,71 @@ for key, _, d, prefix, _, _ in SECTIONS:
                                           "published": key not in UNPUBLISHED, "icon": fm.get("icon"),
                                           "hidden": bool(fm.get("hidden"))}
 
+# ---------------------------------------------------------------- icons
+# Mintlify loads Font Awesome icons from its CDN and only knows some brand names (github, docker, ...).
+# Brand-only icons such as `claude` need iconType="brands", otherwise it requests regular/ and shows nothing.
+FA_CDN = "https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/"
+ICON_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon-types.json")
+_icon_types = json.load(open(ICON_CACHE)) if os.path.exists(ICON_CACHE) else {}
+
+
+def icon_type(name):
+    """'regular', 'brands' or 'missing' (cached in icon-types.json so CI runs offline)."""
+    if name not in _icon_types:
+        import urllib.request
+        _icon_types[name] = "missing"
+        for kind in ("regular", "brands"):
+            try:
+                urllib.request.urlopen(urllib.request.Request(FA_CDN + kind + "/" + name + ".svg", method="HEAD"), timeout=20)
+                _icon_types[name] = kind
+                break
+            except Exception:
+                continue
+    if _icon_types[name] == "missing":
+        WARN.append(f"icon not found in Mintlify's Font Awesome: {name}")
+    return _icon_types[name]
+
+
+def nav_icon(name):
+    """Page/group icons: the sidebar ignores iconType, so brand-only icons are given as their SVG url."""
+    return FA_CDN + "brands/" + name + ".svg" if icon_type(name) == "brands" else name
+
+
+def add_icon_types(text):
+    """Add iconType="brands" to <Icon>/<Card> tags whose icon only exists as a brand."""
+    def fix(m):
+        if "iconType=" in m.group(0) or icon_type(m.group(2)) != "brands":
+            return m.group(0)
+        return m.group(0) + ' iconType="brands"'
+    return re.sub(r'(<(?:Icon|Card)\b[^>]*?\bicon="([^"]+)")', fix, text)
+
+
+# ---------------------------------------------------------------- media
+MAX_MEDIA = 15 * 1024 * 1024  # Mintlify does not deploy large static files (a 34 MB video 404'd)
+
+
+def shrink_video(path):
+    """Re-encode videos above MAX_MEDIA to 1280px H.264 (cached). Needs ffmpeg ($FFMPEG or PATH)."""
+    if os.path.getsize(path) <= MAX_MEDIA:
+        return path
+    import subprocess
+    digest = hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
+    out = os.path.join(CACHE, "video", digest + ".mp4")
+    if not os.path.exists(out):
+        ffmpeg = os.environ.get("FFMPEG") or shutil.which("ffmpeg")
+        if not ffmpeg:
+            WARN.append(f"{path}: {os.path.getsize(path) >> 20} MB video needs ffmpeg to shrink (set $FFMPEG)")
+            return path
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        subprocess.run([ffmpeg, "-loglevel", "error", "-y", "-i", path, "-vf", "scale='min(1280,iw)':-2",
+                        "-c:v", "libx264", "-preset", "slow", "-crf", "23", "-c:a", "aac", "-b:a", "96k",
+                        "-movflags", "+faststart", out + ".tmp.mp4"], check=True)
+        os.replace(out + ".tmp.mp4", out)
+    if os.path.getsize(out) > MAX_MEDIA:
+        WARN.append(f"{path}: still {os.path.getsize(out) >> 20} MB after re-encoding")
+    return out
+
+
 # ---------------------------------------------------------------- output (only touch files that change)
 GENERATED = set()  # absolute paths written by this run
 
@@ -168,7 +233,7 @@ def asset_url(abs_path, sec_key):
         out = f"images/{sec_key}/{safe}-{i}{ext.lower()}"
         i += 1
     os.makedirs(os.path.join(DST, os.path.dirname(out)), exist_ok=True)
-    copy_if_changed(abs_path, os.path.join(DST, out))
+    copy_if_changed(shrink_video(abs_path) if ext.lower() in (".mp4", ".mov", ".webm") else abs_path, os.path.join(DST, out))
     asset_map[abs_path] = "/" + out
     return "/" + out
 
@@ -415,6 +480,8 @@ def convert(src, info):
     sec = info["section"]
     fm, body = split_fm(open(src, encoding="utf-8").read())
     P = Protect()
+    vis = {k: v.get("visible", True) for k, v in (fm.get("layout") or {}).items() if isinstance(v, dict)}
+    landing = vis.get("tableOfContents") is False and vis.get("title") is False
 
     # H1 becomes the frontmatter title
     body = re.sub(r"\A\s*# .*\n", "", body, count=1)
@@ -563,7 +630,9 @@ def convert(src, info):
         n = len(re.findall(r"\{%\s*column\b", inner))
         inner = re.sub(r"\{%\s*column(?:[^%]|%(?!\}))*%\}", "<Column>\n", inner)
         inner = re.sub(r"\{%\s*endcolumn\s*%\}", "\n</Column>", inner)
-        return f"<Columns cols={{{max(1, min(n, 4))}}}>\n{inner.strip()}\n</Columns>"
+        cols = f"<Columns cols={{{max(1, min(n, 4))}}}>\n{inner.strip()}\n</Columns>"
+        # landing pages stack several column blocks; give each room like GitBook does
+        return f'<div style={{{{ margin: "4rem 0" }}}}>\n\n{cols}\n\n</div>' if landing else cols
 
     body = re.sub(r"\{%\s*columns(?:[^%]|%(?!\}))*%\}([\s\S]*?)\{%\s*endcolumns\s*%\}", columns, body)
 
@@ -584,7 +653,7 @@ def convert(src, info):
             out = (f'<iframe className="w-full aspect-video rounded-xl" src="https://www.youtube.com/embed/{yt.group(1)}" '
                    f'title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen />')
         elif re.search(r"videos\.ctfassets\.net|\.mp4|\.webm|\.mov", url, re.I):
-            out = f'<video controls className="w-full aspect-video rounded-xl" src="{attr_str(url)}" />'
+            out = f'<video autoPlay muted loop playsInline controls className="w-full aspect-video rounded-xl" src="{attr_str(url)}" />'  # browsers only autoplay muted video
         else:
             label = caption or urllib.parse.urlparse(url).netloc
             out = f'<Card title="{attr_str(label)}" icon="arrow-up-right-from-square" href="{attr_str(url)}" horizontal />'
@@ -711,7 +780,7 @@ def convert(src, info):
         if lname not in HTML_TAGS or name != lname:
             return full.replace("<", "&lt;").replace(">", "&gt;")
         if close:
-            return P.put(f"</{lname}>")
+            return P.put("</table></div>" if lname == "table" else f"</{lname}>")
         attrs = re.sub(r'\s(data-[\w-]+|valign)(="[^"]*")?', "", attrs)
         attrs = re.sub(r'\sstyle="[^"]*"', "", attrs)
         # Mintlify drops align on headings; use Tailwind instead
@@ -721,9 +790,13 @@ def convert(src, info):
         attrs = re.sub(r"\sclass=", " className=", attrs)
         attrs = re.sub(r"\s(open)(?=[\s/>]|$)", "", attrs) if lname == "details" else attrs
         if lname == "table":
-            attrs += ' style={{ width: "100%" }}'  # GitBook tables span the content width
+            # GitBook tables span the content width; prose makes tables display:block, which stops
+            # columns from stretching, so scroll in a wrapper instead
+            attrs += ' style={{ display: "table", width: "100%" }}'
         attrs = attrs.rstrip().rstrip("/").rstrip()
         selfclose = " /" if lname in VOID else ""
+        if lname == "table":
+            return P.put(f'<div style={{{{ overflowX: "auto" }}}}><table{attrs}>')
         return P.put(f"<{lname}{attrs}{selfclose}>")
 
     body = re.sub(r"<(/?)([A-Za-z][A-Za-z0-9]*)(\s[^<>]*?)?\s*/?>", tag, body)
@@ -738,10 +811,8 @@ def convert(src, info):
     if fm.get("description"):
         out_fm["description"] = " ".join(str(fm["description"]).split())
     if fm.get("icon"):
-        out_fm["icon"] = fm["icon"]
+        out_fm["icon"] = nav_icon(fm["icon"])
     # GitBook layout toggles -> closest Mintlify page mode
-    vis = {k: v.get("visible", True) for k, v in (fm.get("layout") or {}).items() if isinstance(v, dict)}
-    landing = vis.get("tableOfContents") is False and vis.get("title") is False
     if landing:
         # only custom mode hides the title; restore width and typography with a wrapper
         out_fm["mode"] = "custom"
@@ -808,7 +879,7 @@ def node_to_nav(n, key, base=None):
     kids = [x for x in (node_to_nav(c, key) for c in n["children"]) if x]
     group = {"group": n["label"], "root": pg["id"], "pages": kids}
     if pg.get("icon"):
-        group["icon"] = pg["icon"]  # Mintlify shows the group's icon, not the root page's
+        group["icon"] = nav_icon(pg["icon"])  # Mintlify shows the group's icon, not the root page's
     return group
 
 
@@ -844,7 +915,7 @@ def main():
         out = convert(src, info)
         if info.get("sidebar"):
             out = out.replace("---\n\n", f"sidebarTitle: {json.dumps(info['sidebar'], ensure_ascii=False)}\n---\n\n", 1)
-        write_if_changed(os.path.join(DST, info["id"] + ".mdx"), out)
+        write_if_changed(os.path.join(DST, info["id"] + ".mdx"), add_icon_types(out))
         if src not in listed:
             unlisted.append(info["id"])
 
@@ -860,7 +931,10 @@ def main():
             redirects.append({"source": f"/{prefix}/{variant}", "destination": f"/{prefix}"})
             redirects.append({"source": f"/{prefix}/{variant}/:slug*", "destination": f"/{prefix}/:slug*"})
     cfg["redirects"] = redirects
+    for t in tabs:
+        icon_type(t["icon"])
     write_if_changed(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    open(ICON_CACHE, "w").write(json.dumps(dict(sorted(_icon_types.items())), indent=0) + "\n")
     remove_stale(["images"] + [s[3] for s in SECTIONS if s[3]])
 
     print(f"pages: {sum(p['published'] for p in pages.values())} published, {len(pages)} indexed  assets: {len(asset_map)}  hidden (not in SUMMARY.md): {len(unlisted)}")

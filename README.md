@@ -39,6 +39,8 @@ All other `docs.json` settings, such as theme, colors, logo, and navbar, are kep
 
 Sections listed in `UNPUBLISHED` in the script are indexed but not generated. The LaTeX knowledge base (`latex/en`, about 500 pages) is unpublished for now. Links that point into it are rendered as plain text. To publish it, remove `"latex"` from `UNPUBLISHED` and run the script again.
 
+Videos larger than 15 MB are re-encoded to 1280px H.264 because Mintlify does not deploy large static files. This needs `ffmpeg` on `PATH` or in `$FFMPEG`. Brand-only Font Awesome icons, such as `claude`, are resolved against Mintlify's icon CDN and cached in `icon-types.json`.
+
 The script converts:
 
 - `SUMMARY.md` into tabs and groups. Entries with children become groups with a `root` page.
