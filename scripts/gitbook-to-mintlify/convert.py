@@ -32,6 +32,8 @@ SECTIONS = [
 # Sections that are converted for link resolution but not published yet: no pages, no tab,
 # and links pointing into them are rendered as plain text.
 UNPUBLISHED = {"latex"}
+# SUMMARY.md groups left out of the sidebar. Their pages are still generated, so links keep working.
+HIDDEN_GROUPS = {("on-premises", "Getting started")}
 UNPUB = "\x02unpublished\x02"
 SPACE_IDS = {
     "yLFrF2L1FakWXkhqpOnS": "on-premises",
@@ -95,7 +97,41 @@ for key, _, d, prefix, _, _ in SECTIONS:
             title = (fm.get("title") or (m.group(1) if m else f[:-3])).strip()
             title = re.sub(r"\s*<a [^>]*></a>\s*", "", title)
             pages[os.path.normpath(p)] = {"id": route_for(prefix, rel), "title": title, "section": key, "base": base,
-                                          "published": key not in UNPUBLISHED}
+                                          "published": key not in UNPUBLISHED, "icon": fm.get("icon")}
+
+# ---------------------------------------------------------------- output (only touch files that change)
+GENERATED = set()  # absolute paths written by this run
+
+
+def write_if_changed(path, text):
+    GENERATED.add(os.path.abspath(path))
+    if os.path.exists(path) and open(path, encoding="utf-8").read() == text:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w", encoding="utf-8").write(text)
+
+
+def copy_if_changed(src, dst):
+    import filecmp
+    GENERATED.add(os.path.abspath(dst))
+    if os.path.exists(dst) and filecmp.cmp(src, dst, shallow=False):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def remove_stale(dirs):
+    """Delete files in generated folders that this run did not produce."""
+    for d in dirs:
+        root = os.path.join(DST, d)
+        for cur, _, files in os.walk(root, topdown=False):
+            for f in files:
+                fp = os.path.abspath(os.path.join(cur, f))
+                if fp not in GENERATED:
+                    os.remove(fp)
+            if not os.listdir(cur):
+                os.rmdir(cur)
+
 
 # ---------------------------------------------------------------- assets
 asset_map = {}  # abs src asset -> url
@@ -131,7 +167,7 @@ def asset_url(abs_path, sec_key):
         out = f"images/{sec_key}/{safe}-{i}{ext.lower()}"
         i += 1
     os.makedirs(os.path.join(DST, os.path.dirname(out)), exist_ok=True)
-    shutil.copyfile(abs_path, os.path.join(DST, out))
+    copy_if_changed(abs_path, os.path.join(DST, out))
     asset_map[abs_path] = "/" + out
     return "/" + out
 
@@ -311,7 +347,7 @@ def cards_table(tbl, src, sec):
             roles.append("cover")
         else:
             roles.append("text")
-    out = [f'<CardGroup cols={{{2 if len(p.rows) != 3 else 3}}}>']
+    out = ["<CardGroup cols={3}>"]  # GitBook card views show three per row
     for row in p.rows:
         title, href, img, icon, body = None, None, None, None, []
         for role, cell in zip(roles, row):
@@ -337,7 +373,9 @@ def cards_table(tbl, src, sec):
                         href = a.group(1)
                 else:
                     body.append(txt)
-        attrs = [f'title="{attr_str(title or "")}"']
+        # titles are plain strings: math can't render there
+        title = re.sub(r"\x01([^\x01]*)\x01", lambda mm: re.sub(r"\\(La)?TeX", lambda t: (t.group(1) or "") + "TeX", mm.group(1)).strip(), title or "")
+        attrs = [f'title="{attr_str(title)}"']
         if icon:
             attrs.append(f'icon="{icon}"')
         if href:
@@ -612,7 +650,7 @@ def convert(src, info):
         kind = "primary" if "primary" in attrs else "secondary"
         icon = re.search(r'data-icon="([^"]*)"', attrs)
         new, _ = rewrite_url(html.unescape(href), src, sec)
-        ic = f'<Icon icon="{icon.group(1)}" /> ' if icon else ""
+        ic = f'<Icon icon="{icon.group(1)}" color="currentColor" /> ' if icon else ""
         return f'<a href="{attr_str(new)}" className="{BUTTON_CLASSES[kind]}">{ic}{m.group(2)}</a>'
 
     body = re.sub(r'<a ([^>]*class="button[^"]*"[^>]*)>([\s\S]*?)</a>', button, body)
@@ -676,11 +714,13 @@ def convert(src, info):
         attrs = re.sub(r'\s(data-[\w-]+|valign)(="[^"]*")?', "", attrs)
         attrs = re.sub(r'\sstyle="[^"]*"', "", attrs)
         # Mintlify drops align on headings; use Tailwind instead
-        al = re.search(r'\salign="(center|right|left)"', attrs) if lname in {"h1", "h2", "h3", "h4", "h5", "h6", "p", "div"} else None
+        al = re.search(r'\salign="(center|right|left)"', attrs) if lname in {"h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "td", "th"} else None
         if al:
-            attrs = attrs.replace(al.group(0), "") + f' className="text-{al.group(1)}"'
+            attrs = attrs.replace(al.group(0), "") + ' style={{ textAlign: "%s" }}' % al.group(1)
         attrs = re.sub(r"\sclass=", " className=", attrs)
         attrs = re.sub(r"\s(open)(?=[\s/>]|$)", "", attrs) if lname == "details" else attrs
+        if lname == "table":
+            attrs += ' style={{ width: "100%" }}'  # GitBook tables span the content width
         attrs = attrs.rstrip().rstrip("/").rstrip()
         selfclose = " /" if lname in VOID else ""
         return P.put(f"<{lname}{attrs}{selfclose}>")
@@ -698,6 +738,18 @@ def convert(src, info):
         out_fm["description"] = " ".join(str(fm["description"]).split())
     if fm.get("icon"):
         out_fm["icon"] = fm["icon"]
+    # GitBook layout toggles -> closest Mintlify page mode
+    vis = {k: v.get("visible", True) for k, v in (fm.get("layout") or {}).items() if isinstance(v, dict)}
+    landing = vis.get("tableOfContents") is False and vis.get("title") is False
+    if landing:
+        # only custom mode hides the title; restore width and typography with a wrapper
+        out_fm["mode"] = "custom"
+        body = ('<div className="prose dark:prose-invert" style={{ maxWidth: "56rem", margin: "0 auto", padding: "2.5rem 1.25rem" }}>\n\n'
+                + body.strip() + "\n\n</div>\n")
+    elif vis.get("tableOfContents") is False:
+        out_fm["mode"] = "center"  # no left sidebar (Mintlify cannot keep the outline without it)
+    elif vis.get("outline") is False or (fm.get("layout") or {}).get("width") == "wide":
+        out_fm["mode"] = "wide"
     if fm.get("tags"):
         out_fm["keywords"] = fm["tags"]
     if fm.get("hidden"):
@@ -751,16 +803,18 @@ def node_to_nav(n, key, base=None):
     if not n["children"]:
         return pg["id"]
     kids = [x for x in (node_to_nav(c, key) for c in n["children"]) if x]
-    return {"group": n["label"], "root": pg["id"], "pages": kids}
+    group = {"group": n["label"], "root": pg["id"], "pages": kids}
+    if pg.get("icon"):
+        group["icon"] = pg["icon"]  # Mintlify shows the group's icon, not the root page's
+    return group
 
 
 def main():
-    # clean starter content
-    for f in ["index.mdx", "quickstart.mdx", "tester-02.mdx"]:
+    # clean Mintlify starter kit content
+    for f in ["quickstart.mdx", "tester-02.mdx"]:
         if os.path.exists(os.path.join(DST, f)):
             os.remove(os.path.join(DST, f))
-    for d in ["cn", "images"] + [s[3] for s in SECTIONS if s[3]]:
-        shutil.rmtree(os.path.join(DST, d), ignore_errors=True)
+    shutil.rmtree(os.path.join(DST, "cn"), ignore_errors=True)
 
     tabs = []
     for key, title, d, prefix, icon, _ in SECTIONS:
@@ -775,6 +829,8 @@ def main():
                 gname = "Overview" if key != "home" else "Home"
             else:
                 gname = g["group"][:1].upper() + g["group"][1:]
+            if (key, g["group"]) in HIDDEN_GROUPS:
+                continue
             groups.append({"group": gname, "pages": items})
         tabs.append({"tab": title, "icon": icon, "groups": groups})
 
@@ -785,9 +841,7 @@ def main():
         out = convert(src, info)
         if info.get("sidebar"):
             out = out.replace("---\n\n", f"sidebarTitle: {json.dumps(info['sidebar'], ensure_ascii=False)}\n---\n\n", 1)
-        dst = os.path.join(DST, info["id"] + ".mdx")
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        open(dst, "w", encoding="utf-8").write(out)
+        write_if_changed(os.path.join(DST, info["id"] + ".mdx"), out)
         if src not in listed:
             unlisted.append(info["id"])
 
@@ -803,7 +857,8 @@ def main():
             redirects.append({"source": f"/{prefix}/{variant}", "destination": f"/{prefix}"})
             redirects.append({"source": f"/{prefix}/{variant}/:slug*", "destination": f"/{prefix}/:slug*"})
     cfg["redirects"] = redirects
-    open(cfg_path, "w", encoding="utf-8").write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    write_if_changed(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    remove_stale(["images"] + [s[3] for s in SECTIONS if s[3]])
 
     print(f"pages: {sum(p['published'] for p in pages.values())} published, {len(pages)} indexed  assets: {len(asset_map)}  hidden (not in SUMMARY.md): {len(unlisted)}")
     for u in unlisted:

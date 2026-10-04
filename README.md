@@ -33,6 +33,8 @@ The script overwrites these generated files on every run, so don't edit them by 
 - `images/<section>/` (GitBook assets, including files mirrored from the GitBook CDN)
 - `navigation` and `redirects` in `docs.json`
 
+`HIDDEN_GROUPS` in the script lists sidebar groups to leave out, such as On-Premises **Getting started**. Their pages are still generated, so links to them keep working.
+
 All other `docs.json` settings, such as theme, colors, logo, and navbar, are kept.
 
 Sections listed in `UNPUBLISHED` in the script are indexed but not generated. The LaTeX knowledge base (`latex/en`, about 500 pages) is unpublished for now. Links that point into it are rendered as plain text. To publish it, remove `"latex"` from `UNPUBLISHED` and run the script again.
