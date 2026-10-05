@@ -1,0 +1,273 @@
+---
+title: 沙盒编译
+icon: gear-code
+---
+
+Ayakaleaf Pro 提供了在安全沙盒环境中运行编译的选项，以满足企业级安全需求。它通过在各自独立的安全 Docker 环境中运行每个项目来实现这一点。
+
+### 更高的安全性
+
+沙盒编译是 Ayakaleaf Pro 的推荐方式，因为许多 LaTeX 文档在 PDF 编译过程中需要或能够执行任意 shell 命令。如果使用沙盒编译，每次编译都会在一个独立的、能力受限的 Docker 容器中运行，该容器不与任何其他用户或项目共享，也无法访问主机网络等外部资源。
+
+<Warning>
+
+如果你尝试在**不**使用沙盒编译的情况下运行 Ayakaleaf Pro，编译将与其他并发编译一起在主 Docker 容器内运行，并且用户在运行 LaTeX 编译时对 `sharelatex` 容器的资源（文件系统、网络和环境变量）拥有完全的读写权限。
+
+</Warning>
+
+### 更便捷的宏包管理
+
+为了避免手动安装宏包，我们建议启用沙盒编译。这是 Server Pro 中的一项可配置设置，它能让你的用户在自己的本地部署中使用与 overleaf.com 相同的 TeX Live 环境。沙盒编译所使用的 TeX Live 镜像包含最常用的宏包和字体，并已针对我们的模板库进行测试，可确保与本地项目的最大兼容性。
+
+启用沙盒编译后，你可以配置用户在项目中可选择的 TeX Live 版本，并为新项目设置默认的 TeX Live 镜像版本。
+
+<Info>
+
+如果你尝试在不使用沙盒编译的情况下运行 Ayakaleaf Pro，你的实例将默认使用基础方案（basic scheme）版本的 TeX Live 进行编译。这个基础版本很轻量，仅包含非常有限的 LaTeX 宏包子集，很可能会导致用户遇到缺少宏包的错误，尤其是在尝试使用预置模板时。
+
+</Info>
+
+由于 Ayakaleaf Pro 被设计为可离线运行，因此没有自动化的方式将 overleaf.com 模板库集成到你的本地部署中；不过，可以按模板逐个手动完成此操作。有关具体做法的更多信息，请查看我们的从 overleaf.com 迁移模板指南：[#transferring-templates-from-overleaf.com](/zh-CN/on-premises/configuration/overleaf-toolkit/templates#transferring-templates-from-overleaf.com  "mention")。
+
+<Info>
+
+沙盒编译要求 `sharelatex` 容器能够（通过绑定挂载）访问主机上的 Docker socket，以便管理这些同级编译容器。
+
+</Info>
+
+## 工作原理
+
+启用沙盒编译后，Docker socket 将从主机挂载到 `sharelatex` 容器中，使容器内的编译服务能够在主机上创建新的 Docker 容器。然后，对于每个项目的每次编译运行，LaTeX 编译服务（CLSI）将执行以下操作：
+
+* 将项目文件写出到 `OVERLEAF_DATA_PATH` 内的某个位置。
+* 使用挂载的 Docker socket 为本次编译创建一个新的 `texlive` 容器。
+* 让 `texlive` 容器从 `OVERLEAF_DATA_PATH` 下的该位置读取项目数据。
+* 在 `texlive` 容器内编译项目。
+
+### 启用沙盒编译
+
+#### 适用于 Toolkit 用户
+
+要启用沙盒编译（也称为同级容器，Sibling containers），请在 `overleaf-toolkit/config/overleaf.rc` 中设置以下配置选项：
+
+```dotenv title="config/overleaf.rc"
+SERVER_PRO=true
+SIBLING_CONTAINERS_ENABLED=true
+```
+
+#### 适用于 Docker Compose 用户
+
+<Danger>
+
+从 Overleaf CE/Server Pro `5.0.3` 开始，环境变量已从 `SHARELATEX_*` 更名为 `OVERLEAF_*`。
+
+</Danger>
+
+如果你使用的是 `4.x` 版本（或更早版本），请确保变量使用相应的前缀（例如使用 `SHARELATEX_MONGO_URL` 而不是 `OVERLEAF_MONGO_URL`）。
+
+```yml
+version: '2'
+services:
+    sharelatex:
+        #...
+        volumes:
+            - /data/overleaf_data:/var/lib/overleaf
+            - /var/run/docker.sock:/var/run/docker.sock
+        environment:
+            #...
+            DOCKER_RUNNER: "true"
+            SANDBOXED_COMPILES: "true"
+            SANDBOXED_COMPILES_HOST_DIR: "/data/overleaf_data/data/compiles"
+            #...
+        #...
+```
+
+### 设置 TexLive 镜像
+
+<Info>
+
+中国大陆用户可以将 `ghcr.io` 替换为 `ghcr.nju.edu.cn` 以加快下载速度。但**不要**在 Toolkit 的环境变量设置中直接使用 `ghcr.nju.edu.cn`。你应始终只使用 `ghcr.io`。
+
+</Info>
+
+Ayakaleaf Pro 使用三个环境变量来确定沙盒编译所使用的 TeX Live 镜像：
+
+* `TEX_LIVE_DOCKER_IMAGE` <strong>（必需）</strong>，用于编译新项目的默认 TeX Live 镜像。该镜像必须包含在 `ALL_TEX_LIVE_DOCKER_IMAGES` 中。
+* `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES` <strong>（必需）</strong>，以逗号分隔的镜像友好名称列表，用于前端选项。
+* `ALL_TEX_LIVE_DOCKER_IMAGES` <strong>（必需）</strong>，以逗号分隔的要使用的 TeX Live 镜像列表。如果使用 Overleaf Toolkit 进行部署，这些镜像将被下载或更新。要跳过下载，请在 `config/overleaf.rc` 中设置 `SIBLING_CONTAINERS_PULL=false`。
+
+使用 `bin/up` 命令启动 Ayakaleaf Pro 实例时，Toolkit 会自动拉取 `ALL_TEX_LIVE_DOCKER_IMAGES` 中列出的所有镜像。
+
+以下示例中，新项目默认使用 TeX Live 2026，旧项目则继续使用 2025。
+
+<Tabs>
+<Tab title="最小安装">
+
+以下配置会安装 2025 至 2026 年的所有完整 TeX Live Docker 镜像。我们建议在使用此配置前至少准备 **64 GB** 的可用存储空间。
+
+```dotenv title="config/variables.env" wrap
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2026.1, ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2026, Texlive 2025
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+</Tab>
+
+<Tab title="完整安装">
+
+以下配置会安装 2020 至 2026 年的所有完整 TeX Live Docker 镜像。我们建议在使用此配置前至少准备 **150 GB** 的可用存储空间。
+
+```dotenv title="config/variables.env" wrap
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1,ghcr.io/ayaka-notes/texlive-full:2024.1,ghcr.io/ayaka-notes/texlive-full:2023.1,ghcr.io/ayaka-notes/texlive-full:2022.1,ghcr.io/ayaka-notes/texlive-full:2021.1,ghcr.io/ayaka-notes/texlive-full:2020.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2026,Texlive 2025,Texlive 2024,Texlive 2023,Texlive 2022,Texlive 2021,Texlive 2020
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+</Tab>
+</Tabs>
+
+<Danger>
+
+强烈建议设置**至少 2 个 texlive-full 镜像**。具体原因请参阅 [#known-issues](/zh-CN/on-premises/configuration/overleaf-toolkit/sandboxed-compiles#known-issues  "mention")
+
+</Danger>
+
+### 可用的 TeX Live 镜像
+
+以下是一系列专为 Overleaf 优化的 TeX Live 镜像，可添加到 `TEX_LIVE_DOCKER_IMAGE` 和 `ALL_TEX_LIVE_DOCKER_IMAGES` 中：
+
+* `ghcr.io/ayaka-notes/texlive-full:2026.1`（同时也是 `latest` 标签）
+* `ghcr.io/ayaka-notes/texlive-full:2025.1`
+* `ghcr.io/ayaka-notes/texlive-full:2024.1`
+* `ghcr.io/ayaka-notes/texlive-full:2023.1`
+* `ghcr.io/ayaka-notes/texlive-full:2022.1`
+* `ghcr.io/ayaka-notes/texlive-full:2021.1`
+* `ghcr.io/ayaka-notes/texlive-full:2020.1`
+
+<Warning>
+
+镜像的标签**必须**遵循严格的格式（适用正则表达式 `^[0-9]+.[0-9]+`，其中第一个数字表示 TeX Live 年份，第二个数字表示补丁版本）。
+
+</Warning>
+
+### 能否使用其他镜像仓库
+
+> 有些人可能会想，能否将 `ghcr.io` 替换为其他镜像站点，或者将 texlive 切换为 Docker Hub 上的其他镜像？
+
+不，我们不建议这样做，因为配置相对复杂。如果你是从镜像站点下载的，可以将镜像重命名为 `ghcr.io/ayaka-notes/texlive-full`。
+
+但是，如果你确实想使用自己的镜像仓库，请添加：
+
+```dotenv title="config/variables.env" wrap
+IMAGE_ROOT=hub.your.com/your-repo
+```
+
+然后，你需要确保所有 texlive 镜像都位于 `your-repo` 中，例如
+
+* `hub.your.com/your-repo/texlive-full:2025.1`
+* `hub.your.com/your-repo/texlive-full:2024.1`
+
+详细信息请阅读以下源代码，了解我们如何解析你的环境变量：
+
+```mjs title="sandboxed-compiles/index.mjs" wrap expandable
+if (process.env.SANDBOXED_COMPILES === 'true') {
+  // Set default image root if not provided
+  let imageRootPath = process.env.IMAGE_ROOT || "ghcr.io/ayaka-notes";
+  // Export imageRoot to Settings
+  Settings.imageRoot = imageRootPath
+
+  // allowedImageNames should be:
+  // [
+  //  { imageName: "texlive-2023:latest", imageDesc: "TeX Live 2023" },
+  //  { imageName: "texlive-2022:latest", imageDesc: "TeX Live 2022" },
+  // ]
+  Settings.allowedImageNames = parseTextExtensions(process.env.ALL_TEX_LIVE_DOCKER_IMAGES)
+    .map((texImage, index) => ({
+      imageName: texImage.split("/")[texImage.split("/").length - 1],
+      imageDesc: parseTextExtensions(process.env.ALL_TEX_LIVE_DOCKER_IMAGE_NAMES)[index]
+        || texImage.split(':')[1],
+    }))
+  
+  // In the end, imageName will be put together with imageRoot to form the full image path
+  // The full name will be like: ghcr.io/ayaka-notes/texlive-2023:latest
+
+  // Set default image name if not provided
+  if(!process.env.TEX_LIVE_DOCKER_IMAGE) {
+    process.env.TEX_LIVE_DOCKER_IMAGE = imageRootPath + "/" + Settings.allowedImageNames[0].imageName
+  }
+
+  // Export currentImageName to Settings
+  // This is the new created projects' image name
+  Settings.currentImageName = process.env.TEX_LIVE_DOCKER_IMAGE
+}
+```
+
+### 自动同步 TeX Live 镜像
+
+为了避免每次都通过 `bin/up` 手动更新实例，你可以自动更新 TeX Live 镜像。请参阅 [updating-tex-live-full-images-automatically.md](/zh-CN/on-premises/maintenance/updating-tex-live-full-images-automatically  "mention")。
+
+### 已知问题
+
+以下是来自 Overleaf 社区的一个真实案例：
+
+> 我使用的是 `6.0.1-ext-v3.3`，在 `variables.env` 中有以下设置：
+>
+> ```dotenv
+> TEX_LIVE_DOCKER_IMAGE=texlive/texlive:latest-full
+> ALL_TEX_LIVE_DOCKER_IMAGES=texlive/texlive:latest-full
+> ```
+>
+> 使用 `texlive/texlive:latest-full` 时一切正常。但是，我拉取了另一个 texlive 镜像 `danteev/texlive:2025-10-15`，并将这两个变量都改为新镜像名称后，却无法正常工作：
+>
+> ```dotenv
+> TEX_LIVE_DOCKER_IMAGE=danteev/texlive:2025-10-15
+> ALL_TEX_LIVE_DOCKER_IMAGES=danteev/texlive:2025-10-15
+> ```
+>
+> 在日志中，我看到以下内容：
+>
+> ```text wrap
+> {"name":"clsi","level":50,"err":{"message":"(HTTP code 404) no such container - No such image: texlive/texlive:latest-full ","name":"Error","stack":"Error: (HTTP code 404) no such container - No such image: texlive/texlive:latest-full ... 
+> ```
+>
+> 看起来 `variables.env` 中更新后的设置没有生效。编译仍然尝试运行 `texlive/texlive:latest-full` 镜像，而不是新镜像。
+>
+> 我尝试过重启、删除容器后重新运行，但问题依旧。
+>
+> 有什么解决办法吗？
+
+由于一些技术限制，如果你只设置了单个 Docker TeXLive 镜像，例如 `texlive-fullA:latest`
+
+```text
+ALL_TEX_LIVE_DOCKER_IMAGES=texlive/texliveA:latest-full
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=TeXLiveA
+TEX_LIVE_DOCKER_IMAGE=texlive/texliveA:latest-full
+```
+
+并且在运行 Overleaf 实例一段时间后，你可能想将 TeXLive 镜像修改为 `texlive-fullB:latest`。此时，你会发现用户无法编译所有项目。
+
+```text
+ALL_TEX_LIVE_DOCKER_IMAGES=texlive/texliveA:latest-full
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=TeXLiveA
+TEX_LIVE_DOCKER_IMAGE=texlive/texliveA:latest-full
+```
+
+这是因为每个项目所使用的 TeXLive-Full 镜像（用于沙盒编译）名称是持久化保存在数据库中的。_只有当用户切换其项目的 TeXLive 版本（例如从 2024 切换到 2025）时，数据库中的镜像名称才会改变_。
+
+CLSI 编译项目时，会直接使用数据库中记录的容器镜像名称来编译项目。
+
+如果你只提供一个 Docker 镜像，用户将无法修改用于编译项目的镜像。在这种情况下，你需要编写脚本，**手动修改** MongoDB 中所有用户项目的 TeXLive 镜像。
+
+### 调试与报告
+
+运行以下命令，通过 Toolkit 查看 clsi 日志：
+
+```bash wrap
+bin/logs clsi
+```
+
+如果你在使用 TeX Live 镜像编译时遇到任何问题，请在此提交 issue：
+
+[https://github.com/ayaka-notes/texlive-full/issues/new?template=texlive-image-bug.yml](https://github.com/ayaka-notes/texlive-full/issues/new?template=texlive-image-bug.yml)
+
+为了帮助我们复现和排查问题，我们可能会请你将项目上传到 Overleaf。随后我们将拉取该项目，并通过 GitHub Action 运行编译测试。

@@ -1,0 +1,151 @@
+---
+title: 微服務
+icon: microchip
+---
+
+部署與管理 Overleaf Server CE 和 Overleaf Pro 執行個體的建議方式，是使用 Toolkit。
+
+Toolkit 透過一些自訂腳本，將所需微服務的協調工作抽象化，簡化了 Overleaf 執行個體的建立流程。你只需執行內附的初始化腳本，並提供幾個設定選項（例如持久性儲存路徑），Toolkit 就會負責佈建並連接構成 Overleaf Server CE 或 Pro 執行個體的各個微服務。
+
+如此一來，你便能專注於自訂使用者體驗，以及實作構成本地部署執行個體的特定功能。Toolkit 會在背後處理所有複雜的工作，讓 Overleaf 執行個體的部署更加簡單。
+
+<Info>
+
+由於歷史因素，Overleaf 的主要容器名為 `sharelatex`，並以 `sharelatex/sharelatex` Docker 映像檔為基礎。這是因為此技術源自 ShareLaTeX 的程式碼庫，而 ShareLaTeX 已併入 Overleaf。詳細資訊請參閱[這篇部落格文章](https://www.overleaf.com/blog/518-exciting-news-sharelatex-is-joining-overleaf)。未來某個時間點，它將會重新命名以符合 Overleaf 的命名規則。
+
+</Info>
+
+#### 架構
+
+在 Overleaf 容器內，軟體以一組由 `runit` 管理的微服務形式執行。容器內一些較值得注意的檔案包括：
+
+* `/etc/service/`：微服務的初始化檔案。
+* `/var/log/overleaf/`：各個微服務的日誌。
+* `/overleaf/services/`：各個微服務的程式碼。
+* `/var/lib/overleaf/`：持久性資料的掛載點（對應主機上 `OVERLEAF_DATA_PATH` 所指定的目錄）。
+
+#### MongoDB 與 Redis 容器
+
+Overleaf 依賴兩個外部資料庫：MongoDB 與 Redis。預設情況下，除了 Overleaf 容器之外，Toolkit 還會為這兩個資料庫各佈建一個容器，總共三個 Docker 容器。
+
+<Info>
+
+如果你偏好連接到既有的 MongoDB 或 Redis 執行個體，可以在 [overleaf.rc](/zh-TW/on-premises/configuration/overleaf-toolkit/files-and-locations#the-overleaf.rc-file) 設定檔中進行相應設定。
+
+</Info>
+
+#### 編輯器與編譯流程
+
+本節概略說明文件的處理方式與編譯流程。
+
+<Info>
+
+本頁說明的是採用沙箱編譯（Sandboxed Compiles）的編譯流程，此功能僅在 Overleaf Pro 中提供。在 Server CE 中，編譯流程使用簡單的子程序——請將涉及**容器**的項目替換為單一項目**在子程序中執行編譯**。
+
+</Info>
+
+元件／參與者：
+
+* `user` — 應用程式的使用者
+* `editor` — 在瀏覽器中執行的用戶端應用程式
+* `clsi` — 用於編譯 PDF 的微服務
+* `document-updater` — 用於處理文件更新的微服務
+* `filestore` — 處理二進位檔案的微服務
+* `real-time` — 用於處理 WebSocket 的微服務
+* `web` — 用於處理 API 請求的（不那麼）微服務
+
+**Redis 快取**
+
+* **user**：載入編輯器頁面
+* **editor**：開啟 WebSocket
+* **editor**：透過 WebSocket 傳送開啟文件的請求
+  * **real-time** -> **document-updater**：將文件從 MongoDB 載入至 Redis
+* **editor**：透過 WebSocket 傳送文件更新
+  * **real-time** -> **document-updater**：在 Redis 中更新文件
+* **editor**：傳送更多編譯請求
+  * 距離上次寫回已超過 5 分鐘時（以每份文件計）：
+    * **document-updater**：將文件從 Redis 寫回 MongoDB
+* **editor**：傳送更多更新
+  * 每 100 次更新（以每份文件計）：
+    * **document-updater**：將文件歷史從 Redis 寫回 MongoDB
+* **user**：離開編輯器／關閉瀏覽器分頁
+  * 5 分鐘後
+    * **real-time**：檢查是否還有其他協作者，若沒有：
+      * **real-time** -> **document-updater**：將文件從 Redis 寫回 MongoDB
+
+**從 MongoDB 讀取至 Redis**
+
+* **document-updater** -> **web** -> **docstore**：從 MongoDB 讀取
+
+**從 Redis 寫回 MongoDB**
+
+* **document-updater** -> **web** -> **docstore**：寫入 MongoDB
+
+**編譯——「full」同步模式**
+
+* **editor**：傳送同步模式設為「full」的編譯請求
+* **web** -> **document-updater**：將所有文件從 Redis 寫回 MongoDB
+* **web** -> **docstore**：從 MongoDB 下載所有文件
+* **web** -> **clsi**：將編譯請求傳送至 `clsi`，內容包括：
+  * 同步模式
+  * 檔案樹的雜湊值 -> 即「專案狀態」
+  * 所有文件及其內容 -> 受 7MB 請求主體大小限制
+  * 供另行下載的二進位檔案 URL
+* **clsi**：根據同步模式與「專案狀態」檢查磁碟上的狀態
+  * 這是完整同步，因此可忽略先前的磁碟狀態
+* **clsi**：清理編譯目錄
+* **clsi**：將所有文件寫入編譯目錄
+* **clsi**：將所有二進位檔案寫入編譯目錄
+  * `clsi` 會從每個專案各自的本機快取中複製檔案
+  * 快取未命中時：
+    * **clsi** -> **filestore**：下載檔案
+* **clsi**：寫入「專案狀態」
+* **clsi**：確保具有所需設定的 Docker 容器存在
+  * 建立容器選項，包括 texlive 版本
+  * 對選項進行雜湊
+  * 容器名稱：`project-<project-id>-<user-id>-<hash>`
+* **clsi**：啟動容器，並將 stdout/stderr 串流至記憶體 -> 上限 2MB
+* **clsi**：保留已停止的容器 -> 24 小時後清除
+* **clsi**：將 stdout/stderr 寫入磁碟
+* **clsi**：將輸出檔案複製到唯一的輸出目錄
+  * build-id 由 8 個隨機位元組加上毫秒精度的時間戳記組成
+  * 刪除建置資料夾，只保留最後 3 個（匿名使用者）／最後 1 個（已登入使用者）
+* **clsi**：編譯失敗／逾時
+  * 刪除編譯快取——其中可能包含不完整的檔案或已損毀的快取
+* **editor**：下載 output.log 與 output.pdf
+
+**編譯——「incremental」同步模式**
+
+* **editor**：傳送同步模式設為「incremental」的編譯請求
+* **web** -> **document-updater**：從 Redis 取得所有文件
+  * 「專案狀態」雜湊值也儲存在 Redis 中
+  * **web** 將檔案樹的雜湊值傳送給 `document-updater`，若不相符，`document-updater` 可將增量編譯轉為完整編譯
+    * 請參閱 editor 請求「full」編譯時所執行的編譯流程
+* **web** -> **clsi**：將編譯請求傳送至 `clsi`，內容包括：
+  * 同步模式
+  * 檔案樹的雜湊值 -> 即「專案狀態」
+  * 來自 Redis 的所有文件及其內容 -> 受 7MB 請求主體大小限制
+  * 不含二進位檔案
+* **clsi**：根據同步模式與「專案狀態」檢查磁碟上的狀態
+  * 這是增量同步，因此「專案狀態」必須相符
+  * 不相符時：回應 409，讓 web 以「full」同步重試
+    * 請參閱 editor 請求「full」編譯時所執行的編譯流程
+* **clsi**：將已更新的文件寫入編譯目錄
+* **clsi**：確保具有所需設定的 Docker 容器存在
+  * 建立容器選項，包括 texlive 版本
+  * 對選項進行雜湊
+  * 容器名稱：`project-<project-id>-<user-id>-<hash>`
+* **clsi**：啟動容器，並將 stdout/stderr 串流至記憶體 -> 上限 2MB
+* **clsi**：保留已停止的容器 -> 24 小時後清除
+* **clsi**：將 stdout/stderr 寫入磁碟
+* **clsi**：將輸出檔案複製到唯一的輸出目錄
+  * build-id 由 8 個隨機位元組加上毫秒精度的時間戳記組成
+  * 刪除建置資料夾，只保留最後 3 個（匿名使用者）／最後 1 個（已登入使用者）
+* **clsi**：編譯失敗／逾時
+  * 刪除編譯快取——其中可能包含不完整的檔案或已損毀的快取
+* **editor**：下載 output.log 與 output.pdf
+
+**編譯——模式切換**
+
+* **editor**：偵測到編譯失敗，下一次編譯為「full」編譯
+* **editor**：偵測到編譯成功，下一次編譯為「incremental」編譯
