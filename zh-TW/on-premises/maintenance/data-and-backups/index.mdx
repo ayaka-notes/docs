@@ -1,0 +1,194 @@
+---
+title: 資料與備份
+icon: database
+---
+
+隨著 Overleaf 的發展，我們有時需要變更資料庫中的資料結構描述，並使用遷移指令碼自動化此流程。這些指令碼會先在全球最大的 Overleaf 執行個體 [overleaf.com](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit) 上執行，因此大多數狀況都已遇過，但我們無法對你的資料做任何保證。請務必在升級執行個體**之前**，為資料建立**一致性**備份。
+
+<Info>
+
+升級至新的 Docker 映像檔時，任何**尚未**執行的遷移都會自動執行。視資料集大小而定，這可能需要一些時間，你可以透過追蹤日誌了解進度。詳情請參閱我們的[日誌](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/logging)文件。
+
+</Info>
+
+### 資料儲存
+
+Overleaf 社群版與 Server Pro 會將資料儲存在三個不同的位置：
+
+* <strong>MongoDB 資料庫：</strong> 存放使用者與專案資料。
+* <strong>Redis：</strong> 作為處理中資料的高效能快取，主要儲存與專案編輯及協作相關的資訊。
+* <strong>Overleaf 檔案系統：</strong> 儲存不可編輯的專案檔案（包括圖片），並在專案編譯期間作為暫存磁碟快取。
+
+<Info>
+
+視執行個體的建立時間而定，這可能是 `~/sharelatex_data` 或 `~/overleaf_data`。
+
+</Info>
+
+<Check>
+
+對於專案檔案與完整專案歷史資料，我們也支援 S3 相容的儲存後端。
+
+</Check>
+
+關於磁碟上的資料夾配置，請參閱「資料夾詳細說明」。
+
+### 執行一致性備份
+
+建立一致性備份時，需要包含三個儲存區：
+
+* MongoDB
+* Redis
+* Overleaf 檔案系統資料
+
+為了產生一致性備份，在備份進行期間**必須**阻止使用者產生新資料。因此，我們建議安排一段維護時段，在此期間使用者應無法存取執行個體或編輯專案。
+
+開始備份之前，你需要將執行個體下線。自 Server Pro `3.5.0` 起，關閉流程會自動關閉網站並中斷使用者連線。
+
+若要關閉執行個體，使用 Toolkit 部署時請執行 `bin/docker-compose stop sharelatex`，使用 Docker Compose 時則執行 `docker compose stop sharelatex`。
+
+`sharelatex` 容器停止後，即可開始備份。
+
+備份**成功**完成後，你需要啟動 `sharelatex` 容器。使用 Toolkit 部署時請執行 `bin/docker-compose start sharelatex`，使用 Docker Compose 時則執行 `docker compose start sharelatex`。
+
+<Danger>
+
+* 備份應存放在與 Overleaf 執行個體不同的伺服器上，最好位於完全不同的地點。
+* 將資料庫複寫到多個 MongoDB 執行個體或許能提供一定的備援，但無法防範資料損毀。
+* 測試備份是確保其完整且可用的最佳方式。
+
+</Danger>
+
+### MongoDB
+
+MongoDB 內建名為 [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/) 的命令列工具，可用來備份資料庫中儲存的使用者與專案資料。
+
+### Overleaf 檔案系統資料
+
+在 Toolkit 部署中，不可編輯檔案的儲存路徑由 `config/overleaf.rc` 中的 `OVERLEAF_DATA_PATH` 環境變數指定；不過視執行個體的建立時間而定，這也可能是 `data/sharelatex`。
+
+必須使用 **rsync** 等工具遞迴複製此目錄，以確保建立完整的備份。
+
+### Redis
+
+Redis 會儲存使用者工作階段，以及寫入 MongoDB 之前尚待處理的文件更新。
+
+建議使用 Append Only File（AOF）持久化作為 Redis 的持久化設定。
+
+Toolkit 的**新**安裝預設會啟用 AOF 持久化，現有使用者可在[這裡](/zh-TW/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence)找到啟用 AOF 的相關資訊。
+
+若你決定在使用 AOF 持久化的同時繼續使用 RDB 快照，可以將 RDB 檔案複製到安全的位置作為備份。
+
+### 在伺服器之間遷移資料
+
+最理想的情況是新執行個體中尚未有任何重要資料。我們沒有合併執行個體資料的流程。
+
+假設新執行個體尚無資料，你可以依照下列步驟操作。整體而言，我們會將 `mongo`、`redis` 與 `overleaf` 磁碟區打包成 tar 檔，複製到新伺服器後再解開。
+
+#### Toolkit
+
+```bash
+# Gracefully shutdown the old instance
+old-server$ bin/stop
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar config/ data/
+
+# Copy the backup-old-server.tar file from the old-server to the
+# new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ bin/stop
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv config/ data/ backup-new-server/
+
+# Populate config/data dir again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ bin/up
+```
+
+#### Docker Compose
+
+```bash wrap
+# Gracefully shutdown the old instance
+old-server$ docker stop sharelatex
+old-server$ docker stop mongo redis
+
+# Create the tar-ball
+old-server$ tar --create --file backup-old-server.tar ~/OVERLEAF_data ~/mongo_data ~/redis_data
+
+# Copy the backup-old-server.tar file from the old-server to
+# the new-server using any method that fits
+
+# Gracefully shutdown new instance (if started yet)
+new-server$ docker stop sharelatex
+new-server$ docker stop mongo redis
+
+# Move new data, you can delete it too
+new-server$ mkdir backup-new-server
+new-server$ mv ~/OVERLEAF_data ~/mongo_data ~/redis_data backup-new-server/
+
+# Populate data dirs again
+new-server$ tar --extract --file backup-old-server.tar
+
+# Start containers
+new-server$ docker start mongo redis
+new-server$ docker start sharelatex
+```
+
+視你的 **docker-compose.yml** 檔案而定，你可能需要調整 `mongo`、`redis`、`overleaf` 磁碟區的路徑。
+
+<Info>
+
+以 root 使用者（或使用 sudo）執行時，tar 會保留檔案的擁有者／群組與權限，這在還原備份時至關重要。
+
+</Info>
+
+### 資料夾詳細說明
+
+<Info>
+
+下列資料夾附有額外標記：
+
+* (b) 應納入備份，最好在執行個體停止時進行以確保一致性
+* (d) 可刪除
+* (e) 暫時性檔案，可在執行個體停止時刪除
+
+</Info>
+
+1. `~/mongo_data` (b)
+   * MongoDB 資料目錄
+2. `~/redis_data` (b)
+   * Redis 資料庫資料目錄
+3. `~/overleaf_data`
+   1. bin
+      1. synctex (d)
+         * 最新版本中已不使用，先前曾使用自訂的 synctex 執行檔（synctex 用於 .tex 檔案與 PDF 之間的原始碼對應）
+   2. data
+      1. cache (e)
+         * 編譯用的二進位檔案快取
+      2. compiles (e)
+         * LaTeX 編譯在此進行
+      3. db.sqlite (d)
+         * 最新版本中已不使用，先前用於儲存 clsi 快取詳細資料（現已改為簡單的記憶體內對應表或直接掃描磁碟）
+      4. db.sqlite-wal (d)
+         * 最新版本中已不使用，請參閱 db.sqlite
+      5. output (e)
+         * 存放 LaTeX 編譯輸出，以提供給用戶端
+      6. template\_files (b)
+         * 範本系統的圖片預覽（僅限 Server Pro）
+      7. user\_files (b)
+         * 專案的二進位檔案
+      8. history (b)
+         * 完整專案歷史檔案
+   3. tmp
+      1. dumpFolder (e)
+         * 處理 zip 檔案時產生的暫存檔
+      2. uploads (e)
+         * 檔案上傳的緩衝區（二進位檔案／從 zip 建立新專案的上傳）
+      3. projectHistories (e)
+         * 完整專案歷史遷移的暫存檔
