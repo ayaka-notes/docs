@@ -6,7 +6,7 @@ Usage: python3 scripts/gitbook-to-mintlify/convert.py --src ../ayakaleaf-docs [-
 Generated output (overwritten on every run): index.mdx, the section folders listed in
 SECTIONS, images/<section>/, and docs.json "navigation". Other docs.json keys are kept.
 """
-import argparse, hashlib, html, json, os, re, shutil, sys, urllib.parse
+import argparse, hashlib, html, json, os, re, shutil, sys, unicodedata, urllib.parse
 from html.parser import HTMLParser
 import yaml
 
@@ -167,6 +167,46 @@ def shrink_video(path):
 
 # ---------------------------------------------------------------- output (only touch files that change)
 GENERATED = set()  # absolute paths written by this run
+
+
+EMPHASIS = re.compile(r"(?<![*\\])(\*\*\*|\*\*|\*)(?=[^\s*])(.+?)(?<=[^\s*])\1(?!\*)")
+EMPHASIS_TAGS = {1: ("<em>", "</em>"), 2: ("<strong>", "</strong>"), 3: ("<em><strong>", "</strong></em>")}
+
+
+def translation_safe_emphasis(text):
+    """Write emphasis that starts or ends with punctuation as HTML, e.g. `**Note:**` -> `<strong>Note:</strong>`.
+
+    It renders the same in English, but Mintlify's translations turn `**Note:** text` into
+    `**注意：**text`, and Markdown doesn't treat `**` between full-width punctuation and a letter
+    as a closing marker. HTML tags survive translation and always render.
+    """
+    def punct(c):
+        return unicodedata.category(c)[0] in "PS"
+
+    def line_sub(line):
+        masked = re.sub(r"`+[^`]*`+", lambda m: "\0" * len(m.group()), line)  # skip inline code
+        out, last = [], 0
+        for m in EMPHASIS.finditer(masked):
+            n, inner = len(m.group(1)), m.group(2)
+            if not (punct(inner[0]) or punct(inner[-1])):
+                continue
+            open_tag, close_tag = EMPHASIS_TAGS[n]
+            out += [line[last : m.start()], open_tag, line[m.start() + n : m.end() - n], close_tag]
+            last = m.end()
+        return "".join(out) + line[last:]
+
+    lines, fence = text.split("\n"), None
+    body = text.find("\n---\n", 4) + 5 if text.startswith("---\n") else 0  # skip frontmatter
+    start = text[:body].count("\n")
+    for i in range(start, len(lines)):
+        stripped = lines[i].lstrip()
+        if fence:
+            fence = None if stripped.startswith(fence) else fence
+        elif stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+        else:
+            lines[i] = line_sub(lines[i])
+    return "\n".join(lines)
 
 
 def write_if_changed(path, text):
@@ -915,14 +955,17 @@ def main():
         out = convert(src, info)
         if info.get("sidebar"):
             out = out.replace("---\n\n", f"sidebarTitle: {json.dumps(info['sidebar'], ensure_ascii=False)}\n---\n\n", 1)
-        write_if_changed(os.path.join(DST, info["id"] + ".mdx"), add_icon_types(out))
+        write_if_changed(os.path.join(DST, info["id"] + ".mdx"), translation_safe_emphasis(add_icon_types(out)))
         if src not in listed:
             unlisted.append(info["id"])
 
     cfg_path = os.path.join(DST, "docs.json")
     cfg = json.load(open(cfg_path, encoding="utf-8"))
     nav = cfg.get("navigation", {})
-    nav["tabs"] = tabs
+    # With Mintlify translations, navigation is per language; only the default (English) one is ours.
+    langs = nav.get("languages")
+    target = next((l for l in langs if l.get("default")), langs[0]) if langs else nav
+    target["tabs"] = tabs
     cfg["navigation"] = nav
     # GitBook also served every page under its explicit variant slug (e.g. /on-premises/en/...)
     redirects = [{"source": "/home", "destination": "/"}]
