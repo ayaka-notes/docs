@@ -1,0 +1,79 @@
+name: Sync from GitBook
+
+# Regenerates the English pages from the GitBook Git Sync repository and commits the result.
+# The script is idempotent, so a run without upstream changes makes no commit.
+on:
+  schedule:
+    - cron: "0 1 * * *" # daily, 01:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-gitbook
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Private repo, read with a read-only deploy key. Cloned outside the workspace so
+      # Mintlify doesn't pick up the GitBook .md files.
+      - name: Check out GitBook source
+        env:
+          DEPLOY_KEY: ${{ secrets.GITBOOK_DEPLOY_KEY }}
+        run: |
+          key="$RUNNER_TEMP/gitbook_deploy_key"
+          printf '%s\n' "$DEPLOY_KEY" > "$key" && chmod 600 "$key"
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git clone --depth 1 git@github.com:ayaka-notes/ayakaleaf-docs.git "$RUNNER_TEMP/gitbook-src"
+          rm -f "$key"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml
+          # ffmpeg re-encodes videos over 15 MB; skip the man-db rebuild that makes apt very slow
+          sudo rm -f /var/lib/man-db/auto-update
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ffmpeg
+
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: scripts/gitbook-to-mintlify/.cache
+          key: gitbook-cache-${{ github.run_id }}
+          restore-keys: gitbook-cache-
+
+      - name: Convert
+        run: python3 scripts/gitbook-to-mintlify/convert.py --src "$RUNNER_TEMP/gitbook-src" --strict
+
+      - name: Check
+        run: |
+          python3 scripts/gitbook-to-mintlify/check_leftovers.py
+          npx -y mint validate
+          npx -y mint broken-links
+
+      - name: Commit and push
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes."
+            exit 0
+          fi
+          src=$(git -C "$RUNNER_TEMP/gitbook-src" log -1 --format='%h %s')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Sync from GitBook" -m "Source: ayaka-notes/ayakaleaf-docs@${src}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
