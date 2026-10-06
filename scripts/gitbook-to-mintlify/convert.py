@@ -34,6 +34,8 @@ SECTIONS = [
 UNPUBLISHED = {"latex"}
 # SUMMARY.md groups left out of the sidebar. Their pages are still generated, so links keep working.
 HIDDEN_GROUPS = {("on-premises", "Getting started")}
+# Mintlify translation languages that were removed in favour of another code (old -> kept).
+RETIRED_LANGUAGES = {"zh-Hans": "zh-CN", "zh-Hant": "zh-TW"}
 UNPUB = "\x02unpublished\x02"
 SPACE_IDS = {
     "yLFrF2L1FakWXkhqpOnS": "on-premises",
@@ -992,6 +994,9 @@ def main():
     cfg["navigation"] = nav
     # GitBook also served every page under its explicit variant slug (e.g. /on-premises/en/...)
     redirects = [{"source": "/home", "destination": "/"}]
+    for retired, kept in RETIRED_LANGUAGES.items():
+        redirects.append({"source": f"/{retired}", "destination": f"/{kept}"})
+        redirects.append({"source": f"/{retired}/:slug*", "destination": f"/{kept}/:slug*"})
     for key, _, _, prefix, _, variant in SECTIONS:
         if prefix and key not in UNPUBLISHED:
             redirects.append({"source": f"/{prefix}/{variant}", "destination": f"/{prefix}"})
