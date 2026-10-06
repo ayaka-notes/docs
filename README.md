@@ -39,7 +39,7 @@ All other `docs.json` settings, such as theme, colors, logo, and navbar, are kep
 
 Sections listed in `UNPUBLISHED` in the script are indexed but not generated. The LaTeX knowledge base (`latex/en`, about 500 pages) is unpublished for now. Links that point into it are rendered as plain text. To publish it, remove `"latex"` from `UNPUBLISHED` and run the script again.
 
-Videos larger than 15 MB are re-encoded to 1280px H.264 because Mintlify does not deploy large static files. This needs `ffmpeg` on `PATH` or in `$FFMPEG`. Brand-only Font Awesome icons, such as `claude`, are resolved against Mintlify's icon CDN and cached in `icon-types.json`.
+Videos larger than 15 MB are re-encoded to 1280px H.264 because Mintlify does not deploy large static files. This needs `ffmpeg` on `PATH` or in `$FFMPEG`. `derived-assets.json` records the source of each re-encoded video and each file downloaded from the GitBook CDN. While the source is unchanged, the committed file is kept as is, so runs on other machines or in CI don't rewrite it with different bytes. Brand-only Font Awesome icons, such as `claude`, are resolved against Mintlify's icon CDN and cached in `icon-types.json`.
 
 The script converts:
 

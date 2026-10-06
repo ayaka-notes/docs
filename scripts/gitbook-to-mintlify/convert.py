@@ -226,6 +226,24 @@ def copy_if_changed(src, dst):
     shutil.copyfile(src, dst)
 
 
+# Re-encoded videos and files downloaded from the GitBook CDN can come out with different bytes on
+# another machine (ffmpeg version, CDN re-compression). Record which source each committed output was
+# made from, and keep the committed file while that source is unchanged, so runs stay reproducible.
+DERIVED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "derived-assets.json")
+DERIVED = json.load(open(DERIVED_PATH)) if os.path.exists(DERIVED_PATH) else {}
+DERIVED_USED = {}
+
+
+def copy_derived(out, key, make):
+    dst = os.path.join(DST, out)
+    DERIVED_USED[out] = key
+    # no record yet (first run with this file): adopt what is committed
+    if os.path.exists(dst) and DERIVED.get(out, key) == key:
+        GENERATED.add(os.path.abspath(dst))
+        return
+    copy_if_changed(make(), dst)
+
+
 def remove_stale(dirs):
     """Delete files in generated folders that this run did not produce."""
     for d in dirs:
@@ -273,7 +291,12 @@ def asset_url(abs_path, sec_key):
         out = f"images/{sec_key}/{safe}-{i}{ext.lower()}"
         i += 1
     os.makedirs(os.path.join(DST, os.path.dirname(out)), exist_ok=True)
-    copy_if_changed(shrink_video(abs_path) if ext.lower() in (".mp4", ".mov", ".webm") else abs_path, os.path.join(DST, out))
+    if ext.lower() in (".mp4", ".mov", ".webm"):
+        copy_derived(out, "sha1:" + hashlib.sha1(open(abs_path, "rb").read()).hexdigest(), lambda: shrink_video(abs_path))
+    elif abs_path.startswith(CACHE + os.sep):
+        copy_derived(out, "url:" + os.path.relpath(abs_path, CACHE), lambda: abs_path)
+    else:
+        copy_if_changed(abs_path, os.path.join(DST, out))
     asset_map[abs_path] = "/" + out
     return "/" + out
 
@@ -977,6 +1000,7 @@ def main():
     for t in tabs:
         icon_type(t["icon"])
     write_if_changed(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    write_if_changed(DERIVED_PATH, json.dumps(dict(sorted(DERIVED_USED.items())), indent=0) + "\n")
     open(ICON_CACHE, "w").write(json.dumps(dict(sorted(_icon_types.items())), indent=0) + "\n")
     remove_stale(["images"] + [s[3] for s in SECTIONS if s[3]])
 
