@@ -551,6 +551,11 @@ def convert(src, info):
     # H1 becomes the frontmatter title
     body = re.sub(r"\A\s*# .*\n", "", body, count=1)
 
+    # landing pages give their column blocks a margin (columns below); GitBook's
+    # <br> spacers between the blocks would double it
+    if landing:
+        body = re.sub(r"(?m)^<br\s*/?>[ \t]*\n", "", body)
+
     # {% code %} wrappers -> fence meta
     def code_dir(m):
         params = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
