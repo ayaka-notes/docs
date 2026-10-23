@@ -1,0 +1,154 @@
+---
+title: Gitea Synchronisation
+icon: mug-hot
+---
+
+<Info>
+
+This feature is developed by [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). It is introduced in v6.3.2 as an early preview and will be officially released in v6.4.0, so its configuration and behavior may still change. We need your feedback if you have any problem.
+
+</Info>
+
+Gitea Synchronisation works like [GitHub Synchronisation](/on-premises/configuration/overleaf-toolkit/github-synchronisation) and [GitLab Synchronisation](/on-premises/configuration/overleaf-toolkit/gitlab-synchronisation): users link their Gitea account, export projects into new Gitea repositories, import Gitea repositories, and sync changes in both directions. It works with Gitea 1.23 or later, on gitea.com or on your own instance.
+
+### Setup Gitea Synchronisation
+
+<Warning>
+
+You need to enable [git-bridge](/on-premises/configuration/overleaf-toolkit/git-integration) first before using Gitea Synchronisation.
+
+```dotenv title="config/overleaf.rc"
+GIT_BRIDGE_ENABLED=true
+```
+
+</Warning>
+
+Create an OAuth2 application on your Gitea instance, under _Settings → Applications → Manage OAuth2 applications_ (or _Site Administration → Integrations → Applications_ for an instance-wide application):
+
+* **Application name**: e.g. `Overleaf`, users see it when they authorize it
+* **Redirect URIs**: `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback`
+* **Confidential client**: checked
+
+Copy the **Client ID** and the **Client Secret**, then add the following settings to your overleaf env var files.
+
+```dotenv title="config/variables.env" wrap
+# used to encrypt the user's Gitea access and refresh tokens.
+# How to generate: `openssl rand -hex 32`
+GITEA_TOKEN_CIPHER_PASSWORD=0123456789ABCDEFG # changed to yours
+
+# Gitea Sync Settings
+GITEA_SYNC_ENABLED=true
+GITEA_SYNC_CLIENT_ID=
+GITEA_SYNC_CLIENT_SECRET=
+
+# Web address of your Gitea (its ROOT_URL), defaults to https://gitea.com
+# GITEA_SYNC_URL=https://gitea.example.com
+
+# OAuth callback is: ${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback
+# (Optional) GITEA_SYNC_PROXY_URL=http://10.0.0.1:10808
+```
+
+<Warning>
+
+Before configuring the Gitea redirect URI, make sure `OVERLEAF_SITE_URL` is set correctly.
+
+</Warning>
+
+Overleaf asks for everything a sync needs when the user links the account, so users never have to link again for a missing permission:
+
+| Scope                | Used for                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| `write:repository`   | Repositories, their files (CI workflows under `.gitea/workflows` included), branches and pull requests |
+| `write:user`         | Creating a repository of the user when exporting (Gitea asks for it on `POST /user/repos`) |
+| `write:organization` | Listing the user's organizations and creating a repository of one when exporting           |
+
+Gitea shows these scopes when the user authorizes the application, and limits the token to them.
+
+Gitea access tokens expire after an hour (`[oauth2] ACCESS_TOKEN_EXPIRATION_TIME`). Overleaf refreshes them with the refresh token Gitea issues along with them, also when Gitea spends refresh tokens on use (`INVALIDATE_REFRESH_TOKENS = true`), so users stay linked until they unlink or revoke the application in Gitea.
+
+### Your Gitea instance
+
+Set `GITEA_SYNC_URL` to the web address of your instance, its `ROOT_URL`, the one you open repositories with in the browser. The REST API is derived from it:
+
+| Variable             | Default                      |
+| -------------------- | ---------------------------- |
+| `GITEA_SYNC_URL`     | `https://gitea.com`          |
+| `GITEA_SYNC_API_URL` | `${GITEA_SYNC_URL}/api/v1`   |
+
+Gitea served under a sub-path works too, e.g. `GITEA_SYNC_URL=https://example.com/gitea`. Only set `GITEA_SYNC_API_URL` when your instance serves the API somewhere else, for example behind an API gateway.
+
+<Warning>
+
+* Create the OAuth2 application on the instance you set in `GITEA_SYNC_URL`, an application from another instance does not work.
+* `GITEA_SYNC_URL` is the web address only. Do not add `/api/v1` or a user or organization path.
+* Overleaf commits with Gitea's file API, which needs the web editor: keep `[repository.editor]` enabled (the default).
+
+</Warning>
+
+<Info>
+
+If your instance uses a certificate from a private CA, mount the CA certificate into the container and point `NODE_EXTRA_CA_CERTS` at it, e.g. `NODE_EXTRA_CA_CERTS=/var/lib/overleaf/certs/gitea-ca.pem`.
+
+</Info>
+
+<Danger>
+
+Linked accounts and projects belong to the instance they were linked with. Before switching `GITEA_SYNC_URL` to another instance, ask users to unlink their Gitea account and projects.
+
+</Danger>
+
+If you are in a region with restricted network access, you may need to configure a proxy to access Gitea. Set the following environment variable: `GITEA_SYNC_PROXY_URL=http://10.0.0.1:10808`. It must be a standard HTTP/HTTPS forward proxy, and must not use `127.0.0.1`.
+
+### Who can link and sync
+
+Like on Overleaf Cloud, only the project owner can link a project to a Gitea repository. Once it is linked, every collaborator with edit access can sync it.
+
+| Action                                                     | Who can do it                                                  |
+| ---------------------------------------------------------- | -------------------------------------------------------------- |
+| Export a project to a new Gitea repository                 | The project owner                                              |
+| Import a Gitea repository into a new project               | Any user, who becomes the owner of the new project             |
+| Pull, push and merge a linked project                      | The owner and collaborators with edit access                   |
+| Unlink a project from its repository                       | The project owner                                              |
+
+* Overleaf talks to Gitea with the Gitea account of the user who syncs, so every collaborator who syncs links their own Gitea account, and needs to be allowed to push to the default branch of the repository.
+* View-only collaborators cannot use Gitea Synchronisation for the project.
+* Unlinking the account in Overleaf forgets its token; Gitea has no API to revoke it, so revoke the grant under _Settings → Applications_ in Gitea too if you want to.
+
+### How syncing works with Gitea
+
+* **Permissions**: users need to be allowed to push to the default branch of the linked repository. When a branch protection rule does not let the user push to it, Overleaf asks them to contact the project owner, as with a repository they lost access to.
+* **Merging**: when a project changed both in Overleaf and in Gitea, Overleaf commits its changes to a temporary branch named `overleaf-YYYY-MM-DD-HHMMSS` and merges it through a pull request with the repository's default merge style, because Gitea has no API to merge branches without one. After the merge, Overleaf deletes the temporary branch; the merged pull request stays in the repository as a record.
+* **Merge rules**: Overleaf never bypasses the repository's branch protection. When the pull request has a conflict, or needs approvals or passing status checks, it stays open and Overleaf asks the user to merge it in Gitea, then to continue syncing.
+* **CI workflows**: Overleaf does not show dotfiles such as `.gitea/workflows/`, and leaves them as they are in the repository. Commits from Overleaf start Gitea Actions like any other commit.
+
+### Q\&A
+
+<Accordion title="Can I force push to the default branch?">
+
+<strong>Answer:</strong> Please keep force pushes to the default branch disabled, e.g. with a branch protection rule. Overleaf can take over a rewritten branch, but Gitea Synchronisation is designed for a default branch whose history only grows.
+
+</Accordion>
+
+<Accordion title="Can I rename the default branch of a linked project?">
+
+<strong>Answer:</strong> No. Overleaf keeps syncing with the branch the project was linked to, so syncs fail once that branch is renamed or removed. To sync with another branch, unlink the project, then import the repository into a new project, which uses the current default branch.
+
+</Accordion>
+
+<Accordion title="Does Gitea Synchronisation support Git LFS?">
+
+<strong>Answer:</strong> No. Overleaf projects do not support Git Large File Storage. Files tracked by Git LFS appear in Overleaf as LFS pointer files, not as their contents. Commit images and PDFs to the repository directly instead.
+
+</Accordion>
+
+<Accordion title="Does it work with SHA-256 repositories?">
+
+<strong>Answer:</strong> Not yet. Overleaf compares files by their SHA-1 IDs, so in a repository created with the SHA-256 object format every pull rewrites all files, even unchanged ones. Nothing is lost, but please use the default SHA-1 format.
+
+</Accordion>
+
+<Accordion title="Does it work with Forgejo?">
+
+<strong>Answer:</strong> Gitea Synchronisation is built and tested against Gitea only.
+
+</Accordion>
