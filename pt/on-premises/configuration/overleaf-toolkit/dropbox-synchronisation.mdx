@@ -5,7 +5,7 @@ icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.sv
 
 <Info>
 
-Este recurso foi desenvolvido por [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). Ele foi introduzido na v6.4.0 e posteriores. Ainda está em fase beta. Precisamos do seu feedback caso encontre algum problema.
+Este recurso foi desenvolvido por [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). Ele foi introduzido na v6.3.1 como prévia antecipada e será lançado oficialmente na v6.4.0, portanto sua configuração e seu comportamento ainda podem mudar. Precisamos do seu feedback caso encontre algum problema.
 
 </Info>
 
@@ -74,6 +74,34 @@ DROPBOX_APP_NAME=Overleaf
 
 Se você estiver em uma região com acesso restrito à rede, talvez precise configurar um proxy para acessar o Dropbox. Defina a seguinte variável de ambiente: `DROPBOX_SYNC_PROXY_URL=http://10.0.0.1:10808`. Ele deve ser um proxy de encaminhamento HTTP/HTTPS padrão e não deve usar `127.0.0.1`.
 
+#### Criar os índices do banco de dados
+
+Execute isto uma única vez, antes que os usuários vinculem suas contas do Dropbox. O Server CE e o Server Pro não criam os índices que a sincronização com Dropbox usa; sem eles, cada consulta da sincronização percorre a coleção inteira.
+
+Usuários do Toolkit: executem `bin/mongo`. Usuários do Docker Compose: executem `docker compose exec mongo mongosh sharelatex`. Em seguida, colem:
+
+```js
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+```
+
+Executar novamente não causa problemas: o MongoDB ignora os índices que já existem.
+
+<Danger>
+
+Não execute, em vez disso, as migrações de `dropboxEntities` de `tools/migrations`: `20220825160708_recreate_dropboxEntities` remove a coleção, o que apaga o estado de sincronização de todos os usuários.
+
+</Danger>
+
 ### Webhook
 
 O Dropbox informa o Overleaf sobre alterações no Dropbox por meio de um webhook, para que elas apareçam no Overleaf em poucos segundos. O webhook aponta para o endereço do seu site, `${OVERLEAF_SITE_URL}/dropbox/webhook`, e nenhuma porta extra é necessária, mas **o Dropbox precisa conseguir acessá-lo pela internet**. Quando você o adiciona no App Console, o Dropbox o verifica imediatamente.
@@ -95,19 +123,63 @@ Sem um webhook, por exemplo, em um servidor que o Dropbox não consegue acessar,
 
 <strong>Resposta:</strong>
 
-* Os projetos são associados às pastas do Dropbox pelo nome; portanto, um usuário que tem dois projetos com o mesmo nome é solicitado a renomear um deles primeiro.
+* Uma pasta do Dropbox que o Overleaf ainda não conhece é associada a um projeto pelo nome; portanto, um usuário cujos projetos têm o mesmo nome é solicitado a renomeá-los primeiro. Os nomes são comparados sem diferenciar maiúsculas de minúsculas, e projetos arquivados e na lixeira também contam.
 * Uma conta do Dropbox só pode ser vinculada a uma conta do Overleaf.
 
 </Accordion>
 
 <Accordion title="Por que uma conta do Dropbox foi desvinculada?">
 
-<strong>Resposta:</strong> O Overleaf desvincula uma conta do Dropbox quando o Dropbox recusa seu token (por exemplo, depois que o usuário removeu o aplicativo no Dropbox), quando o Dropbox está cheio ou quando o Dropbox suspendeu a conta. O usuário pode vinculá-la novamente quando o problema for resolvido.
+<strong>Resposta:</strong> O Overleaf desvincula uma conta do Dropbox quando o Dropbox recusa seu token (por exemplo, depois que o usuário removeu o aplicativo no Dropbox), quando o Dropbox está cheio ou quando o Dropbox suspendeu a conta. Uma notificação na lista de projetos informa ao usuário qual desses casos ocorreu, até que ele vincule a conta novamente. O usuário pode vinculá-la novamente quando o problema for resolvido.
 
 </Accordion>
 
 <Accordion title="Posso renomear uma pasta de projeto no Dropbox?">
 
-<strong>Resposta:</strong> Em vez disso, renomeie o projeto no Overleaf. Para o Overleaf, renomear a pasta no Dropbox exclui a pasta do projeto e cria uma nova; assim, o projeto antigo é marcado como excluído e um novo projeto é criado a partir dos arquivos.
+<strong>Resposta:</strong> Em vez disso, renomeie o projeto no Overleaf: a pasta dele no Dropbox também é renomeada. Para o Overleaf, renomear a pasta no Dropbox exclui a pasta do projeto e cria uma nova; assim, o projeto antigo é marcado como excluído e um novo projeto é criado a partir dos arquivos.
+
+</Accordion>
+
+<Accordion title="Por que algumas pastas de projeto são numeradas, como “Thesis (1)”?">
+
+<strong>Resposta:</strong> Cada projeto tem sua própria pasta, mesmo quando dois projetos têm o mesmo nome. O Dropbox não pode ter duas pastas com o mesmo nome, então adiciona um número à pasta criada depois. O número depende de quais nomes estavam livres no Dropbox naquele momento, e não de qual projeto é mais antigo. O Overleaf sabe qual é a pasta de cada projeto, então as alterações nunca vão para a pasta de outro projeto com o mesmo nome.
+
+Um projeto enviado cujo nome já está em uso também recebe um nome com número no Overleaf, por exemplo "Thesis (1)".
+
+</Accordion>
+
+<Accordion title="O que acontece quando excluo uma pasta de projeto no Dropbox?">
+
+<strong>Resposta:</strong>
+
+* Se nenhum outro projeto tiver o nome da pasta, o projeto é marcado como excluído no Overleaf. Seus arquivos e seu histórico são mantidos.
+* Se vários projetos tiverem esse nome, o Overleaf não consegue saber a qual deles a pasta pertencia. Ele desvincula a conta do Dropbox e mostra uma notificação pedindo para renomear os projetos. Dê nomes distintos aos projetos antes de excluir as pastas deles no Dropbox.
+* Uma pasta numerada, como "Thesis (1)", não corresponde a nenhum nome de projeto; portanto, excluí-la não altera o projeto no Overleaf. Clique em _sync this project now_ na caixa de diálogo do Dropbox no editor para enviar o projeto ao Dropbox novamente.
+
+</Accordion>
+
+<Accordion title="O que acontece no Dropbox quando excluo um projeto no Overleaf?">
+
+<strong>Resposta:</strong> Nada; a pasta dele permanece no Dropbox. Exclua a pasta no Dropbox se não precisar mais dela.
+
+</Accordion>
+
+<Accordion title="O que acontece com as alterações no Dropbox enquanto um projeto está arquivado ou na lixeira?">
+
+<strong>Resposta:</strong> Elas não são aplicadas ao projeto, e restaurar o projeto também não as traz. Após a restauração, o Overleaf deixa de enviar as próprias alterações dos arquivos que foram alterados no Dropbox nesse meio-tempo, de modo que os dois lados ficam diferentes.
+
+Para sincronizar novamente um desses arquivos, salve-o mais uma vez no Dropbox. O Overleaf então adota a versão do Dropbox: as alterações feitas no arquivo no Overleaf desde a restauração são substituídas e permanecem no histórico do projeto. Restaure um projeto antes de alterá-lo no Dropbox.
+
+</Accordion>
+
+<Accordion title="Por que o link do Dropbox no editor abre a página inicial do Dropbox?">
+
+<strong>Resposta:</strong> O link aponta para `Apps/<app folder>/<project>` no dropbox.com, como no Overleaf Cloud. Quando o Dropbox mostra a pasta `Apps` com um nome traduzido, por exemplo `应用` em chinês, o link não encontra a pasta e o Dropbox abre a página inicial. Abra a pasta do projeto a partir da pasta `Apps` traduzida no Dropbox.
+
+</Accordion>
+
+<Accordion title="Por que alguns arquivos de um projeto estão faltando no Dropbox?">
+
+<strong>Resposta:</strong> As alterações feitas enquanto o serviço de sincronização não estava em execução, por exemplo durante uma reinicialização, não são enviadas ao Dropbox depois. Clique em _sync this project now_ na caixa de diálogo do Dropbox no editor: isso envia o projeto inteiro novamente.
 
 </Accordion>

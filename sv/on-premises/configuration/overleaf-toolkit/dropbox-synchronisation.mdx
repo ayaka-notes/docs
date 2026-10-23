@@ -5,7 +5,7 @@ icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.sv
 
 <Info>
 
-Den här funktionen är utvecklad av [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). Den introducerades i v6.4.0 och finns i senare versioner. Den är fortfarande i betastatus. Vi behöver din återkoppling om du stöter på problem.
+Den här funktionen är utvecklad av [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). Den introducerades i v6.3.1 som en tidig förhandsversion och släpps officiellt i v6.4.0, så dess konfiguration och beteende kan fortfarande ändras. Vi behöver din återkoppling om du stöter på problem.
 
 </Info>
 
@@ -74,6 +74,34 @@ DROPBOX_APP_NAME=Overleaf
 
 Om du befinner dig i en region med begränsad nätverksåtkomst kan du behöva konfigurera en proxy för att nå Dropbox. Ange följande miljövariabel: `DROPBOX_SYNC_PROXY_URL=http://10.0.0.1:10808`. Det måste vara en vanlig HTTP/HTTPS-framåtproxy och får inte använda `127.0.0.1`.
 
+#### Skapa databasindexen
+
+Kör detta en gång, innan användarna länkar sina Dropbox-konton. Server CE och Server Pro skapar inte de index som Dropbox-synkroniseringen använder, så utan dem genomsöker varje synkroniseringsuppslag hela samlingen.
+
+Toolkit-användare: kör `bin/mongo`. Docker Compose-användare: kör `docker compose exec mongo mongosh sharelatex`. Klistra sedan in:
+
+```js
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+```
+
+Det är ofarligt att köra det igen: MongoDB hoppar över index som redan finns.
+
+<Danger>
+
+Kör inte `dropboxEntities`-migreringarna i `tools/migrations` i stället: `20220825160708_recreate_dropboxEntities` tar bort samlingen, vilket raderar synkroniseringstillståndet för alla användare.
+
+</Danger>
+
 ### Webhook
 
 Dropbox meddelar Overleaf om ändringar i Dropbox via en webhook, så att de syns i Overleaf inom några sekunder. Webhooken går till din webbplats adress, `${OVERLEAF_SITE_URL}/dropbox/webhook`, och ingen extra port behövs, men **Dropbox måste kunna nå den från internet**. När du lägger till den i App Console kontrollerar Dropbox den direkt.
@@ -95,19 +123,63 @@ Utan webhook, till exempel på en server som Dropbox inte kan nå, skickas ändr
 
 <strong>Svar:</strong>
 
-* Projekt matchas mot Dropbox-mappar efter namn, så en användare som har två projekt med samma namn ombeds först byta namn på ett av dem.
+* En Dropbox-mapp som Overleaf ännu inte känner till matchas mot ett projekt efter sitt namn, så en användare vars projekt har samma namn ombeds först byta namn på dem. Namnen jämförs utan hänsyn till skiftläge, och arkiverade projekt och projekt i papperskorgen räknas också.
 * Ett Dropbox-konto kan bara länkas till ett Overleaf-konto.
 
 </Accordion>
 
 <Accordion title="Varför avlänkades ett Dropbox-konto?">
 
-<strong>Svar:</strong> Overleaf avlänkar ett Dropbox-konto när Dropbox avvisar dess token (till exempel efter att användaren har tagit bort appen i Dropbox), när Dropbox-lagringen är full eller när Dropbox har stängt av kontot. Användaren kan länka det igen när problemet är löst.
+<strong>Svar:</strong> Overleaf avlänkar ett Dropbox-konto när Dropbox avvisar dess token (till exempel efter att användaren har tagit bort appen i Dropbox), när Dropbox-lagringen är full eller när Dropbox har stängt av kontot. Ett meddelande i projektlistan talar om för användaren vilket av dessa som har hänt, tills användaren länkar kontot igen. Användaren kan länka det igen när problemet är löst.
 
 </Accordion>
 
 <Accordion title="Kan jag byta namn på en projektmapp i Dropbox?">
 
-<strong>Svar:</strong> Byt i stället namn på projektet i Overleaf. För Overleaf innebär ett namnbyte av mappen i Dropbox att projektmappen tas bort och en ny skapas, så det gamla projektet markeras som borttaget och ett nytt projekt skapas från filerna.
+<strong>Svar:</strong> Byt i stället namn på projektet i Overleaf: dess mapp i Dropbox byter också namn. För Overleaf innebär ett namnbyte av mappen i Dropbox att projektmappen tas bort och en ny skapas, så det gamla projektet markeras som borttaget och ett nytt projekt skapas från filerna.
+
+</Accordion>
+
+<Accordion title="Varför är vissa projektmappar numrerade, till exempel ”Thesis (1)”?">
+
+<strong>Svar:</strong> Varje projekt har en egen mapp, även när två projekt har samma namn. Dropbox kan inte ha två mappar med samma namn, så den lägger till ett nummer på mappen som skapades senare. Numret beror på vilka namn som var lediga i Dropbox i det ögonblicket, inte på vilket projekt som är äldst. Overleaf känner till varje projekts mapp, så ändringar hamnar aldrig i mappen för ett annat projekt med samma namn.
+
+Ett uppladdat projekt vars namn redan är upptaget får också ett nummer i Overleaf, till exempel ”Thesis (1)”.
+
+</Accordion>
+
+<Accordion title="Vad händer när jag tar bort en projektmapp i Dropbox?">
+
+<strong>Svar:</strong>
+
+* Om inget annat projekt har mappens namn markeras projektet som borttaget i Overleaf. Dess filer och historik behålls.
+* Om flera projekt har det namnet kan Overleaf inte avgöra vilket av dem mappen tillhörde. Det avlänkar Dropbox-kontot och visar ett meddelande som ber användaren byta namn på projekten. Ge projekten olika namn innan du tar bort deras mappar i Dropbox.
+* En numrerad mapp, till exempel ”Thesis (1)”, matchar inget projektnamn, så att ta bort den ändrar inte projektet i Overleaf. Klicka på _sync this project now_ i Dropbox-dialogrutan i redigeraren för att skicka projektet till Dropbox igen.
+
+</Accordion>
+
+<Accordion title="Vad händer i Dropbox när jag tar bort ett projekt i Overleaf?">
+
+<strong>Svar:</strong> Ingenting, dess mapp finns kvar i Dropbox. Ta bort mappen i Dropbox om du inte längre behöver den.
+
+</Accordion>
+
+<Accordion title="Vad händer med ändringar i Dropbox medan ett projekt är arkiverat eller ligger i papperskorgen?">
+
+<strong>Svar:</strong> De tillämpas inte på projektet, och de förs inte heller in när projektet återställs. Efter återställningen slutar Overleaf skicka sina ändringar av de filer som under tiden har ändrats i Dropbox, så de två sidorna skiljer sig åt.
+
+För att synkronisera en sådan fil igen sparar du den en gång till i Dropbox. Overleaf tar då Dropbox-versionen: ändringar som gjorts i filen i Overleaf sedan återställningen ersätts och finns kvar i projekthistoriken. Återställ ett projekt innan du ändrar det i Dropbox.
+
+</Accordion>
+
+<Accordion title="Varför öppnar redigerarens Dropbox-länk Dropbox startsida?">
+
+<strong>Svar:</strong> Länken går till `Apps/<app folder>/<project>` på dropbox.com, precis som i Overleaf Cloud. När Dropbox visar sin `Apps`-mapp under ett översatt namn, till exempel `应用` på kinesiska, hittar länken inte mappen och Dropbox öppnar i stället sin startsida. Öppna projektmappen från den översatta `Apps`-mappen i Dropbox.
+
+</Accordion>
+
+<Accordion title="Varför saknas vissa filer i ett projekt i Dropbox?">
+
+<strong>Svar:</strong> Ändringar som görs medan synkroniseringstjänsten inte körs, till exempel medan den startas om, skickas inte till Dropbox i efterhand. Klicka på _sync this project now_ i Dropbox-dialogrutan i redigeraren: den skickar hela projektet igen.
 
 </Accordion>
