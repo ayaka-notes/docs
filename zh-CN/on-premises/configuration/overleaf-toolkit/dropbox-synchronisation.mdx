@@ -5,7 +5,7 @@ icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.sv
 
 <Info>
 
-此功能由 [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro) 开发。它自 v6.4.0 起引入，目前仍处于 beta 阶段。如果你遇到任何问题，我们需要你的反馈。
+此功能由 [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro) 开发。它在 v6.3.1 中作为早期预览版引入，并将在 v6.4.0 中正式发布，因此其配置和行为仍可能发生变化。如果你遇到任何问题，我们需要你的反馈。
 
 </Info>
 
@@ -74,6 +74,34 @@ DROPBOX_APP_NAME=Overleaf
 
 如果你所在的地区网络访问受限，可能需要配置代理才能访问 Dropbox。请设置以下环境变量：`DROPBOX_SYNC_PROXY_URL=http://10.0.0.1:10808`。它必须是标准的 HTTP/HTTPS 正向代理，并且不能使用 `127.0.0.1`。
 
+#### 创建数据库索引
+
+请在用户关联 Dropbox 账户之前运行一次。Server CE 和 Server Pro 不会创建 Dropbox 同步所使用的索引，如果没有这些索引，每次同步查找都会扫描整个集合。
+
+Toolkit 用户：运行 `bin/mongo`。Docker Compose 用户：运行 `docker compose exec mongo mongosh sharelatex`。然后粘贴：
+
+```js
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+```
+
+重复运行不会造成任何影响：MongoDB 会跳过已存在的索引。
+
+<Danger>
+
+请不要改为运行 `tools/migrations` 中的 `dropboxEntities` 迁移：`20220825160708_recreate_dropboxEntities` 会删除该集合，从而删除所有用户的同步状态。
+
+</Danger>
+
 ### Webhook
 
 Dropbox 通过 webhook 将 Dropbox 中的更改通知给 Overleaf，因此这些更改会在几秒钟内出现在 Overleaf 中。webhook 指向你网站的地址 `${OVERLEAF_SITE_URL}/dropbox/webhook`，无需额外端口，但 **Dropbox 必须能够从互联网访问它**。当你在 App Console 中添加它时，Dropbox 会立即对其进行检查。
@@ -95,19 +123,63 @@ Dropbox 通过 webhook 将 Dropbox 中的更改通知给 Overleaf，因此这些
 
 <strong>回答：</strong>
 
-* 项目按名称与 Dropbox 文件夹匹配，因此如果用户有两个同名项目，系统会要求其先重命名其中一个。
+* Overleaf 尚不知道的 Dropbox 文件夹会按名称与项目匹配，因此如果用户的项目存在同名情况，系统会要求其先重命名这些项目。名称比较不区分大小写，已归档和已移至回收站的项目也计算在内。
 * 一个 Dropbox 账户只能关联到一个 Overleaf 账户。
 
 </Accordion>
 
 <Accordion title="为什么 Dropbox 账户被取消关联了？">
 
-<strong>回答：</strong>当 Dropbox 拒绝其令牌（例如用户在 Dropbox 中删除了该应用后）、Dropbox 空间已满或 Dropbox 暂停了该账户时，Overleaf 会取消关联该 Dropbox 账户。问题解决后，用户可以重新关联。
+<strong>回答：</strong>当 Dropbox 拒绝其令牌（例如用户在 Dropbox 中删除了该应用后）、Dropbox 空间已满或 Dropbox 暂停了该账户时，Overleaf 会取消关联该 Dropbox 账户。项目列表中的通知会告诉用户发生了哪种情况，直到其重新关联该账户。问题解决后，用户可以重新关联。
 
 </Accordion>
 
 <Accordion title="我可以在 Dropbox 中重命名项目文件夹吗？">
 
-<strong>回答：</strong>请改为在 Overleaf 中重命名项目。对 Overleaf 而言，在 Dropbox 中重命名文件夹相当于删除项目文件夹并新建一个文件夹，因此旧项目会被标记为已删除，并根据这些文件创建一个新项目。
+<strong>回答：</strong>请改为在 Overleaf 中重命名项目：其在 Dropbox 中的文件夹也会随之重命名。对 Overleaf 而言，在 Dropbox 中重命名文件夹相当于删除项目文件夹并新建一个文件夹，因此旧项目会被标记为已删除，并根据这些文件创建一个新项目。
+
+</Accordion>
+
+<Accordion title="为什么有些项目文件夹带有编号，例如“Thesis (1)”？">
+
+<strong>回答：</strong>每个项目都有自己的文件夹，即使两个项目同名也是如此。Dropbox 不能存放两个同名文件夹，因此会为后创建的文件夹添加编号。编号取决于当时 Dropbox 中哪些名称可用，而不是哪个项目更早创建。Overleaf 知道每个项目对应的文件夹，因此更改绝不会发送到另一个同名项目的文件夹中。
+
+如果上传的项目名称已被占用，它在 Overleaf 中也会以带编号的名称命名，例如“Thesis (1)”。
+
+</Accordion>
+
+<Accordion title="在 Dropbox 中删除项目文件夹会发生什么？">
+
+<strong>回答：</strong>
+
+* 如果没有其他项目与该文件夹同名，该项目会在 Overleaf 中被标记为已删除。其文件和历史记录会被保留。
+* 如果有多个项目使用该名称，Overleaf 无法判断该文件夹属于哪个项目。它会取消关联该 Dropbox 账户，并显示一条通知，要求重命名这些项目。在 Dropbox 中删除项目文件夹之前，请为项目设置不同的名称。
+* 带编号的文件夹（例如“Thesis (1)”）不与任何项目名称匹配，因此删除它不会改变 Overleaf 中的项目。点击编辑器 Dropbox 对话框中的 _sync this project now_，即可将项目重新发送到 Dropbox。
+
+</Accordion>
+
+<Accordion title="在 Overleaf 中删除项目时，Dropbox 中会发生什么？">
+
+<strong>回答：</strong>什么都不会发生，其文件夹会保留在 Dropbox 中。如果不再需要，请在 Dropbox 中删除该文件夹。
+
+</Accordion>
+
+<Accordion title="项目被归档或移至回收站期间，Dropbox 中的更改会怎样？">
+
+<strong>回答：</strong>这些更改不会应用到项目中，恢复项目也不会将其带回。恢复后，对于在此期间在 Dropbox 中被更改的文件，Overleaf 会停止发送其更改，因此两边会出现差异。
+
+要让这样的文件重新同步，请在 Dropbox 中再保存一次。Overleaf 随后会采用 Dropbox 中的版本：恢复后在 Overleaf 中对该文件所做的更改会被替换，但仍保留在项目历史记录中。请先恢复项目，再在 Dropbox 中修改它。
+
+</Accordion>
+
+<Accordion title="为什么编辑器中的 Dropbox 链接会打开 Dropbox 主页？">
+
+<strong>回答：</strong>该链接指向 dropbox.com 上的 `Apps/<app folder>/<project>`，与 Overleaf Cloud 上一致。当 Dropbox 以翻译后的名称显示其 `Apps` 文件夹时（例如中文的 `应用`），链接无法找到该文件夹，Dropbox 会转而打开其主页。请在 Dropbox 中从翻译后的 `Apps` 文件夹打开项目文件夹。
+
+</Accordion>
+
+<Accordion title="为什么项目的某些文件在 Dropbox 中缺失？">
+
+<strong>回答：</strong>同步服务未运行期间（例如重启时）所做的更改，之后不会再发送到 Dropbox。点击编辑器 Dropbox 对话框中的 _sync this project now_：它会重新发送整个项目。
 
 </Accordion>
