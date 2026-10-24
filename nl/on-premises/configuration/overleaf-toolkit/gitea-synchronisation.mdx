@@ -1,0 +1,154 @@
+---
+title: Gitea-synchronisatie
+icon: mug-hot
+---
+
+<Info>
+
+Deze functie is ontwikkeld door [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). Ze is geïntroduceerd in v6.3.2 als vroege preview en wordt officieel uitgebracht in v6.4.0, dus de configuratie en het gedrag kunnen nog veranderen. We horen graag je feedback als je problemen hebt.
+
+</Info>
+
+Gitea-synchronisatie werkt zoals [GitHub-synchronisatie](/nl/on-premises/configuration/overleaf-toolkit/github-synchronisation) en [GitLab-synchronisatie](/nl/on-premises/configuration/overleaf-toolkit/gitlab-synchronisation): gebruikers koppelen hun Gitea-account, exporteren projecten naar nieuwe Gitea-repository's, importeren Gitea-repository's en synchroniseren wijzigingen in beide richtingen. Het werkt met Gitea 1.23 of later, op gitea.com of op je eigen instantie.
+
+### Gitea-synchronisatie instellen
+
+<Warning>
+
+Je moet eerst [git-bridge](/nl/on-premises/configuration/overleaf-toolkit/git-integration) inschakelen voordat je Gitea-synchronisatie kunt gebruiken.
+
+```dotenv title="config/overleaf.rc"
+GIT_BRIDGE_ENABLED=true
+```
+
+</Warning>
+
+Maak een OAuth2-applicatie aan op je Gitea-instantie, onder _Settings → Applications → Manage OAuth2 applications_ (of _Site Administration → Integrations → Applications_ voor een applicatie voor de hele instantie):
+
+* **Application name**: bijvoorbeeld `Overleaf`; gebruikers zien deze naam wanneer ze de applicatie autoriseren
+* **Redirect URIs**: `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback`
+* **Confidential client**: aangevinkt
+
+Kopieer de **Client ID** en het **Client Secret** en voeg vervolgens de volgende instellingen toe aan je Overleaf-omgevingsvariabelenbestanden.
+
+```dotenv title="config/variables.env" wrap
+# used to encrypt the user's Gitea access and refresh tokens.
+# How to generate: `openssl rand -hex 32`
+GITEA_TOKEN_CIPHER_PASSWORD=0123456789ABCDEFG # changed to yours
+
+# Gitea Sync Settings
+GITEA_SYNC_ENABLED=true
+GITEA_SYNC_CLIENT_ID=
+GITEA_SYNC_CLIENT_SECRET=
+
+# Web address of your Gitea (its ROOT_URL), defaults to https://gitea.com
+# GITEA_SYNC_URL=https://gitea.example.com
+
+# OAuth callback is: ${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback
+# (Optional) GITEA_SYNC_PROXY_URL=http://10.0.0.1:10808
+```
+
+<Warning>
+
+Zorg ervoor dat `OVERLEAF_SITE_URL` correct is ingesteld voordat je de Gitea-redirect-URI configureert.
+
+</Warning>
+
+Overleaf vraagt alles wat een synchronisatie nodig heeft op het moment dat de gebruiker het account koppelt, zodat gebruikers nooit opnieuw hoeven te koppelen vanwege een ontbrekend recht:
+
+| Scope                | Gebruikt voor                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| `write:repository`   | Repository's, hun bestanden (inclusief CI-workflows onder `.gitea/workflows`), branches en pull requests |
+| `write:user`         | Het aanmaken van een repository van de gebruiker bij het exporteren (Gitea vraagt erom bij `POST /user/repos`) |
+| `write:organization` | Het opsommen van de organisaties van de gebruiker en het aanmaken van een repository van een organisatie bij het exporteren |
+
+Gitea toont deze scopes wanneer de gebruiker de applicatie autoriseert, en beperkt de token daartoe.
+
+Gitea-toegangstokens verlopen na een uur (`[oauth2] ACCESS_TOKEN_EXPIRATION_TIME`). Overleaf vernieuwt ze met de refresh-token die Gitea erbij uitgeeft, ook wanneer Gitea refresh-tokens bij gebruik verbruikt (`INVALIDATE_REFRESH_TOKENS = true`), zodat gebruikers gekoppeld blijven totdat ze de koppeling verbreken of de applicatie in Gitea intrekken.
+
+### Je Gitea-instantie
+
+Stel `GITEA_SYNC_URL` in op het webadres van je instantie, de `ROOT_URL`, het adres waarmee je repository's in de browser opent. De REST API wordt daarvan afgeleid:
+
+| Variabele            | Standaardwaarde              |
+| -------------------- | ---------------------------- |
+| `GITEA_SYNC_URL`     | `https://gitea.com`          |
+| `GITEA_SYNC_API_URL` | `${GITEA_SYNC_URL}/api/v1`   |
+
+Gitea onder een subpad werkt ook, bijvoorbeeld `GITEA_SYNC_URL=https://example.com/gitea`. Stel `GITEA_SYNC_API_URL` alleen in wanneer je instantie de API ergens anders aanbiedt, bijvoorbeeld achter een API-gateway.
+
+<Warning>
+
+* Maak de OAuth2-applicatie aan op de instantie die je in `GITEA_SYNC_URL` instelt; een applicatie van een andere instantie werkt niet.
+* `GITEA_SYNC_URL` is alleen het webadres. Voeg geen `/api/v1` of gebruikers- of organisatiepad toe.
+* Overleaf commit via de bestands-API van Gitea, die de webeditor nodig heeft: laat `[repository.editor]` ingeschakeld (de standaardinstelling).
+
+</Warning>
+
+<Info>
+
+Als je instantie een certificaat van een private CA gebruikt, koppel het CA-certificaat dan in de container en laat `NODE_EXTRA_CA_CERTS` ernaar verwijzen, bijvoorbeeld `NODE_EXTRA_CA_CERTS=/var/lib/overleaf/certs/gitea-ca.pem`.
+
+</Info>
+
+<Danger>
+
+Gekoppelde accounts en projecten horen bij de instantie waarmee ze zijn gekoppeld. Vraag gebruikers om de koppeling van hun Gitea-account en projecten te verbreken voordat je `GITEA_SYNC_URL` naar een andere instantie overzet.
+
+</Danger>
+
+Als je je in een regio met beperkte netwerktoegang bevindt, moet je mogelijk een proxy configureren om Gitea te bereiken. Stel de volgende omgevingsvariabele in: `GITEA_SYNC_PROXY_URL=http://10.0.0.1:10808`. Dit moet een standaard HTTP/HTTPS-forwardproxy zijn en mag geen `127.0.0.1` gebruiken.
+
+### Wie kan koppelen en synchroniseren
+
+Net als bij Overleaf Cloud kan alleen de projecteigenaar een project aan een Gitea-repository koppelen. Zodra het gekoppeld is, kan elke medewerker met bewerkrechten het synchroniseren.
+
+| Actie                                                      | Wie kan het doen                                               |
+| ---------------------------------------------------------- | -------------------------------------------------------------- |
+| Een project exporteren naar een nieuwe Gitea-repository    | De projecteigenaar                                             |
+| Een Gitea-repository importeren in een nieuw project       | Elke gebruiker, die eigenaar wordt van het nieuwe project      |
+| Een gekoppeld project pullen, pushen en mergen             | De eigenaar en medewerkers met bewerkrechten                   |
+| De koppeling van een project met zijn repository verbreken | De projecteigenaar                                             |
+
+* Overleaf communiceert met Gitea via het Gitea-account van de gebruiker die synchroniseert. Elke medewerker die synchroniseert, koppelt dus zijn eigen Gitea-account en moet naar de standaardbranch van de repository mogen pushen.
+* Medewerkers met alleen leesrechten kunnen Gitea-synchronisatie niet voor het project gebruiken.
+* Het verbreken van de koppeling van het account in Overleaf vergeet de token; Gitea heeft geen API om die in te trekken, dus trek de autorisatie desgewenst ook in onder _Settings → Applications_ in Gitea.
+
+### Hoe synchroniseren met Gitea werkt
+
+* **Rechten**: gebruikers moeten naar de standaardbranch van de gekoppelde repository mogen pushen. Wanneer een branch protection-regel de gebruiker niet toestaat ernaar te pushen, vraagt Overleaf hem contact op te nemen met de projecteigenaar, net als bij een repository waartoe hij geen toegang meer heeft.
+* **Mergen**: wanneer een project zowel in Overleaf als in Gitea is gewijzigd, commit Overleaf zijn wijzigingen naar een tijdelijke branch met de naam `overleaf-YYYY-MM-DD-HHMMSS` en merget deze via een pull request met de standaard merge-stijl van de repository, omdat Gitea geen API heeft om branches zonder pull request te mergen. Na de merge verwijdert Overleaf de tijdelijke branch; het gemergede pull request blijft als vastlegging in de repository staan.
+* **Mergeregels**: Overleaf omzeilt nooit de branch protection van de repository. Wanneer het pull request een conflict heeft, of goedkeuringen of geslaagde status checks vereist, blijft het open en vraagt Overleaf de gebruiker het in Gitea te mergen en daarna verder te synchroniseren.
+* **CI-workflows**: Overleaf toont geen dotfiles zoals `.gitea/workflows/` en laat ze ongewijzigd in de repository staan. Commits vanuit Overleaf starten Gitea Actions zoals elke andere commit.
+
+### Q\&A
+
+<Accordion title="Kan ik force pushen naar de standaardbranch?">
+
+<strong>Antwoord:</strong> Houd force pushes naar de standaardbranch uitgeschakeld, bijvoorbeeld met een branch protection-regel. Overleaf kan een herschreven branch overnemen, maar Gitea-synchronisatie is ontworpen voor een standaardbranch waarvan de geschiedenis alleen groeit.
+
+</Accordion>
+
+<Accordion title="Kan ik de standaardbranch van een gekoppeld project hernoemen?">
+
+<strong>Antwoord:</strong> Nee. Overleaf blijft synchroniseren met de branch waaraan het project is gekoppeld, dus synchronisaties mislukken zodra die branch is hernoemd of verwijderd. Om met een andere branch te synchroniseren, verbreek je de koppeling van het project en importeer je de repository vervolgens in een nieuw project, dat de huidige standaardbranch gebruikt.
+
+</Accordion>
+
+<Accordion title="Ondersteunt Gitea-synchronisatie Git LFS?">
+
+<strong>Antwoord:</strong> Nee. Overleaf-projecten ondersteunen geen Git Large File Storage. Bestanden die door Git LFS worden bijgehouden, verschijnen in Overleaf als LFS-pointerbestanden en niet met hun inhoud. Commit afbeeldingen en pdf's in plaats daarvan rechtstreeks naar de repository.
+
+</Accordion>
+
+<Accordion title="Werkt het met SHA-256-repository's?">
+
+<strong>Antwoord:</strong> Nog niet. Overleaf vergelijkt bestanden aan de hand van hun SHA-1-ID's, dus in een repository die met het SHA-256-objectformaat is aangemaakt, herschrijft elke pull alle bestanden, ook ongewijzigde. Er gaat niets verloren, maar gebruik alsjeblieft het standaard SHA-1-formaat.
+
+</Accordion>
+
+<Accordion title="Werkt het met Forgejo?">
+
+<strong>Antwoord:</strong> Gitea-synchronisatie is alleen gebouwd en getest voor Gitea.
+
+</Accordion>

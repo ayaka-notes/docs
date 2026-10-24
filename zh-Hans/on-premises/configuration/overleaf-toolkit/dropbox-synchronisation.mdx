@@ -1,0 +1,185 @@
+---
+title: Dropbox 同步
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.svg
+---
+
+<Info>
+
+此功能由 [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro) 开发。它在 v6.3.1 中作为早期预览版引入，并将在 v6.4.0 中正式发布，因此其配置和行为仍可能发生变化。如果你遇到任何问题，我们需要你的反馈。
+
+</Info>
+
+Dropbox 同步会让用户的项目与其 Dropbox 保持同步，与 Overleaf Cloud 上的体验一致：用户关联自己的 Dropbox 账户后，其每个项目都会在 `Apps/<your Dropbox app>/` 中显示为一个文件夹，在 Overleaf 中所做的更改会发送到 Dropbox，在 Dropbox 中所做的更改也会同步回 Overleaf。
+
+### 设置 Dropbox 同步
+
+<Warning>
+
+你需要先启用 [git-bridge](/zh-Hans/on-premises/configuration/overleaf-toolkit/git-integration)：如果未启用，账户设置中会隐藏项目同步部分。
+
+```dotenv title="config/overleaf.rc"
+GIT_BRIDGE_ENABLED=true
+```
+
+</Warning>
+
+使用将拥有该应用的 Dropbox 账户登录 [Dropbox App Console](https://www.dropbox.com/developers/apps)，并创建一个应用：
+
+1. 点击 **Create app**，然后填写页面：
+   * **1. Choose an API**：选择 **Scoped access**。
+   * **2. Choose the type of access you need**：选择 **App folder**，而不是 **Full Dropbox**。Overleaf 只会在该应用的文件夹内进行同步。
+   * **3. Name your app**：输入一个名称，例如 `Overleaf`。该名称在 Dropbox 上必须唯一。每个用户的项目会显示在其 Dropbox 的 `Apps/<name of your app>/` 中，该名称即下文中的 `DROPBOX_APP_NAME`。
+   * 点击 **Create app**。应用会在其 **Settings** 选项卡中打开。
+2. 在 **Permissions** 选项卡的 **Files and folders** 下，勾选 `files.metadata.write`、`files.content.write` 和 `files.content.read`。`account_info.read` 和 `files.metadata.read` 会随之被勾选，且无法取消勾选。不要勾选其他权限。
+3. 点击 **Permissions** 选项卡底部栏中的 **Submit**。**如果不点击 Submit，权限将不会被保存**，Dropbox 会拒绝为关联账户的用户同步文件。
+
+<Frame caption="Dropbox App Console：需要勾选的权限，通过 Submit 保存">
+  <img src="/images/on-premises/dropbox-app-permissions.png" alt="" />
+</Frame>
+
+4. 在 **Settings** 选项卡的 **OAuth 2** 下，在 **Redirect URIs** 中输入 `${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback`，然后**点击 Add**。仅输入 URI 是不够的：只有当它显示在输入框上方的列表中时才算保存成功。
+
+<Frame caption="Dropbox App Console：输入重定向 URI，然后点击 Add">
+  <img src="/images/on-premises/dropbox-app-redirect-uri.png" alt="" />
+</Frame>
+
+5. 在 **Settings** 选项卡的 **Webhooks** 下，在 **Webhook URIs** 中输入 `${OVERLEAF_SITE_URL}/dropbox/webhook`，然后同样**点击 Add**。Dropbox 会立即调用它进行检查，因此 Overleaf 必须已经使用下面的设置运行，并且可以从互联网访问（参见 [Webhook](#webhook)）。检查通过后，其状态会显示为 **Enabled**。
+
+从 **Settings** 选项卡复制 **App key** 和 **App secret**（点击 **Show**），然后将以下设置添加到你的 Overleaf 环境变量文件中。你可以在 Overleaf 使用这些设置运行后再添加 webhook（第 5 步）。
+
+```dotenv title="config/variables.env" wrap
+# used to encrypt the user's Dropbox refresh token.
+# How to generate: `openssl rand -hex 32`
+DROPBOX_TOKEN_CIPHER_PASSWORD=0123456789ABCDEFG # changed to yours
+
+# Dropbox Sync Settings
+DROPBOX_ENABLED=true
+DROPBOX_APP_KEY=
+DROPBOX_APP_SECRET=
+# the name of your Dropbox app (step 1), which is the folder name in Apps/
+DROPBOX_APP_NAME=Overleaf
+
+# OAuth callback is: ${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback
+# Webhook is: ${OVERLEAF_SITE_URL}/dropbox/webhook
+# (Optional) DROPBOX_SYNC_PROXY_URL=http://10.0.0.1:10808
+```
+
+<Warning>
+
+* 在配置重定向 URI 和 webhook 之前，请确保 `OVERLEAF_SITE_URL` 已正确设置。
+* Dropbox 会在用户关联账户时确定令牌的权限：提交权限不会改变已有的令牌。在提交权限之前或在你更改权限之前已关联的用户，需要取消关联并重新关联他们的 Dropbox 账户。
+* 新建的应用处于 **Development** 状态。如果 **Settings** 选项卡中的 **Development users** 显示 **Only you**，则只有你的 Dropbox 账户可以关联：点击 **Enable additional users** 以允许其他用户关联自己的账户。之后它会显示已关联的用户数量，例如 `1 / 500`：**处于 Development 状态的应用最多支持 500 个用户**。如需支持更多用户，请点击 **Apply for production**，由 Dropbox 审核该应用。
+
+</Warning>
+
+如果你所在的地区网络访问受限，可能需要配置代理才能访问 Dropbox。请设置以下环境变量：`DROPBOX_SYNC_PROXY_URL=http://10.0.0.1:10808`。它必须是标准的 HTTP/HTTPS 正向代理，并且不能使用 `127.0.0.1`。
+
+#### 创建数据库索引
+
+请在用户关联 Dropbox 账户之前运行一次。Server CE 和 Server Pro 不会创建 Dropbox 同步所使用的索引，如果没有这些索引，每次同步查找都会扫描整个集合。
+
+Toolkit 用户：运行 `bin/mongo`。Docker Compose 用户：运行 `docker compose exec mongo mongosh sharelatex`。然后粘贴：
+
+```js
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+```
+
+重复运行不会造成任何影响：MongoDB 会跳过已存在的索引。
+
+<Danger>
+
+请不要改为运行 `tools/migrations` 中的 `dropboxEntities` 迁移：`20220825160708_recreate_dropboxEntities` 会删除该集合，从而删除所有用户的同步状态。
+
+</Danger>
+
+### Webhook
+
+Dropbox 通过 webhook 将 Dropbox 中的更改通知给 Overleaf，因此这些更改会在几秒钟内出现在 Overleaf 中。webhook 指向你网站的地址 `${OVERLEAF_SITE_URL}/dropbox/webhook`，无需额外端口，但 **Dropbox 必须能够从互联网访问它**。当你在 App Console 中添加它时，Dropbox 会立即对其进行检查。
+
+如果没有 webhook（例如服务器无法被 Dropbox 访问），Overleaf 中的更改仍会发送到 Dropbox，但 Dropbox 中的更改只有在用户点击编辑器 Dropbox 对话框中的 _sync this project now_ 时才会同步回来。
+
+### 同步的工作原理
+
+* **关联**：用户关联自己的 Dropbox 账户后，其拥有的项目会被发送到 Dropbox。与其共享的项目会在下一次发生更改时出现在 Dropbox 中。
+* **Overleaf 到 Dropbox**：新文件、重命名、移动、删除以及项目重命名会立即发送。编辑器中的编辑会在 Overleaf 将其保存到存储后发送，即所有人离开项目几分钟后。如需更早发送，请点击编辑器 Dropbox 对话框中的 _sync this project now_（每分钟一次）。
+* **Dropbox 到 Overleaf**：项目文件夹中新增和更改的文件、新建的文件夹以及删除操作都会应用到项目中。在应用文件夹顶层新建的文件夹会成为一个新项目。在 Dropbox 中删除项目文件夹会在 Overleaf 中将该项目标记为已删除。
+* **冲突**：当同一文件同时在两处发生更改时，以最后一次更改为准。Dropbox 可能会将另一个版本保留为 _conflicted copy_。
+* **协作者**：关联了 Dropbox 的协作者会获得与其共享的项目。只读查看者和审阅者也会获得该项目，但他们在 Dropbox 中所做的更改不会同步回 Overleaf。
+* **忽略的文件**：Overleaf 不同步的文件，例如编译输出（`.aux`、`.log`……）、`.DS_Store` 或 Python 虚拟环境，只会保留在 Dropbox 中。
+
+### Q\&A
+
+<Accordion title="为什么用户无法关联自己的 Dropbox 账户？">
+
+<strong>回答：</strong>
+
+* Overleaf 尚不知道的 Dropbox 文件夹会按名称与项目匹配，因此如果用户的项目存在同名情况，系统会要求其先重命名这些项目。名称比较不区分大小写，已归档和已移至回收站的项目也计算在内。
+* 一个 Dropbox 账户只能关联到一个 Overleaf 账户。
+
+</Accordion>
+
+<Accordion title="为什么 Dropbox 账户被取消关联了？">
+
+<strong>回答：</strong>当 Dropbox 拒绝其令牌（例如用户在 Dropbox 中删除了该应用后）、Dropbox 空间已满或 Dropbox 暂停了该账户时，Overleaf 会取消关联该 Dropbox 账户。项目列表中的通知会告诉用户发生了哪种情况，直到其重新关联该账户。问题解决后，用户可以重新关联。
+
+</Accordion>
+
+<Accordion title="我可以在 Dropbox 中重命名项目文件夹吗？">
+
+<strong>回答：</strong>请改为在 Overleaf 中重命名项目：其在 Dropbox 中的文件夹也会随之重命名。对 Overleaf 而言，在 Dropbox 中重命名文件夹相当于删除项目文件夹并新建一个文件夹，因此旧项目会被标记为已删除，并根据这些文件创建一个新项目。
+
+</Accordion>
+
+<Accordion title="为什么有些项目文件夹带有编号，例如“Thesis (1)”？">
+
+<strong>回答：</strong>每个项目都有自己的文件夹，即使两个项目同名也是如此。Dropbox 不能存放两个同名文件夹，因此会为后创建的文件夹添加编号。编号取决于当时 Dropbox 中哪些名称可用，而不是哪个项目更早创建。Overleaf 知道每个项目对应的文件夹，因此更改绝不会发送到另一个同名项目的文件夹中。
+
+如果上传的项目名称已被占用，它在 Overleaf 中也会以带编号的名称命名，例如“Thesis (1)”。
+
+</Accordion>
+
+<Accordion title="在 Dropbox 中删除项目文件夹会发生什么？">
+
+<strong>回答：</strong>
+
+* 如果没有其他项目与该文件夹同名，该项目会在 Overleaf 中被标记为已删除。其文件和历史记录会被保留。
+* 如果有多个项目使用该名称，Overleaf 无法判断该文件夹属于哪个项目。它会取消关联该 Dropbox 账户，并显示一条通知，要求重命名这些项目。在 Dropbox 中删除项目文件夹之前，请为项目设置不同的名称。
+* 带编号的文件夹（例如“Thesis (1)”）不与任何项目名称匹配，因此删除它不会改变 Overleaf 中的项目。点击编辑器 Dropbox 对话框中的 _sync this project now_，即可将项目重新发送到 Dropbox。
+
+</Accordion>
+
+<Accordion title="在 Overleaf 中删除项目时，Dropbox 中会发生什么？">
+
+<strong>回答：</strong>什么都不会发生，其文件夹会保留在 Dropbox 中。如果不再需要，请在 Dropbox 中删除该文件夹。
+
+</Accordion>
+
+<Accordion title="项目被归档或移至回收站期间，Dropbox 中的更改会怎样？">
+
+<strong>回答：</strong>这些更改不会应用到项目中，恢复项目也不会将其带回。恢复后，对于在此期间在 Dropbox 中被更改的文件，Overleaf 会停止发送其更改，因此两边会出现差异。
+
+要让这样的文件重新同步，请在 Dropbox 中再保存一次。Overleaf 随后会采用 Dropbox 中的版本：恢复后在 Overleaf 中对该文件所做的更改会被替换，但仍保留在项目历史记录中。请先恢复项目，再在 Dropbox 中修改它。
+
+</Accordion>
+
+<Accordion title="为什么编辑器中的 Dropbox 链接会打开 Dropbox 主页？">
+
+<strong>回答：</strong>该链接指向 dropbox.com 上的 `Apps/<app folder>/<project>`，与 Overleaf Cloud 上一致。当 Dropbox 以翻译后的名称显示其 `Apps` 文件夹时（例如中文的 `应用`），链接无法找到该文件夹，Dropbox 会转而打开其主页。请在 Dropbox 中从翻译后的 `Apps` 文件夹打开项目文件夹。
+
+</Accordion>
+
+<Accordion title="为什么项目的某些文件在 Dropbox 中缺失？">
+
+<strong>回答：</strong>同步服务未运行期间（例如重启时）所做的更改，之后不会再发送到 Dropbox。点击编辑器 Dropbox 对话框中的 _sync this project now_：它会重新发送整个项目。
+
+</Accordion>
