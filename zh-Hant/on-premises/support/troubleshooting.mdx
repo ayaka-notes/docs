@@ -1,0 +1,123 @@
+---
+title: 疑難排解
+icon: comments-question-check
+---
+
+<Info>
+
+如果您使用的是較早的版本，請在路徑名稱中使用 `sharelatex` 而非 `overleaf`。
+
+</Info>
+
+<Accordion title="在 NFS 檔案系統上執行 Overleaf">
+
+技術上可以在 Overleaf 容器中掛載 NFS 檔案系統，但不建議這麼做，因為可能導致各種效能錯誤。
+
+編譯時常見的錯誤之一是：
+
+```text
+EBUSY: resource busy or locked, unlink '/var/lib/overleaf/data/compiles/62f3d57bef7cf9005c364e75-62f3d57bef7cf9005c364e7a/.nfs573663533034825247625441'
+```
+
+特別是，我們不建議將以 NFS 為後端的檔案系統用於暫時性資料，例如用於編譯資料的目錄。對於以下目錄，我們建議使用本機暫存磁碟，最好是本機 SSD。
+
+對於以 `docker-compose` 為基礎的架構，我們建議直接覆寫來自 NFS 的綁定掛載，這樣就不需要變更應用程式中的路徑。以下是一個 `docker-compose` 設定摘錄的範例，使用掛載於 `/scratch` 的暫存磁碟：
+
+```yaml title="docker-compose excerpt"
+services:
+  sharelatex:
+    environment:
+      SANDBOXED_COMPILES_HOST_DIR: /scratch/compiles/
+    volumes:
+      - nfs:/var/lib/overleaf/data
+      - /scratch/cache/:/var/lib/overleaf/data/cache
+      - /scratch/compiles/:/var/lib/overleaf/data/compiles
+      - /scratch/output/:/var/lib/overleaf/data/output
+      - /scratch/tmp/:/var/lib/overleaf/tmp
+```
+
+更新後，不需要將任何現有檔案從 NFS 遷移到新位置。LaTeX 編譯器在重新執行完整編譯時可以重新建立所有檔案。
+
+更多詳細資訊請參閱：https://docs.overleaf.com/on-premises/support/troubleshooting#running-overleaf-with-an-nfs-filesystem
+
+</Accordion>
+
+<Accordion title="在 Windows 或 macOS 上執行 Overleaf 導致 `mongo` 服務無法啟動">
+
+如果您在 Windows 或 macOS 上執行 Overleaf，`mongo` 服務可能無法重新啟動，並出現以下錯誤：
+
+```text title="Example error"
+Failed to start up WiredTiger under any compatibility version.
+Reason: 1: Operation not permitted
+```
+
+為避免此錯誤，資料需要儲存在磁碟區（volume）中，而非綁定掛載的目錄（詳細資訊請參閱 `mongo` 映像檔文件：https://github.com/docker-library/docs/blob/master/mongo/content.md#where-to-store-data）。若要將資料儲存在掛載於 MongoDB 與 Redis 容器內的 Docker 磁碟區中，請將以下內容加入 `config/docker-compose.override.yml`（若此檔案尚不存在，請建立它）：
+
+```yaml title="config/docker-compose.override.yml"
+volumes:
+  mongo-data:
+  redis-data:
+
+services:
+  mongo:
+    volumes:
+      - mongo-data:/data/db
+
+  redis:
+    volumes:
+      - redis-data:/data
+```
+
+更多資訊請參閱：https://docs.overleaf.com/on-premises/support/troubleshooting#running-overleaf-on-windows-or-macos-results-in-the-mongoservice-not-starting
+
+</Accordion>
+
+<Accordion title="升級至 Redis 6.2 導致不斷重新啟動">
+
+使用 `docker logs redis` 指令輸出日誌副本。
+
+如果您看到 `Fatal: Can't initialize Background Jobs` 這一行，完整輸出大致如下：
+
+```text title="Redis log example"
+1:M 11 Feb 2024 15:19:22.609 # Server initialized
+1:M 11 Feb 2024 15:19:22.609 # Fatal: Can't initialize Background Jobs.
+1:C 11 Feb 2024 15:19:26.055 # oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+```
+
+這可能與目前使用的 Docker 版本有關。更新至 >= 20.10.10 的版本應可解決此問題。
+
+更多資訊請參閱 Redis 上游 issue：https://github.com/redis/redis/issues/12362
+
+參考資料：https://docs.overleaf.com/on-premises/support/troubleshooting#upgrading-to-redis-6.2-results-in-a-restart-loop
+
+</Accordion>
+
+<Accordion title="範本庫預覽圖／縮圖方向不正確">
+
+有時，Server Pro 產生的預覽圖／縮圖可能方向錯誤，需要手動介入修正。這些圖片儲存在 `/var/lib/overleaf/data/template_files/`（>= 5.0.3）與 `/var/lib/sharelatex/data/template_files/`（較早版本）。
+
+建議在進行任何變更之前先備份此資料夾。
+
+您需要對每個受影響的範本執行以下步驟：
+
+找出範本 ID：前往您執行個體的範本庫（/templates/all），開啟受影響的範本，並從 URL 複製 ID（例如：https://your-instance-url/templates/6645d346c224815e9460a695）。執行修正指令：從 Docker 主機執行以下指令（將範本 ID 替換為您複製的 ID，並視需要更新路徑）：docker exec sharelatex /bin/bash -c "mogrify -rotate 90 /var/lib/overleaf/data/template\_files/6645d346c224815e9460a695\_\*\{thumbnail,preview\}"
+
+參考資料：https://docs.overleaf.com/on-premises/support/troubleshooting#incorrect-orientation-of-template-gallery-preview-thumbnail-images
+
+</Accordion>
+
+<Accordion title="請確認您已啟用系統呼叫。對於 pdflatex，這是 'pdflatex -shell-escape'。">
+
+由於所有編譯都在同一個 `sharelatex` 容器中進行，Community Edition 預設停用 `\write18` 指令；這是較安全的預設值。
+
+如果您希望為 pdflatex 啟用它，請在專案根目錄中建立一個 `latexmkrc` 檔案，內容如下：
+
+```perl title="latexmkrc"
+$pdflatex = 'pdflatex --shell-escape';
+```
+
+然後嘗試重新編譯。
+
+參考資料：https://docs.overleaf.com/on-premises/support/troubleshooting#please-verify-that-you-have-enabled-system-calls.-for-pdflatex-this-is-pdflatex-shell-escape
+
+</Accordion>

@@ -1,0 +1,154 @@
+---
+title: Gitea-synkronisering
+icon: mug-hot
+---
+
+<Info>
+
+Den här funktionen är utvecklad av [ayaka-notes/ayakaleaf-pro](https://github.com/ayaka-notes/ayakaleaf-pro). Den introducerades i v6.3.2 som en tidig förhandsversion och släpps officiellt i v6.4.0, så dess konfiguration och beteende kan fortfarande ändras. Vi behöver din återkoppling om du stöter på problem.
+
+</Info>
+
+Gitea-synkronisering fungerar som [GitHub-synkronisering](/sv/on-premises/configuration/overleaf-toolkit/github-synchronisation) och [GitLab-synkronisering](/sv/on-premises/configuration/overleaf-toolkit/gitlab-synchronisation): användare länkar sitt Gitea-konto, exporterar projekt till nya Gitea-repositorier, importerar Gitea-repositorier och synkroniserar ändringar i båda riktningarna. Det fungerar med Gitea 1.23 eller senare, på gitea.com eller på din egen instans.
+
+### Konfigurera Gitea-synkronisering
+
+<Warning>
+
+Du måste aktivera [git-bridge](/sv/on-premises/configuration/overleaf-toolkit/git-integration) innan du kan använda Gitea-synkronisering.
+
+```dotenv title="config/overleaf.rc"
+GIT_BRIDGE_ENABLED=true
+```
+
+</Warning>
+
+Skapa en OAuth2-applikation på din Gitea-instans, under _Settings → Applications → Manage OAuth2 applications_ (eller _Site Administration → Integrations → Applications_ för en applikation som gäller hela instansen):
+
+* **Application name**: t.ex. `Overleaf`, användarna ser det när de auktoriserar applikationen
+* **Redirect URIs**: `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback`
+* **Confidential client**: markerad
+
+Kopiera **Client ID** och **Client Secret** och lägg sedan till följande inställningar i dina filer med miljövariabler för Overleaf.
+
+```dotenv title="config/variables.env" wrap
+# used to encrypt the user's Gitea access and refresh tokens.
+# How to generate: `openssl rand -hex 32`
+GITEA_TOKEN_CIPHER_PASSWORD=0123456789ABCDEFG # changed to yours
+
+# Gitea Sync Settings
+GITEA_SYNC_ENABLED=true
+GITEA_SYNC_CLIENT_ID=
+GITEA_SYNC_CLIENT_SECRET=
+
+# Web address of your Gitea (its ROOT_URL), defaults to https://gitea.com
+# GITEA_SYNC_URL=https://gitea.example.com
+
+# OAuth callback is: ${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback
+# (Optional) GITEA_SYNC_PROXY_URL=http://10.0.0.1:10808
+```
+
+<Warning>
+
+Kontrollera att `OVERLEAF_SITE_URL` är korrekt angiven innan du konfigurerar redirect-URI:n för Gitea.
+
+</Warning>
+
+Overleaf begär allt som en synkronisering behöver när användaren länkar kontot, så användarna behöver aldrig länka om på grund av en saknad behörighet:
+
+| Scope                | Används för                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| `write:repository`   | Repositorier, deras filer (inklusive CI-arbetsflöden under `.gitea/workflows`), grenar och pull requests |
+| `write:user`         | Skapa ett repositorium för användaren vid export (Gitea kräver det för `POST /user/repos`) |
+| `write:organization` | Lista användarens organisationer och skapa ett repositorium i en av dem vid export         |
+
+Gitea visar dessa scopes när användaren auktoriserar applikationen och begränsar token till dem.
+
+Åtkomsttoken för Gitea löper ut efter en timme (`[oauth2] ACCESS_TOKEN_EXPIRATION_TIME`). Overleaf förnyar dem med den uppdateringstoken som Gitea utfärdar tillsammans med dem, även när Gitea förbrukar uppdateringstoken vid användning (`INVALIDATE_REFRESH_TOKENS = true`), så användarna förblir länkade tills de avlänkar eller återkallar applikationen i Gitea.
+
+### Din Gitea-instans
+
+Ange `GITEA_SYNC_URL` till webbadressen för din instans, dess `ROOT_URL`, den du öppnar repositorier med i webbläsaren. REST-API:et härleds från den:
+
+| Variabel             | Standard                     |
+| -------------------- | ---------------------------- |
+| `GITEA_SYNC_URL`     | `https://gitea.com`          |
+| `GITEA_SYNC_API_URL` | `${GITEA_SYNC_URL}/api/v1`   |
+
+Gitea som tillhandahålls under en undersökväg fungerar också, t.ex. `GITEA_SYNC_URL=https://example.com/gitea`. Ange bara `GITEA_SYNC_API_URL` när din instans tillhandahåller API:et någon annanstans, till exempel bakom en API-gateway.
+
+<Warning>
+
+* Skapa OAuth2-applikationen på den instans du anger i `GITEA_SYNC_URL`, en applikation från en annan instans fungerar inte.
+* `GITEA_SYNC_URL` är endast webbadressen. Lägg inte till `/api/v1` eller en användar- eller organisationssökväg.
+* Overleaf committar med Giteas fil-API, som kräver webbredigeraren: låt `[repository.editor]` vara aktiverad (standard).
+
+</Warning>
+
+<Info>
+
+Om din instans använder ett certifikat från en privat CA monterar du CA-certifikatet i containern och låter `NODE_EXTRA_CA_CERTS` peka på det, t.ex. `NODE_EXTRA_CA_CERTS=/var/lib/overleaf/certs/gitea-ca.pem`.
+
+</Info>
+
+<Danger>
+
+Länkade konton och projekt hör till den instans de länkades med. Be användarna att avlänka sitt Gitea-konto och sina projekt innan du byter `GITEA_SYNC_URL` till en annan instans.
+
+</Danger>
+
+Om du befinner dig i en region med begränsad nätverksåtkomst kan du behöva konfigurera en proxy för att nå Gitea. Ange följande miljövariabel: `GITEA_SYNC_PROXY_URL=http://10.0.0.1:10808`. Det måste vara en vanlig HTTP/HTTPS-framåtproxy, och den får inte använda `127.0.0.1`.
+
+### Vem kan länka och synkronisera
+
+Precis som på Overleaf Cloud kan endast projektägaren länka ett projekt till ett Gitea-repositorium. När det väl är länkat kan alla medarbetare med redigeringsbehörighet synkronisera det.
+
+| Åtgärd                                                     | Vem kan utföra den                                             |
+| ---------------------------------------------------------- | -------------------------------------------------------------- |
+| Exportera ett projekt till ett nytt Gitea-repositorium     | Projektägaren                                                  |
+| Importera ett Gitea-repositorium till ett nytt projekt     | Alla användare, som då blir ägare till det nya projektet       |
+| Hämta, pusha och slå samman ett länkat projekt             | Ägaren och medarbetare med redigeringsbehörighet               |
+| Avlänka ett projekt från dess repositorium                 | Projektägaren                                                  |
+
+* Overleaf kommunicerar med Gitea via Gitea-kontot för den användare som synkroniserar, så varje medarbetare som synkroniserar länkar sitt eget Gitea-konto och måste ha behörighet att pusha till repositoriets standardgren.
+* Medarbetare med endast läsbehörighet kan inte använda Gitea-synkronisering för projektet.
+* När kontot avlänkas i Overleaf glöms dess token bort. Gitea har inget API för att återkalla den, så återkalla även behörigheten under _Settings → Applications_ i Gitea om du vill.
+
+### Så fungerar synkronisering med Gitea
+
+* **Behörigheter**: användare måste ha behörighet att pusha till standardgrenen i det länkade repositoriet. När en grenskyddsregel inte låter användaren pusha till den ber Overleaf dem att kontakta projektägaren, precis som med ett repositorium de har förlorat åtkomst till.
+* **Sammanslagning**: när ett projekt har ändrats både i Overleaf och i Gitea committar Overleaf sina ändringar till en tillfällig gren med namnet `overleaf-YYYY-MM-DD-HHMMSS` och slår samman den via en pull request med repositoriets standardmetod för sammanslagning, eftersom Gitea saknar ett API för att slå samman grenar utan en sådan. Efter sammanslagningen tar Overleaf bort den tillfälliga grenen. Den sammanslagna pull requesten blir kvar i repositoriet som dokumentation.
+* **Sammanslagningsregler**: Overleaf kringgår aldrig repositoriets grenskydd. När pull requesten har en konflikt, eller kräver godkännanden eller godkända statuskontroller, förblir den öppen och Overleaf ber användaren att slå samman den i Gitea och sedan fortsätta synkroniseringen.
+* **CI-arbetsflöden**: Overleaf visar inte punktfiler som `.gitea/workflows/` och lämnar dem som de är i repositoriet. Commits från Overleaf startar Gitea Actions precis som alla andra commits.
+
+### Q\&A
+
+<Accordion title="Kan jag force-pusha till standardgrenen?">
+
+<strong>Svar:</strong> Håll force pushes till standardgrenen inaktiverade, t.ex. med en grenskyddsregel. Overleaf kan ta över en omskriven gren, men Gitea-synkronisering är utformad för en standardgren vars historik bara växer.
+
+</Accordion>
+
+<Accordion title="Kan jag byta namn på standardgrenen i ett länkat projekt?">
+
+<strong>Svar:</strong> Nej. Overleaf fortsätter att synkronisera med den gren som projektet länkades till, så synkroniseringar misslyckas när den grenen byter namn eller tas bort. För att synkronisera med en annan gren avlänkar du projektet och importerar sedan repositoriet till ett nytt projekt, som då använder den aktuella standardgrenen.
+
+</Accordion>
+
+<Accordion title="Stöder Gitea-synkronisering Git LFS?">
+
+<strong>Svar:</strong> Nej. Overleaf-projekt stöder inte Git Large File Storage. Filer som spåras av Git LFS visas i Overleaf som LFS-pekarfiler, inte med sitt innehåll. Committa i stället bilder och PDF-filer direkt till repositoriet.
+
+</Accordion>
+
+<Accordion title="Fungerar det med SHA-256-repositorier?">
+
+<strong>Svar:</strong> Inte ännu. Overleaf jämför filer med deras SHA-1-ID:n, så i ett repositorium som skapats med objektformatet SHA-256 skriver varje hämtning om alla filer, även oförändrade. Inget går förlorat, men använd standardformatet SHA-1.
+
+</Accordion>
+
+<Accordion title="Fungerar det med Forgejo?">
+
+<strong>Svar:</strong> Gitea-synkronisering är byggd och testad enbart mot Gitea.
+
+</Accordion>
