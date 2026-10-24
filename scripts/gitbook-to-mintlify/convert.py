@@ -259,6 +259,22 @@ def remove_stale(dirs):
                 os.rmdir(cur)
 
 
+def preserve_referenced_assets():
+    """Keep shared assets until all pages, including translations, stop using them."""
+    for root, dirs, files in os.walk(DST):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"node_modules", "scripts", "images"}]
+        for name in files:
+            if not name.endswith((".mdx", ".md")):
+                continue
+            text = open(os.path.join(root, name), encoding="utf-8").read()
+            # Generated asset names are ASCII; the boundary excludes external URLs.
+            for url in re.findall(r'''(?:^|[\s"'(<])(/images/[A-Za-z0-9._%/-]+)''', text):
+                out = urllib.parse.unquote(url).lstrip("/")
+                GENERATED.add(os.path.abspath(os.path.join(DST, out)))
+                if out in DERIVED:
+                    DERIVED_USED.setdefault(out, DERIVED[out])
+
+
 # ---------------------------------------------------------------- assets
 asset_map = {}  # abs src asset -> url
 MAGIC = [(b"\x89PNG", ".png"), (b"\xff\xd8", ".jpg"), (b"GIF8", ".gif"), (b"%PDF", ".pdf"), (b"<svg", ".svg"), (b"<?xml", ".svg")]
@@ -1010,9 +1026,12 @@ def main():
     for t in tabs:
         icon_type(t["icon"])
     write_if_changed(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    # Remove obsolete English pages before collecting references to shared assets.
+    remove_stale([s[3] for s in SECTIONS if s[3]])
+    preserve_referenced_assets()
+    remove_stale(["images"])
     write_if_changed(DERIVED_PATH, json.dumps(dict(sorted(DERIVED_USED.items())), indent=0) + "\n")
     open(ICON_CACHE, "w").write(json.dumps(dict(sorted(_icon_types.items())), indent=0) + "\n")
-    remove_stale(["images"] + [s[3] for s in SECTIONS if s[3]])
 
     print(f"pages: {sum(p['published'] for p in pages.values())} published, {len(pages)} indexed  assets: {len(asset_map)}  hidden (not in SUMMARY.md): {len(unlisted)}")
     for u in unlisted:
