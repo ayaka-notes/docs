@@ -1,0 +1,136 @@
+---
+title: Kubernetes'te yükseltme
+description: Ayakaleaf Pro'nun bir Kubernetes dağıtımını tek veya birden fazla replikayla yükseltin.
+icon: arrow-up-from-square
+---
+
+Bir yükseltme imaj etiketini değiştirir. Yeni sürüm başlarken veritabanını geçirir ve bu geçişler **tek bir pod'dan, bir kez ve eski hiçbir pod çalışmıyorken** çalışmalıdır. Kubernetes'te bu, ölçeklendirilmiş bir StatefulSet'in düz bir kademeli güncellemesini olanaksız kılar.
+
+<Danger>
+
+Her yükseltmeden önce, Ayakaleaf Pro durdurulmuşken [tutarlı bir yedek](/tr/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) alın. Yükselttiğiniz sürümün adımları için [sürüm notlarını](/tr/on-premises/release-notes) okuyun.
+
+</Danger>
+
+Başlamadan önce, Ayakaleaf Pro çalıştıran her düğümde yeni sürümün veya yeni yapılandırmanızın listelediği tüm TeX Live imajlarını `sudo docker pull` ile çekin.
+
+<Tabs>
+<Tab title="Tek replika">
+
+<Steps>
+<Step title="Ayakaleaf Pro'yu durdurun">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Yedekleyin">
+MongoDB, herhangi bir üyeden:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Veri birimi, onu bağlayan kısa ömürlü bir pod aracılığıyla (pod, birimin düğümüne yerleşir):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Aynısını git-bridge biriminde (`data-git-bridge-0`) de yapın ve `overleaf-secrets` Secret'ının bir kopyasını saklayın. Depolamanız [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/) destekliyorsa, birimlerin bir anlık görüntüsü de aynı işi görür.
+</Step>
+
+<Step title="Sürümü değiştirin ve başlatın">
+Yeni etiketi `40-overleaf.yaml` dosyasında (ve aynı etiketi kullanması gereken `45-git-bridge.yaml` dosyasında) ayarlayın, ardından:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment `strategy: Recreate` kullanır; bu nedenle değişen bir etiket bile hiçbir zaman iki sürümü aynı anda çalıştırmaz.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Birden fazla replika">
+
+[Yatay ölçeklendirme](/tr/on-premises/configuration/kubernetes/horizontal-scaling) sayfasındaki kurulum için.
+
+<Steps>
+<Step title="Tüm replikaları durdurun">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Yedekleyin">
+MongoDB'yi tek replika sekmesindeki gibi, S3 bucket'larınızı sağlayıcınızın araçlarıyla, git-bridge birimini (`data-git-bridge-0`) ve Secret'ları yedekleyin. Replikaların `/srv/overleaf-ha` dizinleri yalnızca derleme çıktısı tutar ve yedeklenmeleri gerekmez.
+</Step>
+
+<Step title="Yeni sürümle bir replika başlatın">
+`70-overleaf.yaml` ve `75-git-bridge.yaml` dosyalarında yeni etiketi ve `replicas: 1` değerini ayarlayın:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Oturum açabildiğinizi, bir proje açıp derleyebildiğinizi kontrol edin.
+</Step>
+
+<Step title="Diğer replikaları başlatın">
+`replicas: 3` değerini yeniden ayarlayın ve uygulayın. `OrderedReady` bunları birbiri ardına başlatır.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Çalışan, ölçeklendirilmiş bir StatefulSet'in imajını `kubectl set image` veya `kubectl apply` ile değiştirmeyin: kademeli güncelleme, eski replikalar hâlâ kullanıcılara hizmet verirken yeni sürümü ve geçişlerini başlatır. Yeni sürüm içermeyen yapılandırma değişiklikleri kademeli yeniden başlatma olarak sorunsuzdur: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB ve Redis
+
+Bunları Ayakaleaf Pro'dan ayrı olarak yükseltin. MongoDB için [MongoDB'yi güncelleme](/tr/on-premises/maintenance/updating-mongodb) sayfasını izleyin (her seferinde bir ana sürüm, her adımdan sonra `featureCompatibilityVersion`); `10-mongo.yaml` içindeki imajı değiştirdiğinizde replika kümesi yeni imajı her seferinde bir üye olacak şekilde alır, çünkü StatefulSet sırasıyla `mongo-2`, `mongo-1` ve `mongo-0` pod'larını değiştirir.
+
+### Geri alma
+
+Ayakaleaf Pro'yu yukarıdaki gibi durdurun, MongoDB'yi arşivden (`mongorestore --drop --archive --gzip`), birimleri veya bucket'ları yedekten geri yükleyin, eski etiketi ayarlayın ve yeniden başlatın. Yeni sürümün geçişleri başka bir yolla geri alınamaz.
+
+### Q\&A
+
+<Accordion title="Bir replika hazır olmuyor ve diğer replikalar hiç başlamıyor">
+
+<strong>Yanıt:</strong> `podManagementPolicy: OrderedReady` ile `overleaf-1` yalnızca `overleaf-0` hazır olduğunda başlar ve kademeli güncelleme hiç hazır olmamış bir pod'u değiştirmez. Nedeni düzelttikten sonra, örneğin ConfigMap'teki yanlış bir ayarı, StatefulSet'in onu mevcut şablondan yeniden oluşturması için takılan pod'u silin:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Test kümemizde bir ayar `overleaf-0`'ın hazır olmasını engellediğinde bununla karşılaştık; pod'u silmek üç replikanın da başlamasını sağladı.
+
+</Accordion>

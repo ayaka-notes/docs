@@ -1,0 +1,67 @@
+---
+title: Gitea-synchronisatie
+description: Laat gebruikers hun projecten synchroniseren met repository's op Gitea.com of je eigen Gitea op een Kubernetes-implementatie.
+icon: mug-hot
+---
+
+Gitea-synchronisatie draait in de **web**-service (de module `gitea-sync`) van elke Ayakaleaf Pro-pod. Hiervoor is de [Git-integratie](/nl/on-premises/configuration/kubernetes/integrations/git-integration) nodig. Maak de OAuth-applicatie aan en lees wat elke instelling doet in [Gitea-synchronisatie](/nl/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); deze pagina zet het in Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (module `gitea-sync`), in elke Ayakaleaf Pro-pod; gelezen wanneer web start |
+| Pod → Gitea | de REST API van `GITEA_SYNC_URL` (standaard `https://gitea.com/api/v1`), telkens wanneer een gebruiker koppelt, importeert, exporteert of synchroniseert |
+| Browser → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` om een account te koppelen, daarna terug naar `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | geen: geen webhook, de instantie hoeft niet bereikbaar te zijn vanaf Gitea |
+| Opgeslagen gegevens | de Gitea-toegangs- en vernieuwingstokens van de gebruiker, versleuteld, in MongoDB |
+| Periodieke taken | geen: synchronisatie gebeurt wanneer een gebruiker klikt |
+
+### Configuratie
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` en de git-bridge-StatefulSet uit [Git-integratie](/nl/on-premises/configuration/kubernetes/integrations/git-integration) moeten aanwezig zijn: zonder deze verbergen de accountinstellingen en de editor Gitea-synchronisatie.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` versleutelt de Gitea-toegangs- en vernieuwingstokens van de gebruikers in MongoDB. Elke replica moet dezelfde waarde gebruiken, en als je deze later wijzigt, moet elke gebruiker Gitea opnieuw koppelen.
+</Step>
+
+<Step title="Privé-CA (optioneel)">
+Als je Gitea een certificaat van je eigen CA heeft, voeg de CA dan toe aan de Secret `overleaf-certs` die is gemount op `/var/lib/overleaf/certs` (zie [Certificaten en andere bestanden](/nl/on-premises/configuration/kubernetes#certificaten-en-andere-bestanden)) en stel `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` in de ConfigMap in.
+</Step>
+
+<Step title="Toepassen, herstarten en controleren">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Elke HTTP-status betekent dat Gitea vanaf die pod bereikbaar is; `000` betekent dat het niet bereikbaar is.
+</Step>
+</Steps>
+
+### Meerdere replica's
+
+Niets extra's naast het gedeelde `GITEA_TOKEN_CIPHER_PASSWORD`. Een synchronisatie neemt een lock in Redis, gedeeld met de andere Git-synchronisaties, zodat twee replica's nooit tegelijk hetzelfde project synchroniseren.
+
+### Getest op Kubernetes
+
+Tegen een echte Gitea 1.23 op `GITEA_SYNC_URL`, op Kubernetes 1.37 met één replica en de Git-integratie ingeschakeld, slagen onze end-to-endtests voor Gitea-synchronisatie (39 gevallen): het account koppelen en ontkoppelen via Gitea's OAuth2, het verlopende toegangstoken vernieuwen en ingetrokken autorisaties, exporteren naar een nieuwe privé- of organisatierepository, een repository importeren, pullen en pushen, merges, conflicten, verwijderde en geforceerd gepushte branches, binaire bestanden, hernoemingen en verwijderingen, en wat eigenaren, editors en kijkers mogen doen.

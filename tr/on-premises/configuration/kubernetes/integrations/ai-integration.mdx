@@ -1,0 +1,65 @@
+---
+title: Yapay Zekâ Entegrasyonu
+description: Kubernetes dağıtımında yapay zekâ sohbetini, LaTeX hata önerilerini, kotaları ve arama hizmetlerini yapılandırın.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+Yapay zekâ asistanı ve LaTeX hata asistanı, her Ayakaleaf Pro pod'unun **web** hizmetinde (`workbench` ve `error-assistant` modülleri) çalışır. Her ayarın ne yaptığı, kullanıcı erişimi ve kotalar [Yapay Zekâ Entegrasyonu](/tr/on-premises/configuration/overleaf-toolkit/integrations/ai-integration) sayfasında açıklanmıştır; bu sayfa bunu Kubernetes'e uygular.
+
+| | |
+| --- | --- |
+| Hizmet | web, her Ayakaleaf Pro pod'unda; web başlarken okunur. `web_fetch` aracı aynı pod'daki linked-url-proxy üzerinden geçer |
+| Pod → dış dünya | `AI_BASE_URL`; arama açıksa `WEB_SEARCH_URL` (varsayılan `https://api.tavily.com/search`) ve `DOCS_MCP_URL`; modelin `web_fetch` ile okuduğu sayfalar |
+| Dış dünya → Overleaf | yok |
+| Durum | Redis'teki token kotası sayaçları, tüm replikalar tarafından paylaşılır; sohbet geçmişi tarayıcıda kalır |
+| Periyodik işler | yok |
+
+### Yapılandırma
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+`AI_ENABLED` tam olarak `"true"` olmalıdır. Asistan yalnızca `AI_ENABLED`, `AI_BASE_URL`, `AI_MODEL` ve `AI_API_KEY` değerlerinin tümü ayarlandığında görünür.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="Uygulayın, yeniden başlatın ve ağ geçidini her pod'dan kontrol edin">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+Herhangi bir HTTP durum kodu ağ geçidine erişilebildiği anlamına gelir; `000` erişilemediği anlamına gelir.
+</Step>
+</Steps>
+
+`web_fetch` aracı sayfaları [Harici URL](/tr/on-premises/configuration/kubernetes/external-url) dosyalarıyla aynı proxy üzerinden getirir; bu nedenle `OVERLEAF_LINKED_URL_*` ayarları modelin neleri okuyabileceğini de sınırlar.
+
+### Birden fazla replika
+
+Ek bir şey gerekmez. Token kotası Redis'te sayılır; böylece bir kullanıcının kullanımı her replikada aynıdır ve bir yöneticinin yaptığı sıfırlama her yerde geçerli olur.
+
+### Kubernetes üzerinde test edildi
+
+OpenAI uyumlu bir ağ geçidinin, Tavily'nin ve GitBook MCP uç noktasının taklitlerine karşı (`overleaf-certs` içinden `NODE_EXTRA_CA_CERTS` aracılığıyla güvenilen), Kubernetes 1.37 üzerinde uçtan uca testlerimiz başarılı oldu: HAProxy arkasında üç replikada yapay zekâ asistanı için (31 vaka) araç çağrıları ve önerilen düzenlemelerle sohbetler, web ve dokümantasyon araması, `OVERLEAF_LINKED_URL_ALLOWED_RESOURCES` ile sınırlandırılmış linked-url-proxy üzerinden web sayfalarını okuma, görsel ve PDF ekleri, onay, Redis'te sayılan token kotası, bir kullanıcı ve örnek için kapatılan yapay zekâ ve ağ geçidine yavaş bağlantılar; tek replikada hata asistanı için (15 vaka) önerilen düzeltmeler, onay, paylaşılan token kotası ve kapatılan yapay zekâ.

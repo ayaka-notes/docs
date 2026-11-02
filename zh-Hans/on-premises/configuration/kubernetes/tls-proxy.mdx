@@ -1,0 +1,87 @@
+---
+title: TLS 代理
+description: 通过 ingress、负载均衡器或 HAProxy 以 HTTPS 提供 Kubernetes 部署的服务。
+icon: lock
+---
+
+在 pod 内部，容器的 nginx 在 80 端口上提供纯 HTTP 服务。HTTPS 在 pod 之前终止：在你的 ingress 控制器、云负载均衡器中，或者如[水平扩展](/zh-Hans/on-premises/configuration/kubernetes/horizontal-scaling)中那样在 HAProxy 中终止。Toolkit 的 NGINX 代理（`bin/init --tls`、`overleaf.rc` 中的 `NGINX_*` 和 `TLS_*`）在这里没有对应项；Toolkit 的相关内容请参见 [TLS 代理](/zh-Hans/on-premises/configuration/overleaf-toolkit/tls-proxy)。
+
+| | |
+| --- | --- |
+| 服务 | 你的 ingress 或负载均衡器；web 在启动时读取以下设置 |
+| 浏览器 → 代理 | 443 端口上的 HTTPS，包括编辑器的 WebSocket |
+| 代理 → pod | 到 pod 80 端口的纯 HTTP |
+| 定期任务 | 无（证书续期由你的代理负责） |
+
+### 代理必须做到的事项
+
+* 传递 WebSocket（`/socket.io`）。
+* 允许持续 10 分钟的请求（耗时较长的编译）以及 50 MB 的请求体（上传），或 `MAX_UPLOAD_SIZE`。
+* 将其到 pod 的空闲 keep-alive 超时保持在 65 秒以下，即 pod 中 nginx 的超时时间。
+* 发送 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`。
+* 使用多个副本时，让用户停留在同一个副本上，参见[水平扩展](/zh-Hans/on-premises/configuration/kubernetes/horizontal-scaling)。
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+如果没有来自受信任地址的 `X-Forwarded-Proto: https`，Ayakaleaf Pro 会认为请求是通过 HTTP 到达的，因而不会设置其安全会话 cookie：登录随之失败。仅当用户确实通过 HTTPS 访问站点时才设置 `OVERLEAF_SECURE_COOKIE`；任何值都会启用它，包括 `"false"`。
+
+### HAProxy 示例
+
+要在[水平扩展](/zh-Hans/on-premises/configuration/kubernetes/horizontal-scaling)的 HAProxy DaemonSet 中终止 HTTPS，请将证书及其私钥放入同一个 PEM 文件和一个 Secret 中：
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+然后修改 `80-haproxy.yaml`：
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+更新 `config-hash` 以便 HAProxy 重启，然后按上述方式设置 ConfigMap 并重启副本。
+
+重定向会保留请求的端口：这适用于监听 80 和 443 端口的负载均衡器，但在 NodePort 上它会将 `http://host:30081` 重定向到 `https://host:30081`。如果前面没有负载均衡器，请省略重定向这一行，并向用户提供 `https://...:30443` 地址。
+
+### 在 Kubernetes 上的测试
+
+在 Kubernetes 1.37 上以三个副本运行，由 HAProxy 按上述方式终止 HTTPS，并将 `OVERLEAF_SITE_URL` 设为 `https://` 且设置 `OVERLEAF_SECURE_COOKIE` 时：用户通过 `https://` 链接激活账户，使用标记为 `Secure` 的会话 cookie 登录，上传并编译项目且成功获取 PDF，始终停留在自己的副本上，打开编辑器的 WebSocket（`wss`），并通过 HTTPS 使用 Git 进行克隆和推送。NodePort 上的 `http://` 请求被重定向到相同端口的 `https://`，与上文所述一致。

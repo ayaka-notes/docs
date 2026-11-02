@@ -1,0 +1,123 @@
+---
+title: 5. 部署 Ayakaleaf Pro
+description: 部署 Ayakaleaf Pro pod、其数据卷以及一个 NodePort Service。
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+首次启动会运行数据库迁移，需要一两分钟。当 `/status` 响应时 pod 即已就绪；然后打开 `OVERLEAF_SITE_URL`。
+
+### 清单为何如此编写
+
+* <strong>数据卷。</strong>`/var/lib/overleaf` 下的所有内容（项目文件、历史记录、上传文件）都位于 PVC 上。使用 local-path 等节点本地存储时，数据会固定在一个节点上；使用网络块存储时，pod 可以在节点之间迁移。
+* <strong>编译卷和 Docker socket。</strong>Ayakaleaf Pro 请求节点的 Docker 启动一个 TeX Live 容器，并**通过项目编译目录在节点上的路径**将其传递给容器。因此这些目录是 `hostPath` 卷，其路径也在 `SANDBOXED_COMPILES_HOST_DIR_*` 中重复出现。其内容是临时数据，无需备份。
+* <strong>`enableServiceLinks: false`。</strong>Kubernetes 会为命名空间中的每个 Service 向每个 pod 添加 Docker 风格的变量：Service `redis` 会变成 `REDIS_PORT=tcp://10.x.x.x:6379`，Service `git-bridge` 会变成 `GIT_BRIDGE_PORT=tcp://...`。部分 Overleaf 服务会读取这些名称的变量。在此 pod 中，`OVERLEAF_REDIS_*` 和 ConfigMap 中的设置优先，但 git-bridge 会把 `GIT_BRIDGE_PORT` 当作其端口并因此停止（参见 [Git 集成](/zh-Hans/on-premises/configuration/kubernetes/integrations/git-integration)）。关闭这些链接可以让环境仅包含你所设置的内容。
+* <strong>`Recreate`。</strong>两个 pod 绝不能使用同一个数据卷，也不能同时运行迁移。
+* <strong>对外暴露。</strong>NodePort Service 在每个节点的 `30080` 端口上响应。在生产环境中，请在前面放置你的 ingress 控制器或负载均衡器并在那里终止 TLS；它必须允许 WebSocket、10 分钟的请求超时（耗时较长的编译）以及 50 MB 的上传，并传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`。

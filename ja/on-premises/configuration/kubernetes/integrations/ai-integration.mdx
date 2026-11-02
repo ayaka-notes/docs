@@ -1,0 +1,65 @@
+---
+title: AI 連携
+description: Kubernetes デプロイで、AI チャット、LaTeX エラーの提案、クォータ、検索サービスを設定します。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+AI アシスタントと LaTeX エラーアシスタントは、各 Ayakaleaf Pro Pod の **web** サービス（`workbench` モジュールと `error-assistant` モジュール）で動作します。各設定の役割、ユーザーアクセス、クォータについては [AI 連携](/ja/on-premises/configuration/overleaf-toolkit/integrations/ai-integration) で説明しています。このページでは、それを Kubernetes に設定する方法を説明します。
+
+| | |
+| --- | --- |
+| サービス | web、すべての Ayakaleaf Pro Pod 内。web の起動時に読み込まれます。`web_fetch` ツールは同じ Pod 内の linked-url-proxy を経由します |
+| Pod → 外部 | `AI_BASE_URL`。検索が有効な場合は `WEB_SEARCH_URL`（デフォルトは `https://api.tavily.com/search`）と `DOCS_MCP_URL`。モデルが `web_fetch` で読み取るページ |
+| 外部 → Overleaf | なし |
+| 状態 | Redis 内のトークンクォータのカウンター（すべてのレプリカで共有）。チャット履歴はブラウザ内に保持されます |
+| 定期ジョブ | なし |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+`AI_ENABLED` は正確に `"true"` である必要があります。アシスタントは、`AI_ENABLED`、`AI_BASE_URL`、`AI_MODEL`、`AI_API_KEY` がすべて設定されている場合にのみ表示されます。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="適用、再起動し、すべての Pod からゲートウェイを確認する">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+何らかの HTTP ステータスが返ればゲートウェイに到達できています。`000` の場合は到達できていません。
+</Step>
+</Steps>
+
+`web_fetch` ツールは [外部 URL](/ja/on-premises/configuration/kubernetes/external-url) のファイルと同じプロキシを通じてページを取得するため、`OVERLEAF_LINKED_URL_*` の設定はモデルが読み取れる範囲も制限します。
+
+### 複数のレプリカ
+
+追加の作業は不要です。トークンクォータは Redis でカウントされるため、ユーザーの使用量はどのレプリカでも同じであり、管理者によるリセットはすべてのレプリカに適用されます。
+
+### Kubernetes でのテスト結果
+
+OpenAI 互換ゲートウェイ、Tavily、GitBook MCP エンドポイントのモック（`overleaf-certs` の `NODE_EXTRA_CA_CERTS` を通じて信頼）に対して、Kubernetes 1.37 上でエンドツーエンドテストに合格しました。HAProxy の背後の 3 つのレプリカでの AI アシスタント（31 ケース）では、ツール呼び出しと編集提案を含むチャット、Web とドキュメントの検索、`OVERLEAF_LINKED_URL_ALLOWED_RESOURCES` で制限された linked-url-proxy 経由での Web ページの読み取り、画像と PDF の添付、同意、Redis でカウントされるトークンクォータ、ユーザー単位およびインスタンス全体での AI の無効化、ゲートウェイへの低速な接続を確認しました。レプリカ 1 つでのエラーアシスタント（15 ケース）では、修正の提案、同意、共有トークンクォータ、AI の無効化を確認しました。

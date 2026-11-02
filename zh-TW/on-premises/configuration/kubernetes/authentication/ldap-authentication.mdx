@@ -1,0 +1,112 @@
+---
+title: LDAP 身分驗證
+description: 在 Kubernetes 部署中，讓使用者以其 LDAP 或 Active Directory 帳號登入。
+icon: address-book
+---
+
+LDAP 登入由每個 Ayakaleaf Pro pod 內的 **web** 服務（`authentication` 模組）處理。與 OIDC 和 SAML 不同，pod 會自行與目錄通訊。請依照 [LDAP 身分驗證](/zh-TW/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication)設定目錄端，再依下列方式將設定值放入 Kubernetes。
+
+### 各元件的執行位置
+
+| | |
+| --- | --- |
+| 服務 | web，位於每個 Ayakaleaf Pro pod 中；設定與 CA 會在 web 啟動時讀取 |
+| Pod → LDAP 伺服器 | `OVERLEAF_LDAP_URL`：每次登入都會建立新連線；若設定了 `OVERLEAF_LDAP_CONTACTS_FILTER`，每次查詢聯絡人時也會建立新連線 |
+| 瀏覽器 → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| 登入狀態 | Redis 中的工作階段與速率限制，由所有副本共用 |
+| 定期工作 | 無 |
+
+### 設定
+
+<Steps>
+<Step title="讓 pod 能連線至目錄">
+每個執行 Ayakaleaf Pro 的 pod 都會建立 LDAP 連線。若目錄受到防火牆或 NetworkPolicy 保護，請允許 pod 離開叢集時所使用的位址：通常是節點的位址，或您的 egress 閘道。
+
+映像檔中沒有 `ldapsearch`。若要從叢集內部執行[搜尋檢查](/zh-TW/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search)，請使用一次性的 pod：
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+輸出中必須恰好有一個 `dn:`。
+</Step>
+
+<Step title="將設定加入 ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+所有 `OVERLEAF_LDAP_*` 設定都列在[環境變數](/zh-TW/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables)中。除了繫結密碼以外，全部都放入 ConfigMap。請為 `"true"`、`"false"`、JSON 值（例如 `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`）以及以 `*` 開頭的值加上引號。
+</Step>
+
+<Step title="將繫結密碼放入 Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="搭配自有 CA 使用 LDAPS 或 STARTTLS（選用）">
+將 CA 放入掛載於 `/var/lib/overleaf/certs` 的 Secret `overleaf-certs`（請參閱[憑證與其他檔案](/zh-TW/on-premises/configuration/kubernetes#憑證與其他檔案)），並指向該檔案：
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+此 CA 清單會取代 LDAP 連線所使用的系統 CA，並在 web 啟動時讀取。
+</Step>
+
+<Step title="套用並重新啟動">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### 多個副本
+
+除了步驟 1 的防火牆設定外，不需要額外處理：每個副本都會各自連線至目錄，而登入結果會存入 Redis 的工作階段中。
+
+### 在 Kubernetes 上的測試
+
+以 goauthentik 的 LDAP outpost 作為目錄，在 Kubernetes 1.37 上以三個副本置於 HAProxy 之後，我們針對 LDAP 的端對端測試全數通過（26 個案例）：從 launchpad 建立的第一位管理員透過 LDAP 登入、使用 Secret 中的繫結密碼登入、拒絕錯誤密碼與未知使用者、依群組對應管理員以及不使用對應、每次登入時更新名稱與管理員旗標（單一名稱屬性，或名字與姓氏）、目錄聯絡人、登出、LDAP 帳號的密碼規則、已停權的帳號，以及搭配 reCAPTCHA 的 LDAP 登入。
+
+### 問與答
+
+<Accordion title="只有部分 pod 上的 LDAP 登入失敗">
+
+<strong>回答：</strong>並非每個節點都能連線至目錄。請從每個 pod 進行檢查：
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="在哪裡可以看到登入失敗的原因？">
+
+<strong>回答：</strong>在處理該次登入之 pod 的 web 日誌中：
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

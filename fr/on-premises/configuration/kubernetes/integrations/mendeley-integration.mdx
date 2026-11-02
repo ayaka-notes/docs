@@ -1,0 +1,56 @@
+---
+title: Intégration Mendeley
+description: Permettez aux utilisateurs d'importer un fichier .bib depuis leur bibliothèque Mendeley sur un déploiement Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+L'import Mendeley s'exécute dans le service **web** (le module `tpr-webmodule`) de chaque pod Ayakaleaf Pro. Enregistrez l'application Mendeley comme indiqué dans [Intégration Mendeley](/fr/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration), avec l'URL de redirection `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`, puis configurez Kubernetes comme ci-dessous.
+
+| | |
+| --- | --- |
+| Service | web, dans chaque pod Ayakaleaf Pro ; lu au démarrage de web |
+| Pod → Mendeley | `https://api.mendeley.com` (jeton OAuth et API), lorsqu'un utilisateur lie Mendeley ou importe ou actualise un fichier |
+| Navigateur → Mendeley | `https://api.mendeley.com/oauth/authorize`, puis retour vers l'URL de redirection |
+| Mendeley → Overleaf | aucun : l'instance n'a pas besoin d'être accessible depuis Internet |
+| Données stockées | les jetons Mendeley de l'utilisateur, chiffrés, dans MongoDB |
+| Tâches périodiques | aucune : un fichier n'est actualisé que lorsqu'un utilisateur le demande |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+Mettez l'identifiant de l'application entre guillemets : c'est un nombre, et un ConfigMap ne contient que des chaînes. `ENABLED_LINKED_FILE_TYPES` remplace la valeur définie lors de l'installation ; conservez les types que vous avez déjà et ajoutez `mendeley` (et `zotero`, si vous utilisez les deux).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD` chiffre les jetons Mendeley des utilisateurs dans MongoDB. Sans lui, chaque pod génère un fichier de clé dans son propre `/var/lib/overleaf/data`. Avec [plusieurs répliques](/fr/on-premises/configuration/kubernetes/horizontal-scaling), chaque nœud a alors une clé différente, et un utilisateur servi par une autre réplique ne peut pas utiliser son compte Mendeley lié. Définissez-le avant que le premier utilisateur ne lie Mendeley : le modifier ultérieurement oblige chaque utilisateur à lier à nouveau Mendeley.
+</Step>
+
+<Step title="Appliquer et redémarrer">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Plusieurs répliques
+
+Définissez `MENDELEY_CIPHER_PASSWORD` dans le Secret, voir ci-dessus. Les jetons Mendeley sont chiffrés par le même code que les clés Zotero : sans le mot de passe, un fichier importé sur une réplique ne peut pas être actualisé sur une autre, comme nous l'avons constaté avec [Zotero](/fr/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas). Le `state` OAuth est conservé dans la session dans Redis, de sorte que le rappel peut atteindre n'importe quelle réplique.
+
+### Testé sur Kubernetes
+
+Face à une simulation de api.mendeley.com (approuvée via `NODE_EXTRA_CA_CERTS` depuis `overleaf-certs`), sur Kubernetes 1.37 avec trois répliques derrière HAProxy, nos tests de bout en bout de Mendeley réussissent (18 cas) : liaison via OAuth 2.0 et déliaison, import de la bibliothèque et des groupes dans un fichier `.bib`, actualisation de celui-ci, rafraîchissement d'un jeton d'accès qui expire, jetons révoqués, demande de nouvelle liaison, références consultables par les collaborateurs, seul l'importateur peut actualiser, erreurs d'API et connexions lentes à Mendeley.

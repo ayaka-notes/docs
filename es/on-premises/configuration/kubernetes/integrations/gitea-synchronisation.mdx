@@ -1,0 +1,67 @@
+---
+title: Sincronización con Gitea
+description: Permite que los usuarios sincronicen sus proyectos con repositorios de Gitea.com o de tu propio Gitea en un despliegue de Kubernetes.
+icon: mug-hot
+---
+
+La sincronización con Gitea se ejecuta en el servicio **web** (el módulo `gitea-sync`) de cada pod de Ayakaleaf Pro. Necesita la [integración con Git](/es/on-premises/configuration/kubernetes/integrations/git-integration). Crea la aplicación OAuth y consulta qué hace cada ajuste en [Sincronización con Gitea](/es/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); esta página explica cómo trasladarlo a Kubernetes.
+
+| | |
+| --- | --- |
+| Servicio | web (módulo `gitea-sync`), en cada pod de Ayakaleaf Pro; se lee cuando web arranca |
+| Pod → Gitea | la API REST de `GITEA_SYNC_URL` (por defecto `https://gitea.com/api/v1`), cada vez que un usuario vincula, importa, exporta o sincroniza |
+| Navegador → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` para vincular una cuenta y, después, de vuelta a `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | ninguna: sin webhook, la instancia no necesita ser accesible desde Gitea |
+| Datos almacenados | los tokens de acceso y de actualización de Gitea del usuario, cifrados, en MongoDB |
+| Tareas periódicas | ninguna: la sincronización se produce cuando un usuario hace clic |
+
+### Configuración
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` y el StatefulSet de git-bridge de [Integración con Git](/es/on-premises/configuration/kubernetes/integrations/git-integration) deben estar en marcha: sin ellos, la configuración de la cuenta y el editor ocultan la sincronización con Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` cifra los tokens de acceso y de actualización de Gitea de los usuarios en MongoDB. Todas las réplicas deben usar el mismo valor, y cambiarlo más adelante obliga a todos los usuarios a volver a vincular Gitea.
+</Step>
+
+<Step title="CA privada (opcional)">
+Si tu Gitea tiene un certificado emitido por tu propia CA, añade la CA al Secret `overleaf-certs` montado en `/var/lib/overleaf/certs` (consulta [Certificados y otros archivos](/es/on-premises/configuration/kubernetes#certificados-y-otros-archivos)) y establece `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` en el ConfigMap.
+</Step>
+
+<Step title="Aplica, reinicia y comprueba">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Cualquier código de estado HTTP significa que Gitea es accesible desde ese pod; `000` significa que no lo es.
+</Step>
+</Steps>
+
+### Varias réplicas
+
+No hace falta nada más aparte de compartir `GITEA_TOKEN_CIPHER_PASSWORD`. Una sincronización toma un bloqueo en Redis, compartido con las demás sincronizaciones de Git, por lo que dos réplicas nunca sincronizan el mismo proyecto a la vez.
+
+### Probado en Kubernetes
+
+Contra un Gitea 1.23 real en `GITEA_SYNC_URL`, en Kubernetes 1.37 con una réplica y la integración con Git activada, nuestras pruebas de extremo a extremo para la sincronización con Gitea se superan (39 casos): vinculación y desvinculación de la cuenta mediante el OAuth2 de Gitea, actualización del token de acceso que caduca y autorizaciones revocadas, exportación a un repositorio nuevo privado o de organización, importación de un repositorio, pull y push, fusiones, conflictos, ramas eliminadas y con force-push, archivos binarios, cambios de nombre y eliminaciones, y lo que pueden hacer los propietarios, editores y lectores.

@@ -1,0 +1,112 @@
+---
+title: Xác thực LDAP
+description: Cho phép người dùng đăng nhập bằng tài khoản LDAP hoặc Active Directory trên triển khai Kubernetes.
+icon: address-book
+---
+
+Đăng nhập LDAP được xử lý bởi dịch vụ **web** (module `authentication`) bên trong mọi pod Ayakaleaf Pro. Khác với OIDC và SAML, các pod tự giao tiếp với thư mục. Hãy thiết lập phía thư mục như trong [Xác thực LDAP](/vi/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication), sau đó đưa các giá trị vào Kubernetes như bên dưới.
+
+### Các thành phần chạy ở đâu
+
+| | |
+| --- | --- |
+| Dịch vụ | web, trong mọi pod Ayakaleaf Pro; các thiết lập và CA được đọc khi web khởi động |
+| Pod → máy chủ LDAP | `OVERLEAF_LDAP_URL`: một kết nối mới cho mỗi lần đăng nhập, và cho mỗi lần tra cứu danh bạ nếu đặt `OVERLEAF_LDAP_CONTACTS_FILTER` |
+| Trình duyệt → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| Trạng thái đăng nhập | session và giới hạn tốc độ trong Redis, dùng chung cho mọi replica |
+| Tác vụ định kỳ | không có |
+
+### Cấu hình
+
+<Steps>
+<Step title="Cho phép các pod truy cập thư mục">
+Mọi pod chạy Ayakaleaf Pro đều mở kết nối LDAP. Nếu tường lửa hoặc NetworkPolicy bảo vệ thư mục, hãy cho phép các địa chỉ mà pod dùng khi rời khỏi cluster: thường là địa chỉ của các node, hoặc egress gateway của bạn.
+
+Image không có `ldapsearch`. Để chạy [bước kiểm tra tìm kiếm](/vi/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) từ bên trong cluster, hãy dùng một pod tạm thời:
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+Lệnh phải in ra đúng một dòng `dn:`.
+</Step>
+
+<Step title="Thêm các thiết lập vào ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Mọi thiết lập `OVERLEAF_LDAP_*` được liệt kê trong [Biến môi trường](/vi/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables). Tất cả đều được đặt trong ConfigMap, ngoại trừ mật khẩu bind. Hãy đặt trong dấu nháy các giá trị `"true"`, `"false"`, các giá trị JSON như `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`, và các giá trị bắt đầu bằng `*`.
+</Step>
+
+<Step title="Đưa mật khẩu bind vào Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="LDAPS hoặc STARTTLS với CA riêng của bạn (tùy chọn)">
+Đưa CA vào Secret `overleaf-certs` được mount tại `/var/lib/overleaf/certs` (xem [Chứng chỉ và các tệp khác](/vi/on-premises/configuration/kubernetes#chứng-chỉ-và-các-tệp-khác)) và trỏ tới nó:
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+Danh sách CA này thay thế các CA của hệ thống cho kết nối LDAP. Nó được đọc khi web khởi động.
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Không cần gì thêm ngoài tường lửa ở bước 1: mỗi replica tự kết nối tới thư mục, và kết quả đăng nhập được lưu vào session trong Redis.
+
+### Đã kiểm thử trên Kubernetes
+
+Với LDAP outpost của goauthentik làm thư mục, trên Kubernetes 1.37 với ba replica phía sau HAProxy, các bài kiểm thử end-to-end của chúng tôi cho LDAP đều đạt (26 trường hợp): quản trị viên đầu tiên từ launchpad đăng nhập qua LDAP, đăng nhập với mật khẩu bind từ Secret, từ chối mật khẩu sai và người dùng không xác định, ánh xạ quản trị viên theo nhóm và khi không có ánh xạ, cập nhật tên và cờ quản trị viên ở mỗi lần đăng nhập (một thuộc tính tên, hoặc họ và tên riêng), danh bạ thư mục, đăng xuất, quy tắc mật khẩu cho tài khoản LDAP, tài khoản bị tạm ngưng, và đăng nhập LDAP với reCAPTCHA.
+
+### Hỏi \& Đáp
+
+<Accordion title="Đăng nhập LDAP chỉ thất bại trên một số pod">
+
+<strong>Trả lời:</strong> Thư mục không thể truy cập được từ mọi node. Hãy kiểm tra từ từng pod:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="Tôi xem lý do đăng nhập thất bại ở đâu?">
+
+<strong>Trả lời:</strong> Trong log web của pod đã phục vụ lần đăng nhập đó:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

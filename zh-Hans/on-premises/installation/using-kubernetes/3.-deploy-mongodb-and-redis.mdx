@@ -1,0 +1,217 @@
+---
+title: 3. 部署 MongoDB 和 Redis
+description: 以副本集方式运行 MongoDB，并运行启用持久化的 Redis，或者指向你自己的服务。
+icon: database
+---
+
+Ayakaleaf Pro 需要：
+
+* 以**副本集**方式运行的 **MongoDB 8**（它会使用事务）。分布在三个节点上的三个成员可以在丢失一个节点时继续运行；单个成员也可以工作。
+* **Redis 7**，单台服务器并启用 AOF 持久化。Redis 保存尚未写入 MongoDB 的编辑、会话以及 Overleaf 各服务之间的消息。Overleaf 只连接单台 Redis 服务器：不支持 Sentinel 和 Redis Cluster。
+
+<Info>
+
+你也可以改用托管服务，例如 MongoDB Atlas 或你的云平台提供的 Redis。跳过本页，并在[第 4 步](/zh-Hans/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)中将 `OVERLEAF_MONGO_URL` 和 `OVERLEAF_REDIS_HOST` 设置为它们的地址。
+
+</Info>
+
+<Steps>
+<Step title="MongoDB">
+```yaml title="10-mongo.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: overleaf
+spec:
+  clusterIP: None                 # headless: gives mongo-0.mongo, mongo-1.mongo, ...
+  publishNotReadyAddresses: true  # members must resolve each other before the set is initiated
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  namespace: overleaf
+spec:
+  serviceName: mongo
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mongo
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: mongo
+          image: mongo:8.0
+          args:
+            - --replSet=overleaf
+            - --bind_ip_all
+            - --wiredTigerCacheSizeGB=0.25   # default is 50% of (RAM - 1 GB); size it for your nodes
+          # env:
+          #   - name: GLIBC_TUNABLES        # only on kernel 6.19+ (SERVER-121912)
+          #     value: glibc.pthread.rseq=1
+          ports:
+            - containerPort: 27017
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 768Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+# Initiates the replica set once. Safe to re-run: it does nothing when the set exists.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongo-init-replica-set
+  namespace: overleaf
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: mongo:8.0
+          command:
+            - mongosh
+            - --quiet
+            - --host=mongo-0.mongo
+            - --eval
+            - |
+              try {
+                rs.status()
+                print('replica set already initiated')
+              } catch (e) {
+                rs.initiate({
+                  _id: 'overleaf',
+                  members: [
+                    { _id: 0, host: 'mongo-0.mongo.overleaf.svc.cluster.local:27017' },
+                    { _id: 1, host: 'mongo-1.mongo.overleaf.svc.cluster.local:27017' },
+                    { _id: 2, host: 'mongo-2.mongo.overleaf.svc.cluster.local:27017' },
+                  ],
+                })
+              }
+```
+
+```bash
+kubectl apply -f 10-mongo.yaml
+kubectl -n overleaf rollout status statefulset/mongo
+kubectl -n overleaf wait --for=condition=complete job/mongo-init-replica-set --timeout=5m
+kubectl -n overleaf exec mongo-0 -- mongosh --quiet --eval 'rs.status().members.map(m => m.name + " " + m.stateStr)'
+```
+
+几秒钟后，应有一个成员为 `PRIMARY`，其余成员为 `SECONDARY`。该 Job 会不断重试，直到所有成员都响应，因此出现几个失败的 Job pod 是正常的。
+
+* headless Service 需要 `publishNotReadyAddresses: true`：在副本集建立之前，成员必须能够通过名称找到彼此。
+* 成员使用其稳定名称（`mongo-0.mongo.overleaf.svc.cluster.local`）添加，绝不使用每次重启都会变化的 pod IP。
+* 如果只使用单个成员，请设置 `replicas: 1`，并在 Job 中只保留 `mongo-0`。
+</Step>
+
+<Step title="Redis">
+```yaml title="20-redis.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: overleaf
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: overleaf
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4
+          args: [--appendonly, "yes"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+```
+
+```bash
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+```
+</Step>
+</Steps>
+
+### 问答
+
+<Accordion title="MongoDB 8 在较新的内核上启动时崩溃，为什么？">
+
+<strong>回答：</strong>MongoDB 8 在 Linux 内核 6.19 及更高版本上会失败（[SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)）。请在 `10-mongo.yaml` 中取消 `GLIBC_TUNABLES` 环境变量的注释。
+
+</Accordion>
+
+<Accordion title="MongoDB 需要多少内存？">
+
+<strong>回答：</strong>默认情况下，MongoDB 会将节点内存的一半减去 1 GB 用作缓存，而且它看到的是节点的内存，而非 pod 的限制。请根据你的节点设置 `--wiredTigerCacheSizeGB`；在我们 4 GB 的测试节点上，`0.25` 让每个成员的内存占用保持在约 200 到 260 MiB。
+
+</Accordion>

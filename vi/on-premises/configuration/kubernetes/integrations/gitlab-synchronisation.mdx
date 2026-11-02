@@ -1,0 +1,67 @@
+---
+title: Đồng bộ hóa GitLab
+description: Cho phép người dùng đồng bộ dự án của họ với các kho lưu trữ trên GitLab.com hoặc GitLab tự quản lý trên một bản triển khai Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+Đồng bộ hóa GitLab chạy trong dịch vụ **web** (mô-đun `gitlab-sync`) của mọi pod Ayakaleaf Pro. Tính năng này cần [Tích hợp Git](/vi/on-premises/configuration/kubernetes/integrations/git-integration). Hãy tạo ứng dụng OAuth và đọc ý nghĩa của từng cài đặt trong [Đồng bộ hóa GitLab](/vi/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); trang này đưa cấu hình đó vào Kubernetes.
+
+| | |
+| --- | --- |
+| Dịch vụ | web (mô-đun `gitlab-sync`), trong mọi pod Ayakaleaf Pro; được đọc khi web khởi động |
+| Pod → GitLab | REST API của `GITLAB_SYNC_URL` (mặc định `https://gitlab.com/api/v4`), mỗi khi người dùng liên kết, nhập, xuất hoặc đồng bộ |
+| Trình duyệt → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` để liên kết tài khoản, sau đó quay lại `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | không có: không có webhook, phiên bản không cần truy cập được từ GitLab |
+| Dữ liệu được lưu trữ | các access token và refresh token GitLab của người dùng, đã được mã hóa, trong MongoDB |
+| Tác vụ định kỳ | không có: việc đồng bộ diễn ra khi người dùng nhấp chuột |
+
+### Cấu hình
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` và StatefulSet git-bridge từ [Tích hợp Git](/vi/on-premises/configuration/kubernetes/integrations/git-integration) phải được thiết lập sẵn: nếu thiếu chúng, phần cài đặt tài khoản và trình soạn thảo sẽ ẩn Đồng bộ hóa GitLab.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` mã hóa các access token và refresh token GitLab của người dùng trong MongoDB. Mọi replica phải dùng cùng một giá trị, và việc thay đổi giá trị này sau đó sẽ buộc mọi người dùng phải liên kết lại GitLab.
+</Step>
+
+<Step title="CA riêng (tùy chọn)">
+Nếu GitLab của bạn dùng chứng chỉ do CA riêng của bạn cấp, hãy thêm CA đó vào Secret `overleaf-certs` được mount tại `/var/lib/overleaf/certs` (xem [Chứng chỉ và các tệp khác](/vi/on-premises/configuration/kubernetes#chứng-chỉ-và-các-tệp-khác)) và đặt `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` trong ConfigMap.
+</Step>
+
+<Step title="Áp dụng, khởi động lại và kiểm tra">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Bất kỳ mã trạng thái HTTP nào cũng có nghĩa là pod đó truy cập được GitLab; `000` có nghĩa là không truy cập được.
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Không cần thêm gì ngoài `GITLAB_TOKEN_CIPHER_PASSWORD` dùng chung. Mỗi lần đồng bộ sẽ giữ một khóa trong Redis, dùng chung với các loại đồng bộ hóa Git khác, nên hai replica không bao giờ đồng bộ cùng một dự án cùng lúc. Việc làm mới token GitLab của người dùng cũng giữ một khóa Redis, nên hai replica không làm mới token đó cùng lúc.
+
+### Đã kiểm thử trên Kubernetes
+
+Với một bản mô phỏng GitLab tự quản lý tại `GITLAB_SYNC_URL` (được tin cậy thông qua `NODE_EXTRA_CA_CERTS` từ `overleaf-certs`), trên Kubernetes 1.37 với một replica và Tích hợp Git được bật, các bài kiểm thử end-to-end của chúng tôi cho Đồng bộ hóa GitLab đều đạt (40 trường hợp): liên kết và hủy liên kết tài khoản, làm mới access token sắp hết hạn và token bị thu hồi, xuất sang một dự án riêng tư hoặc dự án nhóm mới, nhập một kho lưu trữ, pull và push, merge, xung đột, nhánh bị xóa và bị force push, tệp nhị phân, đổi tên và xóa, và những gì chủ sở hữu, người chỉnh sửa và người xem được phép làm.

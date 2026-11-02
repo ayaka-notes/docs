@@ -1,0 +1,116 @@
+---
+title: SAML 인증
+description: Kubernetes 배포에서 사용자가 SAML 2.0 ID 공급자를 통해 로그인하도록 합니다.
+icon: building-columns
+---
+
+SAML 로그인은 모든 Ayakaleaf Pro 파드 내부의 **web** 서비스(`authentication` 모듈)가 처리합니다. 백그라운드 작업이나 별도의 파드는 없습니다. [SAML 인증](/ko/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication)에 따라 ID 공급자(IdP)를 설정한 다음, 아래와 같이 값과 IdP 인증서를 Kubernetes에 넣으세요.
+
+### 실행 위치
+
+| | |
+| --- | --- |
+| 서비스 | web, 모든 Ayakaleaf Pro 파드에서 실행. 설정과 IdP 인증서는 web이 시작될 때 읽음 |
+| 파드 → IdP | 없음: 모든 SAML 메시지는 브라우저를 거쳐 전달됨 |
+| 브라우저 → IdP | `OVERLEAF_SAML_ENTRYPOINT`(로그인), `OVERLEAF_SAML_LOGOUT_URL`(로그아웃) |
+| 브라우저 → Overleaf | `POST ${OVERLEAF_SITE_URL}/saml/login/callback`(ACS), `/saml/logout/callback`, `/saml/meta`(SP 메타데이터) |
+| 파일 | Secret `overleaf-certs`에서 가져오는 IdP 인증서, 그리고 선택적으로 Overleaf 자체 키와 인증서 |
+| 주기적 작업 | 없음 |
+
+### 구성
+
+<Steps>
+<Step title="IdP에 Overleaf 등록하기">
+| IdP 설정 | 값 |
+| --- | --- |
+| ACS URL(assertion consumer service) | `${OVERLEAF_SITE_URL}/saml/login/callback`, HTTP-POST 바인딩 |
+| 단일 로그아웃 URL | `${OVERLEAF_SITE_URL}/saml/logout/callback` |
+| Audience / SP 엔티티 ID | `OVERLEAF_SAML_ISSUER`에 넣은 값 |
+
+[goauthentik 단계별 안내](/ko/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#step-by-step-goauthentik)에서 이 항목들의 위치를 확인할 수 있습니다.
+</Step>
+
+<Step title="IdP 인증서를 Secret `overleaf-certs`에 넣기">
+Toolkit은 `data/overleaf/certs/`에서 인증서를 읽습니다. Kubernetes에서는 [인증서 및 기타 파일](/ko/on-premises/configuration/kubernetes#인증서-및-기타-파일)에 설명된 대로 `/var/lib/overleaf/certs`에 마운트된 Secret `overleaf-certs`에서 가져옵니다.
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem
+```
+
+Secret이 이미 있다면 대신 파일을 추가하세요. 모든 `--from-file`을 포함하여 삭제 후 다시 만들거나, `kubectl -n overleaf edit secret overleaf-certs`를 사용합니다.
+
+`OVERLEAF_SAML_IDP_CERT`는 경로를 받으며, 인증서 교체 기간에는 경로의 JSON 목록을 받습니다. PEM 텍스트 자체는 받지 않습니다.
+</Step>
+
+<Step title="ConfigMap에 설정 추가하기">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: saml
+  OVERLEAF_SAML_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_SAML_ENTRYPOINT: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_LOGOUT_URL: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_ISSUER: overleaf
+  OVERLEAF_SAML_IDP_CERT: /var/lib/overleaf/certs/idp_cert.pem
+  OVERLEAF_SAML_WANT_ASSERTIONS_SIGNED: "true"
+  OVERLEAF_SAML_WANT_AUTHN_RESPONSE_SIGNED: "true"
+  OVERLEAF_SAML_USER_ID_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_EMAIL_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+  OVERLEAF_SAML_FIRST_NAME_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+  OVERLEAF_SAML_LAST_NAME_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_IS_ADMIN_FIELD: http://schemas.xmlsoap.org/claims/Group
+  OVERLEAF_SAML_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_SAML_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+모든 `OVERLEAF_SAML_*` 설정은 [환경 변수](/ko/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#environment-variables)에 나열되어 있습니다. 그 자체로 시크릿인 설정은 없으므로 모두 ConfigMap에 넣습니다. 키 파일(`OVERLEAF_SAML_PRIVATE_KEY`, `OVERLEAF_SAML_DECRYPTION_PVK`)은 `overleaf-certs`에 넣고, ConfigMap에는 그 경로를 둡니다.
+
+<Warning>
+
+`"true"`, `"false"`, 그리고 `OVERLEAF_SAML_AUTHN_CONTEXT: '["urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"]'`와 같은 JSON 값은 따옴표로 감싸세요. 유효한 불리언 또는 JSON 값이 아닌 설정이 있으면 파드는 여전히 준비 상태로 보고되지만 SAML 전략이 로드되지 않아, SAML을 통한 로그인이 실패합니다. 변경할 때마다 `web.log`를 확인하세요. 아래 Q\&A를 참고하세요.
+
+</Warning>
+</Step>
+
+<Step title="적용 및 재시작">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+IdP 인증서와 키는 web이 시작될 때 읽으므로, `overleaf-certs`에 새 인증서를 넣은 경우에도 이 재시작이 필요합니다.
+</Step>
+</Steps>
+
+### 여러 레플리카
+
+IdP는 크로스 사이트 `POST`로 사용자를 ACS URL로 돌려보냅니다. 브라우저는 이 요청에 `SameSite=Lax` 쿠키를 보내지 않으므로, 요청에는 Overleaf의 세션 쿠키도, Chrome과 Edge에서는 로드 밸런서의 스티키 쿠키도 포함되지 않으며 어느 레플리카에든 도착할 수 있습니다. 기본 설정에서는 문제가 되지 않습니다. 요청을 받은 레플리카가 Redis에 세션을 만들고, 그 이후로는 로드 밸런서가 사용자를 해당 레플리카에 유지합니다.
+
+<Warning>
+
+여러 레플리카를 실행할 때는 `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO`를 설정하지 마세요(기본값은 `never`). `always` 또는 `ifPresent`로 설정하면 각 레플리카가 IdP에 보낸 요청을 자체 메모리에 기억하므로, 다른 레플리카에 도착한 응답은 "InResponseTo is not valid"로 거부되고 사용자는 `/saml/login/callback`에 머무르게 됩니다. 세 레플리카와 `always`로 테스트했을 때 19개의 SAML 테스트 케이스 중 12개가 이렇게 실패했고, 기본값에서는 모두 통과했습니다. 레플리카가 하나인 경우에는 `always`에서도 SAML 로그인이 통과합니다.
+
+</Warning>
+
+### Kubernetes에서의 테스트
+
+goauthentik를 IdP로 사용하고(HTTP-POST 바인딩, 서명된 어설션 및 응답) HAProxy 뒤에 세 개의 레플리카를 둔 Kubernetes 1.37 환경에서, SAML에 대한 엔드투엔드 테스트(19개 케이스)가 통과했습니다. 테스트 항목은 런치패드에서 만든 첫 관리자의 SAML 로그인, `overleaf-certs`의 IdP 인증서를 사용한 로그인, 계정 생성 및 재로그인, 그룹에 따른 관리자 매핑과 매핑 없음, 로그인할 때마다 이름과 관리자 플래그 갱신, IdP를 통한 로그아웃, SAML 계정의 비밀번호 규칙, 그리고 정지된 계정입니다. `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO`는 기본값으로 두었습니다.
+
+### Q\&A
+
+<Accordion title="SAML로 로그인하면 바로 “Something went wrong”이 표시됩니다">
+
+<strong>답변:</strong> SAML 전략이 로드되지 않았습니다. 파드는 여전히 준비 상태가 되므로 각 파드의 web 로그를 확인하세요.
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "saml|passport" /var/log/overleaf/web.log | tail
+```
+
+흔한 원인: `OVERLEAF_SAML_IDP_CERT`가 `overleaf-certs`에 없는 파일을 가리키는 경우, 불리언 값이 `"true"` 또는 `"false"`가 아닌 경우, 또는 잘못된 JSON. `EXTERNAL_AUTH`에 여러 방식이 나열되어 있으면, 이러한 오류는 SAML 뒤에 오는 방식(`ldap`, `saml`, `oidc` 순서)도 꺼지게 합니다.
+
+</Accordion>
+
+<Accordion title="IdP가 Overleaf에 접근해야 하나요, 아니면 Overleaf가 IdP에 접근해야 하나요?">
+
+<strong>답변:</strong> 로그인과 로그아웃에는 둘 다 필요하지 않습니다. IdP와 Overleaf는 사용자의 브라우저를 통해서만 메시지를 주고받습니다. IdP를 메타데이터 URL로 구성한 경우에만 IdP가 `${OVERLEAF_SITE_URL}/saml/meta`를 다운로드합니다.
+
+</Accordion>

@@ -1,0 +1,112 @@
+---
+title: Аутентификация через LDAP
+description: Вход пользователей с учётной записью LDAP или Active Directory в развёртывании на Kubernetes.
+icon: address-book
+---
+
+Вход через LDAP обрабатывает сервис **web** (модуль `authentication`) в каждом поде Ayakaleaf Pro. В отличие от OIDC и SAML, поды сами обращаются к каталогу. Настройте сторону каталога, как описано в разделе [Аутентификация через LDAP](/ru/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication), а затем перенесите значения в Kubernetes, как показано ниже.
+
+### Где что выполняется
+
+| | |
+| --- | --- |
+| Сервис | web в каждом поде Ayakaleaf Pro; настройки и CA считываются при запуске web |
+| Под → сервер LDAP | `OVERLEAF_LDAP_URL`: новое соединение при каждом входе, а также при каждом поиске контактов, если задан `OVERLEAF_LDAP_CONTACTS_FILTER` |
+| Браузер → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| Состояние входа | сессия и ограничения частоты запросов в Redis, общие для всех реплик |
+| Периодические задания | нет |
+
+### Настройка
+
+<Steps>
+<Step title="Откройте подам доступ к каталогу">
+Соединения с LDAP открывает каждый под, в котором работает Ayakaleaf Pro. Если каталог защищён файрволом или NetworkPolicy, разрешите адреса, с которых поды выходят из кластера: обычно это адреса узлов или ваш egress-шлюз.
+
+В образе нет `ldapsearch`. Чтобы выполнить [проверку поиска](/ru/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) изнутри кластера, используйте временный под:
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+Команда должна вывести ровно один `dn:`.
+</Step>
+
+<Step title="Добавьте настройки в ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Все настройки `OVERLEAF_LDAP_*` перечислены в разделе [Переменные окружения](/ru/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables). Все они помещаются в ConfigMap, кроме пароля для bind. Заключайте в кавычки `"true"`, `"false"`, значения JSON, например `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`, а также значения, начинающиеся с `*`.
+</Step>
+
+<Step title="Поместите пароль для bind в Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="LDAPS или STARTTLS с собственным CA (необязательно)">
+Поместите CA в Secret `overleaf-certs`, смонтированный в `/var/lib/overleaf/certs` (см. [Сертификаты и другие файлы](/ru/on-premises/configuration/kubernetes#сертификаты-и-другие-файлы)), и укажите путь к нему:
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+Этот список CA заменяет системные CA для соединений с LDAP. Он считывается при запуске web.
+</Step>
+
+<Step title="Примените изменения и перезапустите">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### Несколько реплик
+
+Ничего дополнительного, кроме файрвола из шага 1, не требуется: каждая реплика подключается к каталогу самостоятельно, а результат входа сохраняется в сессии в Redis.
+
+### Проверено на Kubernetes
+
+С LDAP outpost от goauthentik в качестве каталога, на Kubernetes 1.37 с тремя репликами за HAProxy, наши сквозные тесты для LDAP проходят (26 сценариев): вход первого администратора из launchpad через LDAP, вход с паролем для bind из Secret, отклонение неверных паролей и неизвестных пользователей, назначение администратора по группе и без назначения, обновление имени и признака администратора при каждом входе (один атрибут имени или имя и фамилия), контакты из каталога, выход из системы, правила для паролей учётных записей LDAP, заблокированные учётные записи и вход через LDAP с reCAPTCHA.
+
+### Вопросы и ответы
+
+<Accordion title="Вход через LDAP не работает только на некоторых подах">
+
+<strong>Ответ:</strong> Каталог доступен не со всех узлов. Проверьте с каждого пода:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="Где посмотреть, почему вход не удался?">
+
+<strong>Ответ:</strong> В журнале web того пода, который обработал вход:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

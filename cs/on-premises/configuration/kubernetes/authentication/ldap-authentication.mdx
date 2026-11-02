@@ -1,0 +1,112 @@
+---
+title: Ověřování LDAP
+description: Umožněte uživatelům přihlašovat se v nasazení na Kubernetes pomocí účtu LDAP nebo Active Directory.
+icon: address-book
+---
+
+Přihlašování přes LDAP obstarává služba **web** (modul `authentication`) uvnitř každého podu Ayakaleaf Pro. Na rozdíl od OIDC a SAML komunikují pody s adresářem samy. Stranu adresáře nastavte podle stránky [Ověřování LDAP](/cs/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication) a poté hodnoty vložte do Kubernetes, jak je popsáno níže.
+
+### Kde co běží
+
+| | |
+| --- | --- |
+| Služba | web, v každém podu Ayakaleaf Pro; nastavení a CA se načítají při spuštění služby web |
+| Pod → server LDAP | `OVERLEAF_LDAP_URL`: nové spojení pro každé přihlášení a pro každé vyhledání kontaktů, pokud je nastaveno `OVERLEAF_LDAP_CONTACTS_FILTER` |
+| Prohlížeč → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| Stav přihlášení | relace a limity požadavků v Redisu, sdílené všemi replikami |
+| Periodické úlohy | žádné |
+
+### Konfigurace
+
+<Steps>
+<Step title="Umožněte podům dosáhnout na adresář">
+Spojení LDAP otevírá každý pod, ve kterém běží Ayakaleaf Pro. Pokud adresář chrání firewall nebo NetworkPolicy, povolte adresy, se kterými pody opouštějí cluster: obvykle adresy uzlů nebo vaší egress brány.
+
+Image neobsahuje `ldapsearch`. Chcete-li spustit [kontrolu vyhledávání](/cs/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) zevnitř clusteru, použijte dočasný pod:
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+Musí vypsat právě jeden `dn:`.
+</Step>
+
+<Step title="Přidejte nastavení do ConfigMapy">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Všechna nastavení `OVERLEAF_LDAP_*` jsou uvedena v části [Proměnné prostředí](/cs/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables). Všechna patří do ConfigMapy kromě hesla pro bind. Dejte do uvozovek `"true"`, `"false"`, hodnoty JSON, například `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`, a hodnoty začínající znakem `*`.
+</Step>
+
+<Step title="Vložte heslo pro bind do Secretu">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="LDAPS nebo STARTTLS s vlastní CA (volitelné)">
+Vložte CA do Secretu `overleaf-certs` připojeného do `/var/lib/overleaf/certs` (viz [Certifikáty a další soubory](/cs/on-premises/configuration/kubernetes#certifikáty-a-další-soubory)) a odkažte na ni:
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+Seznam CA nahrazuje systémové CA pro spojení LDAP. Načítá se při spuštění služby web.
+</Step>
+
+<Step title="Aplikujte a restartujte">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### Více replik
+
+Kromě firewallu z kroku 1 není potřeba nic dalšího: každá replika se k adresáři připojuje samostatně a výsledek přihlášení se ukládá do relace v Redisu.
+
+### Otestováno na Kubernetes
+
+S LDAP outpostem goauthentik jako adresářem, na Kubernetes 1.37 se třemi replikami za HAProxy, procházejí naše end-to-end testy pro LDAP (26 případů): první administrátor z launchpadu se přihlašuje přes LDAP, přihlášení s heslem pro bind ze Secretu, odmítnutí špatných hesel a neznámých uživatelů, mapování administrátorů podle skupiny i bez mapování, aktualizace jména a příznaku administrátora při každém přihlášení (jeden atribut jména, nebo jméno a příjmení), kontakty z adresáře, odhlášení, pravidla pro hesla u účtů LDAP, pozastavené účty a přihlášení přes LDAP s reCAPTCHA.
+
+### Otázky a odpovědi
+
+<Accordion title="Přihlášení přes LDAP selhává jen na některých podech">
+
+<strong>Odpověď:</strong> Adresář není dostupný ze všech uzlů. Ověřte to z každého podu:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="Kde zjistím, proč přihlášení selhalo?">
+
+<strong>Odpověď:</strong> V logu služby web toho podu, který přihlášení obsloužil:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

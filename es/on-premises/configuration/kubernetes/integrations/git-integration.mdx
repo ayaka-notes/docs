@@ -1,0 +1,144 @@
+---
+title: Integración con Git
+description: Ejecuta git-bridge junto a Ayakaleaf Pro en Kubernetes.
+icon: code-branch
+---
+
+La integración con Git ejecuta el servicio independiente git-bridge. Los usuarios clonan y hacen push a través de `${OVERLEAF_SITE_URL}/git/<project id>`; el pod de Ayakaleaf Pro reenvía esas peticiones a git-bridge, y git-bridge vuelve a llamar al pod para obtener el contenido y el historial del proyecto. Al activarla también se habilita el [servidor MCP](/es/on-premises/configuration/overleaf-toolkit/integrations/mcp-server), y es necesaria para la sincronización con GitHub, GitLab, Gitea y Dropbox.
+
+Esta página amplía la instalación con una sola réplica de [Usar Kubernetes](/es/on-premises/installation/using-kubernetes). Para varias réplicas, consulta [Escalado horizontal](/es/on-premises/configuration/kubernetes/horizontal-scaling).
+
+| | |
+| --- | --- |
+| Servicios | **git-bridge** en su propio pod (StatefulSet); en cada pod de Ayakaleaf Pro: nginx (reenvía `/git/`), web (tokens de Git, la página de Git del proyecto, la API a la que llama git-bridge) e history-v1 (contenido de los archivos) |
+| Cliente Git → Overleaf | `${OVERLEAF_SITE_URL}/git/<project id>`, con `git` como nombre de usuario y un token de autenticación de Git como contraseña |
+| Pod de Ayakaleaf Pro ↔ git-bridge | nginx → el Service `git-bridge`; git-bridge → la API de web (puerto 3000) e history-v1 (puerto 3100) a través de `overleaf-internal` |
+| Datos almacenados | un repositorio git por cada proyecto clonado en el volumen de git-bridge |
+| Tareas periódicas | la tarea de intercambio (swap) horaria de git-bridge, que solo mueve repositorios cuando hay configurado un almacén de intercambio (`GIT_BRIDGE_SWAPSTORE_TYPE`, por defecto `noop`) |
+
+<Steps>
+<Step title="Despliega git-bridge">
+```yaml title="45-git-bridge.yaml" wrap
+# Internal Service for git-bridge: web's API (3000) and history-v1 (3100) of the Overleaf pod.
+# Keep it ClusterIP: the NodePort Service would publish these internal ports on every node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf-internal
+  namespace: overleaf
+spec:
+  selector:
+    app: overleaf
+  ports:
+    - {name: web, port: 3000}
+    - {name: history, port: 3100}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  # Fixed ClusterIP inside your service CIDR, used as GIT_BRIDGE_HOST: the image's nginx proxies
+  # /git/ with Docker's DNS resolver (127.0.0.11), which does not exist in Kubernetes.
+  clusterIP: 10.96.100.80
+  selector:
+    app: git-bridge
+  ports:
+    - {name: http, port: 8000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  serviceName: git-bridge
+  replicas: 1                     # git-bridge must run as a singleton
+  selector:
+    matchLabels:
+      app: git-bridge
+  template:
+    metadata:
+      labels:
+        app: git-bridge
+    spec:
+      # The Service "git-bridge" would inject GIT_BRIDGE_PORT=tcp://..., which git-bridge uses as its port
+      enableServiceLinks: false
+      containers:
+        - name: git-bridge
+          image: ghcr.io/ayaka-notes/overleaf-pro/git-bridge:6.3.2   # same tag as overleaf-pro
+          command: ["/server-pro-start.sh"]
+          securityContext:
+            runAsUser: 0
+          env:
+            - {name: GIT_BRIDGE_API_BASE_URL, value: "http://overleaf-internal.overleaf.svc.cluster.local:3000/api/v0/"}
+            - {name: GIT_BRIDGE_OAUTH2_SERVER, value: "http://overleaf.overleaf.svc.cluster.local"}
+            - {name: GIT_BRIDGE_POSTBACK_BASE_URL, value: "http://git-bridge.overleaf.svc.cluster.local:8000"}
+            - {name: GIT_BRIDGE_ROOT_DIR, value: /data/git-bridge}
+          ports:
+            - containerPort: 8000
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data/git-bridge}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+`10.96.100.80` debe ser una dirección libre dentro del CIDR de servicios de tu clúster (el valor por defecto de kubeadm es `10.96.0.0/12`).
+</Step>
+
+<Step title="Haz que Ayakaleaf Pro apunte a él">
+Añade a `30-config.yaml`:
+
+```yaml title="30-config.yaml (additions)"
+  GIT_BRIDGE_ENABLED: "true"
+  GIT_BRIDGE_HOST: "10.96.100.80"     # the fixed ClusterIP of the Service git-bridge
+  GIT_BRIDGE_PORT: "8000"
+  V1_HISTORY_URL: http://overleaf-internal.overleaf.svc.cluster.local:3100/api
+```
+
+```bash
+kubectl apply -f 45-git-bridge.yaml -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf
+kubectl -n overleaf rollout status statefulset/git-bridge
+```
+</Step>
+
+<Step title="Clona un proyecto">
+Crea un token de autenticación de Git en **Account Settings** y, después:
+
+```bash
+git clone http://192.0.2.10:30080/git/<project id>
+```
+
+Usa `git` como nombre de usuario y el token como contraseña.
+</Step>
+</Steps>
+
+### Por qué el manifiesto es así
+
+* <strong>Una ClusterIP fija como `GIT_BRIDGE_HOST`.</strong> El nginx de la imagen de Ayakaleaf Pro reenvía `/git/` con un resolver configurado en `127.0.0.11`, el DNS integrado de Docker. Kubernetes no tiene ningún servidor DNS ahí, así que un nombre de host como `git-bridge` falla con `502` y "git-bridge could not be resolved" en `/var/log/nginx/error.log`. Una dirección IP no necesita resolución.
+* <strong>`overleaf-internal`.</strong> git-bridge necesita los puertos `3000` (API de web) y `3100` (historial) del pod de Ayakaleaf Pro. Un Service ClusterIP independiente los mantiene dentro del clúster; añadirlos al Service NodePort los publicaría en todos los nodos.
+* <strong>`enableServiceLinks: false`.</strong> El Service `git-bridge` haría que Kubernetes añadiera `GIT_BRIDGE_PORT=tcp://10.96.100.80:8000` al pod; git-bridge lee `GIT_BRIDGE_PORT` como su puerto de escucha y se detiene con `MalformedJsonException ... path $.port`.
+* <strong>Una réplica con su propio volumen.</strong> git-bridge guarda en disco un repositorio git por cada proyecto clonado y no debe ejecutarse dos veces. Haz copias de seguridad de su volumen.
+
+### Probado en Kubernetes
+
+En Kubernetes 1.37 con tres réplicas detrás de HAProxy y git-bridge como contenedor hermano de `overleaf-0`, nuestras pruebas de extremo a extremo para la integración con Git se superan (19 casos), también con git-bridge movido al puerto 8001 para que nginx tenga que usar `GIT_BRIDGE_HOST` y `GIT_BRIDGE_PORT`: los tokens de Git en la configuración de la cuenta, el comando de clonación en el editor, clone, push y pull, archivos binarios y carpetas, cambios de nombre y eliminaciones, el rechazo de pushes desactualizados, el acceso por rol (los editores invitados y los editores mediante enlace pueden hacer push, los lectores y revisores solo pueden clonar, los usuarios sin acceso son rechazados), el rechazo de tokens incorrectos y eliminados, las rutas internas de git-bridge protegidas detrás de nginx, y las cuentas suspendidas. Los propios tokens de autenticación de Git (generación, listado, el límite por usuario, eliminación, caducidad, la comprobación que git-bridge solicita a web, y los tokens de cuentas suspendidas y eliminadas) se superan en una réplica (16 casos).
+
+### Preguntas y respuestas
+
+<Accordion title="`git clone` devuelve 502.">
+
+<strong>Respuesta:</strong> Comprueba `GIT_BRIDGE_HOST`: debe ser la dirección IP del Service de git-bridge, no su nombre; consulta más arriba. `kubectl -n overleaf exec deploy/overleaf -- tail /var/log/nginx/error.log` muestra el motivo.
+
+</Accordion>

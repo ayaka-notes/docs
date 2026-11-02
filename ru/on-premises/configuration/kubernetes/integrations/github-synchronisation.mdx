@@ -1,0 +1,67 @@
+---
+title: Синхронизация с GitHub
+description: Позвольте пользователям синхронизировать проекты с репозиториями GitHub или GitHub Enterprise в развёртывании на Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+Синхронизация с GitHub работает в сервисе **web** (модуль `github-sync`) каждого пода Ayakaleaf Pro. Для неё требуется [интеграция с Git](/ru/on-premises/configuration/kubernetes/integrations/git-integration). Как создать OAuth-приложение и что делает каждая настройка, описано на странице [Синхронизация с GitHub](/ru/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); эта страница переносит всё это в Kubernetes.
+
+| | |
+| --- | --- |
+| Сервис | web (модуль `github-sync`) в каждом поде Ayakaleaf Pro; считывается при запуске web |
+| Под → GitHub | `https://api.github.com` (REST и GraphQL) или API из `GITHUB_SYNC_URL` — каждый раз, когда пользователь привязывает учётную запись, импортирует, экспортирует или синхронизирует |
+| Браузер → GitHub | `https://github.com/login/oauth/authorize` для привязки учётной записи, затем возврат на `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | нет: вебхуков нет, экземпляр не обязан быть доступен из GitHub |
+| Хранимые данные | токены доступа GitHub пользователей, в зашифрованном виде, в MongoDB |
+| Периодические задачи | нет: синхронизация происходит, когда пользователь нажимает кнопку |
+
+### Настройка
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` и StatefulSet git-bridge из раздела [Интеграция с Git](/ru/on-premises/configuration/kubernetes/integrations/git-integration) должны быть уже настроены: без них настройки учётной записи и редактор скрывают синхронизацию с GitHub.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` шифрует токены доступа GitHub пользователей в MongoDB. Все реплики должны использовать одно и то же значение, а его последующее изменение заставит каждого пользователя заново привязать GitHub.
+</Step>
+
+<Step title="Частный CA (необязательно)">
+Если ваш GitHub использует сертификат, выданный вашим собственным центром сертификации (CA), добавьте сертификат CA в Secret `overleaf-certs`, смонтированный в `/var/lib/overleaf/certs` (см. [Сертификаты и другие файлы](/ru/on-premises/configuration/kubernetes#сертификаты-и-другие-файлы)), и задайте `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` в ConfigMap.
+</Step>
+
+<Step title="Применение, перезапуск и проверка">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Любой HTTP-статус означает, что GitHub доступен из этого пода; `000` означает, что он недоступен.
+</Step>
+</Steps>
+
+### Несколько реплик
+
+Ничего дополнительного, кроме общего `GITHUB_TOKEN_CIPHER_PASSWORD`, не требуется. Синхронизация берёт блокировку в Redis, общую с другими Git-синхронизациями, поэтому две реплики никогда не синхронизируют один и тот же проект одновременно.
+
+### Проверено на Kubernetes
+
+На макете github.com и его REST и GraphQL API (доверие через `NODE_EXTRA_CA_CERTS` из `overleaf-certs`), в Kubernetes 1.37 с одной репликой и включённой интеграцией с Git наши сквозные тесты синхронизации с GitHub проходят (31 сценарий): привязка и отвязка учётной записи, отозванные токены, экспорт проекта в новый приватный репозиторий или репозиторий организации, импорт репозитория (в том числе превышающего лимит загрузки), pull и push, слияния, конфликты и ручные слияния, удалённые ветки и ветки после force push, бинарные файлы, переименования и удаления, потеря права на push, а также то, что могут делать владельцы, редакторы и читатели.

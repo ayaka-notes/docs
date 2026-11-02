@@ -1,0 +1,116 @@
+---
+title: SAML 身份验证
+description: 在 Kubernetes 部署中让用户通过 SAML 2.0 身份提供商登录。
+icon: building-columns
+---
+
+SAML 登录由每个 Ayakaleaf Pro pod 中的 **web** 服务（`authentication` 模块）处理。它没有后台任务，也没有单独的 pod。请按照 [SAML 身份验证](/zh-Hans/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication)中的说明设置身份提供商（IdP），然后按如下方式将这些值和 IdP 证书放入 Kubernetes。
+
+### 各组件的运行位置
+
+| | |
+| --- | --- |
+| 服务 | web，位于每个 Ayakaleaf Pro pod 中；设置和 IdP 证书在 web 启动时读取 |
+| Pod → IdP | 无：所有 SAML 消息都经由浏览器传递 |
+| 浏览器 → IdP | `OVERLEAF_SAML_ENTRYPOINT`（登录）、`OVERLEAF_SAML_LOGOUT_URL`（退出登录） |
+| 浏览器 → Overleaf | `POST ${OVERLEAF_SITE_URL}/saml/login/callback`（ACS）、`/saml/logout/callback`、`/saml/meta`（SP 元数据） |
+| 文件 | IdP 证书，以及可选的 Overleaf 自身的密钥和证书，均来自 Secret `overleaf-certs` |
+| 定期任务 | 无 |
+
+### 配置
+
+<Steps>
+<Step title="在 IdP 中注册 Overleaf">
+| IdP 设置 | 值 |
+| --- | --- |
+| ACS URL（断言消费者服务） | `${OVERLEAF_SITE_URL}/saml/login/callback`，HTTP-POST 绑定 |
+| 单点退出 URL | `${OVERLEAF_SITE_URL}/saml/logout/callback` |
+| Audience / SP 实体 ID | 你在 `OVERLEAF_SAML_ISSUER` 中设置的值 |
+
+[goauthentik 分步指南](/zh-Hans/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#step-by-step-goauthentik)展示了这些设置所在的位置。
+</Step>
+
+<Step title="将 IdP 证书放入 Secret `overleaf-certs`">
+Toolkit 从 `data/overleaf/certs/` 读取证书。在 Kubernetes 上，证书来自挂载在 `/var/lib/overleaf/certs` 的 Secret `overleaf-certs`，如[证书和其他文件](/zh-Hans/on-premises/configuration/kubernetes#证书和其他文件)中所述：
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem
+```
+
+如果该 Secret 已存在，请改为将文件添加进去：带上所有 `--from-file` 删除并重新创建它，或使用 `kubectl -n overleaf edit secret overleaf-certs`。
+
+`OVERLEAF_SAML_IDP_CERT` 接受一个路径，或在证书轮换期间接受一个 JSON 路径列表。它不接受 PEM 文本本身。
+</Step>
+
+<Step title="将设置添加到 ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: saml
+  OVERLEAF_SAML_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_SAML_ENTRYPOINT: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_LOGOUT_URL: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_ISSUER: overleaf
+  OVERLEAF_SAML_IDP_CERT: /var/lib/overleaf/certs/idp_cert.pem
+  OVERLEAF_SAML_WANT_ASSERTIONS_SIGNED: "true"
+  OVERLEAF_SAML_WANT_AUTHN_RESPONSE_SIGNED: "true"
+  OVERLEAF_SAML_USER_ID_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_EMAIL_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+  OVERLEAF_SAML_FIRST_NAME_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+  OVERLEAF_SAML_LAST_NAME_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_IS_ADMIN_FIELD: http://schemas.xmlsoap.org/claims/Group
+  OVERLEAF_SAML_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_SAML_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+所有 `OVERLEAF_SAML_*` 设置都列在[环境变量](/zh-Hans/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#environment-variables)中。它们都放入 ConfigMap：其中没有任何一项本身是机密。密钥文件（`OVERLEAF_SAML_PRIVATE_KEY`、`OVERLEAF_SAML_DECRYPTION_PVK`）放入 `overleaf-certs`，ConfigMap 中保存它们的路径。
+
+<Warning>
+
+请为 `"true"`、`"false"` 以及 JSON 值（例如 `OVERLEAF_SAML_AUTHN_CONTEXT: '["urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"]'`）加上引号。如果某项设置不是有效的布尔值或 JSON 值，SAML 策略将无法加载，而 pod 仍会报告就绪；此时通过 SAML 登录会失败。每次更改后请检查 `web.log`，参见下方的问答。
+
+</Warning>
+</Step>
+
+<Step title="应用并重启">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+IdP 证书和密钥在 web 启动时读取，因此 `overleaf-certs` 中的新证书同样需要执行此重启。
+</Step>
+</Steps>
+
+### 多个副本
+
+IdP 通过跨站 `POST` 将用户送回 ACS URL。浏览器不会随该请求发送 `SameSite=Lax` cookie，因此该请求既不携带 Overleaf 的会话 cookie，在 Chrome 和 Edge 中也不携带负载均衡器的粘性 cookie，它可能到达任意副本。在默认设置下这无关紧要：接收请求的副本会在 Redis 中创建会话，此后负载均衡器会让用户保持在该副本上。
+
+<Warning>
+
+运行多个副本时，请不要设置 `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO`（其默认值为 `never`）。设为 `always` 或 `ifPresent` 时，每个副本都会在自己的内存中记住它发送给 IdP 的请求，而到达另一个副本的响应会被以“InResponseTo is not valid”拒绝：用户会停留在 `/saml/login/callback`。在我们使用三个副本和 `always` 的测试中，19 个 SAML 测试用例中有 12 个以这种方式失败，而使用默认值时全部通过。使用一个副本时，SAML 登录在 `always` 下也能通过。
+
+</Warning>
+
+### 在 Kubernetes 上的测试
+
+以 goauthentik 作为 IdP（HTTP-POST 绑定，断言和响应均已签名），在 Kubernetes 1.37 上，三个副本位于 HAProxy 之后，我们针对 SAML 的端到端测试全部通过（19 个用例）：通过 launchpad 创建的首个管理员经由 SAML 登录、使用来自 `overleaf-certs` 的 IdP 证书登录、创建账户并再次登录、按组映射管理员以及不进行映射、每次登录时更新姓名和管理员标志、通过 IdP 退出登录、SAML 账户的密码规则，以及已停用的账户。`OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` 保持默认值。
+
+### 问答
+
+<Accordion title="通过 SAML 登录时立即显示“Something went wrong”">
+
+<strong>答：</strong>SAML 策略加载失败。pod 仍会进入就绪状态，因此请查看每个 pod 的 web 日志：
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "saml|passport" /var/log/overleaf/web.log | tail
+```
+
+常见原因：`OVERLEAF_SAML_IDP_CERT` 指向的文件不在 `overleaf-certs` 中、布尔值既不是 `"true"` 也不是 `"false"`，或 JSON 无效。当 `EXTERNAL_AUTH` 列出了多种方式时，此类错误还会关闭排在 SAML 之后的方式（顺序为 `ldap`、`saml`、`oidc`）。
+
+</Accordion>
+
+<Accordion title="IdP 需要访问 Overleaf，还是 Overleaf 需要访问 IdP？">
+
+<strong>答：</strong>就登录和退出登录而言，两者都不需要：IdP 和 Overleaf 只通过用户的浏览器交换消息。只有当你为 IdP 配置了元数据 URL 时，它才会下载 `${OVERLEAF_SITE_URL}/saml/meta`。
+
+</Accordion>

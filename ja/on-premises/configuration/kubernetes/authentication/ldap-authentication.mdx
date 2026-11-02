@@ -1,0 +1,112 @@
+---
+title: LDAP 認証
+description: Kubernetes デプロイで、ユーザーが LDAP または Active Directory のアカウントでログインできるようにします。
+icon: address-book
+---
+
+LDAP ログインは、各 Ayakaleaf Pro Pod 内の **web** サービス（`authentication` モジュール）が処理します。OIDC や SAML とは異なり、Pod 自身がディレクトリと通信します。ディレクトリ側は [LDAP 認証](/ja/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication) のとおりに設定し、その値を以下の手順で Kubernetes に設定します。
+
+### 各処理の実行場所
+
+| | |
+| --- | --- |
+| サービス | web、すべての Ayakaleaf Pro Pod 内。設定と CA は web の起動時に読み込まれます |
+| Pod → LDAP サーバー | `OVERLEAF_LDAP_URL`：ログインごとに新しい接続。`OVERLEAF_LDAP_CONTACTS_FILTER` を設定している場合は連絡先の検索ごとにも接続 |
+| ブラウザ → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| ログイン状態 | Redis 内のセッションとレート制限。すべてのレプリカで共有されます |
+| 定期ジョブ | なし |
+
+### 設定
+
+<Steps>
+<Step title="Pod からディレクトリに到達できるようにする">
+Ayakaleaf Pro を実行するすべての Pod が LDAP 接続を開きます。ファイアウォールや NetworkPolicy でディレクトリを保護している場合は、Pod がクラスター外に出る際のアドレス（通常はノードのアドレス、またはエグレスゲートウェイ）を許可してください。
+
+イメージには `ldapsearch` が含まれていません。クラスター内から [検索の確認](/ja/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) を実行するには、使い捨ての Pod を使用します。
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+ちょうど 1 つの `dn:` が出力される必要があります。
+</Step>
+
+<Step title="ConfigMap に設定を追加する">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+すべての `OVERLEAF_LDAP_*` 設定は [環境変数](/ja/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables) に一覧があります。バインドパスワード以外はすべて ConfigMap に設定します。`"true"`、`"false"`、`OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'` のような JSON 値、`*` で始まる値は引用符で囲んでください。
+</Step>
+
+<Step title="バインドパスワードを Secret に設定する">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="独自 CA を使った LDAPS または STARTTLS（任意）">
+CA を `/var/lib/overleaf/certs` にマウントされる Secret `overleaf-certs` に格納し（[証明書とその他のファイル](/ja/on-premises/configuration/kubernetes#証明書とその他のファイル) を参照）、そのパスを指定します。
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+この CA リストは、LDAP 接続においてシステムの CA を置き換えます。web の起動時に読み込まれます。
+</Step>
+
+<Step title="適用して再起動する">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### 複数のレプリカ
+
+手順 1 のファイアウォール以外に追加の作業は不要です。各レプリカがそれぞれディレクトリに接続し、ログイン結果は Redis のセッションに保存されます。
+
+### Kubernetes でのテスト結果
+
+goauthentik の LDAP アウトポストをディレクトリとして使用し、Kubernetes 1.37 上で HAProxy の背後に 3 つのレプリカを配置した構成で、LDAP のエンドツーエンドテストに合格しました（26 ケース）。対象は、launchpad で作成した最初の管理者の LDAP 経由でのログイン、Secret のバインドパスワードを使ったログイン、誤ったパスワードと未知のユーザーの拒否、グループによる管理者マッピングとマッピングなしの場合、ログインごとの名前と管理者フラグの更新（名前属性 1 つ、または姓と名）、ディレクトリの連絡先、ログアウト、LDAP アカウントのパスワードルール、停止されたアカウント、そして reCAPTCHA を併用した LDAP ログインです。
+
+### Q\&A
+
+<Accordion title="一部の Pod でのみ LDAP ログインが失敗する">
+
+<strong>回答：</strong>ディレクトリにすべてのノードから到達できていません。各 Pod から確認してください。
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="ログインが失敗した理由はどこで確認できますか？">
+
+<strong>回答：</strong>そのログインを処理した Pod の web ログで確認できます。
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

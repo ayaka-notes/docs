@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Yhdistä Kubernetes-käyttöönotto Redisiin salasanalla ja säilytä Redisin tiedot AOF-pysyvyydellä.
+icon: memory
+---
+
+Jokainen Ayakaleaf Pro -palvelu, joka säilyttää reaaliaikaista tilaa, käyttää samaa Redis-palvelinta: web (istunnot, käyttörajoitukset), real-time, document-updater (muokkaukset, joita ei ole vielä tallennettu MongoDB:hen), project-history (historiajono) ja third-party-datastore (Dropbox-jono). Asennus ajaa sitä StatefulSetinä `redis` sivun [3. MongoDB:n ja Redisin käyttöönotto](/fi/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis) mukaisesti; Toolkitin osalta katso [Redis](/fi/on-premises/configuration/overleaf-toolkit/redis).
+
+| | |
+| --- | --- |
+| Palvelut | web, real-time, document-updater, project-history, history-v1, third-party-datastore, jokaisessa Ayakaleaf Pro -podissa |
+| Asetukset | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (oletus `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| Ei tuettu | Redis Sentinel ja Redis Cluster: vain yksi palvelin |
+
+### Salasanatodennus
+
+<Steps>
+<Step title="Tallenna salasana">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Käynnistä Redis salasanalla">
+Anna tiedostossa `20-redis.yaml` kontille salasana ja välitä se `redis-server`-ohjelmalle:
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes korvaa `$(REDIS_PASS)`-viittauksen Secretin arvolla. Valmiustarkistus (`tcpSocket`) ei vaadi muutoksia.
+</Step>
+
+<Step title="Ota käyttöön ja käynnistä uudelleen">
+Pysäytä ensin Ayakaleaf Pro, jotta yhtään muokkausta ei menetetä kahden uudelleenkäynnistyksen välillä:
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Hallitun Redisin tapauksessa aseta ConfigMapissa `OVERLEAF_REDIS_HOST` (ja `REDIS_HOST`) sen osoitteeseen, salasana yllä kuvatulla tavalla sekä `OVERLEAF_REDIS_TLS: "true"`, jos se vaatii TLS:n.
+
+### AOF-pysyvyys
+
+Asennus käynnistää Redisin jo valmiiksi asetuksella `--appendonly yes`, joka vastaa Toolkitin asetusta `REDIS_AOF_PERSISTENCE=true`, ja säilyttää sen tiedot taltiolla `data-redis-0`. Jos haluat vaihtaa olemassa olevan, ilman AOF:ää toimivan Redisin, noudata [Toolkit-sivun](/fi/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) ohjeita käyttäen komentoa `kubectl -n overleaf exec -it redis-0 -- redis-cli` `docker exec` -komennon sijaan ja lisää sitten argumentteihin `--appendonly yes`.
+
+### Useita replikoita
+
+Kaikkien replikoiden on käytettävä samaa Redisiä: se sisältää istunnot, muokkaukset, jotka eivät vielä ole MongoDB:ssä, sekä lukot, jotka estävät kahta replikaa käsittelemästä samaa projektia samanaikaisesti.
+
+### Testattu Kubernetesissa
+
+Kubernetes 1.37:ssä yhdellä replikalla Redis, joka käynnistettiin yllä kuvatulla tavalla asetuksella `--requirepass $(REDIS_PASS)` Secretistä `redis-auth`, hylkäsi `redis-cli`-yhteyden ilman salasanaa (`NOAUTH`), ja kun `OVERLEAF_REDIS_PASS` ja `REDIS_PASSWORD` olivat `overleaf-secrets`-Secretissä, päästä päähän -testimme menivät läpi launchpadin osalta (13 tapausta) sekä muokkaamisen osalta muutosten seurannalla, kommenteilla ja anonyymillä jakamisella (22 tapausta), jotka kulkevat webin, real-timen, document-updaterin ja project-historyn kautta; mikään palvelu ei kirjannut Redis-todennusvirhettä. Kaikki muut näiden sivujen Kubernetes-testit ajettiin asennuksen Redis-StatefulSetiä vasten AOF-pysyvyydellä ja ilman salasanaa.

@@ -1,0 +1,136 @@
+---
+title: Atualizando no Kubernetes
+description: Atualize uma implantação do Ayakaleaf Pro no Kubernetes, com uma réplica ou várias.
+icon: arrow-up-from-square
+---
+
+Uma atualização substitui a tag da imagem. A nova versão migra o banco de dados ao iniciar, e essas migrações precisam ser executadas **uma única vez, a partir de um pod, enquanto nenhum pod mais antigo estiver em execução**. No Kubernetes, isso descarta uma simples atualização gradual (rolling update) de um StatefulSet escalado.
+
+<Danger>
+
+Faça um [backup consistente](/pt/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) antes de cada atualização, com o Ayakaleaf Pro parado. Leia as [notas de versão](/pt/on-premises/release-notes) para conhecer as etapas da versão para a qual você está atualizando.
+
+</Danger>
+
+Antes de começar, em cada nó que executa o Ayakaleaf Pro, baixe com `sudo docker pull` qualquer imagem do TeX Live listada pela nova versão ou pela sua nova configuração.
+
+<Tabs>
+<Tab title="Uma réplica">
+
+<Steps>
+<Step title="Pare o Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Faça backup">
+O MongoDB, a partir de qualquer membro:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+O volume de dados, por meio de um pod de curta duração que o monta (ele é alocado no nó do volume):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Faça o mesmo com o volume do git-bridge (`data-git-bridge-0`) e guarde uma cópia do Secret `overleaf-secrets`. Se o seu armazenamento oferecer suporte a [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), um snapshot dos volumes tem o mesmo efeito.
+</Step>
+
+<Step title="Altere a versão e inicie">
+Defina a nova tag em `40-overleaf.yaml` (e em `45-git-bridge.yaml`, que precisa usar a mesma tag) e, em seguida:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+O Deployment usa `strategy: Recreate`, então, mesmo com uma tag alterada, nunca são executadas duas versões ao mesmo tempo.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Várias réplicas">
+
+Para a configuração de [Escalonamento horizontal](/pt/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="Pare todas as réplicas">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Faça backup">
+O MongoDB como na aba de uma réplica, seus buckets S3 com as ferramentas do seu provedor, o volume do git-bridge (`data-git-bridge-0`) e os Secrets. O `/srv/overleaf-ha` das réplicas contém apenas saídas de compilação e não precisa de backup.
+</Step>
+
+<Step title="Inicie uma réplica com a nova versão">
+Defina a nova tag em `70-overleaf.yaml` e `75-git-bridge.yaml`, e `replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Verifique se você consegue fazer login, abrir um projeto e compilar.
+</Step>
+
+<Step title="Inicie as outras réplicas">
+Defina `replicas: 3` novamente e aplique. `OrderedReady` as inicia uma após a outra.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Não altere a imagem de um StatefulSet escalado em execução com `kubectl set image` ou `kubectl apply`: a atualização gradual iniciaria a nova versão, e suas migrações, enquanto réplicas mais antigas ainda atendem os usuários. Alterações de configuração sem uma nova versão funcionam bem como uma reinicialização gradual: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB e Redis
+
+Atualize-os separadamente do Ayakaleaf Pro. Para o MongoDB, siga [Atualizando o MongoDB](/pt/on-premises/maintenance/updating-mongodb) (uma versão principal por vez, `featureCompatibilityVersion` após cada etapa); um replica set adota a nova imagem um membro por vez quando você altera a imagem em `10-mongo.yaml`, porque o StatefulSet substitui `mongo-2`, `mongo-1` e `mongo-0` sucessivamente.
+
+### Revertendo
+
+Pare o Ayakaleaf Pro como acima, restaure o MongoDB a partir do arquivo (`mongorestore --drop --archive --gzip`) e os volumes ou buckets a partir do backup, defina a tag antiga e inicie novamente. De outra forma, as migrações da nova versão não podem ser desfeitas.
+
+### Q\&A
+
+<Accordion title="Uma réplica permanece não pronta, e as outras réplicas nunca iniciam">
+
+<strong>Resposta:</strong> Com `podManagementPolicy: OrderedReady`, `overleaf-1` só inicia quando `overleaf-0` está pronto, e uma atualização gradual não substitui um pod que nunca ficou pronto. Depois de corrigir a causa, por exemplo uma configuração incorreta no ConfigMap, exclua o pod travado para que o StatefulSet o crie novamente a partir do template atual:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Encontramos isso no nosso cluster de teste depois que uma configuração impediu `overleaf-0` de ficar pronto; excluir o pod permitiu que as três réplicas iniciassem.
+
+</Accordion>

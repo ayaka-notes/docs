@@ -1,0 +1,67 @@
+---
+title: GitHub 同期
+description: Kubernetes デプロイで、ユーザーがプロジェクトを GitHub または GitHub Enterprise のリポジトリと同期できるようにします。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub 同期は、すべての Ayakaleaf Pro Pod の **web** サービス（`github-sync` モジュール）で動作します。[Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)が必要です。OAuth アプリケーションの作成方法と各設定の意味は [GitHub 同期](/ja/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation)を参照してください。このページでは、それを Kubernetes に適用する方法を説明します。
+
+| | |
+| --- | --- |
+| サービス | web（`github-sync` モジュール）、すべての Ayakaleaf Pro Pod 内。web の起動時に読み込まれる |
+| Pod → GitHub | `https://api.github.com`（REST および GraphQL）、または `GITHUB_SYNC_URL` の API。ユーザーが連携、インポート、エクスポート、同期を行うたび |
+| ブラウザー → GitHub | アカウント連携のための `https://github.com/login/oauth/authorize`。その後 `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` に戻る |
+| GitHub → Overleaf | なし: Webhook はなく、インスタンスに GitHub からアクセスできる必要はない |
+| 保存されるデータ | ユーザーの GitHub アクセストークン（暗号化済み、MongoDB 内） |
+| 定期ジョブ | なし: 同期はユーザーがクリックしたときに行われる |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` と、[Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)の git-bridge StatefulSet が用意されている必要があります。これらがない場合、アカウント設定とエディターに GitHub 同期は表示されません。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` は、MongoDB 内のユーザーの GitHub アクセストークンを暗号化します。すべてのレプリカで同じ値を使用する必要があり、後から変更すると、すべてのユーザーが GitHub を再度連携する必要があります。
+</Step>
+
+<Step title="プライベート CA（任意）">
+GitHub が独自の CA による証明書を使用している場合は、`/var/lib/overleaf/certs` にマウントされる Secret `overleaf-certs` に CA を追加し（[証明書とその他のファイル](/ja/on-premises/configuration/kubernetes#証明書とその他のファイル)を参照）、ConfigMap で `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` を設定します。
+</Step>
+
+<Step title="適用、再起動、確認">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+何らかの HTTP ステータスが返れば、その Pod から GitHub にアクセスできています。`000` の場合はアクセスできていません。
+</Step>
+</Steps>
+
+### 複数のレプリカ
+
+共有の `GITHUB_TOKEN_CIPHER_PASSWORD` 以外に追加の設定は不要です。同期は Redis 内のロック（他の Git 同期と共有）を取得するため、2 つのレプリカが同じプロジェクトを同時に同期することはありません。
+
+### Kubernetes でのテスト
+
+github.com とその REST および GraphQL API のモック（`overleaf-certs` の `NODE_EXTRA_CA_CERTS` を通じて信頼）に対して、Kubernetes 1.37 上でレプリカ 1 つ、Git 連携を有効にした状態で、GitHub 同期のエンドツーエンドテスト（31 ケース）に合格しています。対象は、アカウントの連携と連携解除、失効したトークン、新しいプライベートリポジトリまたは組織リポジトリへのプロジェクトのエクスポート、リポジトリのインポート（アップロード上限を超える場合も含む）、プルとプッシュ、マージ、コンフリクトと手動マージ、削除されたブランチと強制プッシュされたブランチ、バイナリファイル、名前変更と削除、プッシュ権限の喪失、そしてオーナー、編集者、閲覧者がそれぞれ実行できる操作です。

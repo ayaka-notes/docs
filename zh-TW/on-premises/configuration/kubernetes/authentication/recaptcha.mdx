@@ -1,0 +1,64 @@
+---
+title: reCAPTCHA
+description: 在 Kubernetes 部署中，以 Google reCAPTCHA 保護登入、註冊與密碼重設。
+icon: robot
+---
+
+**web** 服務（`login-register` 模組）會在電子郵件登入、LDAP 登入、註冊與密碼重設時要求通過 reCAPTCHA v2（隱藏式）。請在 [reCAPTCHA](/zh-TW/on-premises/configuration/overleaf-toolkit/authentication/recaptcha) 中建立金鑰並了解各項設定的作用；本頁說明如何將其放入 Kubernetes。
+
+| | |
+| --- | --- |
+| 服務 | web，位於每個 Ayakaleaf Pro pod 中；於 web 啟動時讀取 |
+| Pod → Google | `RECAPTCHA_ENDPOINT`（預設為 `https://www.google.com/recaptcha/api/siteverify`），每個需要檢查的請求 |
+| 瀏覽器 → Google | 來自 `www.recaptcha.net` 的小工具指令碼 |
+| 狀態 | Redis 中的速率限制；加密 Cookie 中的「此瀏覽器已通過」裝置記錄 |
+| 定期工作 | 無 |
+
+### 設定
+
+<Steps>
+<Step title="將網站金鑰放入 ConfigMap">
+```yaml
+  RECAPTCHA_SITE_KEY: <site key>
+  # optional
+  # RECAPTCHA_ENDPOINT: https://www.recaptcha.net/recaptcha/api/siteverify
+  # CAPTCHA_TRUSTED_USERS: robot@example.com
+```
+
+網站金鑰是公開的：每個登入頁面都會顯示它。
+</Step>
+
+<Step title="將密鑰與裝置記錄金鑰放入 Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "RECAPTCHA_SECRET_KEY":"<secret key>",
+  "DEVICE_HISTORY_SECRET":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+請同時設定這兩個金鑰：若只有網站金鑰而沒有密鑰，所有檢查都會失敗，沒有人能以密碼登入、註冊或重設密碼。`DEVICE_HISTORY_SECRET` 必須是 64 個十六進位字元；容器不會自動產生它。
+</Step>
+
+<Step title="套用並重新啟動">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+接著檢查每個 pod 是否都能連線至該端點。每次連線嘗試約一秒後 pod 就會放棄，而無法完成檢查的登入會以錯誤收場：
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://www.google.com/recaptcha/api/siteverify
+done
+```
+</Step>
+</Steps>
+
+### 多個副本
+
+所有副本必須共用 `DEVICE_HISTORY_SECRET`，只要它放在 Secret 中即可做到。若值不同，在某個副本上通過驗證的瀏覽器，到了另一個副本又會再次被要求驗證。速率限制會在 Redis 中跨所有副本計算。
+
+### 在 Kubernetes 上的測試
+
+針對 Google 驗證端點的模擬服務（透過 `overleaf-certs` 中的 `NODE_EXTRA_CA_CERTS` 信任），在 Kubernetes 1.37 上，我們針對 reCAPTCHA 的端對端測試全數通過（13 個案例）：在一個副本上，登入、註冊與密碼重設在沒有驗證或驗證失敗時都會被拒絕、驗證通過時則被接受；來自 `DEVICE_HISTORY_SECRET` 的裝置記錄讓瀏覽器可略過驗證；以及 `CAPTCHA_TRUSTED_USERS`；在 HAProxy 後方的三個副本上，搭配驗證的 LDAP 登入。

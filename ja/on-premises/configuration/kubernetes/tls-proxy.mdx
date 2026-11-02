@@ -1,0 +1,87 @@
+---
+title: TLS プロキシ
+description: Ingress、ロードバランサー、または HAProxy を通じて Kubernetes デプロイを HTTPS で提供します。
+icon: lock
+---
+
+Pod 内では、コンテナの nginx がポート 80 でプレーンな HTTP を提供します。HTTPS は Pod の前段で終端します。Ingress コントローラー、クラウドのロードバランサー、または[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)にあるような HAProxy です。Toolkit の NGINX プロキシ（`bin/init --tls`、`overleaf.rc` の `NGINX_*` と `TLS_*`）に相当するものはありません。Toolkit については [TLS プロキシ](/ja/on-premises/configuration/overleaf-toolkit/tls-proxy)を参照してください。
+
+| | |
+| --- | --- |
+| サービス | Ingress またはロードバランサー。web は起動時に以下の設定を読み込む |
+| ブラウザー → プロキシ | 443 番ポートの HTTPS（エディターの WebSocket を含む） |
+| プロキシ → Pod | Pod の 80 番ポートへのプレーンな HTTP |
+| 定期ジョブ | なし（証明書の更新はプロキシ側の役割） |
+
+### プロキシに必要な要件
+
+* WebSocket（`/socket.io`）を通過させること。
+* 10 分間のリクエスト（長時間のコンパイル）と 50 MB（または `MAX_UPLOAD_SIZE`）のリクエストボディ（アップロード）を許可すること。
+* Pod に対するアイドル時の keep-alive タイムアウトを、Pod 内の nginx のタイムアウトである 65 秒未満にすること。
+* `X-Forwarded-For` と `X-Forwarded-Proto: https` を送信すること。
+* 複数のレプリカを使う場合は、ユーザーを 1 つのレプリカにとどめること。[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)を参照してください。
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+信頼されたアドレスから `X-Forwarded-Proto: https` が送られない場合、Ayakaleaf Pro はリクエストが HTTP で届いたと判断し、セキュアなセッション Cookie を設定しません。その結果、ログインに失敗します。`OVERLEAF_SECURE_COOKIE` は、ユーザーが実際に HTTPS でサイトにアクセスする場合にのみ設定してください。値に関係なく（`"false"` でも）有効になります。
+
+### HAProxy の例
+
+[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)の HAProxy DaemonSet で HTTPS を終端するには、証明書とその鍵を 1 つの PEM ファイルにまとめ、Secret に格納します。
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+次に `80-haproxy.yaml` を変更します。
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+HAProxy が再起動するように `config-hash` を更新し、上記のとおり ConfigMap を設定してレプリカを再起動します。
+
+リダイレクトはリクエストのポートを維持します。ポート 80 と 443 のロードバランサーには適していますが、NodePort では `http://host:30081` を `https://host:30081` に送ってしまいます。前段にロードバランサーがない場合は、リダイレクトの行を省き、ユーザーには `https://...:30443` のアドレスを案内してください。
+
+### Kubernetes でのテスト
+
+Kubernetes 1.37 上でレプリカ 3 つ、上記のように HAProxy で HTTPS を終端し、`OVERLEAF_SITE_URL` を `https://` に、`OVERLEAF_SECURE_COOKIE` を設定した状態でテストしました。ユーザーは `https://` のリンクからアカウントを有効化し、`Secure` 属性付きのセッション Cookie でログインし、プロジェクトをアップロードしてコンパイルして PDF を取得し、同じレプリカにとどまり、エディターの WebSocket（`wss`）を開き、HTTPS 経由で Git のクローンとプッシュを行えました。NodePort での `http://` リクエストは、上記のとおり同じポートの `https://` にリダイレクトされました。

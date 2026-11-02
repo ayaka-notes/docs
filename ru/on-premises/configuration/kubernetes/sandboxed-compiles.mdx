@@ -1,0 +1,64 @@
+---
+title: Изолированная компиляция
+description: Компилируйте LaTeX в контейнерах TeX Live на узлах кластера Kubernetes.
+icon: gear-code
+---
+
+Компиляции выполняет сервис **clsi** внутри каждого пода Ayakaleaf Pro. При включённой изолированной компиляции clsi просит **Docker Engine узла**, на котором работает под, запустить контейнер TeX Live для каждой компиляции и передаёт ему каталог проекта по его пути на этом узле. Как работает изоляция и какие образы существуют, описано на странице [Изолированная компиляция](/ru/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Сервис | clsi (компиляции), web (список образов в настройках компилятора), в каждом поде Ayakaleaf Pro |
+| Узел | Docker Engine и все образы из `ALL_TEX_LIVE_DOCKER_IMAGES` на каждом узле, на котором может работать Ayakaleaf Pro |
+| Монтирования пода | `/var/run/docker.sock`, а также каталоги компиляции, вывода и кэша как тома `hostPath` |
+| Периодические задачи | clsi удаляет каталоги компиляции, не использовавшиеся в течение суток, и каждый час удаляет старые контейнеры TeX Live из Docker узла |
+
+### Настройка
+
+Установка настраивает всё сама: Docker и образы на узлах — в разделе [0. Подготовка узлов](/ru/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), настройки — в разделе [4. Персонализация экземпляра](/ru/on-premises/installation/using-kubernetes/4.-personalizing-your-instance), тома — в разделе [5. Развёртывание Ayakaleaf Pro](/ru/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Настройки, все в ConfigMap:
+
+| Переменная | Значение |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | путь на узле к тому, смонтированному в `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | путь на узле к тому, смонтированному в `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | путь на узле к тому, смонтированному в `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | образы, как в Toolkit |
+
+### Добавление версии TeX Live
+
+<Steps>
+<Step title="Загрузите образ на каждом узле">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit загружает образы сам; в Kubernetes этого никто не делает. Загружайте образы в **Docker**, а не с помощью `crictl`: clsi запрашивает образ у Docker. Компиляция с образом, отсутствующим на узле, завершается ошибкой.
+</Step>
+
+<Step title="Укажите его в ConfigMap и перезапустите">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Узлу, добавленному в кластер позже, нужны Docker и все образы до того, как на нём запустится Ayakaleaf Pro. Если подходят не все узлы, пометьте подходящие метками и закрепите Ayakaleaf Pro на них с помощью `nodeSelector`.
+
+### Несколько реплик
+
+Каждая реплика компилирует на своём узле и хранит там результаты компиляции, поэтому пользователь должен оставаться на реплике, которая выполнила компиляцию, что обеспечивает sticky-cookie балансировщика нагрузки. Никогда не запускайте две реплики на одном узле: они будут использовать общие каталоги компиляции узла. Конфигурация из раздела [Горизонтальное масштабирование](/ru/on-premises/configuration/kubernetes/horizontal-scaling) предотвращает это с помощью `podAntiAffinity`.
+
+Контейнеры TeX Live работают рядом с подом, вне его лимита памяти и вне поля зрения планировщика. Оставляйте на узлах свободную память для них, см. [0. Подготовка узлов](/ru/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Проверено на Kubernetes
+
+В Kubernetes 1.37 с тремя репликами за HAProxy, по одной на узел, и с TeX Live 2026 и 2025, загруженными в Docker на каждом узле, наши сквозные тесты изолированной компиляции проходят (7 сценариев): новый проект компилируется в PDF, настройки компилятора предлагают оба образа и переключаются между ними, XeLaTeX с fontspec, ошибки LaTeX и повторная компиляция после исправления, остановка выполняющейся компиляции и SyncTeX в обоих направлениях. Нагрузочный тест, в котором 12 пользователей одновременно компилировали документ на 600 страниц, выполнял по 4 компиляции на узел, см. [Чего ожидать](/ru/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

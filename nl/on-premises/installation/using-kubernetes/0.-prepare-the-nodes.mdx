@@ -1,0 +1,100 @@
+---
+title: 0. De nodes voorbereiden
+description: Installeer Docker Engine, containerd en kubeadm op de nodes, en pull de TeX Live-images.
+icon: server
+---
+
+Ayakaleaf Pro compileert LaTeX in [gesandboxte](/nl/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) TeX Live-containers. Het start deze zelf, via de Docker-socket van de machine waarop het draait. Op Kubernetes betekent dit:
+
+* op elke node die de Ayakaleaf Pro-pod kan draaien, is **Docker Engine** geïnstalleerd en actief;
+* elke TeX Live-image die je configureert, is op elk van die nodes **in Docker** gepulld.
+
+De kubelet kan containerd blijven gebruiken: Docker Engine levert `containerd.io` mee, en beide gebruiken dezelfde daemon in verschillende namespaces.
+
+<Warning>
+
+Beheerde node pools zonder Docker (de meeste standaardinstellingen van EKS, GKE en AKS) kunnen geen sandboxed compiles draaien. Gebruik node pools waarop je Docker Engine kunt installeren, of label zulke nodes en houd Ayakaleaf Pro erop met een `nodeSelector`.
+
+</Warning>
+
+De onderstaande stappen zijn voor Ubuntu 24.04 en een cluster gebouwd met kubeadm. Als je cluster al bestaat, voer dan stap 1, 2 en 5 uit op de nodes die Ayakaleaf Pro zullen draaien.
+
+<Steps>
+<Step title="Kernelmodules en sysctls">
+```bash
+printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+sudo modprobe overlay && sudo modprobe br_netfilter
+printf 'net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1\n' \
+  | sudo tee /etc/sysctl.d/99-k8s.conf
+sudo sysctl --system
+sudo swapoff -a   # and comment out swap in /etc/fstab
+```
+</Step>
+
+<Step title="Docker Engine">
+Installeer Docker Engine vanuit de repository van Docker zoals in [0. Docker installeren](/nl/on-premises/installation/using-the-toolkit/0.-setup-docker). De Compose-plugin is niet nodig. Hiermee wordt ook `containerd.io` geïnstalleerd.
+</Step>
+
+<Step title="containerd voor de kubelet">
+In het pakket `containerd.io` uit de repository van Docker staat de CRI-plugin uit. Schrijf de volledige standaardconfiguratie weg, die deze inschakelt, en zet deze om naar systemd-cgroups:
+
+```bash wrap
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+# containerd 2.x writes config_path = '' and ignores /etc/containerd/certs.d without this
+sudo sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|" /etc/containerd/config.toml
+sudo systemctl restart containerd docker
+```
+</Step>
+
+<Step title="kubeadm, kubelet en kubectl">
+Volg [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/), maak daarna het cluster aan met `kubeadm init` en `kubeadm join` en installeer een netwerkplugin. Bijvoorbeeld met flannel:
+
+```yaml title="kubeadm-config.yaml"
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+networking:
+  podSubnet: 10.244.0.0/16   # flannel's default
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+# Compile containers are started by Docker, outside the kubelet's accounting: keep memory for them
+systemReserved:
+  memory: 300Mi
+kubeReserved:
+  memory: 200Mi
+```
+
+```bash
+sudo kubeadm init --config kubeadm-config.yaml
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+```
+
+Het cluster heeft ook een standaard-StorageClass nodig. Voor een testcluster werkt [local-path-provisioner](https://github.com/rancher/local-path-provisioner); gebruik in productie de blokopslag van je platform (Longhorn, Ceph, een CSI-driver van een cloudprovider).
+</Step>
+
+<Step title="TeX Live-images">
+Pull op **elke** node die Ayakaleaf Pro kan draaien de TeX Live-images die je in `ALL_TEX_LIVE_DOCKER_IMAGES` zult opnemen met Docker, bijvoorbeeld:
+
+```bash
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+`crictl pull` of `ctr` helpen hier niet: Ayakaleaf Pro vraagt Docker om de image. De volledige images zijn groot (elk ongeveer 28 GB); zie [Sandboxed Compiles](/nl/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) voor de lijst. Voor een eerste test is `ghcr.io/ayaka-notes/texlive-basic:2026.1` (ongeveer 630 MB, een minimale TeX Live) voldoende.
+</Step>
+</Steps>
+
+### Q\&A
+
+<Accordion title="Kan ik Ayakaleaf Pro draaien op nodes zonder Docker?">
+
+<strong>Antwoord:</strong> Alleen met `SANDBOXED_COMPILES=false`. Compilaties draaien dan binnen de Ayakaleaf Pro-container met de kleine ingebouwde TeX Live, en LaTeX-documenten kunnen alles lezen en schrijven wat die container kan. We raden dit niet aan; zie [Sandboxed Compiles](/nl/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+</Accordion>
+
+<Accordion title="Tellen compilaties mee voor de geheugenlimiet van de pod?">
+
+<strong>Antwoord:</strong> Nee. De TeX Live-containers worden gestart door de Docker van de node, buiten de pod en buiten het zicht van de kubelet. Laat geheugen vrij op de node voor deze containers, bijvoorbeeld met `systemReserved` zoals hierboven, en vul de node niet met andere pods.
+
+</Accordion>

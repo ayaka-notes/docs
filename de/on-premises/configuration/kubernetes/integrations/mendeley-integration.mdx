@@ -1,0 +1,56 @@
+---
+title: Mendeley-Integration
+description: Ermöglichen Sie Benutzern, in einem Kubernetes-Deployment eine .bib-Datei aus ihrer Mendeley-Bibliothek zu importieren.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Der Mendeley-Import läuft im **web**-Dienst (dem Modul `tpr-webmodule`) jedes Ayakaleaf Pro-Pods. Registrieren Sie die Mendeley-Anwendung wie unter [Mendeley-Integration](/de/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration) beschrieben, mit der Weiterleitungs-URL `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`, und konfigurieren Sie dann Kubernetes wie unten gezeigt.
+
+| | |
+| --- | --- |
+| Dienst | web, in jedem Ayakaleaf Pro-Pod; wird beim Start von web gelesen |
+| Pod → Mendeley | `https://api.mendeley.com` (OAuth-Token und API), wenn ein Benutzer Mendeley verknüpft oder eine Datei importiert bzw. aktualisiert |
+| Browser → Mendeley | `https://api.mendeley.com/oauth/authorize`, danach zurück zur Weiterleitungs-URL |
+| Mendeley → Overleaf | keine: Die Instanz muss nicht aus dem Internet erreichbar sein |
+| Gespeicherte Daten | die Mendeley-Token des Benutzers, verschlüsselt, in MongoDB |
+| Periodische Jobs | keine: Eine Datei wird nur aktualisiert, wenn ein Benutzer dies anfordert |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+Setzen Sie die Anwendungs-ID in Anführungszeichen: Sie ist eine Zahl, und eine ConfigMap enthält nur Zeichenketten. `ENABLED_LINKED_FILE_TYPES` ersetzt den Wert aus der Installation; behalten Sie die bereits vorhandenen Typen bei und fügen Sie `mendeley` hinzu (sowie `zotero`, wenn Sie beide verwenden).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD` verschlüsselt die Mendeley-Token der Benutzer in MongoDB. Ohne diese Variable erzeugt jeder Pod eine Schlüsseldatei in seinem eigenen `/var/lib/overleaf/data`. Mit [mehreren Replikaten](/de/on-premises/configuration/kubernetes/horizontal-scaling) hat dann jeder Knoten einen anderen Schlüssel, und ein Benutzer, der von einem anderen Replikat bedient wird, kann sein verknüpftes Mendeley-Konto nicht verwenden. Setzen Sie sie, bevor der erste Benutzer Mendeley verknüpft: Eine spätere Änderung zwingt alle Benutzer, Mendeley erneut zu verknüpfen.
+</Step>
+
+<Step title="Anwenden und neu starten">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Mehrere Replikate
+
+Setzen Sie `MENDELEY_CIPHER_PASSWORD` im Secret, siehe oben. Mendeley-Token werden mit demselben Code verschlüsselt wie die Zotero-Schlüssel: Ohne das Passwort kann eine auf einem Replikat importierte Datei auf einem anderen nicht aktualisiert werden, wie wir bei [Zotero](/de/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas) gesehen haben. Der OAuth-`state` wird in der Sitzung in Redis gehalten, daher kann der Callback jedes Replikat erreichen.
+
+### Auf Kubernetes getestet
+
+Gegen einen Mock von api.mendeley.com (vertraut über `NODE_EXTRA_CA_CERTS` aus `overleaf-certs`) bestehen auf Kubernetes 1.37 mit drei Replikaten hinter HAProxy unsere End-to-End-Tests für Mendeley (18 Fälle): Verknüpfen über OAuth 2.0 und Trennen, Import der Bibliothek und Gruppen in eine `.bib`-Datei, deren Aktualisierung, Erneuern eines ablaufenden Zugriffstokens, widerrufene Token, Aufforderung zum erneuten Verknüpfen, für Mitarbeitende durchsuchbare Literaturangaben, Aktualisierung nur durch den Importierenden, API-Fehler und langsame Verbindungen zu Mendeley.

@@ -1,0 +1,90 @@
+---
+title: Kubernetes
+description: Kubernetes デプロイを設定します - 設定、シークレット、ファイルの置き場所と、機能ごとのページ。
+icon: dharmachakra
+---
+
+Kubernetes デプロイは、Toolkit と同じ環境変数を読み込みます。Toolkit のページで「`config/variables.env` に追加する」とある場合は、その値を ConfigMap `overleaf-env` に設定します。パスワード、鍵、トークンの場合は Secret `overleaf-secrets` に設定します。その後、再起動します。
+
+```bash
+kubectl -n overleaf apply -f 30-config.yaml        # after editing the ConfigMap
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+kubectl -n overleaf rollout restart deployment/overleaf
+```
+
+`config/overleaf.rc` の値は環境変数ではなく Toolkit の設定です。それらを何で置き換えるかは、このページ末尾の Q\&A で説明しています。
+
+### 機能
+
+Toolkit の設定にある各機能について、ここにページを用意しています。各ページでは、サービス、設定、ネットワーク経路、バックグラウンドジョブ、複数のレプリカで変わる点、テスト方法を説明しています。
+
+| 機能 | Pod 内のサービス | ConfigMap と Secret 以外に必要なもの |
+| --- | --- | --- |
+| [認証](/ja/on-premises/configuration/kubernetes/authentication)：[OIDC](/ja/on-premises/configuration/kubernetes/authentication/oidc-authentication)、[SAML](/ja/on-premises/configuration/kubernetes/authentication/saml-authentication)、[LDAP](/ja/on-premises/configuration/kubernetes/authentication/ldap-authentication)、[パブリックアクセス](/ja/on-premises/configuration/kubernetes/authentication/public-access)、[reCAPTCHA](/ja/on-premises/configuration/kubernetes/authentication/recaptcha)、[パスワードの制限](/ja/on-premises/configuration/kubernetes/authentication/password-restrictions) | web | クライアントシークレット、IdP 証明書、LDAP の CA |
+| [サンドボックスコンパイル](/ja/on-premises/configuration/kubernetes/sandboxed-compiles) | clsi | すべてのノード上の Docker Engine と TeX Live イメージ |
+| [Pandoc のインポートとエクスポート](/ja/on-premises/configuration/kubernetes/pandoc-import-and-export) | clsi、web | すべてのノードの Docker 上の Pandoc イメージ |
+| [Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration) | git-bridge（専用 Pod）、web、history-v1 | git-bridge の StatefulSet と 2 つの Service |
+| [GitHub](/ja/on-premises/configuration/kubernetes/integrations/github-synchronisation)、[GitLab](/ja/on-premises/configuration/kubernetes/integrations/gitlab-synchronisation)、[Gitea](/ja/on-premises/configuration/kubernetes/integrations/gitea-synchronisation) 同期 | web | Git 連携 |
+| [Dropbox 同期](/ja/on-premises/configuration/kubernetes/integrations/dropbox-synchronisation) | web、third-party-datastore、document-updater | Git 連携、インターネットから到達可能な Webhook、データベースのインデックス |
+| [Zotero](/ja/on-premises/configuration/kubernetes/integrations/zotero-integration)、[Mendeley](/ja/on-premises/configuration/kubernetes/integrations/mendeley-integration) 連携 | web | Secret 内の暗号化パスワード |
+| [MCP サーバー](/ja/on-premises/configuration/kubernetes/integrations/mcp-server) | web | Git 連携 |
+| [AI 連携](/ja/on-premises/configuration/kubernetes/integrations/ai-integration) | web、linked-url-proxy | – |
+| [Overleaf インポート API](/ja/on-premises/configuration/kubernetes/integrations/overleaf-import-api) | web、linked-url-proxy | – |
+| [テンプレート](/ja/on-premises/configuration/kubernetes/templates) | web、filestore | 複数のレプリカの場合は S3 |
+| [外部 URL](/ja/on-premises/configuration/kubernetes/external-url) | linked-url-proxy | `OVERLEAF_LINKED_URL_BLOCKED_NETWORKS` に設定するノードのパブリックアドレス |
+| [ロギング](/ja/on-premises/configuration/kubernetes/logging) | すべてのサービス | ログを保持するための `/var/log/overleaf` のボリューム |
+| [TLS プロキシ](/ja/on-premises/configuration/kubernetes/tls-proxy) | Ingress またはロードバランサー | TLS は Pod の手前で終端 |
+| [ブランディング](/ja/on-premises/configuration/kubernetes/branding) | web | – |
+| [ローカライズ](/ja/on-premises/configuration/kubernetes/localization) | web | 言語ごとに 1 つのホスト名 |
+| [メール配信](/ja/on-premises/configuration/kubernetes/email-delivery) | web | – |
+| [Redis](/ja/on-premises/configuration/kubernetes/redis) | ライブ状態を持つすべてのサービス | – |
+| [S3](/ja/on-premises/configuration/kubernetes/s3) | history-v1、filestore | S3 サービス（複数のレプリカでは必須） |
+| [LaTeX ユーザーヘルプの追加](/ja/on-premises/configuration/kubernetes/adding-latex-user-help) | web | Pod から Wiki に到達できる必要があります |
+| [水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling) | すべて | S3、スティッキーセッション対応のロードバランサー |
+
+### 証明書とその他のファイル
+
+一部の機能は、値ではなくファイルパスを受け取ります。SAML 証明書（`OVERLEAF_SAML_IDP_CERT` など）、LDAP の CA（`OVERLEAF_LDAP_TLS_OPTS_CA_PATH`）、セルフホストの GitHub Enterprise、GitLab、Gitea 用のプライベート CA（`NODE_EXTRA_CA_CERTS`）などです。ファイルを Secret に格納し、Toolkit のページが想定する場所 `/var/lib/overleaf/certs` にマウントします。
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem --from-file=ca.pem
+```
+
+```yaml title="40-overleaf.yaml (additions)"
+          volumeMounts:
+            # ...
+            - name: certs
+              mountPath: /var/lib/overleaf/certs
+              readOnly: true
+      volumes:
+        # ...
+        - name: certs
+          secret:
+            secretName: overleaf-certs
+```
+
+次に、ConfigMap でパスを指定して参照し（例：`NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`）、再起動します。
+
+<Warning>
+
+<strong>暗号化パスワード。</strong>使用する機能の `*_CIPHER_PASSWORD` はすべて Secret に設定してください。設定しないと、一部の機能は初回使用時にデータボリューム内に鍵ファイルを生成します。レプリカが 1 つの場合はボリュームが失われるまで機能しますが、複数のレプリカでは各レプリカが異なる鍵で暗号化してしまいます。
+
+</Warning>
+
+### Q\&A
+
+<Accordion title="`config/overleaf.rc` のどの Toolkit 設定が必要ですか？">
+
+<strong>回答：</strong>Ayakaleaf Pro はいずれも読み込みません。Kubernetes での対応は次のとおりです。
+
+| `config/overleaf.rc`                         | Kubernetes                                                        |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `OVERLEAF_LISTEN_IP`、`OVERLEAF_PORT`        | Service（NodePort）または Ingress                            |
+| `SIBLING_CONTAINERS_ENABLED`                 | ConfigMap の `SANDBOXED_COMPILES*`、Pod 内の Docker ソケット  |
+| `GIT_BRIDGE_ENABLED`                         | [Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)                             |
+| `MONGO_ENABLED`、`REDIS_ENABLED`、`MONGO_URL`、`REDIS_HOST` | StatefulSet またはマネージドサービス、`OVERLEAF_MONGO_URL` と `OVERLEAF_REDIS_HOST` |
+| `REDIS_AOF_PERSISTENCE`                      | `20-redis.yaml` 内の `--appendonly yes`                             |
+| `NGINX_ENABLED`、`TLS_*`                     | Ingress またはロードバランサー                                     |
+
+</Accordion>

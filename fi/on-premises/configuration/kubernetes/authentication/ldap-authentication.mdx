@@ -1,0 +1,112 @@
+---
+title: LDAP-todennus
+description: Anna käyttäjien kirjautua LDAP- tai Active Directory -tilillään Kubernetes-käyttöönotossa.
+icon: address-book
+---
+
+LDAP-kirjautumisen hoitaa **web**-palvelu (`authentication`-moduuli) jokaisessa Ayakaleaf Pro -podissa. Toisin kuin OIDC:ssä ja SAML:ssä, podit keskustelevat hakemiston kanssa itse. Määritä hakemiston puoli kuten sivulla [LDAP-todennus](/fi/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication) ja vie sitten arvot Kubernetesiin alla kuvatulla tavalla.
+
+### Missä mikin toimii
+
+| | |
+| --- | --- |
+| Palvelu | web, jokaisessa Ayakaleaf Pro -podissa; asetukset ja CA luetaan, kun web käynnistyy |
+| Pod → LDAP-palvelin | `OVERLEAF_LDAP_URL`: uusi yhteys jokaista kirjautumista varten ja jokaista yhteystietohakua varten, jos `OVERLEAF_LDAP_CONTACTS_FILTER` on asetettu |
+| Selain → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| Kirjautumistila | istunto ja nopeusrajoitukset Redisissä, jaettuina kaikkien replikoiden kesken |
+| Ajastetut tehtävät | ei mitään |
+
+### Konfiguraatio
+
+<Steps>
+<Step title="Salli podien tavoittaa hakemisto">
+Jokainen Ayakaleaf Pro -podi avaa LDAP-yhteyksiä. Jos palomuuri tai NetworkPolicy suojaa hakemistoa, salli ne osoitteet, joista podit lähtevät klusterista: yleensä solmujen osoitteet tai egress-yhdyskäytäväsi.
+
+Imagessa ei ole `ldapsearch`-työkalua. Jos haluat ajaa [haun tarkistuksen](/fi/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) klusterin sisältä, käytä kertakäyttöistä podia:
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+Sen on tulostettava täsmälleen yksi `dn:`.
+</Step>
+
+<Step title="Lisää asetukset ConfigMapiin">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Kaikki `OVERLEAF_LDAP_*`-asetukset on lueteltu kohdassa [Ympäristömuuttujat](/fi/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables). Ne kaikki menevät ConfigMapiin sidontasalasanaa lukuun ottamatta. Lainausmerkitse `"true"`, `"false"`, JSON-arvot kuten `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'` sekä arvot, jotka alkavat merkillä `*`.
+</Step>
+
+<Step title="Vie sidontasalasana Secretiin">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="LDAPS tai STARTTLS omalla CA:lla (valinnainen)">
+Vie CA Secretiin `overleaf-certs`, joka on liitetty polkuun `/var/lib/overleaf/certs` (katso [Varmenteet ja muut tiedostot](/fi/on-premises/configuration/kubernetes#varmenteet-ja-muut-tiedostot)), ja osoita siihen:
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+CA-luettelo korvaa järjestelmän CA:t LDAP-yhteyksissä. Se luetaan, kun web käynnistyy.
+</Step>
+
+<Step title="Ota käyttöön ja käynnistä uudelleen">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Vaiheen 1 palomuurin lisäksi ei tarvita mitään muuta: kukin replika muodostaa yhteyden hakemistoon itsenäisesti, ja kirjautumisen tulos tallennetaan Redisissä olevaan istuntoon.
+
+### Testattu Kubernetesissa
+
+Kun hakemistona oli goauthentikin LDAP-outpost, Kubernetes 1.37:ssä kolmella replikalla HAProxyn takana, LDAP:n päästä päähän -testimme menevät läpi (26 tapausta): launchpadin ensimmäisen ylläpitäjän kirjautuminen LDAP:n kautta, kirjautuminen Secretissä olevalla sidontasalasanalla, väärien salasanojen ja tuntemattomien käyttäjien hylkääminen, ylläpitäjäoikeuksien määritys ryhmän perusteella ja ilman määritystä, nimen ja ylläpitäjälipun päivitys jokaisella kirjautumisella (yksi nimimäärite tai etu- ja sukunimi), hakemiston yhteystiedot, uloskirjautuminen, LDAP-tilien salasanasäännöt, jäädytetyt tilit sekä LDAP-kirjautuminen reCAPTCHAn kanssa.
+
+### Kysymyksiä ja vastauksia
+
+<Accordion title="LDAP-kirjautuminen epäonnistuu vain joissakin podeissa">
+
+<strong>Vastaus:</strong> Hakemistoa ei tavoiteta jokaisesta solmusta. Tarkista jokaisesta podista:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="Mistä näen, miksi kirjautuminen epäonnistui?">
+
+<strong>Vastaus:</strong> Kirjautumisen käsitelleen podin web-lokista:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

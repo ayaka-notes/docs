@@ -1,0 +1,101 @@
+---
+title: Đồng bộ hóa Dropbox
+description: Cho phép người dùng đồng bộ dự án với một thư mục trong Dropbox của họ trên triển khai Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.svg
+---
+
+Đồng bộ hóa Dropbox sử dụng ba thành phần của mọi pod Ayakaleaf Pro, và cả ba chỉ khởi động khi có `DROPBOX_ENABLED: "true"`:
+
+* **web** (module `dropbox`): liên kết, hộp thoại Dropbox của dự án, và webhook mà Dropbox gọi tới.
+* **third-party-datastore**: một dịch vụ riêng bên trong pod, xử lý hàng đợi các thay đổi cần gửi tới hoặc lấy từ Dropbox.
+* **document-updater**: khi bật Dropbox, nó ghi các thay đổi của trình soạn thảo vào MongoDB ở chế độ nền, vài phút sau khi mọi người đã rời khỏi một dự án; chỉ khi đó các thay đổi mới được chuyển tới Dropbox.
+
+Hãy tạo ứng dụng Dropbox và tìm hiểu cách đồng bộ hoạt động trong [Đồng bộ hóa Dropbox](/vi/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation); trang này đưa nó vào Kubernetes.
+
+| | |
+| --- | --- |
+| Dịch vụ | web (module `dropbox`), third-party-datastore và document-updater, trong mọi pod Ayakaleaf Pro |
+| Dropbox → Overleaf | `POST ${OVERLEAF_SITE_URL}/dropbox/webhook` từ internet, được ký bằng app secret |
+| Pod → Dropbox | `https://api.dropboxapi.com` và `https://content.dropboxapi.com` |
+| Trình duyệt → Dropbox | `https://www.dropbox.com/oauth2/authorize`, sau đó quay lại `${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback` |
+| Trạng thái | hàng đợi các thay đổi đang chờ và khóa của nó trong Redis; trạng thái đồng bộ trong MongoDB (`dropboxEntities`, `dropboxProjects`) |
+| Công việc nền | third-party-datastore kiểm tra hàng đợi mỗi giây; document-updater ghi các dự án không ai mở trong 3 phút |
+
+### Cấu hình
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  DROPBOX_ENABLED: "true"
+  DROPBOX_APP_KEY: <app key>
+  DROPBOX_APP_NAME: Overleaf      # the folder name under Apps/ in Dropbox
+  # optional: send the requests to Dropbox through an HTTP proxy
+  # DROPBOX_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` và StatefulSet git-bridge từ [Tích hợp Git](/vi/on-premises/configuration/kubernetes/integrations/git-integration) phải được thiết lập sẵn: nếu không, phần cài đặt tài khoản sẽ ẩn mục đồng bộ dự án.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "DROPBOX_APP_SECRET":"<app secret>",
+  "DROPBOX_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`DROPBOX_TOKEN_CIPHER_PASSWORD` mã hóa token Dropbox của người dùng trong MongoDB. Mọi replica phải dùng cùng một giá trị, và việc thay đổi nó sau này sẽ khiến mọi người dùng phải liên kết lại Dropbox.
+</Step>
+
+<Step title="Tạo chỉ mục cơ sở dữ liệu">
+Chạy các lệnh tạo chỉ mục từ [Tạo chỉ mục cơ sở dữ liệu](/vi/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation#create-the-database-indexes) một lần, trên primary của replica set:
+
+```bash wrap
+kubectl -n overleaf exec -i mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' <<'EOF'
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+EOF
+```
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf exec deploy/overleaf -- tail -n 5 /var/log/overleaf/third-party-datastore.log
+```
+
+`third-party-datastore.log` chỉ tồn tại khi `DROPBOX_ENABLED` là `"true"`.
+</Step>
+
+<Step title="Mở webhook ra internet">
+Dropbox phải truy cập được `${OVERLEAF_SITE_URL}/dropbox/webhook` từ internet. Nếu ingress hoặc load balancer của bạn chỉ cho phép một số đường dẫn hoặc mạng từ bên ngoài, hãy cho phép đường dẫn này; đó là đường dẫn duy nhất mà Dropbox gọi tới. Hãy kiểm tra từ bên ngoài cluster:
+
+```bash
+curl "https://overleaf.example.com/dropbox/webhook?challenge=test"   # prints: test
+```
+
+Sau đó thêm webhook trong Dropbox App Console như mô tả trên trang Toolkit.
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Không cần gì thêm ngoài `DROPBOX_TOKEN_CIPHER_PASSWORD` dùng chung:
+
+* Webhook có thể đến bất kỳ replica nào. Nó chỉ đưa thay đổi vào hàng đợi trong Redis.
+* Mọi replica đều chạy third-party-datastore, và mỗi replica xử lý hàng đợi dùng chung. Hàng đợi của một người dùng được nhận kèm một khóa trong Redis, nên tại một thời điểm chỉ một replica gửi hoặc lấy các thay đổi của người dùng đó.
+* document-updater của mọi replica ghi các dự án nhàn rỗi ở chế độ nền. Mỗi dự án được lấy từ một danh sách dùng chung trong Redis, nên nó chỉ được ghi một lần.
+
+### Đã kiểm thử trên Kubernetes
+
+Với bản giả lập Dropbox API, trên Kubernetes 1.37 với ba replica phía sau HAProxy, các bài kiểm thử end-to-end của chúng tôi cho Đồng bộ hóa Dropbox đều đạt (59 trường hợp): liên kết và hủy liên kết; gửi dự án, chỉnh sửa, tệp nhị phân, đổi tên, di chuyển và xóa tới Dropbox, bao gồm một chỉnh sửa từ trình soạn thảo được chuyển qua thao tác ghi nền sau khi dự án đã đóng, mà không cần biên dịch hay “sync now”; áp dụng các thay đổi được thực hiện trong Dropbox qua webhook (challenge xác minh và kiểm tra chữ ký), dự án mới từ thư mục mới, thư mục dự án bị xóa; các dự án trùng tên; hộp thoại Dropbox của trình soạn thảo và “sync now” cùng giới hạn tốc độ của nó; thử lại, giới hạn tốc độ và timeout của Dropbox; tài khoản bị hủy liên kết khi Dropbox đầy, từ chối token hoặc bị tạm ngưng; tài khoản Overleaf bị tạm ngưng; và phản hồi của webhook khi third-party-datastore ngừng hoạt động.

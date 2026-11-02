@@ -1,0 +1,67 @@
+---
+title: GitHub-synkronisering
+description: Lad brugerne synkronisere deres projekter med GitHub- eller GitHub Enterprise-repositories i en Kubernetes-installation.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub-synkronisering kører i **web**-tjenesten (modulet `github-sync`) i hver Ayakaleaf Pro-pod. Den kræver [Git-integrationen](/da/on-premises/configuration/kubernetes/integrations/git-integration). Opret OAuth-applikationen, og læs, hvad hver indstilling gør, under [GitHub-synkronisering](/da/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); denne side omsætter det til Kubernetes.
+
+| | |
+| --- | --- |
+| Tjeneste | web (modulet `github-sync`), i hver Ayakaleaf Pro-pod; læses, når web starter |
+| Pod → GitHub | `https://api.github.com` (REST og GraphQL) eller API'et for `GITHUB_SYNC_URL`, hver gang en bruger forbinder, importerer, eksporterer eller synkroniserer |
+| Browser → GitHub | `https://github.com/login/oauth/authorize` for at forbinde en konto og derefter tilbage til `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | ingen: ingen webhook, instansen behøver ikke at kunne nås fra GitHub |
+| Lagrede data | brugerens GitHub-adgangstokens, krypteret, i MongoDB |
+| Periodiske job | ingen: synkronisering sker, når en bruger klikker |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` og git-bridge-StatefulSet'et fra [Git-integration](/da/on-premises/configuration/kubernetes/integrations/git-integration) skal være på plads: uden dem skjuler kontoindstillingerne og editoren GitHub-synkronisering.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` krypterer brugernes GitHub-adgangstokens i MongoDB. Alle replikaer skal bruge den samme værdi, og hvis den ændres senere, skal alle brugere forbinde GitHub igen.
+</Step>
+
+<Step title="Privat CA (valgfrit)">
+Hvis din GitHub har et certifikat fra din egen CA, skal du tilføje CA'en til Secret'et `overleaf-certs`, der er monteret på `/var/lib/overleaf/certs` (se [Certifikater og andre filer](/da/on-premises/configuration/kubernetes#certifikater-og-andre-filer)), og sætte `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap'et.
+</Step>
+
+<Step title="Anvend, genstart og kontrollér">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Enhver HTTP-status betyder, at GitHub kan nås fra den pod; `000` betyder, at den ikke kan.
+</Step>
+</Steps>
+
+### Flere replikaer
+
+Intet ekstra ud over den fælles `GITHUB_TOKEN_CIPHER_PASSWORD`. En synkronisering tager en lås i Redis, som deles med de andre Git-synkroniseringer, så to replikaer aldrig synkroniserer det samme projekt på samme tid.
+
+### Testet på Kubernetes
+
+Mod en mock af github.com og dens REST- og GraphQL-API'er (der stoles på via `NODE_EXTRA_CA_CERTS` fra `overleaf-certs`), på Kubernetes 1.37 med én replika og Git-integrationen slået til, består vores end-to-end-tests for GitHub-synkronisering (31 tilfælde): forbindelse og afbrydelse af kontoen, tilbagekaldte tokens, eksport af et projekt til et nyt privat repository eller organisations-repository, import af et repository (også over uploadgrænsen), pull og push, merges, konflikter og manuelle merges, slettede og force-pushede branches, binære filer, omdøbninger og sletninger, tab af push-adgang samt hvad ejere, redaktører og læsere må gøre.

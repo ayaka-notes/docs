@@ -1,0 +1,200 @@
+---
+title: S3
+description: Lagra projektfiler och historik i S3-kompatibel lagring i en Kubernetes-driftsättning.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/aws.svg
+---
+
+Projektfiler och deras historik lagras av tjänsten **history-v1** och mallfiler av tjänsten **filestore**, båda i varje Ayakaleaf Pro-pod. Som standard skriver de till datavolymen; med S3 skriver de till buckets. Vilka buckets och behörigheter som behövs beskrivs i [S3](/sv/on-premises/configuration/overleaf-toolkit/s3).
+
+| | |
+| --- | --- |
+| Tjänster | history-v1 (projektfiler och historik), filestore (mallfiler), i varje Ayakaleaf Pro-pod |
+| Pod → S3 | S3-ändpunkten, för varje fil som läses eller skrivs |
+| Krävs | för [flera repliker](/sv/on-premises/configuration/kubernetes/horizontal-scaling): deras datavolymer delas inte, men det gör buckets |
+| Periodiska jobb | inga |
+
+<Warning>
+
+Välj S3 innan användarna skapar projekt. En instans som redan lagrar filer på sin volym behöver först genomgå [S3-migreringen](/sv/on-premises/maintenance/s3-migration).
+
+</Warning>
+
+### Konfiguration
+
+<Steps>
+<Step title="Buckets och nycklar">
+Skapa de tre bucketsen `overleaf-template-files`, `overleaf-project-blobs` och `overleaf-chunks` och de två begränsade användarna i din S3-tjänst enligt beskrivningen i [Konfiguration av S3](/sv/on-premises/configuration/overleaf-toolkit/s3#s3-setup), eller kör Garage i klustret enligt nedan. Lägg de fyra nycklarna i en Secret:
+
+```bash wrap
+kubectl -n overleaf create secret generic overleaf-s3 \
+  --from-literal=OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID=<filestore key> \
+  --from-literal=OVERLEAF_FILESTORE_S3_SECRET_ACCESS_KEY=<filestore secret> \
+  --from-literal=OVERLEAF_HISTORY_S3_ACCESS_KEY_ID=<history key> \
+  --from-literal=OVERLEAF_HISTORY_S3_SECRET_ACCESS_KEY=<history secret>
+```
+</Step>
+
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_FILESTORE_BACKEND: s3
+  OVERLEAF_FILESTORE_TEMPLATE_FILES_BUCKET_NAME: overleaf-template-files
+  OVERLEAF_FILESTORE_S3_REGION: eu-west-1
+  OVERLEAF_HISTORY_BACKEND: s3
+  OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET: overleaf-project-blobs
+  OVERLEAF_HISTORY_CHUNKS_BUCKET: overleaf-chunks
+  OVERLEAF_HISTORY_S3_REGION: eu-west-1
+  # a self-hosted S3 service also needs its endpoint and path-style addressing
+  # OVERLEAF_FILESTORE_S3_ENDPOINT: http://garage:3900
+  # OVERLEAF_FILESTORE_S3_PATH_STYLE: "true"
+  # OVERLEAF_HISTORY_S3_ENDPOINT: http://garage:3900
+  # OVERLEAF_HISTORY_S3_PATH_STYLE: "true"
+```
+</Step>
+
+<Step title="Lägg till Secret:en i podden och starta om">
+I Deployment:en (eller StatefulSet:en) lägger du till Secret:en bredvid de andra:
+
+```yaml
+          envFrom:
+            - configMapRef: {name: overleaf-env}
+            - secretRef: {name: overleaf-secrets}
+            - secretRef: {name: overleaf-s3}
+```
+
+```bash
+kubectl apply -f 30-config.yaml -f 40-overleaf.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Garage i klustret
+
+Utan en S3-tjänst är [Garage](https://garagehq.deuxfleurs.fr/) en liten S3-server som körs i klustret. Konfigurationen för [Horisontell skalning](/sv/on-premises/configuration/kubernetes/horizontal-scaling) testades med den. Kommandona nedan genererar nycklarna och skapar själva Secret:en `overleaf-s3`, så använd dem i stället för Secret-kommandot i steg 1.
+
+<Info>
+
+MinIO, som används i Overleafs exempel, publicerar inte längre containeravbildningar: `minio/minio` har försvunnit från Docker Hub och quay.io.
+
+</Info>
+
+```yaml title="50-garage.yaml" wrap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: overleaf
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+    replication_factor = 1
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+    # rpc_secret and admin_token come from GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN
+    [s3_api]
+    s3_region = "garage"          # Overleaf's OVERLEAF_*_S3_REGION must match
+    api_bind_addr = "[::]:3900"
+    [admin]
+    api_bind_addr = "[::]:3903"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: overleaf
+spec:
+  selector:
+    app: garage
+  ports:
+    - name: s3
+      port: 3900
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: garage
+  namespace: overleaf
+spec:
+  serviceName: garage
+  replicas: 1
+  selector:
+    matchLabels:
+      app: garage
+  template:
+    metadata:
+      labels:
+        app: garage
+    spec:
+      containers:
+        - name: garage
+          image: dxflrs/garage:v2.5.0
+          env:
+            - name: GARAGE_RPC_SECRET
+              valueFrom: {secretKeyRef: {name: garage-secrets, key: rpc_secret}}
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: garage-secrets, key: admin_token}}
+          ports:
+            - containerPort: 3900
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/garage.toml, subPath: garage.toml}
+            - {name: data, mountPath: /var/lib/garage}
+      volumes:
+        - name: config
+          configMap:
+            name: garage-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+Generera hemligheterna, starta Garage och skapa sedan layouten, buckets och de två begränsade nycklarna. Nyckel-ID:n i Garage är `GK` följt av 24 hexadecimala tecken, och hemligheterna är 64 hexadecimala tecken:
+
+```bash wrap
+kubectl -n overleaf create secret generic garage-secrets \
+  --from-literal=rpc_secret="$(openssl rand -hex 32)" \
+  --from-literal=admin_token="$(openssl rand -base64 32)"
+kubectl -n overleaf create secret generic overleaf-s3 \
+  --from-literal=OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID="GK$(openssl rand -hex 12)" \
+  --from-literal=OVERLEAF_FILESTORE_S3_SECRET_ACCESS_KEY="$(openssl rand -hex 32)" \
+  --from-literal=OVERLEAF_HISTORY_S3_ACCESS_KEY_ID="GK$(openssl rand -hex 12)" \
+  --from-literal=OVERLEAF_HISTORY_S3_SECRET_ACCESS_KEY="$(openssl rand -hex 32)"
+kubectl apply -f 50-garage.yaml
+kubectl -n overleaf rollout status statefulset/garage
+
+g() { kubectl -n overleaf exec garage-0 -- /garage "$@"; }
+s() { kubectl -n overleaf get secret overleaf-s3 -o jsonpath="{.data.$1}" | base64 -d; }
+g layout assign -z dc1 -c 8G "$(g status 2>/dev/null | awk '/^[0-9a-f]{16}/{print $1; exit}')"
+g layout apply --version 1
+for b in overleaf-template-files overleaf-project-blobs overleaf-chunks; do g bucket create "$b"; done
+g key import --yes -n overleaf-filestore "$(s OVERLEAF_FILESTORE_S3_ACCESS_KEY_ID)" "$(s OVERLEAF_FILESTORE_S3_SECRET_ACCESS_KEY)"
+g key import --yes -n overleaf-history "$(s OVERLEAF_HISTORY_S3_ACCESS_KEY_ID)" "$(s OVERLEAF_HISTORY_S3_SECRET_ACCESS_KEY)"
+g bucket allow --read --write overleaf-template-files --key overleaf-filestore
+g bucket allow --read overleaf-project-blobs --key overleaf-filestore
+g bucket allow --read --write overleaf-project-blobs --key overleaf-history
+g bucket allow --read --write overleaf-chunks --key overleaf-history
+```
+
+Behörigheterna motsvarar policyerna i [S3](/sv/on-premises/configuration/overleaf-toolkit/s3#access-policies). Garage kontrollerar regionen: här är den `garage`, och `OVERLEAF_*_S3_REGION` måste vara densamma.
+
+Med Garage anger du ändpunkten, `PATH_STYLE: "true"` och regionen `garage` för båda tjänsterna i ConfigMap:en, som i `60-config.yaml` i [Horisontell skalning](/sv/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### Flera repliker
+
+Alla repliker måste använda samma buckets och nycklar. Säkerhetskopiera buckets med din S3-leverantörs verktyg; replikernas egna diskar innehåller då inga data som behöver säkerhetskopieras.
+
+### Testat på Kubernetes
+
+På Kubernetes 1.37 med tre repliker och Garage enligt ovan klarade sig alla end-to-end-tester på dessa sidor som skapar projekt, laddar upp filer, använder historiken eller publicerar mallar, och efteråt innehöll bucketsen `overleaf-project-blobs`, `overleaf-chunks` och `overleaf-template-files` objekten, medan replikernas egna `/var/lib/overleaf/data/history` förblev tomma.

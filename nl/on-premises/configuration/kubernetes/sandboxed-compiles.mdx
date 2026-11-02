@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: Compileer LaTeX in TeX Live-containers op de nodes van een Kubernetes-cluster.
+icon: gear-code
+---
+
+Compilaties worden uitgevoerd door de **clsi**-service in elke Ayakaleaf Pro-pod. Met sandboxed compiles ingeschakeld vraagt clsi de **Docker Engine van de node** waarop de pod draait om voor elke compilatie een TeX Live-container te starten, en geeft deze de map van het project via het pad op die node. Hoe sandboxing werkt en welke images er bestaan, staat beschreven in [Sandboxed Compiles](/nl/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Service | clsi (compilaties), web (de lijst met images in de compilerinstellingen), in elke Ayakaleaf Pro-pod |
+| Node | Docker Engine en elke image van `ALL_TEX_LIVE_DOCKER_IMAGES`, op elke node die Ayakaleaf Pro kan draaien |
+| Koppelingen in de pod | `/var/run/docker.sock`, en de compile-, output- en cachemappen als `hostPath`-volumes |
+| Periodieke taken | clsi verwijdert compilemappen die een dag niet zijn gebruikt, en verwijdert elk uur oude TeX Live-containers uit de Docker van de node |
+
+### Configuratie
+
+De installatie stelt alles in: Docker en de images op de nodes in [0. De nodes voorbereiden](/nl/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), de instellingen in [4. Je instantie personaliseren](/nl/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) en de volumes in [5. Ayakaleaf Pro deployen](/nl/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). De instellingen, allemaal in de ConfigMap:
+
+| Variabele | Waarde |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | nodepad van het volume dat is gekoppeld op `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | nodepad van het volume dat is gekoppeld op `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | nodepad van het volume dat is gekoppeld op `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | de images, zoals bij de Toolkit |
+
+### Een TeX Live-versie toevoegen
+
+<Steps>
+<Step title="Pull de image op elke node">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+De Toolkit pullt de images zelf; op Kubernetes doet niemand dat. Pull in **Docker**, niet met `crictl`: clsi vraagt Docker om de image. Een compilatie met een image die op de node ontbreekt, mislukt.
+</Step>
+
+<Step title="Zet deze in de ConfigMap en herstart">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Een node die later aan het cluster wordt toegevoegd, heeft Docker en alle images nodig voordat Ayakaleaf Pro daar draait. Label zulke nodes en houd Ayakaleaf Pro erop met een `nodeSelector` als niet elke node geschikt is.
+
+### Meerdere replica's
+
+Elke replica compileert op zijn eigen node en bewaart de compilatie-uitvoer daar, dus een gebruiker moet op de replica blijven die heeft gecompileerd, wat de sticky cookie van de load balancer garandeert. Draai nooit twee replica's op dezelfde node: ze zouden de compilemappen van de node delen. De opzet uit [Horizontaal schalen](/nl/on-premises/configuration/kubernetes/horizontal-scaling) voorkomt dit met `podAntiAffinity`.
+
+De TeX Live-containers draaien naast de pod, buiten de geheugenlimiet ervan en buiten het zicht van de scheduler. Laat geheugen vrij op de nodes voor deze containers, zie [0. De nodes voorbereiden](/nl/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Getest op Kubernetes
+
+Op Kubernetes 1.37 met drie replica's achter HAProxy, één per node, en TeX Live 2026 en 2025 gepulld in Docker op elke node, slagen onze end-to-endtests voor sandboxed compiles (7 gevallen): een nieuw project compileert naar een PDF, de compilerinstellingen bieden beide images aan en wisselen ertussen, XeLaTeX met fontspec, LaTeX-fouten en opnieuw compileren na de correctie, een lopende compilatie stoppen, en SyncTeX in beide richtingen. Een belastingstest met 12 gebruikers die tegelijkertijd een document van 600 pagina's compileerden, draaide 4 compilaties per node, zie [Wat je kunt verwachten](/nl/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

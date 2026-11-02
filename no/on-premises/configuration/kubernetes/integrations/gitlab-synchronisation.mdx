@@ -1,0 +1,67 @@
+---
+title: GitLab-synkronisering
+description: La brukere synkronisere prosjektene sine med repositorier på GitLab.com eller en selvadministrert GitLab i en Kubernetes-distribusjon.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+GitLab-synkronisering kjører i **web**-tjenesten (modulen `gitlab-sync`) i hver Ayakaleaf Pro-pod. Den krever [Git-integrasjonen](/no/on-premises/configuration/kubernetes/integrations/git-integration). Opprett OAuth-applikasjonen og les hva hver innstilling gjør i [GitLab-synkronisering](/no/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); denne siden overfører det til Kubernetes.
+
+| | |
+| --- | --- |
+| Tjeneste | web (modulen `gitlab-sync`), i hver Ayakaleaf Pro-pod; leses når web starter |
+| Pod → GitLab | REST-API-et til `GITLAB_SYNC_URL` (standard `https://gitlab.com/api/v4`), hver gang en bruker kobler til, importerer, eksporterer eller synkroniserer |
+| Nettleser → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` for å koble til en konto, deretter tilbake til `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | ingen: ingen webhook, instansen trenger ikke å være tilgjengelig fra GitLab |
+| Lagrede data | brukerens GitLab-tilgangs- og oppdateringstokener, kryptert, i MongoDB |
+| Periodiske jobber | ingen: synkronisering skjer når en bruker klikker |
+
+### Konfigurasjon
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` og git-bridge-StatefulSet-en fra [Git-integrasjon](/no/on-premises/configuration/kubernetes/integrations/git-integration) må være på plass: uten dem skjuler kontoinnstillingene og redigeringsprogrammet GitLab-synkronisering.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` krypterer brukernes GitLab-tilgangs- og oppdateringstokener i MongoDB. Alle replikaer må bruke samme verdi, og hvis du endrer den senere, må alle brukere koble til GitLab på nytt.
+</Step>
+
+<Step title="Privat CA (valgfritt)">
+Hvis GitLab-instansen din har et sertifikat fra din egen CA, legger du CA-en til i Secret-en `overleaf-certs` som er montert på `/var/lib/overleaf/certs` (se [Sertifikater og andre filer](/no/on-premises/configuration/kubernetes#sertifikater-og-andre-filer)) og angir `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap-en.
+</Step>
+
+<Step title="Bruk, start på nytt og kontroller">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Enhver HTTP-statuskode betyr at GitLab kan nås fra den poden; `000` betyr at den ikke kan det.
+</Step>
+</Steps>
+
+### Flere replikaer
+
+Ingenting ekstra utover den delte `GITLAB_TOKEN_CIPHER_PASSWORD`. En synkronisering tar en lås i Redis, delt med de andre Git-synkroniseringene, slik at to replikaer aldri synkroniserer det samme prosjektet samtidig. Oppdatering av en brukers GitLab-token tar også en Redis-lås, slik at to replikaer ikke oppdaterer det samtidig.
+
+### Testet på Kubernetes
+
+Mot en etterligning av en selvadministrert GitLab på `GITLAB_SYNC_URL` (klarert via `NODE_EXTRA_CA_CERTS` fra `overleaf-certs`), på Kubernetes 1.37 med én replika og Git-integrasjonen slått på, består ende-til-ende-testene våre for GitLab-synkronisering (40 tilfeller): tilkobling og frakobling av kontoen, oppdatering av et tilgangstoken som er i ferd med å utløpe og tilbakekalte tokener, eksport til et nytt privat prosjekt eller gruppeprosjekt, import av et repositorium, pull og push, sammenslåinger, konflikter, slettede og tvangspushede grener, binærfiler, omdøpinger og slettinger, og hva eiere, redaktører og lesere har lov til å gjøre.

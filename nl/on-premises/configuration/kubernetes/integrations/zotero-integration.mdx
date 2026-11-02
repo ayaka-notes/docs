@@ -1,0 +1,56 @@
+---
+title: Zotero-integratie
+description: Laat gebruikers een .bib-bestand importeren uit hun Zotero-bibliotheek in een Kubernetes-deployment.
+icon: z
+---
+
+Zotero-import draait in de **web**-service (de module `tpr-webmodule`) van elke Ayakaleaf Pro-pod. Registreer de Zotero OAuth-client zoals in [Zotero-integratie](/nl/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration), met de callback-URL `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback`, en configureer Kubernetes daarna zoals hieronder.
+
+| | |
+| --- | --- |
+| Service | web, in elke Ayakaleaf Pro-pod; ingelezen wanneer web start |
+| Pod → Zotero | `https://www.zotero.org/oauth/*` en `https://api.zotero.org`, wanneer een gebruiker Zotero koppelt of een bestand importeert of vernieuwt |
+| Browser → Zotero | `https://www.zotero.org/oauth/authorize`, daarna terug naar de callback-URL |
+| Zotero → Overleaf | geen: de instantie hoeft niet bereikbaar te zijn vanaf internet |
+| Opgeslagen gegevens | de Zotero-sleutel van de gebruiker, versleuteld, in MongoDB |
+| Periodieke taken | geen: een bestand wordt alleen vernieuwd wanneer een gebruiker daarom vraagt |
+
+### Configuratie
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES` vervangt de waarde uit de installatie; behoud de typen die je al hebt en voeg `zotero` toe (en `mendeley`, als je beide gebruikt).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD` versleutelt de Zotero-sleutels van de gebruikers in MongoDB. Zonder deze waarde genereert elke pod een sleutelbestand in zijn eigen `/var/lib/overleaf/data`. Met [meerdere replica's](/nl/on-premises/configuration/kubernetes/horizontal-scaling) heeft elke node dan een andere sleutel, en kan een gebruiker die door een andere replica wordt bediend zijn gekoppelde Zotero-account niet gebruiken. Stel deze in voordat de eerste gebruiker Zotero koppelt: als je deze later wijzigt, moet elke gebruiker Zotero opnieuw koppelen.
+</Step>
+
+<Step title="Toepassen en herstarten">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Meerdere replica's
+
+Stel `ZOTERO_CIPHER_PASSWORD` in de Secret in, zie hierboven. Zonder deze waarde kan een bestand dat op de ene replica is geïmporteerd niet op een andere worden vernieuwd: het vernieuwen mislukt met "The remote service produced an error", omdat het sleutelbestand van die replica de Zotero-sleutel van de gebruiker niet kan ontsleutelen. Met het wachtwoord in de Secret werkt het op elke replica; we hebben beide gevallen getest door te importeren op `overleaf-0` en te vernieuwen op `overleaf-1`. De OAuth-handshake bewaart zijn status in de sessie in Redis, dus de callback kan elke replica bereiken.
+
+### Getest op Kubernetes
+
+Tegen een mock van www.zotero.org en api.zotero.org (vertrouwd via `NODE_EXTRA_CA_CERTS` uit `overleaf-certs`), op Kubernetes 1.37 met drie replica's achter HAProxy, slagen onze end-to-endtests voor Zotero (18 gevallen): koppelen via OAuth 1.0a en ontkoppelen, de bibliotheek en groepen importeren in een `.bib`-bestand, het vernieuwen, de sleutel intrekken op Zotero, vragen om opnieuw te koppelen, referenties doorzoekbaar voor de medewerkers, alleen degene die importeerde mag vernieuwen, API-fouten, en trage verbindingen met Zotero.

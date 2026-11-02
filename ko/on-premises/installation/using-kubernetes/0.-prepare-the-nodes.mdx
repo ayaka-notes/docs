@@ -1,0 +1,100 @@
+---
+title: 0. 노드 준비
+description: 노드에 Docker Engine, containerd, kubeadm을 설치하고 TeX Live 이미지를 pull합니다.
+icon: server
+---
+
+Ayakaleaf Pro는 [샌드박스](/ko/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) TeX Live 컨테이너에서 LaTeX를 컴파일합니다. 이 컨테이너는 Ayakaleaf Pro가 실행 중인 머신의 Docker 소켓을 통해 직접 시작합니다. Kubernetes에서는 다음을 의미합니다.
+
+* Ayakaleaf Pro 파드를 실행할 수 있는 모든 노드에 **Docker Engine**이 설치되어 실행 중이어야 합니다.
+* 구성하는 모든 TeX Live 이미지가 해당 노드 각각의 **Docker에** pull되어 있어야 합니다.
+
+kubelet은 계속 containerd를 사용할 수 있습니다. Docker Engine은 `containerd.io`를 포함하며, 둘은 서로 다른 네임스페이스에서 같은 데몬을 사용합니다.
+
+<Warning>
+
+Docker가 없는 관리형 노드 풀(대부분의 EKS, GKE, AKS 기본값)에서는 샌드박스 컴파일을 실행할 수 없습니다. Docker Engine을 설치할 수 있는 노드 풀을 사용하거나, 해당 노드에 레이블을 붙이고 `nodeSelector`로 Ayakaleaf Pro가 그 노드에서만 실행되도록 하세요.
+
+</Warning>
+
+아래 단계는 Ubuntu 24.04와 kubeadm으로 구축한 클러스터를 기준으로 합니다. 클러스터가 이미 있다면 Ayakaleaf Pro를 실행할 노드에서 1, 2, 5단계를 수행하세요.
+
+<Steps>
+<Step title="커널 모듈 및 sysctl">
+```bash
+printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+sudo modprobe overlay && sudo modprobe br_netfilter
+printf 'net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1\n' \
+  | sudo tee /etc/sysctl.d/99-k8s.conf
+sudo sysctl --system
+sudo swapoff -a   # and comment out swap in /etc/fstab
+```
+</Step>
+
+<Step title="Docker Engine">
+[0. Docker 설정](/ko/on-premises/installation/using-the-toolkit/0.-setup-docker)에 설명된 대로 Docker 저장소에서 Docker Engine을 설치하세요. Compose 플러그인은 필요하지 않습니다. 이 과정에서 `containerd.io`도 설치됩니다.
+</Step>
+
+<Step title="kubelet용 containerd">
+Docker 저장소의 `containerd.io` 패키지는 CRI 플러그인이 비활성화되어 있습니다. CRI 플러그인을 활성화하는 전체 기본 구성을 작성하고 systemd cgroup으로 전환하세요.
+
+```bash wrap
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+# containerd 2.x writes config_path = '' and ignores /etc/containerd/certs.d without this
+sudo sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|" /etc/containerd/config.toml
+sudo systemctl restart containerd docker
+```
+</Step>
+
+<Step title="kubeadm, kubelet 및 kubectl">
+[kubeadm 설치하기](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)를 따른 다음, `kubeadm init`과 `kubeadm join`으로 클러스터를 만들고 네트워크 플러그인을 설치하세요. 예를 들어 flannel을 사용하는 경우:
+
+```yaml title="kubeadm-config.yaml"
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+networking:
+  podSubnet: 10.244.0.0/16   # flannel's default
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+# Compile containers are started by Docker, outside the kubelet's accounting: keep memory for them
+systemReserved:
+  memory: 300Mi
+kubeReserved:
+  memory: 200Mi
+```
+
+```bash
+sudo kubeadm init --config kubeadm-config.yaml
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+```
+
+클러스터에는 기본 StorageClass도 필요합니다. 테스트 클러스터에서는 [local-path-provisioner](https://github.com/rancher/local-path-provisioner)로 충분하며, 프로덕션에서는 플랫폼의 블록 스토리지(Longhorn, Ceph, 클라우드 CSI 드라이버)를 사용하세요.
+</Step>
+
+<Step title="TeX Live 이미지">
+Ayakaleaf Pro를 실행할 수 있는 **모든** 노드에서 `ALL_TEX_LIVE_DOCKER_IMAGES`에 나열할 TeX Live 이미지를 Docker로 pull하세요. 예:
+
+```bash
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+`crictl pull`이나 `ctr`은 여기서 도움이 되지 않습니다. Ayakaleaf Pro는 Docker에 이미지를 요청합니다. full 이미지는 용량이 큽니다(각각 약 28 GB). 목록은 [샌드박스 컴파일](/ko/on-premises/configuration/overleaf-toolkit/sandboxed-compiles)을 참조하세요. 첫 테스트에는 `ghcr.io/ayaka-notes/texlive-basic:2026.1`(약 630 MB, 최소 TeX Live)이면 충분합니다.
+</Step>
+</Steps>
+
+### Q\&A
+
+<Accordion title="Docker가 없는 노드에서 Ayakaleaf Pro를 실행할 수 있나요?">
+
+<strong>답변:</strong> `SANDBOXED_COMPILES=false`인 경우에만 가능합니다. 이 경우 컴파일은 Ayakaleaf Pro 컨테이너 내부에서 작은 내장 TeX Live로 실행되며, LaTeX 문서는 해당 컨테이너가 접근할 수 있는 모든 것을 읽고 쓸 수 있습니다. 권장하지 않습니다. [샌드박스 컴파일](/ko/on-premises/configuration/overleaf-toolkit/sandboxed-compiles)을 참조하세요.
+
+</Accordion>
+
+<Accordion title="컴파일이 파드의 메모리 제한에 포함되나요?">
+
+<strong>답변:</strong> 아니요. TeX Live 컨테이너는 노드의 Docker가 시작하며, 파드 밖에 있고 kubelet의 관리 범위 밖에 있습니다. 위와 같이 `systemReserved` 등으로 노드에 여유 메모리를 남겨 두고, 노드를 다른 파드로 가득 채우지 마세요.
+
+</Accordion>

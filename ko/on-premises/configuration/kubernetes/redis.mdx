@@ -1,0 +1,66 @@
+---
+title: Redis
+description: 비밀번호를 사용하여 Kubernetes 배포를 Redis에 연결하고, AOF 지속성으로 Redis 데이터를 보존합니다.
+icon: memory
+---
+
+실시간 상태를 유지하는 모든 Ayakaleaf Pro 서비스는 하나의 Redis 서버를 사용합니다: web(세션, 요청 속도 제한), real-time, document-updater(아직 MongoDB에 저장되지 않은 편집 내용), project-history(기록 대기열), third-party-datastore(Dropbox 대기열). 설치 시 [3. MongoDB 및 Redis 배포](/ko/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis)에서 StatefulSet `redis`로 실행합니다. Toolkit에 대해서는 [Redis](/ko/on-premises/configuration/overleaf-toolkit/redis)를 참조하세요.
+
+| | |
+| --- | --- |
+| 서비스 | web, real-time, document-updater, project-history, history-v1, third-party-datastore, 모든 Ayakaleaf Pro 파드에 포함 |
+| 설정 | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT`(기본값 `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| 지원되지 않음 | Redis Sentinel 및 Redis Cluster: 단일 서버만 지원 |
+
+### 비밀번호 인증
+
+<Steps>
+<Step title="비밀번호 저장">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="비밀번호로 Redis 시작">
+`20-redis.yaml`에서 컨테이너에 비밀번호를 제공하고 이를 `redis-server`에 전달하세요.
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes는 `$(REDIS_PASS)`를 Secret의 값으로 대체합니다. readiness probe(`tcpSocket`)는 변경할 필요가 없습니다.
+</Step>
+
+<Step title="적용 및 재시작">
+두 번의 재시작 사이에 편집 내용이 손실되지 않도록 먼저 Ayakaleaf Pro를 중지하세요.
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+관리형 Redis의 경우 ConfigMap의 `OVERLEAF_REDIS_HOST`(및 `REDIS_HOST`)를 해당 주소로 설정하고, 비밀번호는 위와 같이 설정하며, TLS가 필요하면 `OVERLEAF_REDIS_TLS: "true"`를 설정하세요.
+
+### AOF 지속성
+
+설치 시 이미 Toolkit의 `REDIS_AOF_PERSISTENCE=true`에 해당하는 `--appendonly yes`로 Redis를 시작하며, 데이터를 볼륨 `data-redis-0`에 보관합니다. AOF 없이 실행 중인 기존 Redis를 전환하려면 `docker exec` 대신 `kubectl -n overleaf exec -it redis-0 -- redis-cli`를 사용하여 [Toolkit 페이지](/ko/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence)의 단계를 따른 다음, args에 `--appendonly yes`를 추가하세요.
+
+### 여러 레플리카
+
+모든 레플리카는 같은 Redis를 사용해야 합니다. Redis에는 세션, 아직 MongoDB에 반영되지 않은 편집 내용, 그리고 두 레플리카가 같은 프로젝트를 동시에 처리하지 않도록 하는 잠금이 저장됩니다.
+
+### Kubernetes에서의 테스트
+
+레플리카 하나를 둔 Kubernetes 1.37에서, 위와 같이 Secret `redis-auth`의 `--requirepass $(REDIS_PASS)`로 시작한 Redis는 비밀번호 없는 `redis-cli`를 거부했고(`NOAUTH`), `overleaf-secrets`에 `OVERLEAF_REDIS_PASS`와 `REDIS_PASSWORD`를 설정한 상태에서 launchpad(13개 케이스)와 변경 내용 추적, 댓글, 익명 공유를 포함한 편집(22개 케이스)에 대한 엔드 투 엔드 테스트가 통과했습니다. 이 테스트는 web, real-time, document-updater, project-history를 거치며, 어떤 서비스도 Redis 인증 오류를 기록하지 않았습니다. 이 페이지들의 다른 모든 Kubernetes 테스트는 설치 시의 Redis StatefulSet(AOF 지속성 사용, 비밀번호 없음)을 대상으로 실행되었습니다.

@@ -1,0 +1,64 @@
+---
+title: reCAPTCHA
+description: Bảo vệ đăng nhập, đăng ký và đặt lại mật khẩu bằng Google reCAPTCHA trên triển khai Kubernetes.
+icon: robot
+---
+
+Dịch vụ **web** (module `login-register`) yêu cầu reCAPTCHA v2 (invisible) khi đăng nhập bằng email, đăng nhập LDAP, đăng ký và đặt lại mật khẩu. Hãy tạo khóa và tìm hiểu chức năng của từng thiết lập trong [reCAPTCHA](/vi/on-premises/configuration/overleaf-toolkit/authentication/recaptcha); trang này đưa chúng vào Kubernetes.
+
+| | |
+| --- | --- |
+| Dịch vụ | web, trong mọi pod Ayakaleaf Pro; được đọc khi web khởi động |
+| Pod → Google | `RECAPTCHA_ENDPOINT` (mặc định `https://www.google.com/recaptcha/api/siteverify`), ở mỗi yêu cầu được kiểm tra |
+| Trình duyệt → Google | script widget từ `www.recaptcha.net` |
+| Trạng thái | giới hạn tốc độ trong Redis; lịch sử thiết bị “trình duyệt này đã vượt qua” trong một cookie được mã hóa |
+| Tác vụ định kỳ | không có |
+
+### Cấu hình
+
+<Steps>
+<Step title="Đưa site key vào ConfigMap">
+```yaml
+  RECAPTCHA_SITE_KEY: <site key>
+  # optional
+  # RECAPTCHA_ENDPOINT: https://www.recaptcha.net/recaptcha/api/siteverify
+  # CAPTCHA_TRUSTED_USERS: robot@example.com
+```
+
+Site key là công khai: mọi trang đăng nhập đều hiển thị nó.
+</Step>
+
+<Step title="Đưa secret key và khóa lịch sử thiết bị vào Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "RECAPTCHA_SECRET_KEY":"<secret key>",
+  "DEVICE_HISTORY_SECRET":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+Hãy đặt cả hai khóa cùng lúc: nếu có site key mà không có secret key, mọi lần kiểm tra đều thất bại và không ai có thể đăng nhập bằng mật khẩu, đăng ký hay đặt lại mật khẩu. `DEVICE_HISTORY_SECRET` phải gồm 64 ký tự hex; container không tự tạo giá trị này.
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Sau đó kiểm tra rằng mọi pod đều truy cập được endpoint. Các pod bỏ cuộc sau khoảng một giây cho mỗi lần thử kết nối, và một lần đăng nhập mà không thể thực hiện kiểm tra sẽ thất bại kèm lỗi:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://www.google.com/recaptcha/api/siteverify
+done
+```
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Mọi replica phải dùng chung `DEVICE_HISTORY_SECRET`, điều này được đảm bảo khi nó nằm trong Secret. Nếu các giá trị khác nhau, một trình duyệt đã vượt qua trên một replica sẽ lại bị yêu cầu captcha trên replica khác. Giới hạn tốc độ được đếm trong Redis trên tất cả các replica.
+
+### Đã kiểm thử trên Kubernetes
+
+Với một bản giả lập endpoint xác minh của Google (được tin cậy qua `NODE_EXTRA_CA_CERTS` từ `overleaf-certs`), trên Kubernetes 1.37, các bài kiểm thử end-to-end của chúng tôi cho reCAPTCHA đều đạt (13 trường hợp): trên một replica, đăng nhập, đăng ký và đặt lại mật khẩu đều bị từ chối khi không có captcha hoặc captcha thất bại và được chấp nhận khi captcha thành công, lịch sử thiết bị từ `DEVICE_HISTORY_SECRET` cho phép trình duyệt bỏ qua captcha, và `CAPTCHA_TRUSTED_USERS`; trên ba replica phía sau HAProxy, đăng nhập LDAP với captcha.

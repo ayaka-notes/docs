@@ -1,0 +1,56 @@
+---
+title: Mendeley 연동
+description: Kubernetes 배포에서 사용자가 Mendeley 라이브러리에서 .bib 파일을 가져올 수 있도록 합니다.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Mendeley 가져오기는 모든 Ayakaleaf Pro 파드의 **web** 서비스(`tpr-webmodule` 모듈)에서 실행됩니다. [Mendeley 연동](/ko/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration)에 설명된 대로 리디렉션 URL `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`을 사용하여 Mendeley 애플리케이션을 등록한 다음, 아래와 같이 Kubernetes를 구성하세요.
+
+| | |
+| --- | --- |
+| 서비스 | web, 모든 Ayakaleaf Pro 파드에 포함; web 시작 시 읽음 |
+| 파드 → Mendeley | 사용자가 Mendeley를 연결하거나 파일을 가져오거나 새로 고칠 때 `https://api.mendeley.com`(OAuth 토큰 및 API) |
+| 브라우저 → Mendeley | `https://api.mendeley.com/oauth/authorize`로 이동한 뒤 리디렉션 URL로 돌아옴 |
+| Mendeley → Overleaf | 없음: 인스턴스가 인터넷에서 접근 가능할 필요가 없음 |
+| 저장되는 데이터 | 암호화된 사용자의 Mendeley 토큰, MongoDB에 저장 |
+| 주기적 작업 | 없음: 사용자가 요청할 때만 파일이 새로 고쳐짐 |
+
+### 구성
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+애플리케이션 ID는 따옴표로 감싸세요. ID는 숫자이지만 ConfigMap에는 문자열만 저장할 수 있습니다. `ENABLED_LINKED_FILE_TYPES`는 설치 시의 값을 대체하므로, 기존 유형은 유지하고 `mendeley`를 추가하세요(둘 다 사용한다면 `zotero`도 추가).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD`는 MongoDB에 저장되는 사용자의 Mendeley 토큰을 암호화합니다. 이 값이 없으면 각 파드는 자체 `/var/lib/overleaf/data`에 키 파일을 생성합니다. [여러 레플리카](/ko/on-premises/configuration/kubernetes/horizontal-scaling)를 사용하는 경우 노드마다 키가 달라지며, 다른 레플리카가 처리하는 사용자는 연결된 Mendeley 계정을 사용할 수 없습니다. 첫 사용자가 Mendeley를 연결하기 전에 설정하세요. 나중에 변경하면 모든 사용자가 Mendeley를 다시 연결해야 합니다.
+</Step>
+
+<Step title="적용 및 재시작">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### 여러 레플리카
+
+위에서 설명한 대로 Secret에 `MENDELEY_CIPHER_PASSWORD`를 설정하세요. Mendeley 토큰은 Zotero 키와 같은 코드로 암호화됩니다. 비밀번호가 없으면 [Zotero](/ko/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas)에서 확인한 것처럼 한 레플리카에서 가져온 파일을 다른 레플리카에서 새로 고칠 수 없습니다. OAuth `state`는 Redis의 세션에 보관되므로 콜백은 어느 레플리카에 도달해도 됩니다.
+
+### Kubernetes에서의 테스트
+
+api.mendeley.com의 모의 서버(`overleaf-certs`의 `NODE_EXTRA_CA_CERTS`를 통해 신뢰됨)를 대상으로, HAProxy 뒤에 레플리카 세 개를 둔 Kubernetes 1.37에서 Mendeley에 대한 엔드 투 엔드 테스트가 통과했습니다(18개 케이스). 테스트 항목은 OAuth 2.0을 통한 연결 및 연결 해제, 라이브러리와 그룹을 `.bib` 파일로 가져오기, 파일 새로 고침, 만료되는 액세스 토큰 갱신, 취소된 토큰, 다시 연결 요청, 공동 작업자가 검색할 수 있는 참고문헌, 가져온 사용자만 새로 고칠 수 있는지 여부, API 오류, Mendeley와의 느린 연결입니다.

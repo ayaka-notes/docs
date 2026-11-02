@@ -1,0 +1,67 @@
+---
+title: Envoi des e-mails
+description: Envoyer les e-mails d'activation, d'invitation et de réinitialisation du mot de passe depuis un déploiement Kubernetes.
+icon: paper-plane-top
+---
+
+Le service **web** envoie tous les e-mails (activation, invitations à des projets, réinitialisation du mot de passe) depuis chaque pod Ayakaleaf Pro. Les paramètres sont les mêmes que sur le Toolkit, voir [Envoi des e-mails](/fr/on-premises/configuration/overleaf-toolkit/email-delivery).
+
+| | |
+| --- | --- |
+| Service | web, dans chaque pod Ayakaleaf Pro ; lu au démarrage de web |
+| Pod → extérieur | votre serveur SMTP (`OVERLEAF_EMAIL_SMTP_HOST`), ou l'API Amazon SES de `OVERLEAF_EMAIL_AWS_SES_REGION` |
+| État | la limite de débit d'envoi dans Redis |
+| Tâches périodiques | aucune |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_EMAIL_FROM_ADDRESS: no-reply@example.com
+  OVERLEAF_EMAIL_SMTP_HOST: smtp.example.com
+  OVERLEAF_EMAIL_SMTP_PORT: "587"
+  OVERLEAF_EMAIL_SMTP_SECURE: "false"
+  OVERLEAF_EMAIL_SMTP_USER: no-reply@example.com
+  # optional
+  # OVERLEAF_EMAIL_REPLY_TO: support@example.com
+  # OVERLEAF_EMAIL_SMTP_IGNORE_TLS: "false"
+  # OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH: "true"
+```
+
+`OVERLEAF_EMAIL_FROM_ADDRESS` active l'envoi. Ne le définissez qu'avec le serveur SMTP (ou SES) : avec l'expéditeur seul, Ayakaleaf Pro tente d'utiliser un serveur SMTP à l'intérieur du pod, et tous les e-mails échouent. Sans lui, les e-mails ne sont pas envoyés, mais seulement écrits dans `web.log`.
+
+`OVERLEAF_EMAIL_SMTP_SECURE`, `OVERLEAF_EMAIL_SMTP_IGNORE_TLS` et `OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH` sont lus comme du JSON ; utilisez donc `"true"` ou `"false"` : une valeur telle que `yes` arrête tous les services du pod au démarrage.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_EMAIL_SMTP_PASS":"<SMTP password>"}}'
+```
+
+Pour l'API Amazon SES, placez plutôt ici `OVERLEAF_EMAIL_AWS_SES_ACCESS_KEY_ID` et `OVERLEAF_EMAIL_AWS_SES_SECRET_KEY`, et `OVERLEAF_EMAIL_DRIVER: ses` ainsi que `OVERLEAF_EMAIL_AWS_SES_REGION` dans la ConfigMap.
+</Step>
+
+<Step title="Appliquer, redémarrer et tester">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Envoyez-vous un e-mail de réinitialisation du mot de passe depuis la page de connexion. S'il n'arrive pas, vérifiez que le serveur SMTP est joignable depuis les pods et consultez le journal web :
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- bash -c 'echo > /dev/tcp/smtp.example.com/587 && echo reachable'
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "email|smtp" /var/log/overleaf/web.log | tail
+```
+</Step>
+</Steps>
+
+### Plusieurs réplicas
+
+Rien de plus. Chaque réplica envoie avec les mêmes paramètres, et la limite de débit d'envoi est comptabilisée dans Redis pour l'ensemble des réplicas. Si votre serveur SMTP n'accepte que des expéditeurs connus, autorisez les adresses avec lesquelles les pods sortent du cluster (généralement celles des nœuds).
+
+### Testé sur Kubernetes
+
+Avec Mailpit comme serveur SMTP, sur Kubernetes 1.37 avec un réplica, nos tests de bout en bout qui envoient des e-mails réussissent : l'e-mail d'activation d'un compte créé par un administrateur, l'e-mail d'activation d'une inscription libre limitée à certains domaines, l'e-mail de réinitialisation du mot de passe, l'e-mail informant un utilisateur de la suppression de son compte, et le comportement lorsque le serveur SMTP refuse un e-mail d'activation ou de suppression : le compte est tout de même créé ou supprimé, et l'e-mail d'activation peut être renvoyé plus tard. Avec `OVERLEAF_EMAIL_FROM_ADDRESS` et sans hôte SMTP, une demande de réinitialisation du mot de passe a échoué avec une erreur et `web.log` a affiché « error sending message », comme décrit ci-dessus.

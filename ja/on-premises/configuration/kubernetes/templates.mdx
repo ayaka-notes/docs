@@ -1,0 +1,59 @@
+---
+title: テンプレート
+description: Kubernetes デプロイでテンプレートギャラリーを運用します。
+icon: paste
+---
+
+テンプレートギャラリーは、すべての Ayakaleaf Pro Pod の **web** サービス（`template-gallery` モジュール）で動作します。同じ Pod 内の **filestore** サービスがテンプレートファイルを保存し、プレビューを生成します。カテゴリ、権限、公開については[テンプレート](/ja/on-premises/configuration/overleaf-toolkit/templates)で説明しています。
+
+| | |
+| --- | --- |
+| サービス | web（`template-gallery` モジュール）、filestore（ファイルとプレビュー画像） |
+| 保存されるデータ | テンプレートのメタデータは MongoDB に保存。ZIP、PDF、プレビュー画像は filestore のテンプレートストア（データボリューム上の `/var/lib/overleaf/data/template_files`、または S3 バケット `OVERLEAF_FILESTORE_TEMPLATE_FILES_BUCKET_NAME`）に保存 |
+| Pod → 外部 | なし（使用する場合は S3） |
+| 定期ジョブ | なし: プレビューは初めて表示されたときに生成される |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_TEMPLATE_GALLERY: "true"
+  ENABLE_CONVERSIONS: "true"
+  OVERLEAF_TEMPLATE_CATEGORIES: academic-journal book presentation poster cv report thesis
+  TEMPLATE_ACADEMIC_JOURNAL_NAME: Journal articles
+  TEMPLATE_ACADEMIC_JOURNAL_DESCRIPTION: Templates for academic journal submissions.
+  # ... one _NAME and _DESCRIPTION per category, see the Toolkit page
+```
+</Step>
+
+<Step title="テンプレート用ユーザー（任意）">
+管理者はいつでも公開できます。管理者以外のユーザーにギャラリーを管理させるには、そのユーザーを作成し、MongoDB から ID を読み取って ConfigMap に設定します。
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  --eval 'db.users.findOne({ email: "templates@example.com" })._id.toString()'
+```
+
+```yaml
+  OVERLEAF_TEMPLATES_USER_ID: "<the ID printed above>"
+```
+</Step>
+
+<Step title="適用と再起動">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### 複数のレプリカ
+
+* テンプレートファイルは S3 に置く必要があります。各レプリカ自身のディスクにファイルを置くと、ノードごとに異なるギャラリーが表示されてしまいます。[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)の構成では、すでにバケット `overleaf-template-files` を使用しています。
+* 公開時にはプロジェクトの最後のコンパイルの PDF が使われますが、これはコンパイルしたレプリカにしか存在しません。ロードバランサーのスティッキー Cookie によってユーザーはそのレプリカにとどまるため、コンパイルしたのと同じブラウザーセッションから公開してください。
+
+### Kubernetes でのテスト
+
+Kubernetes 1.37 上で HAProxy の背後に 3 つのレプリカを置き、テンプレートファイルを S3 バケット `overleaf-template-files`（Garage）に置いた状態で、テンプレートギャラリーのエンドツーエンドテスト（41 ケース）に合格しています。対象は、ファイルメニューからのコンパイル済みプロジェクトの公開と、バケットから配信される PDF、プレビュー画像、ソース ZIP、テンプレートからのプロジェクト作成、ギャラリーのカテゴリ・検索・並べ替え・ページ、テンプレートの編集・上書き・削除、管理者・一般ユーザー・`OVERLEAF_TEMPLATES_USER_ID` のテンプレート用ユーザー（上記のとおり MongoDB から ID を読み取り）の権限、そして不正な形式のリクエストです。

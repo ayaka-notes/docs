@@ -1,0 +1,101 @@
+---
+title: Dropbox 동기화
+description: Kubernetes 배포에서 사용자가 프로젝트를 Dropbox의 폴더와 동기화하도록 합니다.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.svg
+---
+
+Dropbox 동기화는 모든 Ayakaleaf Pro 파드의 세 부분을 사용하며, 세 부분 모두 `DROPBOX_ENABLED: "true"`일 때만 시작됩니다.
+
+* **web**(`dropbox` 모듈): 계정 연결, 프로젝트의 Dropbox 대화 상자, Dropbox가 호출하는 웹훅.
+* **third-party-datastore**: 파드 내부의 독립 서비스로, Dropbox로 보내거나 Dropbox에서 가져올 변경 사항의 큐를 처리합니다.
+* **document-updater**: Dropbox가 켜져 있으면 모든 사용자가 프로젝트를 떠난 지 몇 분 후에 에디터의 변경 사항을 백그라운드에서 MongoDB에 기록합니다. 그 이후에야 변경 사항이 Dropbox로 전송됩니다.
+
+Dropbox 앱을 만들고 동기화가 어떻게 동작하는지는 [Dropbox 동기화](/ko/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation)를 참고하세요. 이 페이지에서는 이를 Kubernetes에 적용합니다.
+
+| | |
+| --- | --- |
+| 서비스 | web(`dropbox` 모듈), third-party-datastore, document-updater, 모든 Ayakaleaf Pro 파드에서 실행 |
+| Dropbox → Overleaf | 인터넷에서 오는 `POST ${OVERLEAF_SITE_URL}/dropbox/webhook`, 앱 시크릿으로 서명됨 |
+| 파드 → Dropbox | `https://api.dropboxapi.com` 및 `https://content.dropboxapi.com` |
+| 브라우저 → Dropbox | `https://www.dropbox.com/oauth2/authorize`, 이후 `${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback`으로 복귀 |
+| 상태 | Redis의 대기 중인 변경 사항 큐와 그 잠금, MongoDB의 동기화 상태(`dropboxEntities`, `dropboxProjects`) |
+| 백그라운드 작업 | third-party-datastore는 매초 큐를 확인함. document-updater는 3분 동안 아무도 열지 않은 프로젝트를 기록함 |
+
+### 구성
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  DROPBOX_ENABLED: "true"
+  DROPBOX_APP_KEY: <app key>
+  DROPBOX_APP_NAME: Overleaf      # the folder name under Apps/ in Dropbox
+  # optional: send the requests to Dropbox through an HTTP proxy
+  # DROPBOX_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"`와 [Git 연동](/ko/on-premises/configuration/kubernetes/integrations/git-integration)의 git-bridge StatefulSet이 준비되어 있어야 합니다. 그렇지 않으면 계정 설정에서 프로젝트 동기화 섹션이 숨겨집니다.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "DROPBOX_APP_SECRET":"<app secret>",
+  "DROPBOX_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`DROPBOX_TOKEN_CIPHER_PASSWORD`는 MongoDB에 저장되는 사용자의 Dropbox 토큰을 암호화합니다. 모든 레플리카가 같은 값을 사용해야 하며, 나중에 이 값을 변경하면 모든 사용자가 Dropbox를 다시 연결해야 합니다.
+</Step>
+
+<Step title="데이터베이스 인덱스 만들기">
+[데이터베이스 인덱스 만들기](/ko/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation#create-the-database-indexes)의 인덱스 명령을 레플리카 세트의 프라이머리에서 한 번 실행하세요.
+
+```bash wrap
+kubectl -n overleaf exec -i mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' <<'EOF'
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+EOF
+```
+</Step>
+
+<Step title="적용 및 재시작">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf exec deploy/overleaf -- tail -n 5 /var/log/overleaf/third-party-datastore.log
+```
+
+`third-party-datastore.log`는 `DROPBOX_ENABLED`가 `"true"`일 때만 존재합니다.
+</Step>
+
+<Step title="웹훅을 인터넷에 공개하기">
+Dropbox는 인터넷에서 `${OVERLEAF_SITE_URL}/dropbox/webhook`에 접근할 수 있어야 합니다. 인그레스나 로드 밸런서가 외부에서 일부 경로나 네트워크만 허용한다면 이 경로를 허용하세요. Dropbox가 호출하는 유일한 경로입니다. 클러스터 외부에서 확인하세요.
+
+```bash
+curl "https://overleaf.example.com/dropbox/webhook?challenge=test"   # prints: test
+```
+
+그런 다음 Toolkit 페이지에 설명된 대로 Dropbox App Console에서 웹훅을 추가하세요.
+</Step>
+</Steps>
+
+### 여러 레플리카
+
+공유 `DROPBOX_TOKEN_CIPHER_PASSWORD` 외에는 추가 작업이 없습니다.
+
+* 웹훅은 어느 레플리카에든 도착할 수 있습니다. 웹훅은 변경 사항을 Redis의 큐에 넣기만 합니다.
+* 모든 레플리카가 third-party-datastore를 실행하며, 각각 공유 큐를 처리합니다. 사용자의 큐는 Redis의 잠금으로 가져가므로, 특정 사용자의 변경 사항은 한 번에 하나의 레플리카만 보내거나 가져옵니다.
+* 모든 레플리카의 document-updater가 유휴 프로젝트를 백그라운드에서 기록합니다. 각 프로젝트는 Redis의 공유 목록에서 가져가므로 한 번만 기록됩니다.
+
+### Kubernetes에서의 테스트
+
+Dropbox API의 모의 서버를 대상으로 HAProxy 뒤에 세 개의 레플리카를 둔 Kubernetes 1.37 환경에서, Dropbox 동기화에 대한 엔드투엔드 테스트(59개 케이스)가 통과했습니다. 테스트 항목은 계정 연결 및 연결 해제, 프로젝트·편집·바이너리 파일·이름 변경·이동·삭제를 Dropbox로 전송(프로젝트를 닫은 후 컴파일이나 "지금 동기화" 없이 백그라운드 기록으로 도착하는 에디터 편집 포함), 웹훅(검증 챌린지 및 서명 확인)을 통해 Dropbox에서 이루어진 변경 사항 적용, 새 폴더로부터의 새 프로젝트, 삭제된 프로젝트 폴더, 같은 이름의 프로젝트, 에디터의 Dropbox 대화 상자와 속도 제한이 적용된 "지금 동기화", Dropbox의 재시도·속도 제한·타임아웃, Dropbox 용량이 가득 찼거나 토큰을 거부하거나 정지된 경우의 계정 연결 해제, 정지된 Overleaf 계정, 그리고 third-party-datastore가 중지되었을 때의 웹훅 응답입니다.

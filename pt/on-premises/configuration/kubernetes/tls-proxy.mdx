@@ -1,0 +1,87 @@
+---
+title: Proxy TLS
+description: Sirva uma implantação no Kubernetes por HTTPS por meio de um ingress, de um balanceador de carga ou do HAProxy.
+icon: lock
+---
+
+Dentro do pod, o nginx do contêiner serve HTTP simples na porta 80. O HTTPS termina à frente dos pods: no seu ingress controller, no balanceador de carga da sua nuvem ou no HAProxy, como em [Escalonamento horizontal](/pt/on-premises/configuration/kubernetes/horizontal-scaling). O proxy NGINX do Toolkit (`bin/init --tls`, `NGINX_*` e `TLS_*` em `overleaf.rc`) não tem equivalente; veja [Proxy TLS](/pt/on-premises/configuration/overleaf-toolkit/tls-proxy) para o Toolkit.
+
+| | |
+| --- | --- |
+| Serviço | seu ingress ou balanceador de carga; o web lê as configurações abaixo quando é iniciado |
+| Navegador → proxy | HTTPS na porta 443, incluindo o WebSocket do editor |
+| Proxy → pods | HTTP simples para a porta 80 dos pods |
+| Tarefas periódicas | nenhuma (a renovação de certificados é responsabilidade do seu proxy) |
+
+### O que o proxy precisa fazer
+
+* Repassar WebSockets (`/socket.io`).
+* Permitir requisições de 10 minutos (compilações longas) e corpos de requisição de 50 MB (uploads), ou `MAX_UPLOAD_SIZE`.
+* Manter seu tempo limite de keep-alive ocioso em relação aos pods abaixo de 65 segundos, o tempo limite do nginx no pod.
+* Enviar `X-Forwarded-For` e `X-Forwarded-Proto: https`.
+* Com várias réplicas, manter um usuário em uma única réplica, veja [Escalonamento horizontal](/pt/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Sem `X-Forwarded-Proto: https` vindo de um endereço confiável, o Ayakaleaf Pro entende que as requisições chegam por HTTP e não define seu cookie de sessão seguro: os logins então falham. Defina `OVERLEAF_SECURE_COOKIE` apenas quando os usuários realmente acessarem o site por HTTPS; qualquer valor o ativa, inclusive `"false"`.
+
+### Exemplo com HAProxy
+
+Para terminar o HTTPS no DaemonSet do HAProxy de [Escalonamento horizontal](/pt/on-premises/configuration/kubernetes/horizontal-scaling), coloque o certificado e sua chave em um único arquivo PEM e em um Secret:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+Em seguida, altere `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+Altere o `config-hash` para que o HAProxy reinicie e, em seguida, defina o ConfigMap como acima e reinicie as réplicas.
+
+O redirecionamento mantém a porta da requisição: ele é adequado para um balanceador de carga nas portas 80 e 443, mas nas NodePorts ele envia `http://host:30081` para `https://host:30081`. Sem um balanceador de carga à frente, omita a linha de redirecionamento e forneça aos usuários o endereço `https://...:30443`.
+
+### Testado no Kubernetes
+
+No Kubernetes 1.37 com três réplicas e o HAProxy terminando o HTTPS como acima, com `OVERLEAF_SITE_URL` em `https://` e `OVERLEAF_SECURE_COOKIE`: os usuários foram ativados por meio de links `https://`, fizeram login com um cookie de sessão marcado como `Secure`, enviaram e compilaram projetos com o PDF obtido, permaneceram em sua réplica, abriram o WebSocket do editor (`wss`) e clonaram e fizeram push com o Git por HTTPS. As requisições `http://` na NodePort foram redirecionadas para `https://` com a mesma porta, conforme descrito acima.

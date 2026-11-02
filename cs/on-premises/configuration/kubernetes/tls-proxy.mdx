@@ -1,0 +1,87 @@
+---
+title: TLS proxy
+description: Poskytujte nasazení na Kubernetes přes HTTPS prostřednictvím ingressu, load balanceru nebo HAProxy.
+icon: lock
+---
+
+Uvnitř podu poskytuje nginx kontejneru čisté HTTP na portu 80. HTTPS končí před pody: ve vašem ingress controlleru, v cloudovém load balanceru nebo v HAProxy jako v [horizontálním škálování](/cs/on-premises/configuration/kubernetes/horizontal-scaling). NGINX proxy z Toolkitu (`bin/init --tls`, `NGINX_*` a `TLS_*` v `overleaf.rc`) zde nemá obdobu; pro Toolkit viz [TLS proxy](/cs/on-premises/configuration/overleaf-toolkit/tls-proxy).
+
+| | |
+| --- | --- |
+| Služba | váš ingress nebo load balancer; web čte níže uvedená nastavení při startu |
+| Prohlížeč → proxy | HTTPS na portu 443, včetně WebSocketu editoru |
+| Proxy → pody | čisté HTTP na port 80 podů |
+| Periodické úlohy | žádné (obnova certifikátů je záležitostí vaší proxy) |
+
+### Co musí proxy dělat
+
+* Propouštět WebSockety (`/socket.io`).
+* Povolit požadavky trvající 10 minut (dlouhé kompilace) a těla požadavků o velikosti 50 MB (nahrávání), případně `MAX_UPLOAD_SIZE`.
+* Udržovat svůj idle keep-alive timeout směrem k podům pod 65 sekundami, což je timeout nginxu v podu.
+* Posílat `X-Forwarded-For` a `X-Forwarded-Proto: https`.
+* Při více replikách držet uživatele na jedné replice, viz [Horizontální škálování](/cs/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Bez `X-Forwarded-Proto: https` z důvěryhodné adresy se Ayakaleaf Pro domnívá, že požadavky přicházejí přes HTTP, a nenastaví svou zabezpečenou session cookie: přihlášení pak selhávají. `OVERLEAF_SECURE_COOKIE` nastavte pouze tehdy, když uživatelé k webu skutečně přistupují přes HTTPS; zapne ji jakákoli hodnota, i `"false"`.
+
+### Příklad s HAProxy
+
+Chcete-li ukončovat HTTPS v DaemonSetu HAProxy z [horizontálního škálování](/cs/on-premises/configuration/kubernetes/horizontal-scaling), vložte certifikát a jeho klíč do jednoho souboru PEM a do Secretu:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+Poté upravte `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+Zvyšte `config-hash`, aby se HAProxy restartovala, poté nastavte ConfigMap podle výše uvedeného a restartujte repliky.
+
+Přesměrování zachovává port požadavku: hodí se pro load balancer na portech 80 a 443, ale na NodePortech přesměruje `http://host:30081` na `https://host:30081`. Bez load balanceru před clusterem řádek s přesměrováním vynechte a uživatelům dejte adresu `https://...:30443`.
+
+### Testováno na Kubernetes
+
+Na Kubernetes 1.37 se třemi replikami a HAProxy ukončující HTTPS podle výše uvedeného, s `OVERLEAF_SITE_URL` na `https://` a s `OVERLEAF_SECURE_COOKIE`: uživatelé se aktivovali přes odkazy `https://`, přihlásili se se session cookie označenou `Secure`, nahráli a zkompilovali projekty a stáhli PDF, zůstali na své replice, otevřeli WebSocket editoru (`wss`) a klonovali a pushovali pomocí Gitu přes HTTPS. Požadavky `http://` na NodePortu byly přesměrovány na `https://` se stejným portem, jak je popsáno výše.

@@ -1,0 +1,144 @@
+---
+title: Git 整合
+description: 在 Kubernetes 上與 Ayakaleaf Pro 一起執行 git-bridge。
+icon: code-branch
+---
+
+Git 整合會執行獨立的 git-bridge 服務。使用者透過 `${OVERLEAF_SITE_URL}/git/<project id>` 進行 clone 與 push；Ayakaleaf Pro pod 會將這些請求轉送給 git-bridge，而 git-bridge 則回呼該 pod 以取得專案內容與歷程記錄。啟用此功能也會同時啟用 [MCP server](/zh-Hant/on-premises/configuration/overleaf-toolkit/integrations/mcp-server)，且 GitHub、GitLab、Gitea 與 Dropbox 同步都需要此功能。
+
+本頁延伸自[使用 Kubernetes](/zh-Hant/on-premises/installation/using-kubernetes) 中的單一副本安裝。若有多個副本，請參閱[水平擴展](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling)。
+
+| | |
+| --- | --- |
+| 服務 | 位於獨立 pod（StatefulSet）中的 **git-bridge**；每個 Ayakaleaf Pro pod 中的：nginx（轉送 `/git/`）、web（Git 權杖、專案的 Git 頁面、git-bridge 呼叫的 API）與 history-v1（檔案內容） |
+| Git 用戶端 → Overleaf | `${OVERLEAF_SITE_URL}/git/<project id>`，以 `git` 作為使用者名稱，並以 Git 驗證權杖作為密碼 |
+| Ayakaleaf Pro pod ↔ git-bridge | nginx → Service `git-bridge`；git-bridge → 透過 `overleaf-internal` 存取 web 的 API（連接埠 3000）與 history-v1（連接埠 3100） |
+| 儲存的資料 | git-bridge 磁碟區上每個已 clone 之專案的 git 儲存庫 |
+| 定期工作 | git-bridge 每小時執行的 swap 工作，只有在設定了 swap store（`GIT_BRIDGE_SWAPSTORE_TYPE`，預設為 `noop`）時才會移動儲存庫 |
+
+<Steps>
+<Step title="部署 git-bridge">
+```yaml title="45-git-bridge.yaml" wrap
+# Internal Service for git-bridge: web's API (3000) and history-v1 (3100) of the Overleaf pod.
+# Keep it ClusterIP: the NodePort Service would publish these internal ports on every node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf-internal
+  namespace: overleaf
+spec:
+  selector:
+    app: overleaf
+  ports:
+    - {name: web, port: 3000}
+    - {name: history, port: 3100}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  # Fixed ClusterIP inside your service CIDR, used as GIT_BRIDGE_HOST: the image's nginx proxies
+  # /git/ with Docker's DNS resolver (127.0.0.11), which does not exist in Kubernetes.
+  clusterIP: 10.96.100.80
+  selector:
+    app: git-bridge
+  ports:
+    - {name: http, port: 8000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  serviceName: git-bridge
+  replicas: 1                     # git-bridge must run as a singleton
+  selector:
+    matchLabels:
+      app: git-bridge
+  template:
+    metadata:
+      labels:
+        app: git-bridge
+    spec:
+      # The Service "git-bridge" would inject GIT_BRIDGE_PORT=tcp://..., which git-bridge uses as its port
+      enableServiceLinks: false
+      containers:
+        - name: git-bridge
+          image: ghcr.io/ayaka-notes/overleaf-pro/git-bridge:6.3.2   # same tag as overleaf-pro
+          command: ["/server-pro-start.sh"]
+          securityContext:
+            runAsUser: 0
+          env:
+            - {name: GIT_BRIDGE_API_BASE_URL, value: "http://overleaf-internal.overleaf.svc.cluster.local:3000/api/v0/"}
+            - {name: GIT_BRIDGE_OAUTH2_SERVER, value: "http://overleaf.overleaf.svc.cluster.local"}
+            - {name: GIT_BRIDGE_POSTBACK_BASE_URL, value: "http://git-bridge.overleaf.svc.cluster.local:8000"}
+            - {name: GIT_BRIDGE_ROOT_DIR, value: /data/git-bridge}
+          ports:
+            - containerPort: 8000
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data/git-bridge}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+`10.96.100.80` 必須是您叢集 service CIDR 內一個未被使用的位址（kubeadm 的預設值為 `10.96.0.0/12`）。
+</Step>
+
+<Step title="讓 Ayakaleaf Pro 指向它">
+加入到 `30-config.yaml`：
+
+```yaml title="30-config.yaml (additions)"
+  GIT_BRIDGE_ENABLED: "true"
+  GIT_BRIDGE_HOST: "10.96.100.80"     # the fixed ClusterIP of the Service git-bridge
+  GIT_BRIDGE_PORT: "8000"
+  V1_HISTORY_URL: http://overleaf-internal.overleaf.svc.cluster.local:3100/api
+```
+
+```bash
+kubectl apply -f 45-git-bridge.yaml -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf
+kubectl -n overleaf rollout status statefulset/git-bridge
+```
+</Step>
+
+<Step title="Clone 專案">
+在 **Account Settings** 中建立 Git 驗證權杖，然後執行：
+
+```bash
+git clone http://192.0.2.10:30080/git/<project id>
+```
+
+以 `git` 作為使用者名稱，並以該權杖作為密碼。
+</Step>
+</Steps>
+
+### 為什麼 manifest 是這樣寫的
+
+* <strong>以固定的 ClusterIP 作為 `GIT_BRIDGE_HOST`。</strong>Ayakaleaf Pro 映像檔內的 nginx 會以設定為 `127.0.0.11`（Docker 內建 DNS）的 resolver 轉送 `/git/`。Kubernetes 在該位址沒有 DNS 伺服器，因此像 `git-bridge` 這樣的主機名稱會以 `502` 失敗，並在 `/var/log/nginx/error.log` 中顯示「git-bridge could not be resolved」。IP 位址則不需要查詢。
+* <strong>`overleaf-internal`。</strong>git-bridge 需要 Ayakaleaf Pro pod 的連接埠 `3000`（web API）與 `3100`（歷程記錄）。獨立的 ClusterIP Service 讓它們只在叢集內部可用；若將它們加入 NodePort Service，則會在每個節點上公開這些連接埠。
+* <strong>`enableServiceLinks: false`。</strong>Service `git-bridge` 會使 Kubernetes 在 pod 中加入 `GIT_BRIDGE_PORT=tcp://10.96.100.80:8000`；git-bridge 會將 `GIT_BRIDGE_PORT` 讀取為其監聽連接埠，並以 `MalformedJsonException ... path $.port` 停止。
+* <strong>單一副本並擁有自己的磁碟區。</strong>git-bridge 會在磁碟上為每個已 clone 的專案保存一個 git 儲存庫，且不得同時執行兩個。請備份其磁碟區。
+
+### 在 Kubernetes 上的測試
+
+在 Kubernetes 1.37 上以三個副本置於 HAProxy 之後，並以 git-bridge 作為 `overleaf-0` 的 sibling，我們針對 Git 整合的端對端測試全部通過（19 個案例），在將 git-bridge 移至連接埠 8001、使 nginx 必須使用 `GIT_BRIDGE_HOST` 與 `GIT_BRIDGE_PORT` 的情況下亦然：帳號設定中的 Git 權杖、編輯器中的 clone 命令、clone、push 與 pull、二進位檔案與資料夾、重新命名與刪除、拒絕過時的 push、依角色的存取權（受邀編輯者與透過連結加入的編輯者可以 push，檢視者與審閱者只能 clone，沒有存取權的使用者會被拒絕）、拒絕錯誤與已刪除的權杖、git-bridge 的內部路由保留在 nginx 後方，以及已停權的帳號。Git 驗證權杖本身（產生、列出、每位使用者的上限、刪除、到期、git-bridge 向 web 要求的檢查，以及已停權與已刪除帳號的權杖）在一個副本上通過測試（16 個案例）。
+
+### 問與答
+
+<Accordion title="`git clone` 回傳 502。">
+
+<strong>回答：</strong>請檢查 `GIT_BRIDGE_HOST`：它必須是 git-bridge Service 的 IP 位址，而不是其名稱，請參閱上文。`kubectl -n overleaf exec deploy/overleaf -- tail /var/log/nginx/error.log` 會顯示原因。
+
+</Accordion>

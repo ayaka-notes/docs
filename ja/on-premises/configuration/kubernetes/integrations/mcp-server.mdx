@@ -1,0 +1,38 @@
+---
+title: MCP サーバー
+description: Kubernetes デプロイで、AI クライアントをプロジェクトの MCP サーバー経由でプロジェクトに接続します。
+icon: plug
+---
+
+各プロジェクトの MCP サーバーは、すべての Ayakaleaf Pro Pod の **web** サービス（`mcp-server` モジュール）で動作します。[Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)とともに提供され、独自の設定はありません。Claude Code、Codex、その他のクライアントの接続方法は [MCP サーバー](/ja/on-premises/configuration/overleaf-toolkit/integrations/mcp-server)で説明しています。
+
+| | |
+| --- | --- |
+| サービス | web、すべての Ayakaleaf Pro Pod 内 |
+| 有効化の条件 | `GIT_BRIDGE_ENABLED: "true"` と git-bridge StatefulSet。[Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)を参照 |
+| 外部 → Overleaf | AI クライアントが Git 認証トークンを付けて `POST ${OVERLEAF_SITE_URL}/project/<id>/mcp` を送信。PDF のダウンロードリンクは `${OVERLEAF_SITE_URL}/project/<id>/mcp/download/` 以下 |
+| Pod → 外部 | なし |
+| 状態 | リクエスト間ではなし。コンパイル出力はコンパイルした Pod に残る |
+| 定期ジョブ | なし |
+
+### 設定
+
+[Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)をセットアップします。これで MCP サーバーは `${OVERLEAF_SITE_URL}/project/<project id>/mcp` で利用でき、このアドレスに AI クライアントの実行場所からアクセスできる必要があります。
+
+### 複数のレプリカ
+
+MCP 経由のコンパイルはリクエストを受け取ったレプリカ上で実行され、そのログと PDF はそのレプリカにしか存在しません。AI クライアントは Cookie を送信しないため、ロードバランサーが次のリクエスト（`get_compile_log` や PDF のダウンロードリンク）を別のレプリカに送ることがあり、その場合は "failed to fetch output file from CLSI" または 404 が返されます。3 つのレプリカで追加のルールを設定しなかったテストでは、ログリクエスト 6 件中 5 件、ダウンロード 4 件中 3 件がこの理由で失敗しました。
+
+`/git/` と同様に、プロジェクトのすべての MCP リクエストを 1 つのレプリカにルーティングしてください。[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)の HAProxy を使う場合:
+
+```text
+      use-server overleaf-0 if { path_reg ^/project/[0-9a-f]{24}/mcp(/|$) }
+```
+
+これにより、MCP のコンパイルはすべて `overleaf-0` のノードで実行されます。別の Ingress コントローラーを使う場合は、パス `/project/<id>/mcp` とその配下すべてを 1 つのレプリカ固有の名前（`overleaf-0.overleaf-hl`）にルーティングしてください。
+
+このルールを設定すると、同じテスト（コンパイル 1 回、ログリクエスト 6 件、PDF ダウンロード 4 件、すべて Cookie なし）はすべて成功しました。
+
+### Kubernetes でのテスト
+
+Kubernetes 1.37 上で HAProxy の背後に 3 つのレプリカを置いた状態で、MCP サーバーのエンドツーエンドテスト（37 ケース）に合格しています。対象は、ツールの一覧表示、誤った・削除された・アクセス権のないトークンの拒否、コンパイルとログの読み取り、単語数、プロジェクト設定と履歴、PDF のダウンロードリンク、開いているエディターにリアルタイムで反映され Git クローンにプルされるファイル編集、コメント、ロール別のアクセス、コンパイルと設定のレート制限、停止中のアカウントです。これらのリクエストはブラウザーセッションから送信されたため、ロードバランサーは 1 つのレプリカに振り分け続けました。Cookie を送信しないクライアントについては、[複数のレプリカ](#several-replicas)を参照してください。

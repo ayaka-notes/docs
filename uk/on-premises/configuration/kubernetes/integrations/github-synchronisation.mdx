@@ -1,0 +1,67 @@
+---
+title: Синхронізація з GitHub
+description: Дозвольте користувачам синхронізувати свої проєкти з репозиторіями GitHub або GitHub Enterprise у розгортанні на Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+Синхронізація з GitHub працює в службі **web** (модуль `github-sync`) кожного пода Ayakaleaf Pro. Для неї потрібна [інтеграція з Git](/uk/on-premises/configuration/kubernetes/integrations/git-integration). Як створити OAuth-застосунок і що робить кожне налаштування, описано в розділі [Синхронізація з GitHub](/uk/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); ця сторінка переносить це в Kubernetes.
+
+| | |
+| --- | --- |
+| Служба | web (модуль `github-sync`) у кожному поді Ayakaleaf Pro; зчитується під час запуску web |
+| Под → GitHub | `https://api.github.com` (REST і GraphQL) або API з `GITHUB_SYNC_URL` — щоразу, коли користувач прив'язує обліковий запис, імпортує, експортує чи синхронізує |
+| Браузер → GitHub | `https://github.com/login/oauth/authorize` для прив'язки облікового запису, потім повернення на `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | немає: вебхука немає, екземпляр не мусить бути доступним із GitHub |
+| Збережені дані | токени доступу GitHub користувача, зашифровані, у MongoDB |
+| Періодичні завдання | немає: синхронізація відбувається, коли користувач натискає кнопку |
+
+### Налаштування
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` і StatefulSet git-bridge з розділу [Інтеграція з Git](/uk/on-premises/configuration/kubernetes/integrations/git-integration) мають бути налаштовані: без них налаштування облікового запису та редактор приховують синхронізацію з GitHub.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` шифрує токени доступу GitHub користувачів у MongoDB. Усі репліки мають використовувати однакове значення, а якщо змінити його пізніше, усім користувачам доведеться знову прив'язати GitHub.
+</Step>
+
+<Step title="Приватний CA (необов'язково)">
+Якщо ваш GitHub має сертифікат від вашого власного центру сертифікації (CA), додайте CA до Secret `overleaf-certs`, змонтованого в `/var/lib/overleaf/certs` (див. [Сертифікати та інші файли](/uk/on-premises/configuration/kubernetes#сертифікати-та-інші-файли)), і встановіть `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` у ConfigMap.
+</Step>
+
+<Step title="Застосування, перезапуск і перевірка">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Будь-який HTTP-статус означає, що GitHub доступний із цього пода; `000` означає, що ні.
+</Step>
+</Steps>
+
+### Кілька реплік
+
+Нічого додаткового, окрім спільного `GITHUB_TOKEN_CIPHER_PASSWORD`. Синхронізація бере блокування в Redis, спільне з іншими Git-синхронізаціями, тож дві репліки ніколи не синхронізують той самий проєкт одночасно.
+
+### Перевірено на Kubernetes
+
+З макетом github.com та його REST і GraphQL API (довіра через `NODE_EXTRA_CA_CERTS` з `overleaf-certs`), на Kubernetes 1.37 з однією реплікою та ввімкненою інтеграцією з Git, наші наскрізні тести синхронізації з GitHub проходять (31 випадок): прив'язка та скасування прив'язки облікового запису, відкликані токени, експорт проєкту в новий приватний репозиторій або репозиторій організації, імпорт репозиторію (зокрема понад ліміт завантаження), pull і push, злиття, конфлікти та ручні злиття, видалені гілки та гілки після force push, бінарні файли, перейменування та видалення, втрата права на push, а також те, що можуть робити власники, редактори та глядачі.

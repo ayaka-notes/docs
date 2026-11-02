@@ -1,0 +1,65 @@
+---
+title: Tekoälyintegraatio
+description: Määritä tekoälychat, LaTeX-virheiden korjausehdotukset, kiintiöt ja hakupalvelut Kubernetes-käyttöönotossa.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+Tekoälyavustaja ja LaTeX-virheavustaja toimivat jokaisen Ayakaleaf Pro -podin **web**-palvelussa (`workbench`- ja `error-assistant`-moduulit). Mitä kukin asetus tekee, käyttäjien käyttöoikeudet ja kiintiöt on kuvattu sivulla [Tekoälyintegraatio](/fi/on-premises/configuration/overleaf-toolkit/integrations/ai-integration); tämä sivu vie sen Kubernetesiin.
+
+| | |
+| --- | --- |
+| Palvelu | web, jokaisessa Ayakaleaf Pro -podissa; luetaan, kun web käynnistyy. `web_fetch`-työkalu kulkee saman podin linked-url-proxyn kautta |
+| Pod → ulkoverkko | `AI_BASE_URL`; `WEB_SEARCH_URL` (oletus `https://api.tavily.com/search`) ja `DOCS_MCP_URL`, jos haku on käytössä; sivut, jotka malli lukee `web_fetch`-työkalulla |
+| Ulkoverkko → Overleaf | ei mitään |
+| Tila | token-kiintiön laskurit Redisissä, jaettuina kaikkien replikoiden kesken; keskusteluhistoria pysyy selaimessa |
+| Ajastetut tehtävät | ei mitään |
+
+### Konfiguraatio
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+`AI_ENABLED`-arvon on oltava täsmälleen `"true"`. Avustaja tulee näkyviin vain, kun `AI_ENABLED`, `AI_BASE_URL`, `AI_MODEL` ja `AI_API_KEY` on kaikki asetettu.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="Ota käyttöön, käynnistä uudelleen ja tarkista yhdyskäytävä jokaisesta podista">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+Mikä tahansa HTTP-tila tarkoittaa, että yhdyskäytävä on tavoitettavissa; `000` tarkoittaa, että ei ole.
+</Step>
+</Steps>
+
+`web_fetch`-työkalu noutaa sivut saman välityspalvelimen kautta kuin [Ulkoinen URL-osoite](/fi/on-premises/configuration/kubernetes/external-url) -tiedostot, joten `OVERLEAF_LINKED_URL_*`-asetukset rajoittavat myös sitä, mitä malli saa lukea.
+
+### Useita replikoita
+
+Mitään ylimääräistä ei tarvita. Token-kiintiö lasketaan Redisissä, joten käyttäjän käyttömäärä on sama jokaisella replikalla, ja ylläpitäjän nollaus pätee kaikkialla.
+
+### Testattu Kubernetesissa
+
+OpenAI-yhteensopivan yhdyskäytävän, Tavilyn ja GitBookin MCP-päätepisteen jäljitelmiä vasten (joihin luotettiin `overleaf-certs`-Secretistä tulevan `NODE_EXTRA_CA_CERTS`-asetuksen kautta) Kubernetes 1.37:ssä päästä päähän -testimme menevät läpi: tekoälyavustajan osalta kolmella replikalla HAProxyn takana (31 tapausta) keskustelut työkalukutsuineen ja muokkausehdotuksineen, verkko- ja dokumentaatiohaku, verkkosivujen lukeminen linked-url-proxyn kautta `OVERLEAF_LINKED_URL_ALLOWED_RESOURCES`-rajauksella, kuva- ja PDF-liitteet, suostumus, Redisissä laskettu token-kiintiö, tekoäly poistettuna käytöstä käyttäjältä ja koko instanssilta sekä hitaat yhteydet yhdyskäytävään; virheavustajan osalta yhdellä replikalla (15 tapausta) korjausehdotukset, suostumus, jaettu token-kiintiö ja tekoäly poistettuna käytöstä.

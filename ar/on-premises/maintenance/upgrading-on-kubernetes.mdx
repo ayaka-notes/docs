@@ -1,0 +1,136 @@
+---
+title: الترقية على Kubernetes
+description: رقِّ نشرًا لـ Ayakaleaf Pro قائمًا على Kubernetes، بنسخة متماثلة واحدة أو بعدة نسخ.
+icon: arrow-up-from-square
+---
+
+تستبدل الترقية وسم الصورة. يُرحّل الإصدار الجديد قاعدة البيانات عند بدء تشغيله، ويجب أن تُجرى عمليات الترحيل هذه **مرة واحدة، من pod واحد، بينما لا يعمل أي pod أقدم**. وعلى Kubernetes يستبعد ذلك التحديث المتدرّج (rolling update) العادي لـ StatefulSet موسَّع.
+
+<Danger>
+
+خذ [نسخة احتياطية متّسقة](/ar/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) قبل كل ترقية، مع إيقاف Ayakaleaf Pro. اقرأ [ملاحظات الإصدار](/ar/on-premises/release-notes) للاطلاع على خطوات الإصدار الذي تُرقّي إليه.
+
+</Danger>
+
+قبل أن تبدأ، اسحب على كل عقدة تشغّل Ayakaleaf Pro أي صورة TeX Live يدرجها الإصدار الجديد أو إعداداتك الجديدة، باستخدام `sudo docker pull`.
+
+<Tabs>
+<Tab title="نسخة متماثلة واحدة">
+
+<Steps>
+<Step title="أوقف Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="خذ نسخة احتياطية">
+MongoDB، من أي عضو:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+وحدة تخزين البيانات، عبر pod قصير العمر يركّبها (ويُجدوَل على عقدة وحدة التخزين):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+افعل الشيء نفسه مع وحدة التخزين الخاصة بـ git-bridge ‏(`data-git-bridge-0`)، واحتفظ بنسخة من الـ Secret المسمّى `overleaf-secrets`. إذا كان التخزين لديك يدعم [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/)، فإن لقطة (snapshot) لوحدات التخزين تؤدي الغرض نفسه.
+</Step>
+
+<Step title="غيّر الإصدار وابدأ التشغيل">
+اضبط الوسم الجديد في `40-overleaf.yaml` (وفي `45-git-bridge.yaml`، الذي يجب أن يستخدم الوسم نفسه)، ثم:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+يستخدم الـ Deployment ‏`strategy: Recreate`، لذا حتى مع تغيير الوسم لا يعمل إصداران أبدًا في الوقت نفسه.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="عدة نسخ متماثلة">
+
+للإعداد الوارد في [التوسّع الأفقي](/ar/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="أوقف كل النسخ المتماثلة">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="خذ نسخة احتياطية">
+MongoDB كما في تبويب النسخة المتماثلة الواحدة، وحاويات S3 لديك باستخدام أدوات مزوّدك، ووحدة التخزين الخاصة بـ git-bridge ‏(`data-git-bridge-0`) والـ Secrets. لا يحتوي المجلد `/srv/overleaf-ha` الخاص بالنسخ المتماثلة إلا على مخرجات الترجمة ولا يحتاج إلى نسخ احتياطي.
+</Step>
+
+<Step title="شغّل نسخة متماثلة واحدة بالإصدار الجديد">
+اضبط الوسم الجديد في `70-overleaf.yaml` و`75-git-bridge.yaml`، و`replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+تحقّق من أنك تستطيع تسجيل الدخول، وفتح مشروع، وترجمته.
+</Step>
+
+<Step title="شغّل النسخ المتماثلة الأخرى">
+اضبط `replicas: 3` مجددًا وطبّق التغيير. يشغّلها `OrderedReady` واحدة تلو الأخرى.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+لا تغيّر صورة StatefulSet موسَّع قيد التشغيل باستخدام `kubectl set image` أو `kubectl apply`: إذ سيبدأ التحديث المتدرّج تشغيل الإصدار الجديد، وعمليات الترحيل الخاصة به، بينما لا تزال النسخ المتماثلة الأقدم تخدم المستخدمين. أما تغييرات الإعدادات دون إصدار جديد فلا بأس بها كإعادة تشغيل متدرّجة: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB وRedis
+
+رقِّهما بشكل منفصل عن Ayakaleaf Pro. بالنسبة إلى MongoDB، اتّبع [تحديث MongoDB](/ar/on-premises/maintenance/updating-mongodb) (إصدار رئيسي واحد في كل مرة، مع `featureCompatibilityVersion` بعد كل خطوة)؛ وتأخذ مجموعة النسخ المتماثلة الصورة الجديدة عضوًا تلو الآخر عند تغيير الصورة في `10-mongo.yaml`، لأن الـ StatefulSet يستبدل `mongo-2` و`mongo-1` و`mongo-0` بالتناوب.
+
+### التراجع
+
+أوقف Ayakaleaf Pro كما هو موضّح أعلاه، واستعد MongoDB من الأرشيف (`mongorestore --drop --archive --gzip`) ووحدات التخزين أو حاويات التخزين من النسخة الاحتياطية، واضبط الوسم القديم وابدأ التشغيل مجددًا. لا يمكن التراجع عن عمليات الترحيل الخاصة بالإصدار الجديد بأي طريقة أخرى.
+
+### أسئلة وأجوبة
+
+<Accordion title="تبقى إحدى النسخ المتماثلة غير جاهزة، ولا تبدأ النسخ المتماثلة الأخرى أبدًا">
+
+<strong>الإجابة:</strong> مع `podManagementPolicy: OrderedReady`، لا يبدأ `overleaf-1` إلا بعد أن يصبح `overleaf-0` جاهزًا، ولا يستبدل التحديث المتدرّج pod لم يصبح جاهزًا قط. بعد إصلاح السبب، مثل إعداد خاطئ في الـ ConfigMap، احذف الـ pod العالق حتى يُنشئه الـ StatefulSet من جديد من القالب الحالي:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+واجهنا ذلك في عنقود الاختبار لدينا بعد أن منع أحد الإعدادات `overleaf-0` من أن يصبح جاهزًا؛ وقد أتاح حذف الـ pod بدء تشغيل النسخ المتماثلة الثلاث كلها.
+
+</Accordion>

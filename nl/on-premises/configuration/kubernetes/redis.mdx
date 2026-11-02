@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Verbind een Kubernetes-deployment met Redis met een wachtwoord, en bewaar Redis-gegevens met AOF-persistentie.
+icon: memory
+---
+
+Elke Ayakaleaf Pro-service die live status bijhoudt, gebruikt die ene Redis-server: web (sessies, snelheidslimieten), real-time, document-updater (bewerkingen die nog niet in MongoDB zijn opgeslagen), project-history (geschiedeniswachtrij) en third-party-datastore (Dropbox-wachtrij). De installatie draait deze als de StatefulSet `redis` uit [3. MongoDB en Redis deployen](/nl/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis); zie [Redis](/nl/on-premises/configuration/overleaf-toolkit/redis) voor de Toolkit.
+
+| | |
+| --- | --- |
+| Services | web, real-time, document-updater, project-history, history-v1, third-party-datastore, in elke Ayakaleaf Pro-pod |
+| Instellingen | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (standaard `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| Niet ondersteund | Redis Sentinel en Redis Cluster: slechts één server |
+
+### Wachtwoordauthenticatie
+
+<Steps>
+<Step title="Sla het wachtwoord op">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Start Redis ermee">
+Geef in `20-redis.yaml` de container het wachtwoord en geef het door aan `redis-server`:
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes vervangt `$(REDIS_PASS)` door de waarde uit de Secret. De readiness probe (`tcpSocket`) hoeft niet te worden gewijzigd.
+</Step>
+
+<Step title="Toepassen en herstarten">
+Stop eerst Ayakaleaf Pro, zodat er tussen de twee herstarts geen bewerking verloren gaat:
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Voor een beheerde Redis stel je `OVERLEAF_REDIS_HOST` (en `REDIS_HOST`) in de ConfigMap in op het adres ervan, het wachtwoord zoals hierboven, en `OVERLEAF_REDIS_TLS: "true"` als TLS vereist is.
+
+### AOF-persistentie
+
+De installatie start Redis al met `--appendonly yes`, de tegenhanger van `REDIS_AOF_PERSISTENCE=true` van de Toolkit, en bewaart de gegevens op het volume `data-redis-0`. Om een bestaande Redis zonder AOF om te zetten, volg je de stappen op de [Toolkit-pagina](/nl/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) met `kubectl -n overleaf exec -it redis-0 -- redis-cli` in plaats van `docker exec`, en voeg je daarna `--appendonly yes` toe aan de args.
+
+### Meerdere replica's
+
+Alle replica's moeten dezelfde Redis gebruiken: deze bevat de sessies, de bewerkingen die nog niet in MongoDB staan en de locks die voorkomen dat twee replica's tegelijk hetzelfde project verwerken.
+
+### Getest op Kubernetes
+
+Op Kubernetes 1.37 met één replica weigerde Redis, gestart met `--requirepass $(REDIS_PASS)` uit de Secret `redis-auth` zoals hierboven, `redis-cli` zonder het wachtwoord (`NOAUTH`), en met `OVERLEAF_REDIS_PASS` en `REDIS_PASSWORD` in `overleaf-secrets` slaagden onze end-to-endtests voor het launchpad (13 gevallen) en voor bewerken met wijzigingen bijhouden, opmerkingen en anoniem delen (22 gevallen), die via web, real-time, document-updater en project-history lopen; geen enkele service logde een Redis-authenticatiefout. Alle andere Kubernetes-tests op deze pagina's draaiden tegen de Redis-StatefulSet uit de installatie, met AOF-persistentie en zonder wachtwoord.

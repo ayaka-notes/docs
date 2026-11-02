@@ -1,0 +1,38 @@
+---
+title: Server MCP
+description: Collega i client AI a un progetto tramite il suo server MCP in un deployment Kubernetes.
+icon: plug
+---
+
+Il server MCP di ogni progetto viene eseguito nel servizio **web** (il modulo `mcp-server`) di ogni pod di Ayakaleaf Pro. Viene fornito con l'[integrazione Git](/it/on-premises/configuration/kubernetes/integrations/git-integration) e non ha impostazioni proprie. Come collegare Claude Code, Codex e altri client è descritto in [Server MCP](/it/on-premises/configuration/overleaf-toolkit/integrations/mcp-server).
+
+| | |
+| --- | --- |
+| Servizio | web, in ogni pod di Ayakaleaf Pro |
+| Attivato da | `GIT_BRIDGE_ENABLED: "true"` e lo StatefulSet di git-bridge, vedi [Integrazione Git](/it/on-premises/configuration/kubernetes/integrations/git-integration) |
+| Esterno → Overleaf | i client AI eseguono `POST ${OVERLEAF_SITE_URL}/project/<id>/mcp` con un token di autenticazione Git; link per il download dei PDF sotto `${OVERLEAF_SITE_URL}/project/<id>/mcp/download/` |
+| Pod → esterno | nessuno |
+| Stato | nessuno tra una richiesta e l'altra; l'output della compilazione resta sul pod che ha compilato |
+| Job periodici | nessuno |
+
+### Configurazione
+
+Configura l'[integrazione Git](/it/on-premises/configuration/kubernetes/integrations/git-integration). Il server MCP si trova quindi in `${OVERLEAF_SITE_URL}/project/<project id>/mcp`, e l'indirizzo deve essere raggiungibile dal punto in cui viene eseguito il client AI.
+
+### Più repliche
+
+Una compilazione tramite MCP viene eseguita sulla replica che ha ricevuto la richiesta, e il suo log e il suo PDF esistono solo lì. I client AI non inviano cookie, quindi il load balancer può inviare la richiesta successiva, `get_compile_log` o il link di download del PDF, a un'altra replica, che risponde "failed to fetch output file from CLSI" o 404. Nel nostro test con tre repliche e senza regole aggiuntive, 5 richieste di log su 6 e 3 download su 4 sono falliti in questo modo.
+
+Instrada tutte le richieste MCP di un progetto verso un'unica replica, come per `/git/`. Con HAProxy da [Scalabilità orizzontale](/it/on-premises/configuration/kubernetes/horizontal-scaling):
+
+```text
+      use-server overleaf-0 if { path_reg ^/project/[0-9a-f]{24}/mcp(/|$) }
+```
+
+Tutte le compilazioni MCP vengono quindi eseguite sul nodo di `overleaf-0`. Con un altro ingress controller, instrada il percorso `/project/<id>/mcp` e tutto ciò che si trova al di sotto verso il nome proprio di una replica (`overleaf-0.overleaf-hl`).
+
+Con questa regola, lo stesso test (una compilazione, 6 richieste di log e 4 download di PDF, tutti senza cookie) è riuscito ogni volta.
+
+### Testato su Kubernetes
+
+Su Kubernetes 1.37 con tre repliche dietro HAProxy, i nostri test end-to-end per il server MCP vengono superati (37 casi): elenco degli strumenti, token rifiutati quando errati, eliminati o senza accesso, compilazione e lettura del log, conteggio delle parole, impostazioni e cronologia del progetto, link di download dei PDF, modifica dei file con le modifiche mostrate in tempo reale nell'editor aperto e recuperate in un clone Git, commenti, accesso per ruolo, i limiti di frequenza per compilazione e impostazioni, e account sospesi. Queste richieste provenivano da una sessione del browser, quindi il load balancer le ha mantenute su un'unica replica; per i client senza cookie, vedi [Più repliche](#several-replicas).

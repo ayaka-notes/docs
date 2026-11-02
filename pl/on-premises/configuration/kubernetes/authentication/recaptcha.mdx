@@ -1,0 +1,64 @@
+---
+title: reCAPTCHA
+description: Ochrona logowania, rejestracji i resetowania hasła za pomocą Google reCAPTCHA we wdrożeniu Kubernetes.
+icon: robot
+---
+
+Usługa **web** (moduł `login-register`) wymaga reCAPTCHA v2 (niewidocznej) przy logowaniu przez e-mail, logowaniu LDAP, rejestracji i resetowaniu hasła. Utwórz klucz i przeczytaj, co robi każde ustawienie, w [reCAPTCHA](/pl/on-premises/configuration/overleaf-toolkit/authentication/recaptcha); ta strona opisuje, jak umieścić to w Kubernetes.
+
+| | |
+| --- | --- |
+| Usługa | web, w każdym podzie Ayakaleaf Pro; odczytywane przy starcie web |
+| Pod → Google | `RECAPTCHA_ENDPOINT` (domyślnie `https://www.google.com/recaptcha/api/siteverify`), przy każdym sprawdzanym żądaniu |
+| Przeglądarka → Google | skrypt widżetu z `www.recaptcha.net` |
+| Stan | limity żądań w Redis; historia urządzeń („ta przeglądarka już przeszła weryfikację”) w zaszyfrowanym ciasteczku |
+| Zadania okresowe | brak |
+
+### Konfiguracja
+
+<Steps>
+<Step title="Klucz witryny do ConfigMap">
+```yaml
+  RECAPTCHA_SITE_KEY: <site key>
+  # optional
+  # RECAPTCHA_ENDPOINT: https://www.recaptcha.net/recaptcha/api/siteverify
+  # CAPTCHA_TRUSTED_USERS: robot@example.com
+```
+
+Klucz witryny jest publiczny: wyświetla go każda strona logowania.
+</Step>
+
+<Step title="Klucz tajny i klucz historii urządzeń do Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "RECAPTCHA_SECRET_KEY":"<secret key>",
+  "DEVICE_HISTORY_SECRET":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+Ustaw oba klucze jednocześnie: przy kluczu witryny bez klucza tajnego każde sprawdzenie kończy się niepowodzeniem i nikt nie może zalogować się hasłem, zarejestrować ani zresetować hasła. `DEVICE_HISTORY_SECRET` musi mieć 64 znaki szesnastkowe; kontener go nie generuje.
+</Step>
+
+<Step title="Zastosuj i zrestartuj">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Następnie sprawdź, czy każdy pod ma dostęp do punktu końcowego. Pody rezygnują po około jednej sekundzie na każdą próbę połączenia, a logowanie, którego sprawdzenia nie da się wykonać, kończy się błędem:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://www.google.com/recaptcha/api/siteverify
+done
+```
+</Step>
+</Steps>
+
+### Kilka replik
+
+Wszystkie repliki muszą współdzielić `DEVICE_HISTORY_SECRET`, co ma miejsce, gdy znajduje się on w Secret. Przy różnych wartościach przeglądarka, która przeszła weryfikację na jednej replice, ponownie otrzymałaby captchę na innej. Limity żądań są liczone w Redis dla wszystkich replik łącznie.
+
+### Przetestowano na Kubernetes
+
+Wobec atrapy punktu końcowego weryfikacji Google (zaufanej przez `NODE_EXTRA_CA_CERTS` z `overleaf-certs`), na Kubernetes 1.37, nasze testy end-to-end dla reCAPTCHA przechodzą pomyślnie (13 przypadków): na jednej replice logowanie, rejestracja i resetowanie hasła — każde odrzucane bez captchy lub z nieudaną captchą i akceptowane z udaną, historia urządzeń z `DEVICE_HISTORY_SECRET` pozwalająca przeglądarce pominąć captchę oraz `CAPTCHA_TRUSTED_USERS`; na trzech replikach za HAProxy logowanie LDAP z captchą.

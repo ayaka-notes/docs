@@ -1,0 +1,45 @@
+---
+title: 添加 LaTeX 用户帮助
+description: 在 Kubernetes 部署中，于 /learn 路径下提供来自 MediaWiki 站点的 LaTeX 帮助页面。
+icon: graduation-cap
+---
+
+`/learn` 页面由每个 Ayakaleaf Pro Pod 中的 **web** 服务（`learn` 模块）提供，内容来自 `WIKI_URL` 中设置的 Wiki 的缓存。该模块的作用以及哪些 Wiki 可用，请参见[添加 LaTeX 用户帮助](/zh-CN/on-premises/configuration/overleaf-toolkit/adding-latex-user-help)。
+
+| | |
+| --- | --- |
+| 服务 | web（`learn` 模块），位于每个 Ayakaleaf Pro Pod 中 |
+| Pod → 外部 | `WIKI_URL`（默认为 `https://learnwiki.overleaf.com`）：首次启动时获取所有页面，之后当用户在超过 `WIKI_MAX_CACHE_AGE` 后打开某个页面时再次获取该页面 |
+| 浏览器 → 外部 | 页面中的图片，直接从 `WIKI_URL` 加载 |
+| 存储的数据 | 数据卷上 `/var/lib/overleaf/data/learnPages` 中的页面缓存 |
+| 定期任务 | 无：页面在用户打开时刷新 |
+
+### 配置
+
+```yaml title="30-config.yaml (additions)"
+  OVERLEAF_PROXY_LEARN: "true"
+  # optional: your own MediaWiki
+  # WIKI_URL: https://wiki.example.com
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf --timeout=30m
+```
+
+<Warning>
+
+在启用该模块后首次启动时，web 服务会先下载整个 Wiki，然后才接受请求，这需要几分钟时间。在此之前 Pod 一直处于未就绪状态，因此请在 `rollout status --timeout` 以及你添加的任何启动探针或存活探针中预留足够时间。之后的启动会复用数据卷上的缓存。
+
+</Warning>
+
+首次启动时，在缓存尚不存在之前，Pod 必须能够访问 `WIKI_URL`：否则 web 服务会在启动过程中失败，并在 Pod 内被反复重启，导致 Pod 永远无法就绪。请关闭该模块，或允许 Pod 向外访问该 Wiki。一旦缓存存在，即使 Wiki 无法访问，Pod 也能启动并提供缓存的页面。
+
+### 多个副本
+
+每个副本都在其所在节点的磁盘上保留自己的缓存，因此每个副本在首次启动时都会下载 Wiki；使用 `podManagementPolicy: OrderedReady` 时，它们会依次进行下载。在某个页面于另一个副本上刷新之前，用户可能会在该副本上看到版本略有不同的页面。
+
+### 在 Kubernetes 上的测试
+
+在 Kubernetes 1.37 上，使用位于 HAProxy 之后的三个副本，每个副本在首次启动时将 `https://learnwiki.overleaf.com` 下载到其所在节点的缓存中，我们针对 `/learn` 的端到端测试全部通过（12 个用例）：页眉中的 Documentation 链接、欢迎消息和编辑器的帮助菜单、目录侧边栏、Wiki 内的页面、链接和重定向、从 Wiki 加载的图片、未知页面返回 404、未开启公开访问时需要登录，以及在将 `WIKI_URL` 改为无法访问的地址后，从缓存中提供过期页面。在缓存为空且 `WIKI_URL` 指向一个拒绝连接的地址时启动，Pod 一直保持未就绪而没有重启，而其中的 web 服务在三分钟内启动并失败了 77 次。

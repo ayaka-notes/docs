@@ -1,0 +1,45 @@
+---
+title: LaTeX ユーザーヘルプの追加
+description: Kubernetes デプロイで、MediaWiki サイトの LaTeX ヘルプページを /learn 以下で配信します。
+icon: graduation-cap
+---
+
+`/learn` のページは、すべての Ayakaleaf Pro Pod の **web** サービス（`learn` モジュール）が、`WIKI_URL` で設定した Wiki のキャッシュから配信します。モジュールの動作と利用できる Wiki については、[LaTeX ユーザーヘルプの追加](/ja/on-premises/configuration/overleaf-toolkit/adding-latex-user-help) を参照してください。
+
+| | |
+| --- | --- |
+| サービス | web（`learn` モジュール）、すべての Ayakaleaf Pro Pod 内 |
+| Pod → 外部 | `WIKI_URL`（デフォルトは `https://learnwiki.overleaf.com`）：初回起動時にすべてのページ、その後は `WIKI_MAX_CACHE_AGE` 経過後にユーザーが開いたページを再取得 |
+| ブラウザ → 外部 | ページの画像を `WIKI_URL` から直接取得 |
+| 保存データ | データボリューム上の `/var/lib/overleaf/data/learnPages` にあるページキャッシュ |
+| 定期ジョブ | なし：ページはユーザーが開いたときに更新されます |
+
+### 設定
+
+```yaml title="30-config.yaml (additions)"
+  OVERLEAF_PROXY_LEARN: "true"
+  # optional: your own MediaWiki
+  # WIKI_URL: https://wiki.example.com
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf --timeout=30m
+```
+
+<Warning>
+
+モジュールを有効にして初めて起動するとき、web サービスはリクエストを受け付ける前に Wiki 全体をダウンロードするため、数分かかります。それまで Pod は Ready になりません。`rollout status --timeout` や、追加する startup プローブ・liveness プローブでこの時間を考慮してください。2 回目以降の起動では、データボリューム上のキャッシュが再利用されます。
+
+</Warning>
+
+初回起動時、キャッシュがまだ存在しない段階では、Pod から `WIKI_URL` に到達できる必要があります。到達できないと web サービスは起動中に失敗し、Pod 内で何度も再起動されるため、Pod は Ready になりません。モジュールを無効にするか、Pod から Wiki への外部通信を許可してください。キャッシュが作成された後は、Wiki に到達できない間も Pod は起動し、キャッシュされたページを配信します。
+
+### 複数のレプリカ
+
+各レプリカは自身のノードのディスク上に独自のキャッシュを保持するため、それぞれが初回起動時に Wiki をダウンロードします。`podManagementPolicy: OrderedReady` の場合、これは 1 つずつ順番に行われます。あるページが別のレプリカで更新されるまでは、ユーザーにはそのレプリカでわずかに異なるバージョンのページが表示されることがあります。
+
+### Kubernetes でのテスト結果
+
+Kubernetes 1.37 上で、HAProxy の背後に 3 つのレプリカを配置し、それぞれが初回起動時に `https://learnwiki.overleaf.com` を自身のノードのキャッシュにダウンロードする構成で、`/learn` のエンドツーエンドテストに合格しました（12 ケース）。対象は、ヘッダーの Documentation リンク、ウェルカムメッセージとエディターの Help メニュー、目次サイドバー、Wiki 内のページ・リンク・リダイレクト、Wiki から読み込まれる画像、未知のページに対する 404、パブリックアクセスなしでのログイン要求、そして `WIKI_URL` を到達できないアドレスに変更した後にキャッシュから配信される古いページです。キャッシュが空で、`WIKI_URL` が接続を拒否するアドレスを指している状態で起動したところ、Pod は再起動せずに Ready にならないままとなり、その内部の web サービスは 3 分間に 77 回起動と失敗を繰り返しました。

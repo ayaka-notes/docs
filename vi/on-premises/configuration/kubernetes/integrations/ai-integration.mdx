@@ -1,0 +1,65 @@
+---
+title: Tích hợp AI
+description: Cấu hình trò chuyện AI, gợi ý sửa lỗi LaTeX, hạn mức và dịch vụ tìm kiếm trên triển khai Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+Trợ lý AI và trợ lý lỗi LaTeX chạy trong dịch vụ **web** (các module `workbench` và `error-assistant`) của mọi pod Ayakaleaf Pro. Chức năng của từng thiết lập, quyền truy cập của người dùng và hạn mức được mô tả trong [Tích hợp AI](/vi/on-premises/configuration/overleaf-toolkit/integrations/ai-integration); trang này đưa chúng vào Kubernetes.
+
+| | |
+| --- | --- |
+| Dịch vụ | web, trong mọi pod Ayakaleaf Pro; được đọc khi web khởi động. Công cụ `web_fetch` đi qua linked-url-proxy trong cùng pod |
+| Pod → bên ngoài | `AI_BASE_URL`; `WEB_SEARCH_URL` (mặc định `https://api.tavily.com/search`) và `DOCS_MCP_URL` nếu bật tìm kiếm; các trang mà mô hình đọc bằng `web_fetch` |
+| Bên ngoài → Overleaf | không có |
+| Trạng thái | bộ đếm hạn mức token trong Redis, dùng chung cho mọi replica; lịch sử trò chuyện nằm trong trình duyệt |
+| Tác vụ định kỳ | không có |
+
+### Cấu hình
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+`AI_ENABLED` phải chính xác là `"true"`. Trợ lý chỉ xuất hiện khi `AI_ENABLED`, `AI_BASE_URL`, `AI_MODEL` và `AI_API_KEY` đều được đặt.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="Áp dụng, khởi động lại và kiểm tra gateway từ mọi pod">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+Bất kỳ mã trạng thái HTTP nào đều có nghĩa là gateway truy cập được; `000` nghĩa là không.
+</Step>
+</Steps>
+
+Công cụ `web_fetch` lấy các trang qua cùng proxy với các tệp [URL bên ngoài](/vi/on-premises/configuration/kubernetes/external-url), vì vậy các thiết lập `OVERLEAF_LINKED_URL_*` cũng giới hạn những gì mô hình có thể đọc.
+
+### Nhiều replica
+
+Không cần gì thêm. Hạn mức token được đếm trong Redis, nên mức sử dụng của một người dùng là như nhau trên mọi replica, và việc đặt lại của quản trị viên áp dụng ở mọi nơi.
+
+### Đã kiểm thử trên Kubernetes
+
+Với bản giả lập của một gateway tương thích OpenAI, Tavily và endpoint MCP của GitBook (được tin cậy qua `NODE_EXTRA_CA_CERTS` từ `overleaf-certs`), trên Kubernetes 1.37, các bài kiểm thử end-to-end của chúng tôi đều đạt: đối với trợ lý AI trên ba replica phía sau HAProxy (31 trường hợp), trò chuyện với lệnh gọi công cụ và đề xuất chỉnh sửa, tìm kiếm web và tài liệu, đọc trang web qua linked-url-proxy được giới hạn bởi `OVERLEAF_LINKED_URL_ALLOWED_RESOURCES`, tệp đính kèm hình ảnh và PDF, sự đồng ý, hạn mức token được đếm trong Redis, AI bị tắt cho một người dùng và cho toàn phiên bản, và kết nối chậm tới gateway; đối với trợ lý lỗi trên một replica (15 trường hợp), đề xuất sửa lỗi, sự đồng ý, hạn mức token dùng chung và AI bị tắt.

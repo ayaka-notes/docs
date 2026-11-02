@@ -1,0 +1,112 @@
+---
+title: LDAP 인증
+description: Kubernetes 배포에서 사용자가 LDAP 또는 Active Directory 계정으로 로그인하도록 합니다.
+icon: address-book
+---
+
+LDAP 로그인은 모든 Ayakaleaf Pro 파드 내부의 **web** 서비스(`authentication` 모듈)가 처리합니다. OIDC 및 SAML과 달리 파드가 디렉터리와 직접 통신합니다. [LDAP 인증](/ko/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication)에 따라 디렉터리 측을 설정한 다음, 아래와 같이 값을 Kubernetes에 넣으세요.
+
+### 실행 위치
+
+| | |
+| --- | --- |
+| 서비스 | web, 모든 Ayakaleaf Pro 파드에서 실행. 설정과 CA는 web이 시작될 때 읽음 |
+| 파드 → LDAP 서버 | `OVERLEAF_LDAP_URL`: 로그인할 때마다, 그리고 `OVERLEAF_LDAP_CONTACTS_FILTER`가 설정된 경우 연락처를 조회할 때마다 새 연결 |
+| 브라우저 → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| 로그인 상태 | Redis의 세션과 속도 제한, 모든 레플리카가 공유 |
+| 주기적 작업 | 없음 |
+
+### 구성
+
+<Steps>
+<Step title="파드가 디렉터리에 접근할 수 있도록 하기">
+Ayakaleaf Pro를 실행하는 모든 파드가 LDAP 연결을 엽니다. 방화벽이나 NetworkPolicy가 디렉터리를 보호하고 있다면, 파드가 클러스터 밖으로 나갈 때 사용하는 주소(보통 노드의 주소 또는 egress 게이트웨이)를 허용하세요.
+
+이미지에는 `ldapsearch`가 없습니다. 클러스터 내부에서 [검색 확인](/ko/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search)을 실행하려면 일회용 파드를 사용하세요.
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+정확히 하나의 `dn:`이 출력되어야 합니다.
+</Step>
+
+<Step title="ConfigMap에 설정 추가하기">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+모든 `OVERLEAF_LDAP_*` 설정은 [환경 변수](/ko/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables)에 나열되어 있습니다. 바인드 비밀번호를 제외한 모든 설정은 ConfigMap에 넣습니다. `"true"`, `"false"`, `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`와 같은 JSON 값, 그리고 `*`로 시작하는 값은 따옴표로 감싸세요.
+</Step>
+
+<Step title="바인드 비밀번호를 Secret에 넣기">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="자체 CA를 사용하는 LDAPS 또는 STARTTLS(선택 사항)">
+CA를 `/var/lib/overleaf/certs`에 마운트된 Secret `overleaf-certs`에 넣고([인증서 및 기타 파일](/ko/on-premises/configuration/kubernetes#인증서-및-기타-파일) 참고) 이를 가리키도록 설정하세요.
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+이 CA 목록은 LDAP 연결에서 시스템 CA를 대체합니다. web이 시작될 때 읽습니다.
+</Step>
+
+<Step title="적용 및 재시작">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### 여러 레플리카
+
+1단계의 방화벽 설정 외에는 추가 작업이 없습니다. 각 레플리카가 독립적으로 디렉터리에 연결하고, 로그인 결과는 Redis의 세션에 저장됩니다.
+
+### Kubernetes에서의 테스트
+
+goauthentik의 LDAP 아웃포스트를 디렉터리로 사용하고 HAProxy 뒤에 세 개의 레플리카를 둔 Kubernetes 1.37 환경에서, LDAP에 대한 엔드투엔드 테스트(26개 케이스)가 통과했습니다. 테스트 항목은 런치패드에서 만든 첫 관리자의 LDAP 로그인, Secret의 바인드 비밀번호를 사용한 로그인, 잘못된 비밀번호와 알 수 없는 사용자의 거부, 그룹에 따른 관리자 매핑과 매핑 없음, 로그인할 때마다 이름과 관리자 플래그 갱신(단일 이름 속성 또는 이름과 성), 디렉터리 연락처, 로그아웃, LDAP 계정의 비밀번호 규칙, 정지된 계정, 그리고 reCAPTCHA를 사용한 LDAP 로그인입니다.
+
+### Q\&A
+
+<Accordion title="일부 파드에서만 LDAP 로그인이 실패합니다">
+
+<strong>답변:</strong> 일부 노드에서 디렉터리에 접근할 수 없습니다. 각 파드에서 확인하세요.
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="로그인이 실패한 이유는 어디에서 확인하나요?">
+
+<strong>답변:</strong> 해당 로그인을 처리한 파드의 web 로그에서 확인합니다.
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

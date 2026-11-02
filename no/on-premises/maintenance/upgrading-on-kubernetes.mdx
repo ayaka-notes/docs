@@ -1,0 +1,136 @@
+---
+title: Oppgradering på Kubernetes
+description: Oppgrader en Kubernetes-distribusjon av Ayakaleaf Pro, med én eller flere replikaer.
+icon: arrow-up-from-square
+---
+
+En oppgradering erstatter image-taggen. Den nye versjonen migrerer databasen når den starter, og disse migreringene må kjøres **én gang, fra én pod, mens ingen eldre pod kjører**. På Kubernetes utelukker dette en vanlig rullerende oppdatering av en skalert StatefulSet.
+
+<Danger>
+
+Ta en [konsistent sikkerhetskopi](/no/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) før hver oppgradering, med Ayakaleaf Pro stoppet. Les [versjonsmerknadene](/no/on-premises/release-notes) for trinn som gjelder versjonen du oppgraderer til.
+
+</Danger>
+
+Før du begynner, henter du med `sudo docker pull` på hver node som kjører Ayakaleaf Pro, alle TeX Live-images som den nye versjonen eller den nye konfigurasjonen din lister opp.
+
+<Tabs>
+<Tab title="Én replika">
+
+<Steps>
+<Step title="Stopp Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Ta sikkerhetskopi">
+MongoDB, fra et hvilket som helst medlem:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Datavolumet, via en kortlivet pod som monterer det (den havner på volumets node):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Gjør det samme for git-bridge-volumet (`data-git-bridge-0`), og ta vare på en kopi av Secret-en `overleaf-secrets`. Hvis lagringen din støtter [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), gjør et øyeblikksbilde av volumene samme nytten.
+</Step>
+
+<Step title="Endre versjonen og start">
+Angi den nye taggen i `40-overleaf.yaml` (og i `45-git-bridge.yaml`, som må bruke samme tagg), og deretter:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment-en bruker `strategy: Recreate`, så selv en endret tagg kjører aldri to versjoner samtidig.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Flere replikaer">
+
+For oppsettet i [Horisontal skalering](/no/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="Stopp alle replikaer">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Ta sikkerhetskopi">
+MongoDB som i fanen for én replika, S3-bøttene dine med leverandørens verktøy, git-bridge-volumet (`data-git-bridge-0`) og Secret-ene. Replikaenes `/srv/overleaf-ha` inneholder bare kompileringsutdata og trenger ingen sikkerhetskopi.
+</Step>
+
+<Step title="Start én replika med den nye versjonen">
+Angi den nye taggen i `70-overleaf.yaml` og `75-git-bridge.yaml`, og `replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Kontroller at du kan logge inn, åpne et prosjekt og kompilere.
+</Step>
+
+<Step title="Start de andre replikaene">
+Angi `replicas: 3` igjen og bruk endringen. `OrderedReady` starter dem den ene etter den andre.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Ikke endre imaget til en kjørende skalert StatefulSet med `kubectl set image` eller `kubectl apply`: den rullerende oppdateringen ville starte den nye versjonen, og migreringene dens, mens eldre replikaer fortsatt betjener brukere. Konfigurasjonsendringer uten ny versjon er greit å gjøre som en rullerende omstart: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB og Redis
+
+Oppgrader dem separat fra Ayakaleaf Pro. For MongoDB følger du [Oppdatere MongoDB](/no/on-premises/maintenance/updating-mongodb) (én hovedversjon om gangen, `featureCompatibilityVersion` etter hvert trinn); et replikasett tar i bruk det nye imaget ett medlem om gangen når du endrer imaget i `10-mongo.yaml`, fordi StatefulSet-en erstatter `mongo-2`, `mongo-1` og `mongo-0` etter tur.
+
+### Rulle tilbake
+
+Stopp Ayakaleaf Pro som ovenfor, gjenopprett MongoDB fra arkivet (`mongorestore --drop --archive --gzip`) og volumene eller bøttene fra sikkerhetskopien, angi den gamle taggen og start igjen. Migreringene til den nye versjonen kan ikke angres på annen måte.
+
+### Q\&A
+
+<Accordion title="En replika blir aldri klar, og de andre replikaene starter aldri">
+
+<strong>Svar:</strong> Med `podManagementPolicy: OrderedReady` starter `overleaf-1` først når `overleaf-0` er klar, og en rullerende oppdatering erstatter ikke en pod som aldri ble klar. Etter at du har rettet årsaken, for eksempel en feil innstilling i ConfigMap-en, sletter du den fastlåste poden slik at StatefulSet-en oppretter den på nytt fra gjeldende mal:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Vi støtte på dette i testklyngen vår etter at en innstilling hindret `overleaf-0` i å bli klar; sletting av poden lot alle tre replikaene starte.
+
+</Accordion>

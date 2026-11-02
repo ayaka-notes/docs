@@ -1,0 +1,100 @@
+---
+title: 0. Chuẩn bị các node
+description: Cài đặt Docker Engine, containerd và kubeadm trên các node, và pull các image TeX Live.
+icon: server
+---
+
+Ayakaleaf Pro biên dịch LaTeX trong các container TeX Live [chạy trong sandbox](/vi/on-premises/configuration/overleaf-toolkit/sandboxed-compiles). Nó tự khởi động các container này thông qua Docker socket của máy mà nó đang chạy. Trên Kubernetes, điều này có nghĩa là:
+
+* mọi node có thể chạy pod Ayakaleaf Pro đều phải cài đặt và chạy **Docker Engine**;
+* mọi image TeX Live bạn cấu hình đều phải được pull **vào Docker** trên từng node đó.
+
+Kubelet vẫn có thể tiếp tục dùng containerd: Docker Engine đi kèm `containerd.io`, và cả hai dùng cùng một daemon trong các namespace khác nhau.
+
+<Warning>
+
+Các node pool được quản lý không có Docker (phần lớn cấu hình mặc định của EKS, GKE và AKS) không thể chạy biên dịch trong sandbox. Hãy dùng các node pool mà bạn có thể cài đặt Docker Engine, hoặc gắn nhãn cho các node như vậy và giữ Ayakaleaf Pro trên chúng bằng `nodeSelector`.
+
+</Warning>
+
+Các bước dưới đây dành cho Ubuntu 24.04 và một cluster được dựng bằng kubeadm. Nếu cluster của bạn đã tồn tại, hãy thực hiện các bước 1, 2 và 5 trên các node sẽ chạy Ayakaleaf Pro.
+
+<Steps>
+<Step title="Kernel module và sysctl">
+```bash
+printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+sudo modprobe overlay && sudo modprobe br_netfilter
+printf 'net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1\n' \
+  | sudo tee /etc/sysctl.d/99-k8s.conf
+sudo sysctl --system
+sudo swapoff -a   # and comment out swap in /etc/fstab
+```
+</Step>
+
+<Step title="Docker Engine">
+Cài đặt Docker Engine từ kho lưu trữ của Docker như trong [Cài đặt Docker](/vi/on-premises/installation/using-the-toolkit/0.-setup-docker). Không cần plugin Compose. Việc này cũng cài đặt `containerd.io`.
+</Step>
+
+<Step title="containerd cho kubelet">
+Gói `containerd.io` từ kho lưu trữ của Docker tắt sẵn plugin CRI. Hãy ghi cấu hình mặc định đầy đủ, vốn bật plugin này, và chuyển sang dùng systemd cgroups:
+
+```bash wrap
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+# containerd 2.x writes config_path = '' and ignores /etc/containerd/certs.d without this
+sudo sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|" /etc/containerd/config.toml
+sudo systemctl restart containerd docker
+```
+</Step>
+
+<Step title="kubeadm, kubelet và kubectl">
+Làm theo [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/), sau đó tạo cluster bằng `kubeadm init` và `kubeadm join` và cài đặt một network plugin. Ví dụ, với flannel:
+
+```yaml title="kubeadm-config.yaml"
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+networking:
+  podSubnet: 10.244.0.0/16   # flannel's default
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+# Compile containers are started by Docker, outside the kubelet's accounting: keep memory for them
+systemReserved:
+  memory: 300Mi
+kubeReserved:
+  memory: 200Mi
+```
+
+```bash
+sudo kubeadm init --config kubeadm-config.yaml
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+```
+
+Cluster cũng cần một StorageClass mặc định. Với cluster thử nghiệm, [local-path-provisioner](https://github.com/rancher/local-path-provisioner) là đủ; trong môi trường production, hãy dùng block storage của nền tảng bạn (Longhorn, Ceph, một CSI driver của nhà cung cấp đám mây).
+</Step>
+
+<Step title="Image TeX Live">
+Trên **mọi** node có thể chạy Ayakaleaf Pro, hãy dùng Docker để pull các image TeX Live mà bạn sẽ liệt kê trong `ALL_TEX_LIVE_DOCKER_IMAGES`, ví dụ:
+
+```bash
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+`crictl pull` hay `ctr` không giúp được ở đây: Ayakaleaf Pro yêu cầu image từ Docker. Các image full có dung lượng lớn (khoảng 28 GB mỗi image); xem danh sách tại [Biên dịch trong sandbox](/vi/on-premises/configuration/overleaf-toolkit/sandboxed-compiles). Để thử nghiệm lần đầu, `ghcr.io/ayaka-notes/texlive-basic:2026.1` (khoảng 630 MB, một bản TeX Live tối giản) là đủ.
+</Step>
+</Steps>
+
+### Q\&A
+
+<Accordion title="Tôi có thể chạy Ayakaleaf Pro trên các node không có Docker không?">
+
+<strong>Trả lời:</strong> Chỉ khi dùng `SANDBOXED_COMPILES=false`. Khi đó các lần biên dịch chạy bên trong container Ayakaleaf Pro với bản TeX Live tích hợp nhỏ của nó, và tài liệu LaTeX có thể đọc và ghi mọi thứ mà container đó có quyền truy cập. Chúng tôi không khuyến nghị cách này; xem [Biên dịch trong sandbox](/vi/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+</Accordion>
+
+<Accordion title="Các lần biên dịch có bị tính vào giới hạn bộ nhớ của pod không?">
+
+<strong>Trả lời:</strong> Không. Các container TeX Live được Docker của node khởi động, nằm ngoài pod và ngoài tầm quan sát của kubelet. Hãy để trống bộ nhớ trên node cho chúng, ví dụ bằng `systemReserved` như trên, và đừng lấp đầy node bằng các pod khác.
+
+</Accordion>

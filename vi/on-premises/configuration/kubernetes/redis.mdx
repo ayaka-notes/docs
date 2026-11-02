@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Kết nối một bản triển khai Kubernetes với Redis bằng mật khẩu, và lưu giữ dữ liệu Redis với cơ chế lưu trữ bền vững AOF.
+icon: memory
+---
+
+Mọi dịch vụ Ayakaleaf Pro giữ trạng thái trực tiếp đều dùng chung một máy chủ Redis: web (phiên, giới hạn tần suất), real-time, document-updater (các chỉnh sửa chưa được lưu vào MongoDB), project-history (hàng đợi lịch sử) và third-party-datastore (hàng đợi Dropbox). Quá trình cài đặt chạy nó dưới dạng StatefulSet `redis` từ [3. Triển khai MongoDB và Redis](/vi/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis); xem [Redis](/vi/on-premises/configuration/overleaf-toolkit/redis) cho Toolkit.
+
+| | |
+| --- | --- |
+| Dịch vụ | web, real-time, document-updater, project-history, history-v1, third-party-datastore, trong mọi pod Ayakaleaf Pro |
+| Cài đặt | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (mặc định `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| Không được hỗ trợ | Redis Sentinel và Redis Cluster: chỉ một máy chủ |
+
+### Xác thực bằng mật khẩu
+
+<Steps>
+<Step title="Lưu mật khẩu">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Khởi động Redis với mật khẩu đó">
+Trong `20-redis.yaml`, cung cấp mật khẩu cho container và truyền nó cho `redis-server`:
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes thay thế `$(REDIS_PASS)` bằng giá trị từ Secret. Readiness probe (`tcpSocket`) không cần thay đổi.
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+Hãy dừng Ayakaleaf Pro trước, để không chỉnh sửa nào bị mất giữa hai lần khởi động lại:
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Với Redis được quản lý, hãy đặt `OVERLEAF_REDIS_HOST` (và `REDIS_HOST`) trong ConfigMap thành địa chỉ của nó, mật khẩu như trên, và `OVERLEAF_REDIS_TLS: "true"` nếu nó yêu cầu TLS.
+
+### Lưu trữ bền vững AOF
+
+Quá trình cài đặt đã khởi động Redis với `--appendonly yes`, tương đương với `REDIS_AOF_PERSISTENCE=true` của Toolkit, và lưu dữ liệu của nó trên volume `data-redis-0`. Để chuyển một Redis hiện có chưa dùng AOF, hãy làm theo các bước trên [trang Toolkit](/vi/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) với `kubectl -n overleaf exec -it redis-0 -- redis-cli` thay cho `docker exec`, sau đó thêm `--appendonly yes` vào args.
+
+### Nhiều replica
+
+Tất cả các replica phải dùng cùng một Redis: nó chứa các phiên, các chỉnh sửa chưa có trong MongoDB và các khóa giúp hai replica không xử lý cùng một dự án cùng lúc.
+
+### Đã kiểm thử trên Kubernetes
+
+Trên Kubernetes 1.37 với một replica, Redis được khởi động với `--requirepass $(REDIS_PASS)` từ Secret `redis-auth` như trên đã từ chối `redis-cli` khi không có mật khẩu (`NOAUTH`), và với `OVERLEAF_REDIS_PASS` và `REDIS_PASSWORD` trong `overleaf-secrets`, các bài kiểm thử end-to-end của chúng tôi đều đạt cho launchpad (13 trường hợp) và cho việc chỉnh sửa với theo dõi thay đổi, bình luận và chia sẻ ẩn danh (22 trường hợp), vốn đi qua web, real-time, document-updater và project-history; không dịch vụ nào ghi log lỗi xác thực Redis. Tất cả các bài kiểm thử Kubernetes khác trong các trang này đều chạy với StatefulSet Redis từ quá trình cài đặt, với lưu trữ bền vững AOF và không có mật khẩu.

@@ -1,0 +1,66 @@
+---
+title: Redis
+description: 使用密碼將 Kubernetes 部署連接至 Redis，並透過 AOF 持久化保存 Redis 資料。
+icon: memory
+---
+
+每個保存即時狀態的 Ayakaleaf Pro 服務都使用同一台 Redis 伺服器：web（工作階段、速率限制）、real-time、document-updater（尚未儲存至 MongoDB 的編輯內容）、project-history（歷史記錄佇列）以及 third-party-datastore（Dropbox 佇列）。安裝時會依照 [3. 部署 MongoDB 與 Redis](/zh-Hant/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis) 將其以 StatefulSet `redis` 的形式執行；Toolkit 的相關說明請參閱 [Redis](/zh-Hant/on-premises/configuration/overleaf-toolkit/redis)。
+
+| | |
+| --- | --- |
+| 服務 | web、real-time、document-updater、project-history、history-v1、third-party-datastore，位於每個 Ayakaleaf Pro Pod 中 |
+| 設定 | `OVERLEAF_REDIS_HOST`、`OVERLEAF_REDIS_PORT`（預設為 `6379`）、`OVERLEAF_REDIS_PASS`、`OVERLEAF_REDIS_TLS` |
+| 不支援 | Redis Sentinel 與 Redis Cluster：僅支援單一伺服器 |
+
+### 密碼驗證
+
+<Steps>
+<Step title="儲存密碼">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="使用密碼啟動 Redis">
+在 `20-redis.yaml` 中，將密碼提供給容器並傳遞給 `redis-server`：
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes 會以 Secret 中的值取代 `$(REDIS_PASS)`。就緒探針（`tcpSocket`）不需要變更。
+</Step>
+
+<Step title="套用並重新啟動">
+請先停止 Ayakaleaf Pro，以免在兩次重新啟動之間遺失任何編輯內容：
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+若使用受管理的 Redis，請在 ConfigMap 中將 `OVERLEAF_REDIS_HOST`（以及 `REDIS_HOST`）設為其位址，依上述方式設定密碼，若其需要 TLS，請設定 `OVERLEAF_REDIS_TLS: "true"`。
+
+### AOF 持久化
+
+安裝時已使用 `--appendonly yes` 啟動 Redis（相當於 Toolkit 的 `REDIS_AOF_PERSISTENCE=true`），並將其資料保存在磁碟區 `data-redis-0` 上。若要讓既有未啟用 AOF 的 Redis 改用 AOF，請依照 [Toolkit 頁面](/zh-Hant/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) 中的步驟操作，並以 `kubectl -n overleaf exec -it redis-0 -- redis-cli` 取代 `docker exec`，然後將 `--appendonly yes` 加入 args。
+
+### 多個副本
+
+所有副本都必須使用同一個 Redis：它保存著工作階段、尚未寫入 MongoDB 的編輯內容，以及防止兩個副本同時處理同一個專案的鎖。
+
+### 在 Kubernetes 上的測試
+
+我們在 Kubernetes 1.37 上以單一副本進行測試，依上述方式以來自 Secret `redis-auth` 的 `--requirepass $(REDIS_PASS)` 啟動的 Redis，會拒絕未提供密碼的 `redis-cli`（`NOAUTH`）；而在 `overleaf-secrets` 中設定 `OVERLEAF_REDIS_PASS` 與 `REDIS_PASSWORD` 後，我們針對 launchpad（13 個案例）以及包含追蹤修訂、留言與匿名分享的編輯功能（22 個案例，會經過 web、real-time、document-updater 與 project-history）所做的端對端測試全部通過；沒有任何服務記錄 Redis 驗證錯誤。本系列頁面中的其他所有 Kubernetes 測試，皆是針對安裝時建立的 Redis StatefulSet 執行，該 Redis 啟用 AOF 持久化且未設定密碼。

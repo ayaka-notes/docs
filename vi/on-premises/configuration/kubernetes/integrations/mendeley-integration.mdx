@@ -1,0 +1,56 @@
+---
+title: Tích hợp Mendeley
+description: Cho phép người dùng nhập tệp .bib từ thư viện Mendeley của họ trên một bản triển khai Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Tính năng nhập từ Mendeley chạy trong dịch vụ **web** (mô-đun `tpr-webmodule`) của mọi pod Ayakaleaf Pro. Hãy đăng ký ứng dụng Mendeley như trong [Tích hợp Mendeley](/vi/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration), với URL chuyển hướng `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`, sau đó cấu hình Kubernetes như bên dưới.
+
+| | |
+| --- | --- |
+| Dịch vụ | web, trong mọi pod Ayakaleaf Pro; được đọc khi web khởi động |
+| Pod → Mendeley | `https://api.mendeley.com` (OAuth token và API), khi người dùng liên kết Mendeley hoặc nhập hay làm mới một tệp |
+| Trình duyệt → Mendeley | `https://api.mendeley.com/oauth/authorize`, sau đó quay lại URL chuyển hướng |
+| Mendeley → Overleaf | không có: phiên bản không cần truy cập được từ internet |
+| Dữ liệu được lưu trữ | các token Mendeley của người dùng, đã được mã hóa, trong MongoDB |
+| Tác vụ định kỳ | không có: một tệp chỉ được làm mới khi người dùng yêu cầu |
+
+### Cấu hình
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+Hãy đặt application ID trong dấu ngoặc kép: đó là một số, trong khi ConfigMap chỉ chứa chuỗi. `ENABLED_LINKED_FILE_TYPES` thay thế giá trị từ quá trình cài đặt; hãy giữ các loại bạn đã có và thêm `mendeley` (và `zotero`, nếu bạn dùng cả hai).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD` mã hóa các token Mendeley của người dùng trong MongoDB. Nếu không có nó, mỗi pod sẽ tự tạo một tệp khóa trong `/var/lib/overleaf/data` của riêng mình. Với [nhiều replica](/vi/on-premises/configuration/kubernetes/horizontal-scaling), khi đó mỗi node sẽ có một khóa khác nhau, và người dùng được phục vụ bởi replica khác không thể dùng tài khoản Mendeley đã liên kết của họ. Hãy đặt giá trị này trước khi người dùng đầu tiên liên kết Mendeley: việc thay đổi nó sau đó sẽ buộc mọi người dùng phải liên kết lại Mendeley.
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Hãy đặt `MENDELEY_CIPHER_PASSWORD` trong Secret, xem ở trên. Các token Mendeley được mã hóa bởi cùng đoạn mã với các khóa Zotero: nếu không có mật khẩu, một tệp được nhập trên một replica không thể được làm mới trên replica khác, như chúng tôi đã thấy với [Zotero](/vi/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas). `state` của OAuth được giữ trong phiên trong Redis, nên callback có thể tới bất kỳ replica nào.
+
+### Đã kiểm thử trên Kubernetes
+
+Với một bản mô phỏng api.mendeley.com (được tin cậy thông qua `NODE_EXTRA_CA_CERTS` từ `overleaf-certs`), trên Kubernetes 1.37 với ba replica phía sau HAProxy, các bài kiểm thử end-to-end của chúng tôi cho Mendeley đều đạt (18 trường hợp): liên kết qua OAuth 2.0 và hủy liên kết, nhập thư viện và các nhóm vào một tệp `.bib`, làm mới tệp đó, làm mới access token sắp hết hạn, token bị thu hồi, yêu cầu liên kết lại, tài liệu tham khảo có thể tìm kiếm được đối với các cộng tác viên, chỉ người nhập mới được làm mới, lỗi API, và kết nối chậm tới Mendeley.

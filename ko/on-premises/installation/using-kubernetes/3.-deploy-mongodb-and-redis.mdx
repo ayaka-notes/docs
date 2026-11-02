@@ -1,0 +1,217 @@
+---
+title: 3. MongoDB 및 Redis 배포
+description: MongoDB를 레플리카 세트로, Redis를 지속성과 함께 실행하거나 자체 서비스를 지정합니다.
+icon: database
+---
+
+Ayakaleaf Pro에는 다음이 필요합니다.
+
+* **레플리카 세트**로 구성된 **MongoDB 8**(트랜잭션을 사용함). 세 노드에 분산된 세 멤버는 노드 하나를 잃어도 유지되며, 멤버 하나로도 동작합니다.
+* AOF 지속성을 갖춘 **Redis 7** 서버 하나. Redis에는 아직 MongoDB에 기록되지 않은 편집 내용, 세션, Overleaf 서비스 간 메시지가 저장됩니다. Overleaf는 단일 Redis 서버에 연결하며, Sentinel과 Redis Cluster는 지원되지 않습니다.
+
+<Info>
+
+MongoDB Atlas나 클라우드의 Redis 같은 관리형 서비스를 대신 사용할 수 있습니다. 이 페이지를 건너뛰고 [4단계](/ko/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)에서 `OVERLEAF_MONGO_URL`과 `OVERLEAF_REDIS_HOST`를 해당 서비스로 설정하세요.
+
+</Info>
+
+<Steps>
+<Step title="MongoDB">
+```yaml title="10-mongo.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: overleaf
+spec:
+  clusterIP: None                 # headless: gives mongo-0.mongo, mongo-1.mongo, ...
+  publishNotReadyAddresses: true  # members must resolve each other before the set is initiated
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  namespace: overleaf
+spec:
+  serviceName: mongo
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mongo
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: mongo
+          image: mongo:8.0
+          args:
+            - --replSet=overleaf
+            - --bind_ip_all
+            - --wiredTigerCacheSizeGB=0.25   # default is 50% of (RAM - 1 GB); size it for your nodes
+          # env:
+          #   - name: GLIBC_TUNABLES        # only on kernel 6.19+ (SERVER-121912)
+          #     value: glibc.pthread.rseq=1
+          ports:
+            - containerPort: 27017
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 768Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+# Initiates the replica set once. Safe to re-run: it does nothing when the set exists.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongo-init-replica-set
+  namespace: overleaf
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: mongo:8.0
+          command:
+            - mongosh
+            - --quiet
+            - --host=mongo-0.mongo
+            - --eval
+            - |
+              try {
+                rs.status()
+                print('replica set already initiated')
+              } catch (e) {
+                rs.initiate({
+                  _id: 'overleaf',
+                  members: [
+                    { _id: 0, host: 'mongo-0.mongo.overleaf.svc.cluster.local:27017' },
+                    { _id: 1, host: 'mongo-1.mongo.overleaf.svc.cluster.local:27017' },
+                    { _id: 2, host: 'mongo-2.mongo.overleaf.svc.cluster.local:27017' },
+                  ],
+                })
+              }
+```
+
+```bash
+kubectl apply -f 10-mongo.yaml
+kubectl -n overleaf rollout status statefulset/mongo
+kubectl -n overleaf wait --for=condition=complete job/mongo-init-replica-set --timeout=5m
+kubectl -n overleaf exec mongo-0 -- mongosh --quiet --eval 'rs.status().members.map(m => m.name + " " + m.stateStr)'
+```
+
+몇 초 후 멤버 하나는 `PRIMARY`, 나머지는 `SECONDARY`가 되어야 합니다. Job은 모든 멤버가 응답할 때까지 재시도하므로, 실패한 Job 파드가 몇 개 있는 것은 정상입니다.
+
+* 헤드리스 Service에는 `publishNotReadyAddresses: true`가 필요합니다. 레플리카 세트가 생성되기 전에 멤버들이 이름으로 서로를 찾을 수 있어야 하기 때문입니다.
+* 멤버는 재시작할 때마다 바뀌는 파드 IP가 아니라 고정된 이름(`mongo-0.mongo.overleaf.svc.cluster.local`)으로 추가됩니다.
+* 멤버를 하나만 사용하려면 `replicas: 1`로 설정하고 Job에는 `mongo-0`만 남기세요.
+</Step>
+
+<Step title="Redis">
+```yaml title="20-redis.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: overleaf
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: overleaf
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4
+          args: [--appendonly, "yes"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+```
+
+```bash
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+```
+</Step>
+</Steps>
+
+### Q\&A
+
+<Accordion title="최신 커널에서 MongoDB 8이 시작 시 충돌합니다. 왜 그런가요?">
+
+<strong>답변:</strong> MongoDB 8은 Linux 커널 6.19 이상에서 실패합니다([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). `10-mongo.yaml`에서 `GLIBC_TUNABLES` 환경 변수의 주석을 해제하세요.
+
+</Accordion>
+
+<Accordion title="MongoDB에는 메모리가 얼마나 필요한가요?">
+
+<strong>답변:</strong> 기본적으로 MongoDB는 노드 메모리의 절반에서 1 GB를 뺀 만큼을 캐시로 사용하며, 파드의 제한이 아닌 노드의 메모리를 기준으로 합니다. 노드에 맞게 `--wiredTigerCacheSizeGB`를 설정하세요. 4 GB 테스트 노드에서는 `0.25`로 각 멤버를 약 200~260 MiB로 유지했습니다.
+
+</Accordion>

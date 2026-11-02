@@ -1,0 +1,67 @@
+---
+title: Gitea-synkronisering
+description: Låt användare synkronisera sina projekt med repositorier på Gitea.com eller din egen Gitea i en Kubernetes-driftsättning.
+icon: mug-hot
+---
+
+Gitea-synkronisering körs i tjänsten **web** (modulen `gitea-sync`) i varje Ayakaleaf Pro-pod. Den kräver [Git-integrationen](/sv/on-premises/configuration/kubernetes/integrations/git-integration). Skapa OAuth-applikationen och läs vad varje inställning gör i [Gitea-synkronisering](/sv/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); den här sidan för in det i Kubernetes.
+
+| | |
+| --- | --- |
+| Tjänst | web (modulen `gitea-sync`), i varje Ayakaleaf Pro-pod; läses när web startar |
+| Pod → Gitea | REST-API:et för `GITEA_SYNC_URL` (standard `https://gitea.com/api/v1`), när en användare länkar, importerar, exporterar eller synkroniserar |
+| Webbläsare → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` för att länka ett konto, sedan tillbaka till `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | inget: ingen webhook, instansen behöver inte gå att nå från Gitea |
+| Lagrade data | användarens åtkomst- och uppdateringstokens för Gitea, krypterade, i MongoDB |
+| Periodiska jobb | inga: synkronisering sker när en användare klickar |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` och git-bridge-StatefulSet från [Git-integration](/sv/on-premises/configuration/kubernetes/integrations/git-integration) måste finnas på plats: utan dem döljer kontoinställningarna och redigeraren Gitea-synkronisering.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` krypterar användarnas åtkomst- och uppdateringstokens för Gitea i MongoDB. Varje replik måste använda samma värde, och om det ändras senare måste alla användare länka Gitea på nytt.
+</Step>
+
+<Step title="Privat CA (valfritt)">
+Om din Gitea har ett certifikat från din egen CA lägger du till CA:n i Secret `overleaf-certs` som är monterad på `/var/lib/overleaf/certs` (se [Certifikat och andra filer](/sv/on-premises/configuration/kubernetes#certifikat-och-andra-filer)) och anger `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap.
+</Step>
+
+<Step title="Tillämpa, starta om och kontrollera">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Vilken HTTP-status som helst betyder att Gitea går att nå från den podden; `000` betyder att den inte gör det.
+</Step>
+</Steps>
+
+### Flera repliker
+
+Inget extra utöver det delade `GITEA_TOKEN_CIPHER_PASSWORD`. En synkronisering tar ett lås i Redis, delat med de andra Git-synkroniseringarna, så två repliker synkroniserar aldrig samma projekt samtidigt.
+
+### Testat på Kubernetes
+
+Mot en riktig Gitea 1.23 på `GITEA_SYNC_URL`, på Kubernetes 1.37 med en replik och Git-integrationen aktiverad, klarar våra end-to-end-tester för Gitea-synkronisering sig (39 fall): länkning och avlänkning av kontot via Giteas OAuth2, förnyelse av den utgående åtkomsttoken och återkallade behörigheter, export till ett nytt privat repositorium eller organisationsrepositorium, import av ett repositorium, pull och push, sammanslagningar, konflikter, borttagna och force-pushade grenar, binära filer, namnbyten och borttagningar, samt vad ägare, redigerare och läsare får göra.

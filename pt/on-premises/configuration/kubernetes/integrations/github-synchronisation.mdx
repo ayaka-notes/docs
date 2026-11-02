@@ -1,0 +1,67 @@
+---
+title: Sincronização com GitHub
+description: Permita que os usuários sincronizem seus projetos com repositórios do GitHub ou do GitHub Enterprise em uma implantação no Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+A sincronização com GitHub é executada no serviço **web** (o módulo `github-sync`) de cada pod do Ayakaleaf Pro. Ela precisa da [integração com Git](/pt/on-premises/configuration/kubernetes/integrations/git-integration). Crie o aplicativo OAuth e leia o que cada configuração faz em [Sincronização com GitHub](/pt/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); esta página a leva para o Kubernetes.
+
+| | |
+| --- | --- |
+| Serviço | web (módulo `github-sync`), em cada pod do Ayakaleaf Pro; lido quando o web é iniciado |
+| Pod → GitHub | `https://api.github.com` (REST e GraphQL), ou a API de `GITHUB_SYNC_URL`, sempre que um usuário vincula, importa, exporta ou sincroniza |
+| Navegador → GitHub | `https://github.com/login/oauth/authorize` para vincular uma conta e, em seguida, de volta para `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | nenhum: sem webhook, a instância não precisa estar acessível a partir do GitHub |
+| Dados armazenados | os tokens de acesso do GitHub do usuário, criptografados, no MongoDB |
+| Tarefas periódicas | nenhuma: a sincronização acontece quando um usuário clica |
+
+### Configuração
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` e o StatefulSet do git-bridge da [integração com Git](/pt/on-premises/configuration/kubernetes/integrations/git-integration) precisam estar configurados: sem eles, as configurações da conta e o editor ocultam a sincronização com GitHub.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` criptografa os tokens de acesso do GitHub dos usuários no MongoDB. Todas as réplicas devem usar o mesmo valor, e alterá-lo depois faz com que todos os usuários precisem vincular o GitHub novamente.
+</Step>
+
+<Step title="CA privada (opcional)">
+Se o seu GitHub tiver um certificado da sua própria CA, adicione a CA ao Secret `overleaf-certs` montado em `/var/lib/overleaf/certs` (veja [Certificados e outros arquivos](/pt/on-premises/configuration/kubernetes#certificados-e-outros-arquivos)) e defina `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` no ConfigMap.
+</Step>
+
+<Step title="Aplicar, reiniciar e verificar">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Qualquer status HTTP significa que o GitHub está acessível a partir desse pod; `000` significa que não está.
+</Step>
+</Steps>
+
+### Várias réplicas
+
+Nada além do `GITHUB_TOKEN_CIPHER_PASSWORD` compartilhado. Uma sincronização obtém um lock no Redis, compartilhado com as outras sincronizações Git, de modo que duas réplicas nunca sincronizam o mesmo projeto ao mesmo tempo.
+
+### Testado no Kubernetes
+
+Contra um mock do github.com e de suas APIs REST e GraphQL (confiável por meio de `NODE_EXTRA_CA_CERTS` a partir de `overleaf-certs`), no Kubernetes 1.37 com uma réplica e a integração com Git ativada, nossos testes ponta a ponta da sincronização com GitHub são aprovados (31 casos): vincular e desvincular a conta, tokens revogados, exportar um projeto para um novo repositório privado ou de organização, importar um repositório (inclusive acima do limite de upload), pull e push, merges, conflitos e merges manuais, branches excluídos e com force push, arquivos binários, renomeações e exclusões, perda de acesso de push e o que proprietários, editores e leitores podem fazer.

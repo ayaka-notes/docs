@@ -1,0 +1,67 @@
+---
+title: GitLab 同步
+description: 讓使用者在 Kubernetes 部署中，將專案與 GitLab.com 或自行管理的 GitLab 上的儲存庫同步。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+GitLab 同步在每個 Ayakaleaf Pro Pod 的 **web** 服務（`gitlab-sync` 模組）中執行，並需要 [Git 整合](/zh-TW/on-premises/configuration/kubernetes/integrations/git-integration)。請在 [GitLab 同步](/zh-TW/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation)中建立 OAuth 應用程式並了解各項設定的作用；本頁說明如何將其套用到 Kubernetes。
+
+| | |
+| --- | --- |
+| 服務 | web（`gitlab-sync` 模組），位於每個 Ayakaleaf Pro Pod 中；於 web 啟動時讀取 |
+| Pod → GitLab | 每當使用者連結、匯入、匯出或同步時，連線至 `GITLAB_SYNC_URL` 的 REST API（預設為 `https://gitlab.com/api/v4`） |
+| 瀏覽器 → GitLab | 前往 `${GITLAB_SYNC_URL}/oauth/authorize` 連結帳號，再返回 `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | 無：沒有 webhook，執行個體不需要能從 GitLab 連線 |
+| 儲存的資料 | 使用者的 GitLab 存取權杖與更新權杖，經加密後儲存在 MongoDB 中 |
+| 定期工作 | 無：同步會在使用者點擊時進行 |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+必須先備妥 `GIT_BRIDGE_ENABLED: "true"` 以及 [Git 整合](/zh-TW/on-premises/configuration/kubernetes/integrations/git-integration)中的 git-bridge StatefulSet：否則帳號設定與編輯器會隱藏 GitLab 同步。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` 用於加密儲存在 MongoDB 中的使用者 GitLab 存取權杖與更新權杖。每個副本都必須使用相同的值，之後若變更此值，所有使用者都必須重新連結 GitLab。
+</Step>
+
+<Step title="私人 CA（選用）">
+如果您的 GitLab 使用由您自己的 CA 簽發的憑證，請將該 CA 加入掛載於 `/var/lib/overleaf/certs` 的 Secret `overleaf-certs`（請參閱[憑證與其他檔案](/zh-TW/on-premises/configuration/kubernetes#憑證與其他檔案)），並在 ConfigMap 中設定 `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`。
+</Step>
+
+<Step title="套用、重新啟動並檢查">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+只要出現任何 HTTP 狀態碼，就表示該 Pod 可以連線至 GitLab；`000` 則表示無法連線。
+</Step>
+</Steps>
+
+### 多個副本
+
+除了共用的 `GITLAB_TOKEN_CIPHER_PASSWORD` 之外，不需要額外設定。同步時會在 Redis 中取得鎖定（與其他 Git 同步共用），因此兩個副本絕不會同時同步同一個專案。更新使用者的 GitLab 權杖時也會取得 Redis 鎖定，因此兩個副本不會同時更新權杖。
+
+### 在 Kubernetes 上的測試
+
+我們以位於 `GITLAB_SYNC_URL` 的模擬自行管理 GitLab（透過來自 `overleaf-certs` 的 `NODE_EXTRA_CA_CERTS` 信任），在 Kubernetes 1.37 上以一個副本並啟用 Git 整合進行測試，GitLab 同步的端對端測試全數通過（40 個案例）：連結與解除連結帳號、更新即將過期的存取權杖與已撤銷的權杖、匯出至新的私人或群組專案、匯入儲存庫、拉取與推送、合併、衝突、已刪除及遭強制推送的分支、二進位檔案、重新命名與刪除，以及擁有者、編輯者與檢視者各自可執行的操作。

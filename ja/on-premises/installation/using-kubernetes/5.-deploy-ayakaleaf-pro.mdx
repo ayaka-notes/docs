@@ -1,0 +1,123 @@
+---
+title: 5. Ayakaleaf Pro のデプロイ
+description: Ayakaleaf Pro の Pod、データボリューム、NodePort Service をデプロイします。
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+初回の起動ではデータベースのマイグレーションが実行され、1〜2 分かかります。`/status` が応答すれば Pod の準備は完了です。その後 `OVERLEAF_SITE_URL` を開いてください。
+
+### マニフェストがこのような構成になっている理由
+
+* <strong>データボリューム。</strong> `/var/lib/overleaf` 以下のすべて（プロジェクトファイル、履歴、アップロード）は PVC に保存されます。local-path のようなノードローカルのストレージでは、データは 1 つのノードにとどまります。ネットワークブロックストレージであれば、Pod はノード間を移動できます。
+* <strong>コンパイル用ボリュームと Docker ソケット。</strong> Ayakaleaf Pro はノードの Docker に TeX Live コンテナの起動を要求し、プロジェクトのコンパイルディレクトリを**ノード上のパスで**渡します。そのため、これらのディレクトリは `hostPath` ボリュームとし、そのパスを `SANDBOXED_COMPILES_HOST_DIR_*` にも記述します。内容は一時的なデータであり、バックアップは不要です。
+* <strong>`enableServiceLinks: false`。</strong> Kubernetes は、Namespace 内のすべての Service について Docker 形式の変数を各 Pod に追加します。Service `redis` は `REDIS_PORT=tcp://10.x.x.x:6379` に、Service `git-bridge` は `GIT_BRIDGE_PORT=tcp://...` になります。一部の Overleaf サービスはこれらの名前の変数を読み取ります。この Pod では `OVERLEAF_REDIS_*` と ConfigMap の設定が優先されますが、git-bridge は `GIT_BRIDGE_PORT` をポートとして解釈して停止してしまいます（[Git 連携](/ja/on-premises/configuration/kubernetes/integrations/git-integration)を参照）。リンクを無効にすることで、環境を自分で設定したものだけに保てます。
+* <strong>`Recreate`。</strong> 2 つの Pod が同じデータボリュームを使用したり、同時にマイグレーションを実行したりしてはなりません。
+* <strong>公開方法。</strong> NodePort Service はすべてのノードのポート `30080` で応答します。本番環境では、前段に Ingress コントローラーまたはロードバランサーを置いてそこで TLS を終端してください。WebSocket、10 分間のリクエストタイムアウト（長時間のコンパイル）、50 MB のアップロードを許可し、`X-Forwarded-For` と `X-Forwarded-Proto` を渡す必要があります。

@@ -1,0 +1,65 @@
+---
+title: Integração com IA
+description: Configure o chat de IA, as sugestões para erros de LaTeX, as cotas e os serviços de busca em uma implantação Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+O assistente de IA e o assistente de erros de LaTeX são executados no serviço **web** (os módulos `workbench` e `error-assistant`) de cada pod do Ayakaleaf Pro. O que cada configuração faz, o acesso dos usuários e as cotas estão descritos em [Integração com IA](/pt/on-premises/configuration/overleaf-toolkit/integrations/ai-integration); esta página os coloca no Kubernetes.
+
+| | |
+| --- | --- |
+| Serviço | web, em cada pod do Ayakaleaf Pro; lido quando o web inicia. A ferramenta `web_fetch` passa pelo linked-url-proxy no mesmo pod |
+| Pod → exterior | `AI_BASE_URL`; `WEB_SEARCH_URL` (padrão `https://api.tavily.com/search`) e `DOCS_MCP_URL`, se a busca estiver ativada; páginas que o modelo lê com `web_fetch` |
+| Exterior → Overleaf | nenhum |
+| Estado | os contadores de cota de tokens no Redis, compartilhados por todas as réplicas; o histórico do chat fica no navegador |
+| Tarefas periódicas | nenhuma |
+
+### Configuração
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+`AI_ENABLED` deve ser exatamente `"true"`. O assistente aparece somente quando `AI_ENABLED`, `AI_BASE_URL`, `AI_MODEL` e `AI_API_KEY` estão todas definidas.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="Aplique, reinicie e verifique o gateway a partir de cada pod">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+Qualquer status HTTP significa que o gateway está acessível; `000` significa que não está.
+</Step>
+</Steps>
+
+A ferramenta `web_fetch` busca páginas por meio do mesmo proxy que os arquivos de [URL externa](/pt/on-premises/configuration/kubernetes/external-url), então as configurações `OVERLEAF_LINKED_URL_*` também limitam o que o modelo pode ler.
+
+### Várias réplicas
+
+Nada extra. A cota de tokens é contada no Redis, então o uso de um usuário é o mesmo em todas as réplicas, e a redefinição feita por um administrador se aplica a todas.
+
+### Testado no Kubernetes
+
+Contra um mock de um gateway compatível com OpenAI, do Tavily e do endpoint MCP do GitBook (confiáveis por meio de `NODE_EXTRA_CA_CERTS` a partir de `overleaf-certs`), no Kubernetes 1.37, nossos testes de ponta a ponta passam: para o assistente de IA em três réplicas atrás do HAProxy (31 casos), chats com chamadas de ferramentas e edições sugeridas, busca na web e na documentação, leitura de páginas web por meio do linked-url-proxy limitada por `OVERLEAF_LINKED_URL_ALLOWED_RESOURCES`, anexos de imagem e PDF, consentimento, a cota de tokens contada no Redis, IA desativada para um usuário e para a instância, e conexões lentas com o gateway; para o assistente de erros em uma réplica (15 casos), correções sugeridas, consentimento, a cota de tokens compartilhada e IA desativada.

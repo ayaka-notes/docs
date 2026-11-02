@@ -1,0 +1,112 @@
+---
+title: مصادقة LDAP
+description: اسمح للمستخدمين بتسجيل الدخول بحساب LDAP أو Active Directory الخاص بهم في نشر على Kubernetes.
+icon: address-book
+---
+
+تتولى خدمة **web** (وحدة `authentication`) تسجيل الدخول عبر LDAP داخل كل Pod من Pods ‏Ayakaleaf Pro. وعلى خلاف OIDC وSAML، تتواصل الـ Pods مع الدليل بنفسها. أعدّ جانب الدليل كما في [مصادقة LDAP](/ar/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication)، ثم ضع القيم في Kubernetes كما هو موضح أدناه.
+
+### أين تعمل المكوّنات
+
+| | |
+| --- | --- |
+| الخدمة | web، في كل Pod من Pods ‏Ayakaleaf Pro؛ تُقرأ الإعدادات وجهة الشهادات (CA) عند بدء تشغيل web |
+| Pod → خادم LDAP | `OVERLEAF_LDAP_URL`: اتصال جديد لكل عملية تسجيل دخول، ولكل عملية بحث عن جهات اتصال إذا كان `OVERLEAF_LDAP_CONTACTS_FILTER` مضبوطًا |
+| المتصفح → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| حالة تسجيل الدخول | الجلسة وحدود المعدّل في Redis، مشتركة بين جميع النسخ المتماثلة |
+| المهام الدورية | لا توجد |
+
+### الإعداد
+
+<Steps>
+<Step title="اسمح للـ Pods بالوصول إلى الدليل">
+يفتح كل Pod يشغّل Ayakaleaf Pro اتصالات LDAP. إذا كان الدليل محميًا بجدار حماية أو NetworkPolicy، فاسمح بالعناوين التي تغادر بها الـ Pods الكتلة (cluster): وهي عادةً عناوين العقد، أو بوابة الخروج (egress gateway) لديك.
+
+لا تحتوي الصورة على `ldapsearch`. لتشغيل [فحص البحث](/ar/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) من داخل الكتلة، استخدم Pod مؤقتًا:
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+يجب أن يطبع سطر `dn:` واحدًا بالضبط.
+</Step>
+
+<Step title="أضف الإعدادات إلى الـ ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+جميع إعدادات `OVERLEAF_LDAP_*` مدرجة في [متغيرات البيئة](/ar/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables). وكلها توضع في الـ ConfigMap باستثناء كلمة مرور الربط (bind). ضع بين علامتي اقتباس القيمتين `"true"` و`"false"`، وقيم JSON مثل `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`، والقيم التي تبدأ بـ `*`.
+</Step>
+
+<Step title="ضع كلمة مرور الربط في الـ Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="LDAPS أو STARTTLS مع جهة شهادات خاصة بك (اختياري)">
+ضع جهة الشهادات (CA) في الـ Secret ‏`overleaf-certs` المركّب على `/var/lib/overleaf/certs` (راجع [الشهادات والملفات الأخرى](/ar/on-premises/configuration/kubernetes#الشهادات-والملفات-الأخرى)) ثم أشر إليها:
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+تحلّ قائمة جهات الشهادات هذه محل جهات شهادات النظام في اتصالات LDAP. وتُقرأ عند بدء تشغيل web.
+</Step>
+
+<Step title="طبّق التغييرات وأعد التشغيل">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+لا حاجة إلى شيء إضافي سوى جدار الحماية في الخطوة 1: تتصل كل نسخة متماثلة بالدليل بنفسها، وتُحفظ نتيجة تسجيل الدخول في الجلسة داخل Redis.
+
+### الاختبار على Kubernetes
+
+مع LDAP outpost من goauthentik بوصفه الدليل، على Kubernetes 1.37 مع ثلاث نسخ متماثلة خلف HAProxy، نجحت اختباراتنا الشاملة لـ LDAP ‏(26 حالة): تسجيل دخول المسؤول الأول من launchpad عبر LDAP، وتسجيل الدخول بكلمة مرور الربط من الـ Secret، ورفض كلمات المرور الخاطئة والمستخدمين غير المعروفين، وربط صلاحية المسؤول حسب المجموعة ودون ربط، وتحديث الاسم وعلامة المسؤول عند كل تسجيل دخول (سمة اسم واحدة، أو الاسم الأول واسم العائلة)، وجهات الاتصال من الدليل، وتسجيل الخروج، وقواعد كلمات المرور لحسابات LDAP، والحسابات المعلّقة، وتسجيل الدخول عبر LDAP مع reCAPTCHA.
+
+### أسئلة وأجوبة
+
+<Accordion title="يفشل تسجيل الدخول عبر LDAP على بعض الـ Pods فقط">
+
+<strong>الإجابة:</strong> لا يمكن الوصول إلى الدليل من كل العقد. تحقّق من كل Pod:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="أين أرى سبب فشل تسجيل الدخول؟">
+
+<strong>الإجابة:</strong> في سجل web الخاص بالـ Pod الذي خدم عملية تسجيل الدخول:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

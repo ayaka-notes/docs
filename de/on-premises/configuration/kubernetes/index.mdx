@@ -1,0 +1,90 @@
+---
+title: Kubernetes
+description: Ein Kubernetes-Deployment konfigurieren - wohin Einstellungen, Secrets und Dateien gehören, und eine Seite pro Funktion.
+icon: dharmachakra
+---
+
+Ein Kubernetes-Deployment liest dieselben Umgebungsvariablen wie das Toolkit. Wenn eine Toolkit-Seite sagt "fügen Sie dies zu `config/variables.env` hinzu", tragen Sie den Wert in die ConfigMap `overleaf-env` ein, oder in das Secret `overleaf-secrets`, wenn es sich um ein Passwort, einen Schlüssel oder ein Token handelt. Starten Sie dann neu:
+
+```bash
+kubectl -n overleaf apply -f 30-config.yaml        # after editing the ConfigMap
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+kubectl -n overleaf rollout restart deployment/overleaf
+```
+
+Werte in `config/overleaf.rc` sind Toolkit-Einstellungen, keine Umgebungsvariablen; das Q\&A am Ende dieser Seite erklärt, was sie ersetzt.
+
+### Funktionen
+
+Jede Funktion der Toolkit-Konfiguration hat hier eine eigene Seite mit ihren Diensten, Einstellungen, Netzwerkpfaden, Hintergrundjobs, den Änderungen bei mehreren Replikaten und der Art, wie sie getestet wurde:
+
+| Funktion | Dienste im Pod | Über die ConfigMap und das Secret hinaus |
+| --- | --- | --- |
+| [Authentifizierung](/de/on-premises/configuration/kubernetes/authentication): [OIDC](/de/on-premises/configuration/kubernetes/authentication/oidc-authentication), [SAML](/de/on-premises/configuration/kubernetes/authentication/saml-authentication), [LDAP](/de/on-premises/configuration/kubernetes/authentication/ldap-authentication), [Öffentlicher Zugriff](/de/on-premises/configuration/kubernetes/authentication/public-access), [reCAPTCHA](/de/on-premises/configuration/kubernetes/authentication/recaptcha), [Passwortbeschränkungen](/de/on-premises/configuration/kubernetes/authentication/password-restrictions) | web | Client Secrets, das IdP-Zertifikat, die LDAP-CA |
+| [Sandboxed Compiles](/de/on-premises/configuration/kubernetes/sandboxed-compiles) | clsi | Docker Engine und die TeX-Live-Images auf jedem Knoten |
+| [Pandoc-Import und -Export](/de/on-premises/configuration/kubernetes/pandoc-import-and-export) | clsi, web | das Pandoc-Image in Docker auf jedem Knoten |
+| [Git-Integration](/de/on-premises/configuration/kubernetes/integrations/git-integration) | git-bridge (eigener Pod), web, history-v1 | das git-bridge-StatefulSet und zwei Services |
+| [GitHub](/de/on-premises/configuration/kubernetes/integrations/github-synchronisation)-, [GitLab](/de/on-premises/configuration/kubernetes/integrations/gitlab-synchronisation)-, [Gitea](/de/on-premises/configuration/kubernetes/integrations/gitea-synchronisation)-Synchronisierung | web | Git-Integration |
+| [Dropbox-Synchronisierung](/de/on-premises/configuration/kubernetes/integrations/dropbox-synchronisation) | web, third-party-datastore, document-updater | Git-Integration, der aus dem Internet erreichbare Webhook, Datenbankindizes |
+| [Zotero](/de/on-premises/configuration/kubernetes/integrations/zotero-integration)-, [Mendeley](/de/on-premises/configuration/kubernetes/integrations/mendeley-integration)-Integration | web | das Cipher-Passwort im Secret |
+| [MCP-Server](/de/on-premises/configuration/kubernetes/integrations/mcp-server) | web | Git-Integration |
+| [KI-Integration](/de/on-premises/configuration/kubernetes/integrations/ai-integration) | web, linked-url-proxy | – |
+| [Overleaf Import API](/de/on-premises/configuration/kubernetes/integrations/overleaf-import-api) | web, linked-url-proxy | – |
+| [Vorlagen](/de/on-premises/configuration/kubernetes/templates) | web, filestore | S3 für mehrere Replikate |
+| [Externe URL](/de/on-premises/configuration/kubernetes/external-url) | linked-url-proxy | öffentliche Knotenadressen in `OVERLEAF_LINKED_URL_BLOCKED_NETWORKS` |
+| [Logging](/de/on-premises/configuration/kubernetes/logging) | jeder Dienst | ein Volume unter `/var/log/overleaf`, um Logs aufzubewahren |
+| [TLS-Proxy](/de/on-premises/configuration/kubernetes/tls-proxy) | Ihr Ingress oder Load Balancer | TLS endet vor den Pods |
+| [Branding](/de/on-premises/configuration/kubernetes/branding) | web | – |
+| [Lokalisierung](/de/on-premises/configuration/kubernetes/localization) | web | ein Hostname pro Sprache |
+| [E-Mail-Zustellung](/de/on-premises/configuration/kubernetes/email-delivery) | web | – |
+| [Redis](/de/on-premises/configuration/kubernetes/redis) | jeder Dienst mit Live-Zustand | – |
+| [S3](/de/on-premises/configuration/kubernetes/s3) | history-v1, filestore | ein S3-Dienst, erforderlich für mehrere Replikate |
+| [LaTeX-Benutzerhilfe hinzufügen](/de/on-premises/configuration/kubernetes/adding-latex-user-help) | web | die Pods müssen das Wiki erreichen |
+| [Horizontale Skalierung](/de/on-premises/configuration/kubernetes/horizontal-scaling) | alle | S3, ein Load Balancer mit Sticky Sessions |
+
+### Zertifikate und andere Dateien
+
+Einige Funktionen erwarten einen Dateipfad statt eines Werts: die SAML-Zertifikate (`OVERLEAF_SAML_IDP_CERT`, ...), die LDAP-CA (`OVERLEAF_LDAP_TLS_OPTS_CA_PATH`) oder eine private CA für ein selbst gehostetes GitHub Enterprise, GitLab oder Gitea (`NODE_EXTRA_CA_CERTS`). Legen Sie die Dateien in ein Secret und hängen Sie es dort ein, wo die Toolkit-Seiten sie erwarten, unter `/var/lib/overleaf/certs`:
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem --from-file=ca.pem
+```
+
+```yaml title="40-overleaf.yaml (additions)"
+          volumeMounts:
+            # ...
+            - name: certs
+              mountPath: /var/lib/overleaf/certs
+              readOnly: true
+      volumes:
+        # ...
+        - name: certs
+          secret:
+            secretName: overleaf-certs
+```
+
+Verweisen Sie dann in der ConfigMap per Pfad darauf, zum Beispiel `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`, und starten Sie neu.
+
+<Warning>
+
+<strong>Cipher-Passwörter.</strong> Setzen Sie jedes `*_CIPHER_PASSWORD` der von Ihnen genutzten Funktionen im Secret. Andernfalls erzeugen einige Funktionen bei der ersten Verwendung eine Schlüsseldatei im Daten-Volume: Mit einem Replikat funktioniert das, bis das Volume verloren geht; mit mehreren Replikaten würde jedes Replikat mit einem anderen Schlüssel verschlüsseln.
+
+</Warning>
+
+### Q\&A
+
+<Accordion title="Welche Toolkit-Einstellungen aus `config/overleaf.rc` benötige ich?">
+
+<strong>Antwort:</strong> Keine davon wird von Ayakaleaf Pro gelesen. Ihre Kubernetes-Entsprechungen:
+
+| `config/overleaf.rc`                         | Kubernetes                                                        |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `OVERLEAF_LISTEN_IP`, `OVERLEAF_PORT`        | der Service (NodePort) oder Ihr Ingress                           |
+| `SIBLING_CONTAINERS_ENABLED`                 | `SANDBOXED_COMPILES*` in der ConfigMap, Docker-Socket im Pod      |
+| `GIT_BRIDGE_ENABLED`                         | [Git-Integration](/de/on-premises/configuration/kubernetes/integrations/git-integration)                             |
+| `MONGO_ENABLED`, `REDIS_ENABLED`, `MONGO_URL`, `REDIS_HOST` | die StatefulSets oder Ihre verwalteten Dienste, `OVERLEAF_MONGO_URL` und `OVERLEAF_REDIS_HOST` |
+| `REDIS_AOF_PERSISTENCE`                      | `--appendonly yes` in `20-redis.yaml`                             |
+| `NGINX_ENABLED`, `TLS_*`                     | Ihr Ingress oder Load Balancer                                    |
+
+</Accordion>

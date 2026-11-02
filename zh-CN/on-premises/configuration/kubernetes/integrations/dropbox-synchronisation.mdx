@@ -1,0 +1,101 @@
+---
+title: Dropbox 同步
+description: 在 Kubernetes 部署中，让用户将其项目与 Dropbox 中的文件夹同步。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.svg
+---
+
+Dropbox 同步使用每个 Ayakaleaf Pro Pod 中的三个部分，并且这三个部分只有在设置 `DROPBOX_ENABLED: "true"` 时才会启动：
+
+* **web**（`dropbox` 模块）：关联账户、项目的 Dropbox 对话框，以及 Dropbox 调用的 Webhook。
+* **third-party-datastore**：Pod 中的一个独立服务，负责处理要发送到 Dropbox 或从 Dropbox 获取的变更队列。
+* **document-updater**：开启 Dropbox 后，在所有人离开项目几分钟后，它会在后台将编辑器中的变更写入 MongoDB；只有在此之后，这些变更才会发送到 Dropbox。
+
+请在 [Dropbox 同步](/zh-CN/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation)中创建 Dropbox 应用并了解同步的工作方式；本页介绍如何将其放入 Kubernetes。
+
+| | |
+| --- | --- |
+| 服务 | web（`dropbox` 模块）、third-party-datastore 和 document-updater，位于每个 Ayakaleaf Pro Pod 中 |
+| Dropbox → Overleaf | 来自互联网的 `POST ${OVERLEAF_SITE_URL}/dropbox/webhook`，使用应用密钥签名 |
+| Pod → Dropbox | `https://api.dropboxapi.com` 和 `https://content.dropboxapi.com` |
+| 浏览器 → Dropbox | `https://www.dropbox.com/oauth2/authorize`，然后返回 `${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback` |
+| 状态 | Redis 中的待处理变更队列及其锁；MongoDB 中的同步状态（`dropboxEntities`、`dropboxProjects`） |
+| 后台工作 | third-party-datastore 每秒检查一次其队列；document-updater 写入 3 分钟内无人打开的项目 |
+
+### 配置
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  DROPBOX_ENABLED: "true"
+  DROPBOX_APP_KEY: <app key>
+  DROPBOX_APP_NAME: Overleaf      # the folder name under Apps/ in Dropbox
+  # optional: send the requests to Dropbox through an HTTP proxy
+  # DROPBOX_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+必须已配置好 `GIT_BRIDGE_ENABLED: "true"` 以及 [Git 集成](/zh-CN/on-premises/configuration/kubernetes/integrations/git-integration)中的 git-bridge StatefulSet：否则账户设置会隐藏项目同步部分。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "DROPBOX_APP_SECRET":"<app secret>",
+  "DROPBOX_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`DROPBOX_TOKEN_CIPHER_PASSWORD` 用于加密 MongoDB 中用户的 Dropbox 令牌。每个副本都必须使用相同的值，之后若更改该值，所有用户都需要重新关联 Dropbox。
+</Step>
+
+<Step title="创建数据库索引">
+在副本集的主节点上运行一次[创建数据库索引](/zh-CN/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation#create-the-database-indexes)中的索引命令：
+
+```bash wrap
+kubectl -n overleaf exec -i mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' <<'EOF'
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+EOF
+```
+</Step>
+
+<Step title="应用并重启">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf exec deploy/overleaf -- tail -n 5 /var/log/overleaf/third-party-datastore.log
+```
+
+只有当 `DROPBOX_ENABLED` 为 `"true"` 时，`third-party-datastore.log` 才会存在。
+</Step>
+
+<Step title="向互联网开放 Webhook">
+Dropbox 必须能够从互联网访问 `${OVERLEAF_SITE_URL}/dropbox/webhook`。如果你的 Ingress 或负载均衡器只允许外部访问部分路径或网络，请放行此路径；这是 Dropbox 调用的唯一路径。请从集群外部进行检查：
+
+```bash
+curl "https://overleaf.example.com/dropbox/webhook?challenge=test"   # prints: test
+```
+
+然后按照 Toolkit 页面中的说明，在 Dropbox App Console 中添加该 Webhook。
+</Step>
+</Steps>
+
+### 多个副本
+
+除共享的 `DROPBOX_TOKEN_CIPHER_PASSWORD` 外无需其他操作：
+
+* Webhook 可能到达任意副本。它只会将变更放入 Redis 中的队列。
+* 每个副本都运行 third-party-datastore，并且都处理共享的队列。用户的队列通过 Redis 中的锁获取，因此同一时间只有一个副本发送或获取某个用户的变更。
+* 每个副本的 document-updater 都会在后台写入空闲项目。每个项目都从 Redis 中的共享列表中取出，因此只会被写入一次。
+
+### 在 Kubernetes 上的测试
+
+针对 Dropbox API 的模拟服务，在 Kubernetes 1.37 上使用位于 HAProxy 之后的三个副本，我们针对 Dropbox 同步的端到端测试全部通过（59 个用例）：关联和取消关联；将项目、编辑、二进制文件、重命名、移动和删除发送到 Dropbox，包括在项目关闭后通过后台写入到达的编辑器编辑，无需编译或“立即同步”；通过 Webhook 应用在 Dropbox 中所做的更改（验证质询和签名检查）、从新文件夹创建新项目、删除的项目文件夹；同名项目；编辑器的 Dropbox 对话框以及带速率限制的“立即同步”；Dropbox 的重试、速率限制和超时；当 Dropbox 空间已满、拒绝令牌或账户被停用时取消关联的账户；已停用的 Overleaf 账户；以及 third-party-datastore 宕机时 Webhook 的响应。

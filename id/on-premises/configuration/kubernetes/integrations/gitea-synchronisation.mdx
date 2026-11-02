@@ -1,0 +1,67 @@
+---
+title: Sinkronisasi Gitea
+description: Izinkan pengguna menyinkronkan proyek mereka dengan repositori di Gitea.com atau Gitea Anda sendiri pada deployment Kubernetes.
+icon: mug-hot
+---
+
+Sinkronisasi Gitea berjalan di layanan **web** (modul `gitea-sync`) di setiap pod Ayakaleaf Pro. Fitur ini memerlukan [Integrasi Git](/id/on-premises/configuration/kubernetes/integrations/git-integration). Buat aplikasi OAuth dan baca apa fungsi setiap pengaturan di [Sinkronisasi Gitea](/id/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); halaman ini menerapkannya ke Kubernetes.
+
+| | |
+| --- | --- |
+| Layanan | web (modul `gitea-sync`), di setiap pod Ayakaleaf Pro; dibaca saat web dimulai |
+| Pod → Gitea | REST API dari `GITEA_SYNC_URL` (default `https://gitea.com/api/v1`), setiap kali pengguna menautkan, mengimpor, mengekspor, atau menyinkronkan |
+| Browser → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` untuk menautkan akun, lalu kembali ke `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | tidak ada: tanpa webhook, instans tidak perlu dapat dijangkau dari Gitea |
+| Data yang disimpan | access token dan refresh token Gitea milik pengguna, terenkripsi, di MongoDB |
+| Job berkala | tidak ada: sinkronisasi terjadi saat pengguna mengklik |
+
+### Konfigurasi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` dan StatefulSet git-bridge dari [Integrasi Git](/id/on-premises/configuration/kubernetes/integrations/git-integration) harus sudah tersedia: tanpa keduanya, pengaturan akun dan editor menyembunyikan Sinkronisasi Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` mengenkripsi access token dan refresh token Gitea milik pengguna di MongoDB. Setiap replika harus menggunakan nilai yang sama, dan mengubahnya nanti membuat setiap pengguna harus menautkan Gitea lagi.
+</Step>
+
+<Step title="CA privat (opsional)">
+Jika Gitea Anda memiliki sertifikat dari CA Anda sendiri, tambahkan CA tersebut ke Secret `overleaf-certs` yang di-mount di `/var/lib/overleaf/certs` (lihat [Sertifikat dan file lainnya](/id/on-premises/configuration/kubernetes#sertifikat-dan-file-lainnya)) dan atur `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` di ConfigMap.
+</Step>
+
+<Step title="Terapkan, restart, dan periksa">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Status HTTP apa pun berarti Gitea dapat dijangkau dari pod tersebut; `000` berarti tidak.
+</Step>
+</Steps>
+
+### Beberapa replika
+
+Tidak ada yang perlu ditambahkan selain `GITEA_TOKEN_CIPHER_PASSWORD` yang sama. Sinkronisasi mengambil lock di Redis, yang dibagi dengan sinkronisasi Git lainnya, sehingga dua replika tidak pernah menyinkronkan proyek yang sama secara bersamaan.
+
+### Diuji di Kubernetes
+
+Terhadap Gitea 1.23 sungguhan di `GITEA_SYNC_URL`, di Kubernetes 1.37 dengan satu replika dan Integrasi Git aktif, pengujian end-to-end kami untuk Sinkronisasi Gitea lulus (39 kasus): menautkan dan melepas tautan akun melalui OAuth2 Gitea, memperbarui access token yang kedaluwarsa dan grant yang dicabut, mengekspor ke repositori privat atau repositori organisasi baru, mengimpor repositori, pull dan push, merge, konflik, branch yang dihapus dan di-force-push, file biner, penggantian nama dan penghapusan, serta apa yang boleh dilakukan pemilik, editor, dan viewer.

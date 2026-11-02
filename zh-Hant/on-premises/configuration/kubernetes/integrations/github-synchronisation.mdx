@@ -1,0 +1,67 @@
+---
+title: GitHub 同步
+description: 在 Kubernetes 部署中，讓使用者將專案與 GitHub 或 GitHub Enterprise 儲存庫同步。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub 同步在每個 Ayakaleaf Pro Pod 的 **web** 服務（`github-sync` 模組）中執行，並且需要 [Git 整合](/zh-Hant/on-premises/configuration/kubernetes/integrations/git-integration)。請參閱 [GitHub 同步](/zh-Hant/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation) 以建立 OAuth 應用程式並了解各項設定的作用；本頁說明如何將其套用到 Kubernetes。
+
+| | |
+| --- | --- |
+| 服務 | web（`github-sync` 模組），位於每個 Ayakaleaf Pro Pod 中；於 web 啟動時讀取 |
+| Pod → GitHub | 每當使用者連結、匯入、匯出或同步時，連線至 `https://api.github.com`（REST 與 GraphQL），或 `GITHUB_SYNC_URL` 的 API |
+| 瀏覽器 → GitHub | 透過 `https://github.com/login/oauth/authorize` 連結帳號，接著返回 `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | 無：沒有 webhook，GitHub 不需要能連線至您的執行個體 |
+| 儲存的資料 | 使用者的 GitHub 存取權杖，經加密後儲存於 MongoDB |
+| 定期工作 | 無：同步會在使用者點擊時進行 |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+必須先設定 `GIT_BRIDGE_ENABLED: "true"`，並部署 [Git 整合](/zh-Hant/on-premises/configuration/kubernetes/integrations/git-integration) 中的 git-bridge StatefulSet：缺少這些時，帳號設定與編輯器會隱藏 GitHub 同步。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` 用於加密儲存在 MongoDB 中的使用者 GitHub 存取權杖。所有副本都必須使用相同的值，之後若變更此值，所有使用者都必須重新連結 GitHub。
+</Step>
+
+<Step title="私人 CA（選用）">
+如果您的 GitHub 使用由您自己的 CA 簽發的憑證，請將該 CA 加入掛載於 `/var/lib/overleaf/certs` 的 Secret `overleaf-certs`（請參閱[憑證與其他檔案](/zh-Hant/on-premises/configuration/kubernetes#憑證與其他檔案)），並在 ConfigMap 中設定 `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`。
+</Step>
+
+<Step title="套用、重新啟動並檢查">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+任何 HTTP 狀態碼都表示該 Pod 可以連線至 GitHub；`000` 則表示無法連線。
+</Step>
+</Steps>
+
+### 多個副本
+
+除了共用的 `GITHUB_TOKEN_CIPHER_PASSWORD` 之外，不需要其他額外設定。同步時會在 Redis 中取得一個鎖（與其他 Git 同步共用），因此兩個副本永遠不會同時同步同一個專案。
+
+### 在 Kubernetes 上的測試
+
+我們在 Kubernetes 1.37 上以單一副本並啟用 Git 整合，針對模擬的 github.com 及其 REST 與 GraphQL API（透過來自 `overleaf-certs` 的 `NODE_EXTRA_CA_CERTS` 信任）執行 GitHub 同步的端對端測試，全部通過（31 個案例）：連結與解除連結帳號、已撤銷的權杖、將專案匯出至新的私人或組織儲存庫、匯入儲存庫（包括超過上傳限制的情況）、拉取與推送、合併、衝突與手動合併、已刪除與被強制推送的分支、二進位檔案、重新命名與刪除、失去推送權限，以及擁有者、編輯者與檢視者各自可以執行的操作。

@@ -1,0 +1,123 @@
+---
+title: 5. نشر Ayakaleaf Pro
+description: انشر الـ pod الخاص بـ Ayakaleaf Pro، ووحدة تخزين البيانات الخاصة به، وService من النوع NodePort.
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+يُجري التشغيل الأول عمليات ترحيل قاعدة البيانات ويستغرق دقيقة أو دقيقتين. يكون الـ pod جاهزًا عندما يستجيب `/status`؛ افتح بعد ذلك `OVERLEAF_SITE_URL`.
+
+### لماذا يبدو ملف manifest بهذا الشكل
+
+* <strong>وحدة تخزين البيانات.</strong> كل ما يقع تحت `/var/lib/overleaf` (ملفات المشاريع، والسجلّ، والملفات المرفوعة) يوجد على الـ PVC. تبقى البيانات على عقدة واحدة مع التخزين المحلي للعقدة مثل local-path؛ أما مع التخزين الكتلي الشبكي فيمكن للـ pod الانتقال بين العقد.
+* <strong>وحدات تخزين الترجمة ومقبس Docker.</strong> يطلب Ayakaleaf Pro من Docker الخاص بالعقدة تشغيل حاوية TeX Live ويمرّر إليها مجلد الترجمة الخاص بالمشروع **عبر مساره على العقدة**. لذلك تكون هذه المجلدات وحدات تخزين من النوع `hostPath`، وتتكرر مساراتها في `SANDBOXED_COMPILES_HOST_DIR_*`. ومحتواها بيانات مؤقتة لا تحتاج إلى نسخ احتياطي.
+* <strong>`enableServiceLinks: false`.</strong> يضيف Kubernetes إلى كل pod متغيّرات بأسلوب Docker لكل Service في مساحة الأسماء: فتصبح الـ Service ‏`redis` ‏`REDIS_PORT=tcp://10.x.x.x:6379`، والـ Service ‏`git-bridge` ‏`GIT_BRIDGE_PORT=tcp://...`. تقرأ بعض خدمات Overleaf متغيّرات بهذه الأسماء. في هذا الـ pod تكون الأولوية للإعدادات من `OVERLEAF_REDIS_*` ومن الـ ConfigMap، لكن git-bridge يأخذ `GIT_BRIDGE_PORT` كمنفذ له ويتوقف (راجع [تكامل Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration)). يؤدي تعطيل هذه الروابط إلى إبقاء البيئة مقتصرة على ما تضبطه أنت.
+* <strong>`Recreate`.</strong> يجب ألا يستخدم اثنان من الـ pods أبدًا وحدة تخزين البيانات نفسها أو يُجريا عمليات الترحيل في الوقت ذاته.
+* <strong>إتاحته للوصول.</strong> تستجيب الـ Service من النوع NodePort على المنفذ `30080` في كل عقدة. في بيئة الإنتاج، ضع متحكّم الـ ingress أو موازن الأحمال لديك في المقدّمة وأنهِ TLS هناك؛ ويجب أن يسمح باتصالات WebSocket، ومهلات طلبات تبلغ 10 دقائق (عمليات الترجمة الطويلة)، وعمليات رفع بحجم 50 MB، وأن يمرّر `X-Forwarded-For` و`X-Forwarded-Proto`.

@@ -1,0 +1,67 @@
+---
+title: GitHub-synkronisering
+description: Låt användare synkronisera sina projekt med repositorier på GitHub eller GitHub Enterprise i en Kubernetes-driftsättning.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub-synkronisering körs i tjänsten **web** (modulen `github-sync`) i varje Ayakaleaf Pro-pod. Den kräver [Git-integrationen](/sv/on-premises/configuration/kubernetes/integrations/git-integration). Skapa OAuth-applikationen och läs vad varje inställning gör i [GitHub-synkronisering](/sv/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); den här sidan tillämpar det på Kubernetes.
+
+| | |
+| --- | --- |
+| Tjänst | web (modulen `github-sync`), i varje Ayakaleaf Pro-pod; läses när web startar |
+| Pod → GitHub | `https://api.github.com` (REST och GraphQL), eller API:t för `GITHUB_SYNC_URL`, när en användare länkar, importerar, exporterar eller synkroniserar |
+| Webbläsare → GitHub | `https://github.com/login/oauth/authorize` för att länka ett konto, sedan tillbaka till `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | ingen: ingen webhook, instansen behöver inte vara nåbar från GitHub |
+| Lagrade data | användarens GitHub-åtkomsttokens, krypterade, i MongoDB |
+| Periodiska jobb | inga: synkronisering sker när en användare klickar |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` och git-bridge-StatefulSet:en från [Git-integration](/sv/on-premises/configuration/kubernetes/integrations/git-integration) måste finnas på plats: utan dem döljer kontoinställningarna och redigeraren GitHub-synkroniseringen.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` krypterar användarnas GitHub-åtkomsttokens i MongoDB. Alla repliker måste använda samma värde, och om du ändrar det senare måste alla användare länka GitHub på nytt.
+</Step>
+
+<Step title="Privat CA (valfritt)">
+Om din GitHub har ett certifikat från din egen CA lägger du till CA:n i Secret:en `overleaf-certs` som monteras på `/var/lib/overleaf/certs` (se [Certifikat och andra filer](/sv/on-premises/configuration/kubernetes#certifikat-och-andra-filer)) och anger `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap:en.
+</Step>
+
+<Step title="Tillämpa, starta om och kontrollera">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Vilken HTTP-statuskod som helst betyder att GitHub kan nås från den podden; `000` betyder att den inte kan det.
+</Step>
+</Steps>
+
+### Flera repliker
+
+Inget extra utöver det gemensamma `GITHUB_TOKEN_CIPHER_PASSWORD`. En synkronisering tar ett lås i Redis, som delas med de andra Git-synkroniseringarna, så två repliker synkroniserar aldrig samma projekt samtidigt.
+
+### Testat på Kubernetes
+
+Mot en mock av github.com och dess REST- och GraphQL-API:er (betrodd via `NODE_EXTRA_CA_CERTS` från `overleaf-certs`), på Kubernetes 1.37 med en replik och Git-integrationen påslagen, klarar våra end-to-end-tester för GitHub-synkronisering sig (31 fall): länkning och avlänkning av kontot, återkallade tokens, export av ett projekt till ett nytt privat repositorium eller organisationsrepositorium, import av ett repositorium (även över uppladdningsgränsen), hämtning och pushning, sammanslagningar, konflikter och manuella sammanslagningar, borttagna och force-pushade grenar, binära filer, namnbyten och borttagningar, förlorad push-behörighet samt vad ägare, redigerare och läsare får göra.

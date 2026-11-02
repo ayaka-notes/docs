@@ -1,0 +1,59 @@
+---
+title: 模板
+description: 在 Kubernetes 部署中运行模板库。
+icon: paste
+---
+
+模板库运行在每个 Ayakaleaf Pro pod 的 **web** 服务（`template-gallery` 模块）中；同一 pod 中的 **filestore** 服务存储模板文件并渲染其预览。分类、权限和发布请参见[模板](/zh-Hans/on-premises/configuration/overleaf-toolkit/templates)。
+
+| | |
+| --- | --- |
+| 服务 | web（`template-gallery` 模块）、filestore（文件和预览图像） |
+| 存储的数据 | 模板元数据存储在 MongoDB 中；ZIP、PDF 和预览图像存储在 filestore 的模板存储中：数据卷上的 `/var/lib/overleaf/data/template_files`，或 S3 存储桶 `OVERLEAF_FILESTORE_TEMPLATE_FILES_BUCKET_NAME` |
+| Pod → 外部 | 无（如使用 S3 则为 S3） |
+| 定期任务 | 无：预览在首次查看时渲染 |
+
+### 配置
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_TEMPLATE_GALLERY: "true"
+  ENABLE_CONVERSIONS: "true"
+  OVERLEAF_TEMPLATE_CATEGORIES: academic-journal book presentation poster cv report thesis
+  TEMPLATE_ACADEMIC_JOURNAL_NAME: Journal articles
+  TEMPLATE_ACADEMIC_JOURNAL_DESCRIPTION: Templates for academic journal submissions.
+  # ... one _NAME and _DESCRIPTION per category, see the Toolkit page
+```
+</Step>
+
+<Step title="模板用户（可选）">
+管理员始终可以发布模板。要让非管理员用户管理模板库，请创建该用户，从 MongoDB 中读取其 ID 并放入 ConfigMap：
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  --eval 'db.users.findOne({ email: "templates@example.com" })._id.toString()'
+```
+
+```yaml
+  OVERLEAF_TEMPLATES_USER_ID: "<the ID printed above>"
+```
+</Step>
+
+<Step title="应用并重启">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### 多个副本
+
+* 模板文件必须存放在 S3 中：如果文件位于每个副本自身的磁盘上，每个节点显示的模板库都会不同。[水平扩展](/zh-Hans/on-premises/configuration/kubernetes/horizontal-scaling) 的配置已经使用了存储桶 `overleaf-template-files`。
+* 发布时会使用项目最近一次编译生成的 PDF，而它仅存在于执行该编译的副本上。负载均衡器的粘性 cookie 会让用户停留在该副本上，因此请在执行编译的同一浏览器会话中发布。
+
+### 在 Kubernetes 上的测试
+
+在 Kubernetes 1.37 上以三个副本部署于 HAProxy 之后，并将模板文件存放在 S3 存储桶 `overleaf-template-files`（Garage）中时，模板库的端到端测试全部通过（41 个用例）：从“文件”菜单发布已编译的项目，以及从存储桶提供 PDF、预览图像和源码 ZIP；从模板创建项目；模板库的分类、搜索、排序和分页；编辑、覆盖和删除模板；管理员、普通用户以及来自 `OVERLEAF_TEMPLATES_USER_ID` 的模板用户（其 ID 按上述方式从 MongoDB 读取）的权限；以及格式错误的请求。

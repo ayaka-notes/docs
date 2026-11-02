@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Hubungkan deployment Kubernetes ke Redis dengan kata sandi, dan simpan data Redis dengan persistensi AOF.
+icon: memory
+---
+
+Setiap layanan Ayakaleaf Pro yang menyimpan status langsung menggunakan satu server Redis yang sama: web (sesi, batas laju), real-time, document-updater (editan yang belum disimpan ke MongoDB), project-history (antrean riwayat), dan third-party-datastore (antrean Dropbox). Instalasi menjalankannya sebagai StatefulSet `redis` dari [3. Deploy MongoDB dan Redis](/id/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis); lihat [Redis](/id/on-premises/configuration/overleaf-toolkit/redis) untuk Toolkit.
+
+| | |
+| --- | --- |
+| Layanan | web, real-time, document-updater, project-history, history-v1, third-party-datastore, di setiap pod Ayakaleaf Pro |
+| Pengaturan | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (default `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| Tidak didukung | Redis Sentinel dan Redis Cluster: hanya satu server |
+
+### Autentikasi kata sandi
+
+<Steps>
+<Step title="Simpan kata sandi">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Jalankan Redis dengan kata sandi tersebut">
+Di `20-redis.yaml`, berikan kata sandi ke kontainer dan teruskan ke `redis-server`:
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes mengganti `$(REDIS_PASS)` dengan nilai dari Secret. Readiness probe (`tcpSocket`) tidak perlu diubah.
+</Step>
+
+<Step title="Terapkan dan mulai ulang">
+Hentikan Ayakaleaf Pro terlebih dahulu, agar tidak ada editan yang hilang di antara kedua mulai ulang:
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Untuk Redis terkelola, atur `OVERLEAF_REDIS_HOST` (dan `REDIS_HOST`) di ConfigMap ke alamatnya, kata sandi seperti di atas, dan `OVERLEAF_REDIS_TLS: "true"` jika memerlukan TLS.
+
+### Persistensi AOF
+
+Instalasi sudah menjalankan Redis dengan `--appendonly yes`, padanan dari `REDIS_AOF_PERSISTENCE=true` milik Toolkit, dan menyimpan datanya di volume `data-redis-0`. Untuk mengalihkan Redis yang sudah ada tanpa AOF, ikuti langkah-langkah di [halaman Toolkit](/id/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) dengan `kubectl -n overleaf exec -it redis-0 -- redis-cli` sebagai ganti `docker exec`, lalu tambahkan `--appendonly yes` ke args.
+
+### Beberapa replika
+
+Semua replika harus menggunakan Redis yang sama: Redis menyimpan sesi, editan yang belum ada di MongoDB, dan lock yang mencegah dua replika memproses proyek yang sama secara bersamaan.
+
+### Diuji di Kubernetes
+
+Di Kubernetes 1.37 dengan satu replika, Redis yang dijalankan dengan `--requirepass $(REDIS_PASS)` dari Secret `redis-auth` seperti di atas menolak `redis-cli` tanpa kata sandi (`NOAUTH`), dan dengan `OVERLEAF_REDIS_PASS` serta `REDIS_PASSWORD` di `overleaf-secrets`, pengujian end-to-end kami lulus untuk launchpad (13 kasus) dan untuk pengeditan dengan track changes, komentar, dan berbagi anonim (22 kasus), yang melewati web, real-time, document-updater, dan project-history; tidak ada layanan yang mencatat error autentikasi Redis. Semua pengujian Kubernetes lainnya di halaman-halaman ini dijalankan terhadap StatefulSet Redis dari instalasi, dengan persistensi AOF dan tanpa kata sandi.

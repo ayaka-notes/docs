@@ -63,6 +63,18 @@ Cuando el proceso de copia de seguridad haya finalizado **correctamente**, tendr
 
 MongoDB incluye una herramienta de línea de comandos llamada [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/) que puede usarse para crear una copia de seguridad de los datos de usuarios y proyectos almacenados en la base de datos.
 
+Con el contenedor `sharelatex` detenido y el contenedor `mongo` todavía en ejecución, vuelca la base de datos `sharelatex` en un archivo del host y restáurala de la misma manera (`--drop` sustituye las colecciones existentes):
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Datos del sistema de archivos de Overleaf
 
 En los despliegues con el Toolkit, la ruta donde se almacenan tus archivos no editables se especifica en `config/overleaf.rc` mediante la variable de entorno `OVERLEAF_DATA_PATH`, aunque, según cuándo se creó tu instancia, podría ser `data/sharelatex`.
@@ -192,3 +204,37 @@ Las siguientes carpetas tienen indicaciones adicionales:
          * búfer de las subidas de archivos (subida de archivos binarios/nuevo proyecto desde zip)
       3. projectHistories (e)
          * archivos temporales para las migraciones del historial completo de los proyectos
+
+### Preguntas y respuestas
+
+<Accordion title="Los datos de MongoDB están dañados o se han borrado en parte y no tengo copia de seguridad. ¿Qué puedo hacer?">
+
+<strong>Respuesta:</strong> El contenedor `mongo` no guarda datos por sí mismo: la base de datos está en `data/mongo` (`MONGO_DATA_PATH` en `config/overleaf.rc`). Si solo está dañado el contenedor, elimínalo con `bin/docker-compose rm -sf mongo` y ejecuta `bin/up -d` para volver a crearlo.
+
+Si MongoDB no puede arrancar porque sus archivos están dañados o faltan, el último recurso es la propia herramienta de MongoDB [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/). Descarta los datos corruptos y crea archivos vacíos para los que faltan, así que cuenta con perder datos. Detén todo y copia primero el directorio de datos; después, ejecuta la reparación con la misma imagen que tu contenedor `mongo` (`MONGO_IMAGE` y `MONGO_VERSION` en `config/overleaf.rc`, `mongo:8.0` de forma predeterminada):
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+Si la reparación tuvo que modificar datos, MongoDB ya no arranca como miembro de un replica set, y el Toolkit lo ejecuta como tal (`--replSet overleaf`): `bin/logs mongo` muestra `This instance has been repaired and may contain modified replicated data`. En ese caso, arranca los archivos reparados sin `--replSet`, vuélcalos y restaura el volcado en una base de datos nueva:
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+Después, restaura `mongo-backup.gz` con el comando `mongorestore` de la sección [MongoDB](#mongodb) anterior.
+
+Si los datos de MongoDB han desaparecido por completo, Ayakaleaf Pro no puede reconstruir los proyectos. Los usuarios, la lista de proyectos, los árboles de carpetas, el texto actual de los documentos y el índice del historial se almacenan en MongoDB. `data/overleaf/data/history` sigue conteniendo los archivos subidos y el contenido del historial, almacenados bajo hashes de contenido (`overleaf-project-blobs`) y como fragmentos de historial JSON comprimidos con gzip (`overleaf-chunks`), pero no existe ninguna herramienta que los vuelva a convertir en proyectos. Solo puedes buscar en ellos a mano.
+
+</Accordion>

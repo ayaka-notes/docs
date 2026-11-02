@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Connectez un déploiement Kubernetes à Redis avec un mot de passe, et conservez les données Redis grâce à la persistance AOF.
+icon: memory
+---
+
+Chaque service Ayakaleaf Pro qui conserve un état en direct utilise l'unique serveur Redis : web (sessions, limites de fréquence), real-time, document-updater (modifications pas encore enregistrées dans MongoDB), project-history (file d'attente de l'historique) et third-party-datastore (file d'attente Dropbox). L'installation l'exécute sous forme de StatefulSet `redis` décrit dans [3. Déployer MongoDB et Redis](/fr/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis) ; voir [Redis](/fr/on-premises/configuration/overleaf-toolkit/redis) pour le Toolkit.
+
+| | |
+| --- | --- |
+| Services | web, real-time, document-updater, project-history, history-v1, third-party-datastore, dans chaque pod Ayakaleaf Pro |
+| Paramètres | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (par défaut `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| Non pris en charge | Redis Sentinel et Redis Cluster : un seul serveur uniquement |
+
+### Authentification par mot de passe
+
+<Steps>
+<Step title="Stocker le mot de passe">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Démarrer Redis avec ce mot de passe">
+Dans `20-redis.yaml`, fournissez le mot de passe au conteneur et transmettez-le à `redis-server` :
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes remplace `$(REDIS_PASS)` par la valeur du Secret. La sonde de disponibilité (`tcpSocket`) ne nécessite aucune modification.
+</Step>
+
+<Step title="Appliquer et redémarrer">
+Arrêtez d'abord Ayakaleaf Pro, afin qu'aucune modification ne soit perdue entre les deux redémarrages :
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Pour un Redis managé, définissez `OVERLEAF_REDIS_HOST` (et `REDIS_HOST`) dans le ConfigMap sur son adresse, le mot de passe comme ci-dessus, et `OVERLEAF_REDIS_TLS: "true"` s'il exige TLS.
+
+### Persistance AOF
+
+L'installation démarre déjà Redis avec `--appendonly yes`, l'équivalent de `REDIS_AOF_PERSISTENCE=true` dans le Toolkit, et conserve ses données sur le volume `data-redis-0`. Pour basculer un Redis existant sans AOF, suivez les étapes de la [page du Toolkit](/fr/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) en utilisant `kubectl -n overleaf exec -it redis-0 -- redis-cli` au lieu de `docker exec`, puis ajoutez `--appendonly yes` aux arguments.
+
+### Plusieurs répliques
+
+Toutes les répliques doivent utiliser le même Redis : il contient les sessions, les modifications pas encore enregistrées dans MongoDB et les verrous qui empêchent deux répliques de traiter le même projet en même temps.
+
+### Testé sur Kubernetes
+
+Sur Kubernetes 1.37 avec une réplique, Redis démarré avec `--requirepass $(REDIS_PASS)` à partir du Secret `redis-auth` comme ci-dessus refusait `redis-cli` sans le mot de passe (`NOAUTH`), et avec `OVERLEAF_REDIS_PASS` et `REDIS_PASSWORD` dans `overleaf-secrets`, nos tests de bout en bout réussissaient pour le launchpad (13 cas) et pour l'édition avec suivi des modifications, commentaires et partage anonyme (22 cas), qui passent par web, real-time, document-updater et project-history ; aucun service n'a journalisé d'erreur d'authentification Redis. Tous les autres tests Kubernetes de ces pages ont été exécutés avec le StatefulSet Redis de l'installation, avec la persistance AOF et sans mot de passe.

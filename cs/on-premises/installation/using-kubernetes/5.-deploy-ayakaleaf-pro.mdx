@@ -1,0 +1,123 @@
+---
+title: 5. Nasazení Ayakaleaf Pro
+description: Nasaďte pod Ayakaleaf Pro, jeho datový svazek a Service typu NodePort.
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+První start spouští migrace databáze a trvá minutu nebo dvě. Pod je připraven, když odpovídá `/status`; poté otevřete `OVERLEAF_SITE_URL`.
+
+### Proč manifest vypadá takto
+
+* <strong>Datový svazek.</strong> Vše pod `/var/lib/overleaf` (soubory projektů, historie, nahrané soubory) je uloženo na PVC. S úložištěm lokálním pro uzel, jako je local-path, zůstávají data na jednom uzlu; se síťovým blokovým úložištěm se pod může přesouvat mezi uzly.
+* <strong>Svazky pro kompilace a Docker socket.</strong> Ayakaleaf Pro žádá Docker uzlu o spuštění kontejneru TeX Live a předává mu adresář kompilace projektu **pomocí jeho cesty na uzlu**. Tyto adresáře jsou proto svazky `hostPath` a jejich cesty se opakují v `SANDBOXED_COMPILES_HOST_DIR_*`. Jejich obsah jsou dočasná data a nepotřebuje zálohu.
+* <strong>`enableServiceLinks: false`.</strong> Kubernetes přidává do každého podu proměnné ve stylu Dockeru pro každou Service v namespace: ze Service `redis` se stane `REDIS_PORT=tcp://10.x.x.x:6379`, ze Service `git-bridge` `GIT_BRIDGE_PORT=tcp://...`. Některé služby Overleafu čtou proměnné s těmito názvy. V tomto podu mají přednost nastavení z `OVERLEAF_REDIS_*` a z ConfigMapu, ale git-bridge bere `GIT_BRIDGE_PORT` jako svůj port a zastaví se (viz [Integrace s Gitem](/cs/on-premises/configuration/kubernetes/integrations/git-integration)). Vypnutí těchto odkazů omezí prostředí na to, co nastavíte.
+* <strong>`Recreate`.</strong> Dva pody nikdy nesmí používat stejný datový svazek ani současně spouštět migrace.
+* <strong>Zpřístupnění.</strong> Service typu NodePort odpovídá na portu `30080` každého uzlu. V produkci před ni umístěte svůj ingress controller nebo load balancer a ukončujte TLS tam; musí povolovat WebSockety, časové limity požadavků 10 minut (dlouhé kompilace) a nahrávání o velikosti 50 MB a předávat `X-Forwarded-For` a `X-Forwarded-Proto`.

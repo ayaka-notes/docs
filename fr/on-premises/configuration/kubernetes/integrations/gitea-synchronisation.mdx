@@ -1,0 +1,67 @@
+---
+title: Synchronisation Gitea
+description: Permettre aux utilisateurs de synchroniser leurs projets avec des dépôts sur Gitea.com ou sur votre propre Gitea sur un déploiement Kubernetes.
+icon: mug-hot
+---
+
+La synchronisation Gitea s'exécute dans le service **web** (le module `gitea-sync`) de chaque pod Ayakaleaf Pro. Elle nécessite l'[intégration Git](/fr/on-premises/configuration/kubernetes/integrations/git-integration). Créez l'application OAuth et consultez le rôle de chaque paramètre dans [Synchronisation Gitea](/fr/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation) ; cette page explique comment l'intégrer dans Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (module `gitea-sync`), dans chaque pod Ayakaleaf Pro ; lu au démarrage de web |
+| Pod → Gitea | l'API REST de `GITEA_SYNC_URL` (par défaut `https://gitea.com/api/v1`), chaque fois qu'un utilisateur lie, importe, exporte ou synchronise |
+| Navigateur → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` pour lier un compte, puis retour vers `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | aucun : pas de webhook, l'instance n'a pas besoin d'être joignable depuis Gitea |
+| Données stockées | les jetons d'accès et d'actualisation Gitea de l'utilisateur, chiffrés, dans MongoDB |
+| Tâches périodiques | aucune : la synchronisation a lieu lorsqu'un utilisateur clique |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` et le StatefulSet git-bridge de l'[intégration Git](/fr/on-premises/configuration/kubernetes/integrations/git-integration) doivent être en place : sans eux, les paramètres du compte et l'éditeur masquent la synchronisation Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` chiffre les jetons d'accès et d'actualisation Gitea des utilisateurs dans MongoDB. Tous les réplicas doivent utiliser la même valeur, et la modifier ultérieurement oblige chaque utilisateur à lier à nouveau Gitea.
+</Step>
+
+<Step title="CA privée (facultatif)">
+Si votre Gitea possède un certificat émis par votre propre CA, ajoutez la CA au Secret `overleaf-certs` monté sur `/var/lib/overleaf/certs` (voir [Certificats et autres fichiers](/fr/on-premises/configuration/kubernetes#certificats-et-autres-fichiers)) et définissez `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` dans la ConfigMap.
+</Step>
+
+<Step title="Appliquer, redémarrer et vérifier">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+N'importe quel code HTTP signifie que Gitea est joignable depuis ce pod ; `000` signifie qu'il ne l'est pas.
+</Step>
+</Steps>
+
+### Plusieurs réplicas
+
+Rien de plus que le `GITEA_TOKEN_CIPHER_PASSWORD` partagé. Une synchronisation prend un verrou dans Redis, partagé avec les autres synchronisations Git, de sorte que deux réplicas ne synchronisent jamais le même projet en même temps.
+
+### Testé sur Kubernetes
+
+Face à un véritable Gitea 1.23 à l'adresse `GITEA_SYNC_URL`, sur Kubernetes 1.37 avec un réplica et l'intégration Git activée, nos tests de bout en bout pour la synchronisation Gitea réussissent (39 cas) : la liaison et la dissociation du compte via l'OAuth2 de Gitea, l'actualisation du jeton d'accès arrivant à expiration et les autorisations révoquées, l'export vers un nouveau dépôt privé ou d'organisation, l'import d'un dépôt, le pull et le push, les fusions, les conflits, les branches supprimées et poussées de force, les fichiers binaires, les renommages et suppressions, et ce que les propriétaires, éditeurs et lecteurs peuvent faire.

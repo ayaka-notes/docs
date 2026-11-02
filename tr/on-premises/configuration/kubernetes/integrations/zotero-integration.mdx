@@ -1,0 +1,56 @@
+---
+title: Zotero Entegrasyonu
+description: Kubernetes dağıtımında kullanıcıların Zotero kitaplıklarından bir .bib dosyası içe aktarmasını sağlayın.
+icon: z
+---
+
+Zotero içe aktarma, her Ayakaleaf Pro pod'unun **web** hizmetinde (`tpr-webmodule` modülü) çalışır. Zotero OAuth istemcisini [Zotero Entegrasyonu](/tr/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration) sayfasında anlatıldığı gibi `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback` geri çağırma URL'si ile kaydedin, ardından Kubernetes'i aşağıdaki gibi yapılandırın.
+
+| | |
+| --- | --- |
+| Hizmet | web, her Ayakaleaf Pro pod'unda; web başlarken okunur |
+| Pod → Zotero | Bir kullanıcı Zotero'yu bağladığında ya da bir dosyayı içe aktardığında veya yenilediğinde `https://www.zotero.org/oauth/*` ve `https://api.zotero.org` |
+| Tarayıcı → Zotero | `https://www.zotero.org/oauth/authorize`, ardından geri çağırma URL'sine geri dönüş |
+| Zotero → Overleaf | yok: örneğin internetten erişilebilir olması gerekmez |
+| Depolanan veriler | kullanıcının Zotero anahtarı, şifrelenmiş olarak MongoDB'de |
+| Periyodik işler | yok: bir dosya yalnızca kullanıcı istediğinde yenilenir |
+
+### Yapılandırma
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES`, kurulumdaki değerin yerine geçer; mevcut türleri koruyun ve `zotero` ekleyin (ikisini birlikte kullanıyorsanız `mendeley` da ekleyin).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD`, kullanıcıların Zotero anahtarlarını MongoDB'de şifreler. Bu değer olmadan her pod, kendi `/var/lib/overleaf/data` dizininde bir anahtar dosyası oluşturur. [Birden fazla replika](/tr/on-premises/configuration/kubernetes/horizontal-scaling) ile bu durumda her düğümün farklı bir anahtarı olur ve başka bir replika tarafından hizmet verilen kullanıcı bağlı Zotero hesabını kullanamaz. Bunu ilk kullanıcı Zotero'yu bağlamadan önce ayarlayın: daha sonra değiştirmek her kullanıcının Zotero'yu yeniden bağlamasını gerektirir.
+</Step>
+
+<Step title="Uygulayın ve yeniden başlatın">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+Secret'ta `ZOTERO_CIPHER_PASSWORD` değerini ayarlayın, yukarıya bakın. Bu değer olmadan, bir replikada içe aktarılan dosya başka bir replikada yenilenemez: yenileme "The remote service produced an error" hatasıyla başarısız olur, çünkü o replikanın anahtar dosyası kullanıcının Zotero anahtarının şifresini çözemez. Parola Secret'ta olduğunda her replikada çalışır; her iki durumu da `overleaf-0` üzerinde içe aktarıp `overleaf-1` üzerinde yenileyerek test ettik. OAuth el sıkışması durumunu Redis'teki oturumda tutar; böylece geri çağırma herhangi bir replikaya ulaşabilir.
+
+### Kubernetes üzerinde test edildi
+
+www.zotero.org ve api.zotero.org'un bir taklidine karşı (`overleaf-certs` içinden `NODE_EXTRA_CA_CERTS` aracılığıyla güvenilen), HAProxy arkasında üç replikalı Kubernetes 1.37 üzerinde, Zotero için uçtan uca testlerimiz başarılı oldu (18 vaka): OAuth 1.0a ile bağlama ve bağlantıyı kaldırma, kitaplığı ve grupları bir `.bib` dosyasına içe aktarma, dosyayı yenileme, anahtarı Zotero'da iptal etme, yeniden bağlanma isteği, kaynakçaların ortak çalışanlar için aranabilir olması, yalnızca içe aktaranın yenileyebilmesi, API hataları ve Zotero'ya yavaş bağlantılar.

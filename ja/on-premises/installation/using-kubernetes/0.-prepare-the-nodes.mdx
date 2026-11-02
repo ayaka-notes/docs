@@ -1,0 +1,100 @@
+---
+title: 0. ノードの準備
+description: ノードに Docker Engine、containerd、kubeadm をインストールし、TeX Live イメージをプルします。
+icon: server
+---
+
+Ayakaleaf Pro は、[サンドボックス化された](/ja/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) TeX Live コンテナで LaTeX をコンパイルします。これらのコンテナは、Ayakaleaf Pro が動作しているマシンの Docker ソケットを通じて Ayakaleaf Pro 自身が起動します。Kubernetes では、これは次のことを意味します。
+
+* Ayakaleaf Pro Pod を実行できるすべてのノードに **Docker Engine** がインストールされ、動作していること。
+* 設定するすべての TeX Live イメージが、それらの各ノードの **Docker に**プルされていること。
+
+kubelet は引き続き containerd を使用できます。Docker Engine には `containerd.io` が同梱されており、両者は同じデーモンを異なる名前空間で使用します。
+
+<Warning>
+
+Docker のないマネージドノードプール（EKS、GKE、AKS のほとんどのデフォルト）では Sandboxed Compiles を実行できません。Docker Engine をインストールできるノードプールを使用するか、そのようなノードにラベルを付け、`nodeSelector` で Ayakaleaf Pro をそれらのノードに限定してください。
+
+</Warning>
+
+以下の手順は、Ubuntu 24.04 と kubeadm で構築したクラスターを対象としています。クラスターがすでに存在する場合は、Ayakaleaf Pro を実行するノードで手順 1、2、5 を実施してください。
+
+<Steps>
+<Step title="カーネルモジュールと sysctl">
+```bash
+printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+sudo modprobe overlay && sudo modprobe br_netfilter
+printf 'net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1\n' \
+  | sudo tee /etc/sysctl.d/99-k8s.conf
+sudo sysctl --system
+sudo swapoff -a   # and comment out swap in /etc/fstab
+```
+</Step>
+
+<Step title="Docker Engine">
+[0. Docker のセットアップ](/ja/on-premises/installation/using-the-toolkit/0.-setup-docker)のとおり、Docker のリポジトリから Docker Engine をインストールします。Compose プラグインは不要です。これにより `containerd.io` もインストールされます。
+</Step>
+
+<Step title="kubelet 用の containerd">
+Docker のリポジトリにある `containerd.io` パッケージでは、CRI プラグインが無効になっています。CRI プラグインを有効にする完全なデフォルト設定を書き出し、systemd cgroups に切り替えます。
+
+```bash wrap
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+# containerd 2.x writes config_path = '' and ignores /etc/containerd/certs.d without this
+sudo sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|" /etc/containerd/config.toml
+sudo systemctl restart containerd docker
+```
+</Step>
+
+<Step title="kubeadm、kubelet、kubectl">
+[Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/) に従ってから、`kubeadm init` と `kubeadm join` でクラスターを作成し、ネットワークプラグインをインストールします。たとえば flannel を使う場合:
+
+```yaml title="kubeadm-config.yaml"
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+networking:
+  podSubnet: 10.244.0.0/16   # flannel's default
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+# Compile containers are started by Docker, outside the kubelet's accounting: keep memory for them
+systemReserved:
+  memory: 300Mi
+kubeReserved:
+  memory: 200Mi
+```
+
+```bash
+sudo kubeadm init --config kubeadm-config.yaml
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+```
+
+クラスターにはデフォルトの StorageClass も必要です。テスト用クラスターでは [local-path-provisioner](https://github.com/rancher/local-path-provisioner) が使えます。本番環境では、プラットフォームのブロックストレージ（Longhorn、Ceph、クラウドの CSI ドライバー）を使用してください。
+</Step>
+
+<Step title="TeX Live イメージ">
+Ayakaleaf Pro を実行できる**すべての**ノードで、`ALL_TEX_LIVE_DOCKER_IMAGES` に列挙する TeX Live イメージを Docker でプルします。例:
+
+```bash
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+`crictl pull` や `ctr` はここでは役に立ちません。Ayakaleaf Pro は Docker にイメージを要求します。フルイメージは大きく（それぞれ約 28 GB）、一覧は [Sandboxed Compiles](/ja/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) を参照してください。最初のテストには `ghcr.io/ayaka-notes/texlive-basic:2026.1`（約 630 MB、最小構成の TeX Live）で十分です。
+</Step>
+</Steps>
+
+### Q\&A
+
+<Accordion title="Docker のないノードで Ayakaleaf Pro を実行できますか？">
+
+<strong>回答：</strong> `SANDBOXED_COMPILES=false` の場合のみ可能です。その場合、コンパイルは Ayakaleaf Pro コンテナ内で、組み込みの小さな TeX Live を使って実行され、LaTeX ドキュメントはそのコンテナがアクセスできるすべてのものを読み書きできてしまいます。推奨しません。[Sandboxed Compiles](/ja/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) を参照してください。
+
+</Accordion>
+
+<Accordion title="コンパイルは Pod のメモリ制限に含まれますか？">
+
+<strong>回答：</strong> いいえ。TeX Live コンテナはノードの Docker によって、Pod の外部かつ kubelet から見えない場所で起動されます。上記の `systemReserved` などを使ってノードにそのための空きメモリを残し、ノードを他の Pod で埋め尽くさないようにしてください。
+
+</Accordion>

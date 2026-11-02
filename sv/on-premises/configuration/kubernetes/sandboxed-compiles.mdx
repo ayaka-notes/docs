@@ -1,0 +1,64 @@
+---
+title: Sandlådekompilering
+description: Kompilera LaTeX i TeX Live-containrar på noderna i ett Kubernetes-kluster.
+icon: gear-code
+---
+
+Kompileringar körs av tjänsten **clsi** i varje Ayakaleaf Pro-pod. Med sandlådekompilering påslagen ber clsi **nodens Docker Engine**, där podden körs, att starta en TeX Live-container för varje kompilering och ger den projektets katalog via dess sökväg på noden. Hur sandlådan fungerar och vilka avbildningar som finns beskrivs i [Sandlådekompilering](/sv/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Tjänst | clsi (kompileringar), web (avbildningslistan i kompilatorinställningarna), i varje Ayakaleaf Pro-pod |
+| Nod | Docker Engine och varje avbildning i `ALL_TEX_LIVE_DOCKER_IMAGES`, på varje nod som kan köra Ayakaleaf Pro |
+| Monteringar i podden | `/var/run/docker.sock` samt katalogerna för kompilering, utdata och cache som `hostPath`-volymer |
+| Periodiska jobb | clsi tar bort kompileringskataloger som inte använts på ett dygn och tar varje timme bort gamla TeX Live-containrar från nodens Docker |
+
+### Konfiguration
+
+Installationen konfigurerar allt: Docker och avbildningarna på noderna i [0. Förbered noderna](/sv/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), inställningarna i [4. Anpassa din instans](/sv/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) och volymerna i [5. Driftsätt Ayakaleaf Pro](/sv/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Inställningarna, alla i ConfigMap:en:
+
+| Variabel | Värde |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | nodens sökväg för volymen som monteras på `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | nodens sökväg för volymen som monteras på `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | nodens sökväg för volymen som monteras på `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | avbildningarna, som i Toolkit |
+
+### Lägga till en TeX Live-version
+
+<Steps>
+<Step title="Hämta avbildningen på varje nod">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit hämtar avbildningarna själv; på Kubernetes gör ingen det. Hämta till **Docker**, inte med `crictl`: clsi frågar Docker efter avbildningen. En kompilering med en avbildning som saknas på noden misslyckas.
+</Step>
+
+<Step title="Lista den i ConfigMap:en och starta om">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+En nod som läggs till i klustret senare behöver Docker och alla avbildningar innan Ayakaleaf Pro körs där. Märk sådana noder med en etikett och håll Ayakaleaf Pro på dem med en `nodeSelector` om inte alla noder uppfyller kraven.
+
+### Flera repliker
+
+Varje replik kompilerar på sin egen nod och behåller kompileringsutdata där, så en användare måste stanna på repliken som kompilerade, vilket lastbalanserarens sticky-cookie säkerställer. Kör aldrig två repliker på samma nod: de skulle dela nodens kompileringskataloger. Konfigurationen för [Horisontell skalning](/sv/on-premises/configuration/kubernetes/horizontal-scaling) förhindrar detta med `podAntiAffinity`.
+
+TeX Live-containrarna körs bredvid podden, utanför dess minnesgräns och utanför schemaläggarens överblick. Lämna minne ledigt på noderna för dem, se [0. Förbered noderna](/sv/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Testat på Kubernetes
+
+På Kubernetes 1.37 med tre repliker bakom HAProxy, en per nod, och TeX Live 2026 och 2025 hämtade till Docker på varje nod, klarar våra end-to-end-tester för sandlådekompilering sig (7 fall): ett nytt projekt kompileras till en PDF, kompilatorinställningarna erbjuder båda avbildningarna och växlar mellan dem, XeLaTeX med fontspec, LaTeX-fel och omkompilering efter rättningen, avbrytande av en pågående kompilering samt SyncTeX åt båda hållen. Ett belastningstest med 12 användare som kompilerade ett 600-sidigt dokument samtidigt körde 4 kompileringar per nod, se [Vad du kan förvänta dig](/sv/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

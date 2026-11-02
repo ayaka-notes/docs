@@ -1,0 +1,56 @@
+---
+title: Zotero-integraatio
+description: Anna käyttäjien tuoda .bib-tiedosto Zotero-kirjastostaan Kubernetes-käyttöönotossa.
+icon: z
+---
+
+Zotero-tuonti toimii jokaisen Ayakaleaf Pro -podin **web**-palvelussa (`tpr-webmodule`-moduuli). Rekisteröi Zotero OAuth -asiakas sivun [Zotero-integraatio](/fi/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration) ohjeiden mukaisesti takaisinkutsu-URL-osoitteella `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback` ja määritä sitten Kubernetes alla kuvatulla tavalla.
+
+| | |
+| --- | --- |
+| Palvelu | web, jokaisessa Ayakaleaf Pro -podissa; luetaan, kun web käynnistyy |
+| Pod → Zotero | `https://www.zotero.org/oauth/*` ja `https://api.zotero.org`, kun käyttäjä linkittää Zoteron tai tuo tai päivittää tiedoston |
+| Selain → Zotero | `https://www.zotero.org/oauth/authorize`, sitten takaisin takaisinkutsu-URL-osoitteeseen |
+| Zotero → Overleaf | ei mitään: instanssin ei tarvitse olla tavoitettavissa internetistä |
+| Tallennetut tiedot | käyttäjän Zotero-avain salattuna MongoDB:ssä |
+| Ajastetut tehtävät | ei mitään: tiedosto päivitetään vain, kun käyttäjä pyytää |
+
+### Konfigurointi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES` korvaa asennuksen arvon; säilytä jo käytössä olevat tyypit ja lisää `zotero` (ja `mendeley`, jos käytät molempia).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD` salaa käyttäjien Zotero-avaimet MongoDB:ssä. Ilman sitä jokainen podi luo avaintiedoston omaan hakemistoonsa `/var/lib/overleaf/data`. [Useilla replikoilla](/fi/on-premises/configuration/kubernetes/horizontal-scaling) jokaisella solmulla on silloin eri avain, eikä toisen replikan palvelema käyttäjä voi käyttää linkitettyä Zotero-tiliään. Aseta se ennen kuin ensimmäinen käyttäjä linkittää Zoteron: sen muuttaminen myöhemmin pakottaa jokaisen käyttäjän linkittämään Zoteron uudelleen.
+</Step>
+
+<Step title="Ota käyttöön ja käynnistä uudelleen">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Aseta `ZOTERO_CIPHER_PASSWORD` Secretiin, katso yllä. Ilman sitä yhdellä replikalla tuotua tiedostoa ei voi päivittää toisella: päivitys epäonnistuu virheellä ”The remote service produced an error”, koska kyseisen replikan avaintiedosto ei pysty purkamaan käyttäjän Zotero-avaimen salausta. Kun salasana on Secretissä, se toimii jokaisella replikalla; testasimme molemmat tapaukset tuomalla tiedoston `overleaf-0`:lla ja päivittämällä sen `overleaf-1`:llä. OAuth-kättely säilyttää tilansa istunnossa Redisissä, joten takaisinkutsu voi saapua mille tahansa replikalle.
+
+### Testattu Kubernetesissa
+
+www.zotero.orgin ja api.zotero.orgin mallitoteutusta vasten (johon luotetaan `overleaf-certs`-Secretin `NODE_EXTRA_CA_CERTS`-asetuksen kautta), Kubernetes 1.37:ssä kolmella replikalla HAProxyn takana Zoteron päästä päähän -testimme menevät läpi (18 tapausta): linkittäminen OAuth 1.0a:lla ja linkityksen poistaminen, kirjaston ja ryhmien tuonti `.bib`-tiedostoon, sen päivittäminen, avaimen peruuttaminen Zoterossa, pyyntö linkittää uudelleen, viitteiden haettavuus yhteistyökumppaneille, vain tuojan oikeus päivittää, API-virheet ja hitaat yhteydet Zoteroon.

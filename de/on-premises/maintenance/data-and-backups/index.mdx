@@ -63,6 +63,18 @@ Nachdem der Backup-Vorgang **erfolgreich** abgeschlossen ist, müssen Sie den Co
 
 MongoDB enthält ein Kommandozeilenwerkzeug namens [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/), mit dem Sie ein Backup der in der Datenbank gespeicherten Benutzer- und Projektdaten erstellen können.
 
+Stoppen Sie den Container `sharelatex`, lassen Sie den Container `mongo` weiterlaufen und sichern Sie die Datenbank `sharelatex` in eine Datei auf dem Host. Die Wiederherstellung erfolgt auf die gleiche Weise (`--drop` ersetzt die vorhandenen Collections):
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Daten des Overleaf-Dateisystems
 
 Bei Toolkit-Bereitstellungen wird der Pfad, unter dem Ihre nicht bearbeitbaren Dateien gespeichert sind, in `config/overleaf.rc` über die Umgebungsvariable `OVERLEAF_DATA_PATH` festgelegt. Je nachdem, wann Ihre Instanz erstellt wurde, kann dies jedoch auch `data/sharelatex` sein.
@@ -192,3 +204,37 @@ Die folgenden Ordner sind mit zusätzlichen Hinweisen versehen:
          * Zwischenspeicher für Datei-Uploads (Upload von Binärdateien/neuem Projekt aus ZIP)
       3. projectHistories (e)
          * temporäre Dateien für Migrationen des vollständigen Projektverlaufs
+
+### Fragen & Antworten
+
+<Accordion title="MongoDB-Daten sind beschädigt oder teilweise gelöscht, und ich habe kein Backup. Was kann ich tun?">
+
+<strong>Antwort:</strong> Der Container `mongo` speichert selbst keine Daten: Die Datenbank liegt in `data/mongo` (`MONGO_DATA_PATH` in `config/overleaf.rc`). Wenn nur der Container defekt ist, entfernen Sie ihn mit `bin/docker-compose rm -sf mongo` und führen Sie `bin/up -d` aus, um ihn neu zu erstellen.
+
+Wenn MongoDB nicht starten kann, weil seine Dateien beschädigt sind oder fehlen, ist der letzte Ausweg MongoDBs eigenes [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/). Es verwirft beschädigte Daten und erstellt leere Platzhalterdateien für fehlende, rechnen Sie also mit Datenverlust. Stoppen Sie alles und kopieren Sie zuerst das Datenverzeichnis. Führen Sie die Reparatur dann mit demselben Image wie Ihr Container `mongo` aus (`MONGO_IMAGE` und `MONGO_VERSION` in `config/overleaf.rc`, standardmäßig `mongo:8.0`):
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+Wenn die Reparatur Daten ändern musste, startet MongoDB nicht mehr als Mitglied eines Replica Sets, das Toolkit führt es jedoch als solches aus (`--replSet overleaf`): `bin/logs mongo` zeigt `This instance has been repaired and may contain modified replicated data`. Starten Sie in diesem Fall die reparierten Dateien ohne `--replSet`, erstellen Sie einen Dump davon und stellen Sie den Dump in einer neuen Datenbank wieder her:
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+Stellen Sie anschließend `mongo-backup.gz` mit dem Befehl `mongorestore` aus dem Abschnitt [MongoDB](#mongodb) oben wieder her.
+
+Wenn die MongoDB-Daten vollständig verloren sind, kann Ayakaleaf Pro die Projekte nicht wiederherstellen. Benutzer, die Projektliste, Ordnerstrukturen, der aktuelle Text der Dokumente und der Index des Verlaufs sind alle in MongoDB gespeichert. `data/overleaf/data/history` enthält zwar noch hochgeladene Dateien und Verlaufsinhalte, gespeichert unter Inhalts-Hashes (`overleaf-project-blobs`) und als gzip-komprimierte JSON-Verlaufsabschnitte (`overleaf-chunks`), aber es gibt kein Werkzeug, das daraus wieder Projekte macht. Sie können sie nur von Hand durchsuchen.
+
+</Accordion>

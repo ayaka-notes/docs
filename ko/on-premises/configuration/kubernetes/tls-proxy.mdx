@@ -1,0 +1,87 @@
+---
+title: TLS 프록시
+description: 인그레스, 로드 밸런서 또는 HAProxy를 통해 HTTPS로 Kubernetes 배포를 제공합니다.
+icon: lock
+---
+
+파드 내부에서는 컨테이너의 nginx가 포트 80에서 일반 HTTP를 제공합니다. HTTPS는 파드 앞단에서 종료됩니다: 인그레스 컨트롤러, 클라우드 로드 밸런서, 또는 [수평 확장](/ko/on-premises/configuration/kubernetes/horizontal-scaling)에서와 같은 HAProxy입니다. Toolkit의 NGINX 프록시(`bin/init --tls`, `overleaf.rc`의 `NGINX_*` 및 `TLS_*`)에 해당하는 것은 없습니다. Toolkit에 대해서는 [TLS 프록시](/ko/on-premises/configuration/overleaf-toolkit/tls-proxy)를 참조하세요.
+
+| | |
+| --- | --- |
+| 서비스 | 인그레스 또는 로드 밸런서; web은 시작 시 아래 설정을 읽음 |
+| 브라우저 → 프록시 | 편집기의 WebSocket을 포함하여 443에서 HTTPS |
+| 프록시 → 파드 | 파드의 포트 80으로 일반 HTTP |
+| 주기적 작업 | 없음(인증서 갱신은 프록시가 담당) |
+
+### 프록시가 해야 하는 일
+
+* WebSocket(`/socket.io`)을 전달합니다.
+* 10분 길이의 요청(긴 컴파일)과 50 MB(업로드) 또는 `MAX_UPLOAD_SIZE` 크기의 요청 본문을 허용합니다.
+* 파드 방향의 유휴 keep-alive 타임아웃을 파드 내 nginx의 타임아웃인 65초보다 짧게 유지합니다.
+* `X-Forwarded-For`와 `X-Forwarded-Proto: https`를 보냅니다.
+* 레플리카가 여러 개인 경우 사용자를 하나의 레플리카에 유지합니다. [수평 확장](/ko/on-premises/configuration/kubernetes/horizontal-scaling)을 참조하세요.
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+신뢰할 수 있는 주소로부터 `X-Forwarded-Proto: https`가 전달되지 않으면 Ayakaleaf Pro는 요청이 HTTP로 도착했다고 판단하여 보안 세션 쿠키를 설정하지 않으며, 그 결과 로그인이 실패합니다. `OVERLEAF_SECURE_COOKIE`는 사용자가 실제로 HTTPS로 사이트에 접근할 때만 설정하세요. `"false"`를 포함하여 어떤 값이든 설정하면 활성화됩니다.
+
+### HAProxy 예시
+
+[수평 확장](/ko/on-premises/configuration/kubernetes/horizontal-scaling)의 HAProxy DaemonSet에서 HTTPS를 종료하려면 인증서와 키를 하나의 PEM 파일로 합쳐 Secret에 넣으세요.
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+그런 다음 `80-haproxy.yaml`을 변경하세요.
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+HAProxy가 재시작되도록 `config-hash`를 변경한 다음, 위와 같이 ConfigMap을 설정하고 레플리카를 재시작하세요.
+
+리디렉션은 요청의 포트를 유지합니다. 포트 80과 443의 로드 밸런서에는 적합하지만, NodePort에서는 `http://host:30081`을 `https://host:30081`로 보냅니다. 앞단에 로드 밸런서가 없다면 리디렉션 줄을 빼고 사용자에게 `https://...:30443` 주소를 안내하세요.
+
+### Kubernetes에서의 테스트
+
+레플리카 세 개와 위와 같이 HTTPS를 종료하는 HAProxy를 두고, `OVERLEAF_SITE_URL`을 `https://`로, `OVERLEAF_SECURE_COOKIE`를 설정한 Kubernetes 1.37에서: 사용자는 `https://` 링크로 계정을 활성화하고, `Secure`로 표시된 세션 쿠키로 로그인했으며, 프로젝트를 업로드하고 컴파일하여 PDF를 가져왔고, 자신의 레플리카에 머물렀으며, 편집기의 WebSocket(`wss`)을 열고, HTTPS를 통해 Git으로 clone 및 push했습니다. NodePort의 `http://` 요청은 위에서 설명한 대로 같은 포트의 `https://`로 리디렉션되었습니다.

@@ -1,0 +1,136 @@
+---
+title: Päivittäminen Kubernetesissa
+description: Päivitä Ayakaleaf Pron Kubernetes-käyttöönotto yhdellä tai useammalla replikalla.
+icon: arrow-up-from-square
+---
+
+Päivitys vaihtaa imagen tagin. Uusi versio migroi tietokannan käynnistyessään, ja nämä migraatiot on ajettava **kerran, yhdestä podista, kun yksikään vanhempi podi ei ole käynnissä**. Kubernetesissa tämä sulkee pois skaalatun StatefulSetin tavallisen rullaavan päivityksen.
+
+<Danger>
+
+Ota [yhtenäinen varmuuskopio](/fi/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) ennen jokaista päivitystä Ayakaleaf Pron ollessa pysäytettynä. Lue [julkaisutiedotteista](/fi/on-premises/release-notes) vaiheet versiolle, johon päivität.
+
+</Danger>
+
+Ennen kuin aloitat, hae komennolla `sudo docker pull` jokaisella solmulla, joka ajaa Ayakaleaf Prota, kaikki TeX Live -imaget, jotka uusi versio tai uusi konfiguraatiosi listaa.
+
+<Tabs>
+<Tab title="Yksi replika">
+
+<Steps>
+<Step title="Pysäytä Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Varmuuskopioi">
+MongoDB miltä tahansa jäseneltä:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Datataltio lyhytikäisen podin kautta, joka liittää sen (podi päätyy taltion solmulle):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Tee sama git-bridgen taltiolle (`data-git-bridge-0`) ja säilytä kopio Secretistä `overleaf-secrets`. Jos tallennustilasi tukee [VolumeSnapshoteja](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), taltioiden tilannevedos tekee saman.
+</Step>
+
+<Step title="Vaihda versio ja käynnistä">
+Aseta uusi tagi tiedostoon `40-overleaf.yaml` (ja tiedostoon `45-git-bridge.yaml`, jonka on käytettävä samaa tagia) ja sitten:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment käyttää asetusta `strategy: Recreate`, joten muutettukaan tagi ei koskaan aja kahta versiota samanaikaisesti.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Useita replikoita">
+
+Sivun [Horisontaalinen skaalaus](/fi/on-premises/configuration/kubernetes/horizontal-scaling) kokoonpanolle.
+
+<Steps>
+<Step title="Pysäytä kaikki replikat">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Varmuuskopioi">
+MongoDB kuten yhden replikan välilehdellä, S3-bucketit palveluntarjoajasi työkaluilla, git-bridgen taltio (`data-git-bridge-0`) sekä Secretit. Replikoiden `/srv/overleaf-ha` sisältää vain käännöstulosteita eikä vaadi varmuuskopiointia.
+</Step>
+
+<Step title="Käynnistä yksi replika uudella versiolla">
+Aseta uusi tagi tiedostoihin `70-overleaf.yaml` ja `75-git-bridge.yaml` sekä `replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Tarkista, että voit kirjautua sisään, avata projektin ja kääntää.
+</Step>
+
+<Step title="Käynnistä muut replikat">
+Aseta jälleen `replicas: 3` ja ota käyttöön. `OrderedReady` käynnistää ne yksi toisensa jälkeen.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Älä vaihda käynnissä olevan skaalatun StatefulSetin imagea komennolla `kubectl set image` tai `kubectl apply`: rullaava päivitys käynnistäisi uuden version ja sen migraatiot, kun vanhemmat replikat palvelevat vielä käyttäjiä. Konfiguraatiomuutokset ilman uutta versiota sopivat hyvin rullaavaksi uudelleenkäynnistykseksi: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB ja Redis
+
+Päivitä ne erikseen Ayakaleaf Prosta. MongoDB:n osalta noudata sivua [MongoDB:n päivittäminen](/fi/on-premises/maintenance/updating-mongodb) (yksi pääversio kerrallaan, `featureCompatibilityVersion` jokaisen vaiheen jälkeen); replikajoukko ottaa uuden imagen käyttöön jäsen kerrallaan, kun muutat imagea tiedostossa `10-mongo.yaml`, koska StatefulSet korvaa vuorollaan `mongo-2`:n, `mongo-1`:n ja `mongo-0`:n.
+
+### Palauttaminen aiempaan versioon
+
+Pysäytä Ayakaleaf Pro kuten yllä, palauta MongoDB arkistosta (`mongorestore --drop --archive --gzip`) sekä taltiot tai bucketit varmuuskopiosta, aseta vanha tagi ja käynnistä uudelleen. Uuden version migraatioita ei voi muuten perua.
+
+### Kysymyksiä ja vastauksia
+
+<Accordion title="Replika ei tule valmiiksi, eivätkä muut replikat koskaan käynnisty">
+
+<strong>Vastaus:</strong> Asetuksella `podManagementPolicy: OrderedReady` `overleaf-1` käynnistyy vasta, kun `overleaf-0` on valmis, eikä rullaava päivitys korvaa podia, joka ei koskaan tullut valmiiksi. Kun olet korjannut syyn, esimerkiksi virheellisen asetuksen ConfigMapissa, poista jumiutunut podi, jotta StatefulSet luo sen uudelleen nykyisestä mallista:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Kohtasimme tämän testiklusterillamme, kun asetus esti `overleaf-0`:aa tulemasta valmiiksi; podin poistaminen antoi kaikkien kolmen replikan käynnistyä.
+
+</Accordion>

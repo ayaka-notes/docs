@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: Kompiluj LaTeX w kontenerach TeX Live na węzłach klastra Kubernetes.
+icon: gear-code
+---
+
+Kompilacje są wykonywane przez usługę **clsi** w każdym podzie Ayakaleaf Pro. Przy włączonych sandboxed compiles clsi prosi **Docker Engine węzła**, na którym działa pod, o uruchomienie kontenera TeX Live dla każdej kompilacji i przekazuje mu katalog projektu za pomocą jego ścieżki na tym węźle. Sposób działania izolacji i dostępne obrazy opisano na stronie [Sandboxed Compiles](/pl/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Usługa | clsi (kompilacje), web (lista obrazów w ustawieniach kompilatora), w każdym podzie Ayakaleaf Pro |
+| Węzeł | Docker Engine i każdy obraz z `ALL_TEX_LIVE_DOCKER_IMAGES`, na każdym węźle, na którym może działać Ayakaleaf Pro |
+| Montowania w podzie | `/var/run/docker.sock` oraz katalogi kompilacji, wyników i pamięci podręcznej jako woluminy `hostPath` |
+| Zadania okresowe | clsi usuwa katalogi kompilacji nieużywane przez dobę, a co godzinę usuwa stare kontenery TeX Live z Dockera węzła |
+
+### Konfiguracja
+
+Instalacja konfiguruje wszystko: Dockera i obrazy na węzłach w kroku [0. Przygotuj węzły](/pl/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), ustawienia w kroku [4. Personalizacja instancji](/pl/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) oraz woluminy w kroku [5. Wdróż Ayakaleaf Pro](/pl/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Ustawienia, wszystkie w ConfigMap:
+
+| Zmienna | Wartość |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | ścieżka na węźle woluminu zamontowanego w `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | ścieżka na węźle woluminu zamontowanego w `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | ścieżka na węźle woluminu zamontowanego w `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | obrazy, tak jak w Toolkit |
+
+### Dodawanie wersji TeX Live
+
+<Steps>
+<Step title="Pobierz obraz na każdym węźle">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit sam pobiera obrazy; w Kubernetes nikt tego nie robi. Pobieraj do **Dockera**, a nie za pomocą `crictl`: clsi prosi o obraz Dockera. Kompilacja z obrazem, którego brakuje na węźle, kończy się niepowodzeniem.
+</Step>
+
+<Step title="Dodaj go do ConfigMap i uruchom ponownie">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Węzeł dodany później do klastra potrzebuje Dockera i wszystkich obrazów, zanim zostanie na nim uruchomiony Ayakaleaf Pro. Jeśli nie każdy węzeł się do tego nadaje, oznacz takie węzły etykietą i utrzymuj na nich Ayakaleaf Pro za pomocą `nodeSelector`.
+
+### Kilka replik
+
+Każda replika kompiluje na własnym węźle i tam przechowuje wyniki kompilacji, więc użytkownik musi pozostać na replice, która kompilowała, co zapewnia ciasteczko przypisania (sticky cookie) load balancera. Nigdy nie uruchamiaj dwóch replik na tym samym węźle: współdzieliłyby katalogi kompilacji węzła. Konfiguracja ze strony [Skalowanie poziome](/pl/on-premises/configuration/kubernetes/horizontal-scaling) zapobiega temu za pomocą `podAntiAffinity`.
+
+Kontenery TeX Live działają obok poda, poza jego limitem pamięci i poza widokiem harmonogramu (scheduler). Zostaw dla nich wolną pamięć na węzłach, zobacz [0. Przygotuj węzły](/pl/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Przetestowano na Kubernetes
+
+Na Kubernetes 1.37 z trzema replikami za HAProxy, po jednej na węzeł, oraz TeX Live 2026 i 2025 pobranymi do Dockera na każdym węźle, nasze testy end-to-end sandboxed compiles przechodzą pomyślnie (7 przypadków): nowy projekt kompiluje się do PDF, ustawienia kompilatora oferują oba obrazy i pozwalają się między nimi przełączać, XeLaTeX z fontspec, błędy LaTeX i ponowna kompilacja po poprawce, zatrzymanie trwającej kompilacji oraz SyncTeX w obu kierunkach. Test obciążeniowy z 12 użytkownikami kompilującymi jednocześnie dokument o 600 stronach uruchamiał 4 kompilacje na węzeł, zobacz [Czego się spodziewać](/pl/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).
