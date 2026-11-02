@@ -1,0 +1,129 @@
+---
+title: Ověřování OIDC
+description: Umožněte uživatelům přihlašovat se v nasazení na Kubernetes přes poskytovatele OpenID Connect.
+icon: id-card-clip
+---
+
+Přihlašování přes OIDC obstarává služba **web** (modul `authentication`) uvnitř každého podu Ayakaleaf Pro. Nemá žádnou úlohu na pozadí ani samostatný pod. Strana poskytovatele (klient, URI přesměrování, claim administrátora) je stejná jako v Toolkitu, proto nejprve nastavte svého poskytovatele OpenID (OP) podle stránky [Ověřování OIDC](/cs/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication) a poté hodnoty vložte do Kubernetes, jak je popsáno níže.
+
+### Kde co běží
+
+| | |
+| --- | --- |
+| Služba | web, v každém podu Ayakaleaf Pro; nastavení se načítají při spuštění služby web |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` a `OVERLEAF_OIDC_USER_INFO_URL`, při každém přihlášení |
+| Prohlížeč → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL` a při odhlášení `OVERLEAF_OIDC_LOGOUT_URL` |
+| OP → Overleaf | nic: OP pouze přesměruje prohlížeč zpět |
+| Stav přihlášení | relace v Redisu, sdílená všemi replikami |
+| Periodické úlohy | žádné |
+
+### Konfigurace
+
+<Steps>
+<Step title="Zaregistrujte Overleaf u OP">
+Ve svém OP povolte tyto adresy sestavené z `OVERLEAF_SITE_URL`:
+
+| Účel | URI |
+| --- | --- |
+| URI přesměrování (přihlášení) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| URI přesměrování po odhlášení | `${OVERLEAF_SITE_URL}` |
+| URI přesměrování po odhlášení, po propojení existujícího účtu | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Pět URL najdete v discovery dokumentu OP, jak je popsáno v části [Zjištění hodnot pomocí discovery dokumentu](/cs/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document).
+</Step>
+
+<Step title="Přidejte nastavení do ConfigMapy">
+Přidejte do `overleaf-env` (`30-config.yaml`, nebo `60-config.yaml` pro [více replik](/cs/on-premises/configuration/kubernetes/horizontal-scaling)):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` přijímá seznam oddělený mezerami, například `ldap oidc`. Všechna nastavení `OVERLEAF_OIDC_*` najdete v části [Proměnné prostředí](/cs/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables); všechna patří do ConfigMapy kromě tajného klíče klienta.
+
+<Warning>
+
+Dejte `"true"` a `"false"` do uvozovek: ConfigMapa obsahuje pouze řetězce. Klíč nastavený na `""` není totéž co chybějící klíč: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` vypne vytváření účtů při prvním přihlášení, zatímco vynechání klíče povolí všechny domény.
+
+</Warning>
+</Step>
+
+<Step title="Vložte tajný klíč klienta do Secretu">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Důvěřujte soukromé CA (volitelné)">
+Pokud certifikát OP pochází od vaší vlastní CA, přidejte CA do Secretu `overleaf-certs` připojeného do `/var/lib/overleaf/certs` (viz [Certifikáty a další soubory](/cs/on-premises/configuration/kubernetes#certificates-and-other-files)) a nasměrujte na ni Node.js:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Aplikujte a restartujte">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Poté ověřte, že každý pod dosáhne na endpoint token. Volají ho pody, nikoli prohlížeč, takže problém s firewallem nebo DNS se projeví pouze zde:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Jakýkoli stavový kód HTTP (`405` pro GET) znamená, že endpoint je dostupný; `000` znamená, že dostupný není.
+</Step>
+</Steps>
+
+### Více replik
+
+Nic dalšího není potřeba. Hodnota `state` přihlášení a ID token používaný pro odhlášení se uchovávají v relaci, která je uložena v Redisu, takže callback funguje na kterékoli replice, která ho přijme.
+
+### Otestováno na Kubernetes
+
+S goauthentik jako OP, na Kubernetes 1.37 se třemi replikami za HAProxy, procházejí naše end-to-end testy pro OIDC (35 případů): přihlášení a odhlášení přes OP; mapování administrátorů podle skupiny, podle e-mailu a podle jediné hodnoty i bez mapování; aktualizace jména a příznaku administrátora při každém přihlášení; propojování a rozpojování účtů; obnovení a změna hesla u účtů OIDC; pozastavené účty; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; a OIDC společně s veřejným přístupem.
+
+### Otázky a odpovědi
+
+<Accordion title="Přihlášení selže s chybou „Unable to verify authorization request state“">
+
+<strong>Odpověď:</strong> Prohlížeč neposlal s callbackem zpět cookie relace. Na Kubernetes jsou obvyklé příčiny tyto:
+
+* `OVERLEAF_SECURE_COOKIE` je nastaveno, ale uživatelé otevírají web přes prosté HTTP, takže prohlížeč cookie nikdy neuloží. Jakákoli hodnota `OVERLEAF_SECURE_COOKIE`, i `"false"`, zapíná zabezpečené cookies; místo toho klíč odstraňte.
+* Web se otevírá pod jinou adresou než `OVERLEAF_SITE_URL`.
+* Za HTTPS váš ingress nebo load balancer neposílá `X-Forwarded-Proto: https`, nebo jeho adresa chybí v `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="Kde zjistím, proč přihlášení selhalo?">
+
+<strong>Odpověď:</strong> V logu služby web toho podu, který požadavek obsloužil, nikoli v `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Při více replikách zkontrolujte každý `overleaf-N`.
+
+</Accordion>

@@ -63,6 +63,18 @@ Ayakaleaf Pro зберігає свої дані у трьох окремих м
 
 MongoDB постачається з інструментом командного рядка [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/), за допомогою якого можна створити резервну копію даних користувачів і проєктів, що зберігаються в базі даних.
 
+Коли контейнер `sharelatex` зупинено, а контейнер `mongo` ще працює, створіть дамп бази даних `sharelatex` у файл на хості й відновіть його в такий самий спосіб (`--drop` замінює наявні колекції):
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Дані файлової системи Overleaf
 
 Для розгортань через Toolkit шлях, де зберігаються нередаговані файли, задається в `config/overleaf.rc` за допомогою змінної середовища `OVERLEAF_DATA_PATH`, однак залежно від того, коли було створено ваш екземпляр, це може бути `data/sharelatex`.
@@ -192,3 +204,37 @@ new-server$ docker start sharelatex
          * буферизація завантажуваних файлів (бінарні файли / новий проєкт із zip)
       3. projectHistories (e)
          * тимчасові файли для міграцій повної історії проєктів
+
+### Питання та відповіді
+
+<Accordion title="Дані MongoDB пошкоджено або частково видалено, а резервної копії немає. Що робити?">
+
+<strong>Відповідь:</strong> Контейнер `mongo` сам не зберігає даних: база даних розташована в `data/mongo` (`MONGO_DATA_PATH` у `config/overleaf.rc`). Якщо зламався лише контейнер, видаліть його командою `bin/docker-compose rm -sf mongo` і виконайте `bin/up -d`, щоб створити його знову.
+
+Якщо MongoDB не може запуститися, бо її файли пошкоджено або їх бракує, крайнім заходом є власний інструмент MongoDB [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/). Він відкидає пошкоджені дані й створює порожні файли-заглушки замість відсутніх, тож очікуйте втрати даних. Спершу зупиніть усе й скопіюйте каталог даних, а потім запустіть відновлення з тим самим образом, що й ваш контейнер `mongo` (`MONGO_IMAGE` і `MONGO_VERSION` у `config/overleaf.rc`, за замовчуванням `mongo:8.0`):
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+Якщо під час відновлення довелося змінити дані, MongoDB більше не запускається як учасник набору реплік, а Toolkit запускає її саме так (`--replSet overleaf`): `bin/logs mongo` показує `This instance has been repaired and may contain modified replicated data`. У такому разі запустіть відновлені файли без `--replSet`, створіть їхній дамп і відновіть його в нову базу даних:
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+Потім відновіть `mongo-backup.gz` командою `mongorestore` з розділу [MongoDB](#mongodb) вище.
+
+Якщо дані MongoDB зникли повністю, Ayakaleaf Pro не зможе відтворити проєкти. Користувачі, список проєктів, дерева тек, поточний текст документів та індекс історії зберігаються в MongoDB. `data/overleaf/data/history` і далі містить завантажені файли та вміст історії, збережені за хешами вмісту (`overleaf-project-blobs`) і як стиснуті gzip фрагменти історії у JSON (`overleaf-chunks`), але інструмента, який перетворює їх назад на проєкти, немає. Шукати в них можна лише вручну.
+
+</Accordion>

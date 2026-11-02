@@ -1,0 +1,112 @@
+---
+title: LDAP Kimlik Doğrulaması
+description: Kubernetes dağıtımında kullanıcıların LDAP veya Active Directory hesaplarıyla oturum açmasını sağlayın.
+icon: address-book
+---
+
+LDAP ile oturum açma, her Ayakaleaf Pro pod'undaki **web** hizmeti (`authentication` modülü) tarafından yürütülür. OIDC ve SAML'den farklı olarak pod'lar dizinle doğrudan kendileri iletişim kurar. Dizin tarafını [LDAP Kimlik Doğrulaması](/tr/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication) sayfasındaki gibi kurun, ardından değerleri aşağıdaki gibi Kubernetes'e aktarın.
+
+### Neyin nerede çalıştığı
+
+| | |
+| --- | --- |
+| Hizmet | web, her Ayakaleaf Pro pod'unda; ayarlar ve CA web başlarken okunur |
+| Pod → LDAP sunucusu | `OVERLEAF_LDAP_URL`: her oturum açma için ve `OVERLEAF_LDAP_CONTACTS_FILTER` ayarlıysa her kişi aramasında yeni bir bağlantı |
+| Tarayıcı → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| Oturum açma durumu | Redis'teki oturum ve hız sınırları, tüm replikalar tarafından paylaşılır |
+| Periyodik işler | yok |
+
+### Yapılandırma
+
+<Steps>
+<Step title="Pod'ların dizine erişmesine izin verin">
+Ayakaleaf Pro çalıştıran her pod LDAP bağlantılarını açar. Dizin bir güvenlik duvarı veya NetworkPolicy ile korunuyorsa, pod'ların kümeden çıktığı adreslere izin verin: genellikle düğümlerin adresleri veya egress ağ geçidiniz.
+
+İmajda `ldapsearch` yoktur. [Arama kontrolünü](/tr/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) küme içinden çalıştırmak için geçici bir pod kullanın:
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+Tam olarak bir `dn:` yazdırmalıdır.
+</Step>
+
+<Step title="Ayarları ConfigMap'e ekleyin">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Tüm `OVERLEAF_LDAP_*` ayarları [Ortam Değişkenleri](/tr/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#ortam-değişkenleri) bölümünde listelenmiştir. Bağlama (bind) parolası dışında hepsi ConfigMap'e girer. `"true"`, `"false"`, `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'` gibi JSON değerlerini ve `*` ile başlayan değerleri tırnak içine alın.
+</Step>
+
+<Step title="Bağlama parolasını Secret'a koyun">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="Kendi CA'nızla LDAPS veya STARTTLS (isteğe bağlı)">
+CA'yı `/var/lib/overleaf/certs` konumuna bağlanan `overleaf-certs` Secret'ına koyun (bkz. [Sertifikalar ve diğer dosyalar](/tr/on-premises/configuration/kubernetes#sertifikalar-ve-diğer-dosyalar)) ve ona işaret edin:
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+CA listesi, LDAP bağlantıları için sistem CA'larının yerini alır. Web başlarken okunur.
+</Step>
+
+<Step title="Uygulayın ve yeniden başlatın">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+1. adımdaki güvenlik duvarı dışında ek bir şey gerekmez: her replika dizine kendi başına bağlanır ve oturum açma sonucu Redis'teki oturuma yazılır.
+
+### Kubernetes üzerinde test edildi
+
+Dizin olarak goauthentik'in LDAP outpost'u ile, HAProxy arkasında üç replikalı Kubernetes 1.37 üzerinde LDAP için uçtan uca testlerimiz başarılı oldu (26 vaka): launchpad'den oluşturulan ilk yöneticinin LDAP üzerinden oturum açması, Secret'taki bağlama parolasıyla oturum açma, yanlış parolaların ve bilinmeyen kullanıcıların reddedilmesi, gruba göre ve eşleme olmadan yönetici eşlemesi, her oturum açmada güncellenen ad ve yönetici bayrağı (tek bir ad özniteliği veya ad ve soyad), dizin kişileri, oturumu kapatma, LDAP hesapları için parola kuralları, askıya alınmış hesaplar ve reCAPTCHA ile LDAP oturum açma.
+
+### Soru\&Cevap
+
+<Accordion title="LDAP ile oturum açma yalnızca bazı pod'larda başarısız oluyor">
+
+<strong>Cevap:</strong> Dizine her düğümden erişilemiyor. Her pod'dan kontrol edin:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="Bir oturum açmanın neden başarısız olduğunu nerede görebilirim?">
+
+<strong>Cevap:</strong> Oturum açmayı sunan pod'un web günlüğünde:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: Kompilujte LaTeX v kontejnerech TeX Live na uzlech clusteru Kubernetes.
+icon: gear-code
+---
+
+Kompilace provádí služba **clsi** uvnitř každého podu Ayakaleaf Pro. Se zapnutými sandboxed compiles požádá clsi **Docker Engine uzlu**, na kterém pod běží, o spuštění kontejneru TeX Live pro každou kompilaci a předá mu adresář projektu pomocí jeho cesty na tomto uzlu. Jak sandboxing funguje a které obrazy existují, je popsáno v části [Sandboxed Compiles](/cs/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Služba | clsi (kompilace), web (seznam obrazů v nastavení kompilátoru), v každém podu Ayakaleaf Pro |
+| Uzel | Docker Engine a všechny obrazy z `ALL_TEX_LIVE_DOCKER_IMAGES` na každém uzlu, na kterém může běžet Ayakaleaf Pro |
+| Připojení v podu | `/var/run/docker.sock` a adresáře kompilací, výstupu a cache jako svazky `hostPath` |
+| Periodické úlohy | clsi maže adresáře kompilací nepoužité den a každou hodinu odstraňuje staré kontejnery TeX Live z Dockeru uzlu |
+
+### Konfigurace
+
+Vše nastaví instalace: Docker a obrazy na uzlech v kroku [0. Příprava uzlů](/cs/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), nastavení v kroku [4. Přizpůsobení instance](/cs/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) a svazky v kroku [5. Nasazení Ayakaleaf Pro](/cs/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Nastavení, všechna v ConfigMapu:
+
+| Proměnná | Hodnota |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | cesta na uzlu ke svazku připojenému do `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | cesta na uzlu ke svazku připojenému do `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | cesta na uzlu ke svazku připojenému do `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | obrazy, stejně jako v Toolkitu |
+
+### Přidání verze TeX Live
+
+<Steps>
+<Step title="Stáhněte obraz na každém uzlu">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit si obrazy stahuje sám; na Kubernetes to nedělá nikdo. Stahujte do **Dockeru**, ne pomocí `crictl`: clsi žádá o obraz Docker. Kompilace s obrazem, který na uzlu chybí, selže.
+</Step>
+
+<Step title="Uveďte jej v ConfigMapu a restartujte">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Uzel přidaný do clusteru později potřebuje Docker a všechny obrazy dříve, než na něm Ayakaleaf Pro poběží. Pokud nevyhovuje každý uzel, takové uzly označte labelem a udržujte na nich Ayakaleaf Pro pomocí `nodeSelector`.
+
+### Více replik
+
+Každá replika kompiluje na svém vlastním uzlu a uchovává tam výstup kompilace, takže uživatel musí zůstat na replice, která kompilovala, což zajišťuje sticky cookie load balanceru. Nikdy nespouštějte dvě repliky na stejném uzlu: sdílely by adresáře kompilací uzlu. Nastavení z [horizontálního škálování](/cs/on-premises/configuration/kubernetes/horizontal-scaling) tomu brání pomocí `podAntiAffinity`.
+
+Kontejnery TeX Live běží vedle podu, mimo jeho limit paměti a mimo dohled scheduleru. Ponechte jim na uzlech volnou paměť, viz [0. Příprava uzlů](/cs/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Testováno na Kubernetes
+
+Na Kubernetes 1.37 se třemi replikami za HAProxy, jednou na uzel, a s TeX Live 2026 a 2025 staženými do Dockeru na každém uzlu procházejí naše end-to-end testy sandboxed compiles (7 případů): nový projekt se zkompiluje do PDF, nastavení kompilátoru nabízí oba obrazy a přepíná mezi nimi, XeLaTeX s fontspec, chyby LaTeXu a opětovná kompilace po opravě, zastavení běžící kompilace a SyncTeX v obou směrech. Zátěžový test s 12 uživateli, kteří současně kompilovali dokument o 600 stranách, spustil 4 kompilace na uzel, viz [Co očekávat](/cs/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

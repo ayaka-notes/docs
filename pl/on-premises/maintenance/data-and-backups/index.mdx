@@ -63,6 +63,18 @@ Gdy proces tworzenia kopii zapasowej zakończy się **pomyślnie**, musisz uruch
 
 MongoDB zawiera narzędzie wiersza poleceń o nazwie [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/), które może służyć do tworzenia kopii zapasowej danych użytkowników i projektów przechowywanych w bazie danych.
 
+Gdy kontener `sharelatex` jest zatrzymany, a kontener `mongo` nadal działa, zrzuć bazę danych `sharelatex` do pliku na hoście i przywróć ją w ten sam sposób (`--drop` zastępuje istniejące kolekcje):
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Dane systemu plików Overleaf
 
 W przypadku wdrożeń opartych na Toolkit ścieżka, w której przechowywane są nieedytowalne pliki, jest określona w `config/overleaf.rc` za pomocą zmiennej środowiskowej `OVERLEAF_DATA_PATH`, ale w zależności od tego, kiedy utworzono Twoją instancję, może to być `data/sharelatex`.
@@ -192,3 +204,37 @@ Poniższe foldery mają dodatkowe oznaczenia:
          * buforowanie przesyłanych plików (przesyłanie plików binarnych/nowego projektu z pliku zip)
       3. projectHistories (e)
          * pliki tymczasowe dla migracji pełnej historii projektów
+
+### Pytania i odpowiedzi
+
+<Accordion title="Dane MongoDB są uszkodzone lub częściowo usunięte, a nie mam kopii zapasowej. Co mogę zrobić?">
+
+<strong>Odpowiedź:</strong> Kontener `mongo` sam nie przechowuje żadnych danych: baza danych znajduje się w `data/mongo` (`MONGO_DATA_PATH` w `config/overleaf.rc`). Jeśli uszkodzony jest tylko kontener, usuń go poleceniem `bin/docker-compose rm -sf mongo` i uruchom `bin/up -d`, aby utworzyć go ponownie.
+
+Jeśli MongoDB nie może się uruchomić, ponieważ jego pliki są uszkodzone lub ich brakuje, ostatecznością jest wbudowane w MongoDB polecenie [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/). Odrzuca ono uszkodzone dane i tworzy puste pliki zastępcze w miejsce brakujących, więc należy spodziewać się utraty danych. Najpierw zatrzymaj wszystko i skopiuj katalog danych, a następnie uruchom naprawę przy użyciu tego samego obrazu co kontener `mongo` (`MONGO_IMAGE` i `MONGO_VERSION` w `config/overleaf.rc`, domyślnie `mongo:8.0`):
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+Jeśli naprawa musiała zmienić dane, MongoDB nie uruchamia się już jako członek zestawu replik (replica set), a Toolkit uruchamia go właśnie w ten sposób (`--replSet overleaf`): `bin/logs mongo` wyświetla `This instance has been repaired and may contain modified replicated data`. Wówczas uruchom naprawione pliki bez `--replSet`, zrzuć je i przywróć zrzut do nowej bazy danych:
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+Następnie przywróć `mongo-backup.gz` za pomocą polecenia `mongorestore` z sekcji [MongoDB](#mongodb) powyżej.
+
+Jeśli dane MongoDB zostały całkowicie utracone, Ayakaleaf Pro nie może odtworzyć projektów. Użytkownicy, lista projektów, drzewa folderów, bieżąca treść dokumentów oraz indeks historii są przechowywane w MongoDB. `data/overleaf/data/history` nadal zawiera przesłane pliki i treść historii, zapisane pod skrótami zawartości (`overleaf-project-blobs`) oraz jako skompresowane gzipem fragmenty historii w formacie JSON (`overleaf-chunks`), ale nie istnieje narzędzie, które przekształciłoby je z powrotem w projekty. Można je jedynie przeszukiwać ręcznie.
+
+</Accordion>

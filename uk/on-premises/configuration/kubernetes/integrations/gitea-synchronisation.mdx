@@ -1,0 +1,67 @@
+---
+title: Синхронізація з Gitea
+description: Дозвольте користувачам синхронізувати свої проєкти з репозиторіями на Gitea.com або у вашому власному Gitea у розгортанні Kubernetes.
+icon: mug-hot
+---
+
+Синхронізація з Gitea працює у службі **web** (модуль `gitea-sync`) кожного пода Ayakaleaf Pro. Їй потрібна [Інтеграція з Git](/uk/on-premises/configuration/kubernetes/integrations/git-integration). Створіть застосунок OAuth і прочитайте, що робить кожен параметр, у розділі [Синхронізація з Gitea](/uk/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); ця сторінка описує, як перенести це в Kubernetes.
+
+| | |
+| --- | --- |
+| Служба | web (модуль `gitea-sync`), у кожному поді Ayakaleaf Pro; зчитується під час запуску web |
+| Под → Gitea | REST API `GITEA_SYNC_URL` (за замовчуванням `https://gitea.com/api/v1`), щоразу, коли користувач прив'язує, імпортує, експортує або синхронізує |
+| Браузер → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` для прив'язки облікового запису, а потім назад до `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | немає: без webhook, екземпляр не мусить бути доступним з Gitea |
+| Збережені дані | токени доступу й оновлення Gitea користувача, зашифровані, у MongoDB |
+| Періодичні завдання | немає: синхронізація відбувається, коли користувач натискає кнопку |
+
+### Конфігурація
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` і StatefulSet git-bridge з розділу [Інтеграція з Git](/uk/on-premises/configuration/kubernetes/integrations/git-integration) мають бути налаштовані: без них налаштування облікового запису й редактор приховують синхронізацію з Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` шифрує токени доступу й оновлення Gitea користувачів у MongoDB. Кожна репліка має використовувати те саме значення, а його подальша зміна змушує кожного користувача знову прив'язати Gitea.
+</Step>
+
+<Step title="Приватний CA (необов'язково)">
+Якщо ваш Gitea має сертифікат від вашого власного CA, додайте CA до Secret `overleaf-certs`, змонтованого в `/var/lib/overleaf/certs` (див. [Сертифікати та інші файли](/uk/on-premises/configuration/kubernetes#certificates-and-other-files)), і задайте `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` у ConfigMap.
+</Step>
+
+<Step title="Застосуйте, перезапустіть і перевірте">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Будь-який статус HTTP означає, що Gitea доступний із цього пода; `000` означає, що ні.
+</Step>
+</Steps>
+
+### Кілька реплік
+
+Нічого додаткового, окрім спільного `GITEA_TOKEN_CIPHER_PASSWORD`. Синхронізація захоплює блокування в Redis, спільне з іншими синхронізаціями Git, тож дві репліки ніколи не синхронізують той самий проєкт одночасно.
+
+### Перевірено в Kubernetes
+
+Зі справжнім Gitea 1.23 за адресою `GITEA_SYNC_URL`, у Kubernetes 1.37 з однією реплікою та ввімкненою інтеграцією з Git, наші наскрізні тести синхронізації з Gitea проходять (39 випадків): прив'язка та скасування прив'язки облікового запису через OAuth2 Gitea, оновлення токена доступу, строк дії якого спливає, і відкликані дозволи, експорт у новий приватний репозиторій або репозиторій організації, імпорт репозиторію, pull і push, злиття, конфлікти, видалені гілки та гілки після force push, бінарні файли, перейменування й видалення, а також те, що можуть робити власники, редактори та глядачі.

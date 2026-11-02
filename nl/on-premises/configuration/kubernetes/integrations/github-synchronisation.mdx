@@ -1,0 +1,67 @@
+---
+title: GitHub-synchronisatie
+description: Laat gebruikers hun projecten synchroniseren met GitHub- of GitHub Enterprise-repository's in een Kubernetes-deployment.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub-synchronisatie draait in de **web**-service (de module `github-sync`) van elke Ayakaleaf Pro-pod. Ze vereist de [Git-integratie](/nl/on-premises/configuration/kubernetes/integrations/git-integration). Maak de OAuth-applicatie aan en lees wat elke instelling doet in [GitHub-synchronisatie](/nl/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); deze pagina zet het om naar Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (module `github-sync`), in elke Ayakaleaf Pro-pod; ingelezen wanneer web start |
+| Pod → GitHub | `https://api.github.com` (REST en GraphQL), of de API van `GITHUB_SYNC_URL`, telkens wanneer een gebruiker koppelt, importeert, exporteert of synchroniseert |
+| Browser → GitHub | `https://github.com/login/oauth/authorize` om een account te koppelen, daarna terug naar `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | geen: geen webhook, de instantie hoeft niet bereikbaar te zijn vanaf GitHub |
+| Opgeslagen gegevens | de GitHub-toegangstokens van de gebruiker, versleuteld, in MongoDB |
+| Periodieke taken | geen: synchronisatie gebeurt wanneer een gebruiker klikt |
+
+### Configuratie
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` en de git-bridge-StatefulSet uit [Git-integratie](/nl/on-premises/configuration/kubernetes/integrations/git-integration) moeten aanwezig zijn: zonder deze verbergen de accountinstellingen en de editor GitHub-synchronisatie.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` versleutelt de GitHub-toegangstokens van de gebruikers in MongoDB. Elke replica moet dezelfde waarde gebruiken, en als je deze later wijzigt, moet elke gebruiker GitHub opnieuw koppelen.
+</Step>
+
+<Step title="Private CA (optioneel)">
+Als je GitHub een certificaat van je eigen CA heeft, voeg de CA dan toe aan de Secret `overleaf-certs` die is gekoppeld op `/var/lib/overleaf/certs` (zie [Certificaten en andere bestanden](/nl/on-premises/configuration/kubernetes#certificates-and-other-files)) en stel `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` in de ConfigMap in.
+</Step>
+
+<Step title="Toepassen, herstarten en controleren">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Elke HTTP-status betekent dat GitHub bereikbaar is vanaf die pod; `000` betekent dat dat niet zo is.
+</Step>
+</Steps>
+
+### Meerdere replica's
+
+Niets extra's naast de gedeelde `GITHUB_TOKEN_CIPHER_PASSWORD`. Een synchronisatie neemt een lock in Redis, gedeeld met de andere Git-synchronisaties, zodat twee replica's nooit tegelijk hetzelfde project synchroniseren.
+
+### Getest op Kubernetes
+
+Tegen een mock van github.com en de bijbehorende REST- en GraphQL-API's (vertrouwd via `NODE_EXTRA_CA_CERTS` uit `overleaf-certs`), op Kubernetes 1.37 met één replica en de Git-integratie ingeschakeld, slagen onze end-to-endtests voor GitHub-synchronisatie (31 gevallen): het account koppelen en ontkoppelen, ingetrokken tokens, een project exporteren naar een nieuwe private repository of organisatierepository, een repository importeren (ook boven de uploadlimiet), pullen en pushen, merges, conflicten en handmatige merges, verwijderde en geforceerd gepushte branches, binaire bestanden, hernoemingen en verwijderingen, het verliezen van pushrechten, en wat eigenaren, bewerkers en kijkers mogen doen.

@@ -1,0 +1,56 @@
+---
+title: Integrace Mendeley
+description: Umožněte uživatelům importovat soubor .bib z jejich knihovny Mendeley v nasazení na Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Import z Mendeley běží ve službě **web** (modul `tpr-webmodule`) každého podu Ayakaleaf Pro. Zaregistrujte aplikaci Mendeley podle části [Integrace Mendeley](/cs/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration) s přesměrovací URL `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback` a poté nakonfigurujte Kubernetes podle níže uvedeného postupu.
+
+| | |
+| --- | --- |
+| Služba | web v každém podu Ayakaleaf Pro; načítá se při startu webu |
+| Pod → Mendeley | `https://api.mendeley.com` (OAuth token a API), když uživatel propojuje Mendeley nebo importuje či obnovuje soubor |
+| Prohlížeč → Mendeley | `https://api.mendeley.com/oauth/authorize`, poté zpět na přesměrovací URL |
+| Mendeley → Overleaf | žádné: instance nemusí být dostupná z internetu |
+| Uložená data | tokeny uživatele k Mendeley, šifrované, v MongoDB |
+| Periodické úlohy | žádné: soubor se obnoví jen tehdy, když o to uživatel požádá |
+
+### Konfigurace
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+ID aplikace uzavřete do uvozovek: je to číslo a ConfigMap obsahuje pouze řetězce. `ENABLED_LINKED_FILE_TYPES` nahrazuje hodnotu z instalace; ponechte typy, které již máte, a přidejte `mendeley` (a `zotero`, pokud používáte obojí).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD` šifruje tokeny uživatelů k Mendeley v MongoDB. Bez něj si každý pod vygeneruje soubor s klíčem ve svém vlastním `/var/lib/overleaf/data`. S [více replikami](/cs/on-premises/configuration/kubernetes/horizontal-scaling) má pak každý uzel jiný klíč a uživatel obsluhovaný jinou replikou nemůže svůj propojený účet Mendeley použít. Nastavte jej dříve, než první uživatel propojí Mendeley: pozdější změna donutí všechny uživatele propojit Mendeley znovu.
+</Step>
+
+<Step title="Použití a restart">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Více replik
+
+Nastavte `MENDELEY_CIPHER_PASSWORD` v Secretu, viz výše. Tokeny k Mendeley šifruje stejný kód jako klíče k Zotero: bez hesla nelze soubor importovaný na jedné replice obnovit na jiné, jak jsme viděli u [Zotero](/cs/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas). OAuth `state` se uchovává v relaci v Redisu, takže callback může dorazit na kteroukoli repliku.
+
+### Testováno na Kubernetes
+
+Proti napodobenině api.mendeley.com (důvěryhodné díky `NODE_EXTRA_CA_CERTS` z `overleaf-certs`), na Kubernetes 1.37 se třemi replikami za HAProxy, procházejí naše end-to-end testy Mendeley (18 případů): propojení přes OAuth 2.0 a zrušení propojení, import knihovny a skupin do souboru `.bib`, jeho obnovení, obnovení přístupového tokenu, jehož platnost vyprší, odvolané tokeny, výzva k opětovnému propojení, citace vyhledatelné pro spolupracovníky, obnovit může pouze ten, kdo importoval, chyby API a pomalá připojení k Mendeley.

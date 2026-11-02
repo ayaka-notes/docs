@@ -1,0 +1,67 @@
+---
+title: GitLab-synkronisering
+description: Låt användare synkronisera sina projekt med repositorier på GitLab.com eller en egendriftad GitLab i en Kubernetes-driftsättning.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+GitLab-synkronisering körs i tjänsten **web** (modulen `gitlab-sync`) i varje Ayakaleaf Pro-pod. Den kräver [Git-integrationen](/sv/on-premises/configuration/kubernetes/integrations/git-integration). Skapa OAuth-applikationen och läs vad varje inställning gör i [GitLab-synkronisering](/sv/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); den här sidan tillämpar det på Kubernetes.
+
+| | |
+| --- | --- |
+| Tjänst | web (modulen `gitlab-sync`), i varje Ayakaleaf Pro-pod; läses när web startar |
+| Pod → GitLab | REST-API:t för `GITLAB_SYNC_URL` (standard `https://gitlab.com/api/v4`), när en användare länkar, importerar, exporterar eller synkroniserar |
+| Webbläsare → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` för att länka ett konto, sedan tillbaka till `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | ingen: ingen webhook, instansen behöver inte vara nåbar från GitLab |
+| Lagrade data | användarens GitLab-åtkomst- och förnyelsetokens, krypterade, i MongoDB |
+| Periodiska jobb | inga: synkronisering sker när en användare klickar |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` och git-bridge-StatefulSet:en från [Git-integration](/sv/on-premises/configuration/kubernetes/integrations/git-integration) måste finnas på plats: utan dem döljer kontoinställningarna och redigeraren GitLab-synkroniseringen.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` krypterar användarnas GitLab-åtkomst- och förnyelsetokens i MongoDB. Alla repliker måste använda samma värde, och om du ändrar det senare måste alla användare länka GitLab på nytt.
+</Step>
+
+<Step title="Privat CA (valfritt)">
+Om din GitLab har ett certifikat från din egen CA lägger du till CA:n i Secret:en `overleaf-certs` som monteras på `/var/lib/overleaf/certs` (se [Certifikat och andra filer](/sv/on-premises/configuration/kubernetes#certifikat-och-andra-filer)) och anger `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap:en.
+</Step>
+
+<Step title="Tillämpa, starta om och kontrollera">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Vilken HTTP-statuskod som helst betyder att GitLab kan nås från den podden; `000` betyder att den inte kan det.
+</Step>
+</Steps>
+
+### Flera repliker
+
+Inget extra utöver det gemensamma `GITLAB_TOKEN_CIPHER_PASSWORD`. En synkronisering tar ett lås i Redis, som delas med de andra Git-synkroniseringarna, så två repliker synkroniserar aldrig samma projekt samtidigt. Förnyelse av en användares GitLab-token tar också ett Redis-lås, så två repliker förnyar den inte samtidigt.
+
+### Testat på Kubernetes
+
+Mot en mock av en egendriftad GitLab på `GITLAB_SYNC_URL` (betrodd via `NODE_EXTRA_CA_CERTS` från `overleaf-certs`), på Kubernetes 1.37 med en replik och Git-integrationen påslagen, klarar våra end-to-end-tester för GitLab-synkronisering sig (40 fall): länkning och avlänkning av kontot, förnyelse av en åtkomsttoken som löper ut och återkallade tokens, export till ett nytt privat projekt eller gruppprojekt, import av ett repositorium, hämtning och pushning, sammanslagningar, konflikter, borttagna och force-pushade grenar, binära filer, namnbyten och borttagningar samt vad ägare, redigerare och läsare får göra.

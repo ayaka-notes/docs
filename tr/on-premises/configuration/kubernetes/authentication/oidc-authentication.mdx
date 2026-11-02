@@ -1,0 +1,129 @@
+---
+title: OIDC Kimlik Doğrulama
+description: Kubernetes dağıtımında kullanıcıların bir OpenID Connect sağlayıcısı üzerinden oturum açmasını sağlayın.
+icon: id-card-clip
+---
+
+OIDC ile oturum açma, her Ayakaleaf Pro pod'undaki **web** hizmeti (`authentication` modülü) tarafından yürütülür. Arka plan işi veya ayrı bir pod'u yoktur. Sağlayıcı tarafı (istemci, yönlendirme URI'leri, yönetici talebi) Toolkit ile aynıdır; bu nedenle önce OpenID Sağlayıcınızı (OP) [OIDC Kimlik Doğrulama](/tr/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication) sayfasına göre kurun, ardından değerleri aşağıdaki gibi Kubernetes'e aktarın.
+
+### Neyin nerede çalıştığı
+
+| | |
+| --- | --- |
+| Hizmet | web, her Ayakaleaf Pro pod'unda; ayarlar web başlarken okunur |
+| Pod → OP | her oturum açmada `OVERLEAF_OIDC_TOKEN_URL` ve `OVERLEAF_OIDC_USER_INFO_URL` |
+| Tarayıcı → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL` ve oturum kapatılırken `OVERLEAF_OIDC_LOGOUT_URL` |
+| OP → Overleaf | yok: OP yalnızca tarayıcıyı geri yönlendirir |
+| Oturum açma durumu | Redis'teki oturum, tüm replikalar tarafından paylaşılır |
+| Periyodik işler | yok |
+
+### Yapılandırma
+
+<Steps>
+<Step title="Overleaf'i OP'ye kaydedin">
+OP'nizde `OVERLEAF_SITE_URL` değerinden oluşturulan şu adreslere izin verin:
+
+| Amaç | URI |
+| --- | --- |
+| Yönlendirme URI'si (oturum açma) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| Oturum kapatma sonrası yönlendirme URI'si | `${OVERLEAF_SITE_URL}` |
+| Mevcut bir hesap bağlandıktan sonraki oturum kapatma sonrası yönlendirme URI'si | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Beş URL'yi, [Değerleri keşif belgesiyle bulma](/tr/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#değerleri-keşif-belgesiyle-bulma) bölümünde açıklandığı gibi OP'nin keşif belgesinde bulun.
+</Step>
+
+<Step title="Ayarları ConfigMap'e ekleyin">
+`overleaf-env` öğesine ekleyin (`30-config.yaml` veya [birden fazla replika](/tr/on-premises/configuration/kubernetes/horizontal-scaling) için `60-config.yaml`):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` boşlukla ayrılmış bir liste alır, örneğin `ldap oidc`. Tüm `OVERLEAF_OIDC_*` ayarları için [Ortam Değişkenleri](/tr/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#ortam-değişkenleri) bölümüne bakın; istemci gizli anahtarı dışında hepsi ConfigMap'e girer.
+
+<Warning>
+
+`"true"` ve `"false"` değerlerini tırnak içine alın: bir ConfigMap yalnızca dize tutar. `""` olarak ayarlanmış bir anahtar, eksik bir anahtarla aynı şey değildir: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` ilk oturum açmada hesap oluşturmayı kapatır, anahtarı hiç yazmamak ise her alan adına izin verir.
+
+</Warning>
+</Step>
+
+<Step title="İstemci gizli anahtarını Secret'a koyun">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Özel bir CA'ya güvenin (isteğe bağlı)">
+OP'nin sertifikası kendi CA'nızdan geliyorsa, CA'yı `/var/lib/overleaf/certs` konumuna bağlanan `overleaf-certs` Secret'ına ekleyin (bkz. [Sertifikalar ve diğer dosyalar](/tr/on-premises/configuration/kubernetes#sertifikalar-ve-diğer-dosyalar)) ve Node.js'i ona yönlendirin:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Uygulayın ve yeniden başlatın">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Ardından her pod'un token uç noktasına erişebildiğini kontrol edin. Bu uç noktayı tarayıcı değil pod'lar çağırır; bu nedenle bir güvenlik duvarı veya DNS sorunu yalnızca burada ortaya çıkar:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Herhangi bir HTTP durum kodu (bir GET için `405`) uç noktaya erişilebildiği anlamına gelir; `000` erişilemediği anlamına gelir.
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+Ek bir şey gerekmez. Bir oturum açmanın `state` değeri ve oturum kapatma için kullanılan ID token, Redis'te bulunan oturumda tutulur; böylece geri çağırma (callback) hangi replikaya ulaşırsa ulaşsın çalışır.
+
+### Kubernetes üzerinde test edildi
+
+OP olarak goauthentik ile, HAProxy arkasında üç replikalı Kubernetes 1.37 üzerinde OIDC için uçtan uca testlerimiz başarılı oldu (35 vaka): oturum açma ve OP üzerinden oturum kapatma; gruba, e-postaya ve tek bir değere göre ve eşleme olmadan yönetici eşlemesi; her oturum açmada güncellenen ad ve yönetici bayrağı; hesapları bağlama ve bağlantısını kaldırma; OIDC hesaplarının parola sıfırlama ve parola değişiklikleri; askıya alınmış hesaplar; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; ve herkese açık erişimle birlikte OIDC.
+
+### Soru\&Cevap
+
+<Accordion title="Oturum açma “Unable to verify authorization request state” hatasıyla başarısız oluyor">
+
+<strong>Cevap:</strong> Tarayıcı, geri çağırma isteğiyle birlikte oturum çerezini geri göndermedi. Kubernetes'te olağan nedenler şunlardır:
+
+* `OVERLEAF_SECURE_COOKIE` ayarlanmış, ancak kullanıcılar siteyi düz HTTP üzerinden açıyor; bu nedenle tarayıcı çerezi hiç saklamıyor. `OVERLEAF_SECURE_COOKIE` için herhangi bir değer, `"false"` bile, güvenli çerezleri açar; bunun yerine anahtarı kaldırın.
+* Site, `OVERLEAF_SITE_URL` dışında başka bir adres altında açılıyor.
+* HTTPS arkasında, ingress'iniz veya yük dengeleyiciniz `X-Forwarded-Proto: https` göndermiyor ya da adresi `OVERLEAF_TRUSTED_PROXY_IPS` içinde eksik.
+
+</Accordion>
+
+<Accordion title="Bir oturum açmanın neden başarısız olduğunu nerede görebilirim?">
+
+<strong>Cevap:</strong> `kubectl logs` içinde değil, isteği sunan pod'un web günlüğünde:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Birden fazla replikada her `overleaf-N` pod'unu kontrol edin.
+
+</Accordion>

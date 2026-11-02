@@ -63,6 +63,18 @@ Ayakaleaf Pro хранит свои данные в трёх разных мес
 
 В комплекте с MongoDB поставляется инструмент командной строки [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/), с помощью которого можно создать резервную копию данных пользователей и проектов, хранящихся в базе данных.
 
+Остановив контейнер `sharelatex` и оставив контейнер `mongo` запущенным, выгрузите базу данных `sharelatex` в файл на хосте и восстанавливайте её тем же способом (`--drop` заменяет существующие коллекции):
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Данные файловой системы Overleaf
 
 Для развертываний через Toolkit путь, по которому хранятся нередактируемые файлы, задаётся в `config/overleaf.rc` переменной окружения `OVERLEAF_DATA_PATH`, однако в зависимости от того, когда был создан ваш экземпляр, это может быть `data/sharelatex`.
@@ -192,3 +204,37 @@ new-server$ docker start sharelatex
          * буферизация загружаемых файлов (загрузка бинарных файлов / создание нового проекта из zip)
       3. projectHistories (e)
          * временные файлы для миграций полной истории проектов
+
+### Вопросы и ответы
+
+<Accordion title="Данные MongoDB повреждены или частично удалены, а резервной копии нет. Что можно сделать?">
+
+<strong>Ответ:</strong> Сам контейнер `mongo` не хранит данных: база данных находится в `data/mongo` (`MONGO_DATA_PATH` в `config/overleaf.rc`). Если повреждён только контейнер, удалите его командой `bin/docker-compose rm -sf mongo` и выполните `bin/up -d`, чтобы создать его заново.
+
+Если MongoDB не может запуститься, потому что её файлы повреждены или отсутствуют, последнее средство — встроенная в MongoDB команда [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/). Она отбрасывает повреждённые данные и создаёт пустые файлы-заглушки вместо отсутствующих, поэтому потеря данных неизбежна. Сначала остановите всё и скопируйте каталог данных, затем запустите восстановление с тем же образом, что и у вашего контейнера `mongo` (`MONGO_IMAGE` и `MONGO_VERSION` в `config/overleaf.rc`, по умолчанию `mongo:8.0`):
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+Если при восстановлении пришлось изменить данные, MongoDB больше не запускается как участник набора реплик, а Toolkit запускает её именно так (`--replSet overleaf`): `bin/logs mongo` показывает `This instance has been repaired and may contain modified replicated data`. В этом случае запустите восстановленные файлы без `--replSet`, выгрузите их и восстановите дамп в новую базу данных:
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+Затем восстановите `mongo-backup.gz` с помощью команды `mongorestore` из раздела [MongoDB](#mongodb) выше.
+
+Если данные MongoDB полностью утрачены, Ayakaleaf Pro не может восстановить проекты. Пользователи, список проектов, деревья папок, текущий текст документов и индекс истории хранятся в MongoDB. В `data/overleaf/data/history` по-прежнему находятся загруженные файлы и содержимое истории, сохранённые под хешами содержимого (`overleaf-project-blobs`) и в виде сжатых gzip JSON-фрагментов истории (`overleaf-chunks`), но инструмента, который превращал бы их обратно в проекты, не существует. Искать в них можно только вручную.
+
+</Accordion>

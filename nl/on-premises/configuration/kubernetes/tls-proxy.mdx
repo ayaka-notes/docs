@@ -1,0 +1,87 @@
+---
+title: TLS-proxy
+description: Bied een Kubernetes-deployment aan via HTTPS met een ingress, een load balancer of HAProxy.
+icon: lock
+---
+
+Binnen de pod levert de nginx van de container gewoon HTTP op poort 80. HTTPS eindigt vóór de pods: in je ingress-controller, je cloud-load-balancer, of HAProxy zoals in [Horizontaal schalen](/nl/on-premises/configuration/kubernetes/horizontal-scaling). De NGINX-proxy van de Toolkit (`bin/init --tls`, `NGINX_*` en `TLS_*` in `overleaf.rc`) heeft geen tegenhanger; zie [TLS-proxy](/nl/on-premises/configuration/overleaf-toolkit/tls-proxy) voor de Toolkit.
+
+| | |
+| --- | --- |
+| Service | je ingress of load balancer; web leest de onderstaande instellingen bij het opstarten |
+| Browser → proxy | HTTPS op 443, inclusief de WebSocket van de editor |
+| Proxy → pods | gewoon HTTP naar poort 80 van de pods |
+| Periodieke taken | geen (certificaatvernieuwing is de taak van je proxy) |
+
+### Wat de proxy moet doen
+
+* WebSockets doorgeven (`/socket.io`).
+* Verzoeken van 10 minuten toestaan (lange compilaties) en request bodies van 50 MB (uploads), of `MAX_UPLOAD_SIZE`.
+* De idle keep-alive-timeout richting de pods onder 65 seconden houden, de timeout van de nginx in de pod.
+* `X-Forwarded-For` en `X-Forwarded-Proto: https` meesturen.
+* Bij meerdere replica's een gebruiker op één replica houden, zie [Horizontaal schalen](/nl/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Zonder `X-Forwarded-Proto: https` vanaf een vertrouwd adres denkt Ayakaleaf Pro dat verzoeken via HTTP binnenkomen en stelt het zijn beveiligde sessiecookie niet in: inloggen mislukt dan. Stel `OVERLEAF_SECURE_COOKIE` alleen in wanneer gebruikers de site echt via HTTPS bereiken; elke waarde schakelt het in, ook `"false"`.
+
+### HAProxy-voorbeeld
+
+Om HTTPS te beëindigen in de HAProxy-DaemonSet uit [Horizontaal schalen](/nl/on-premises/configuration/kubernetes/horizontal-scaling), zet je het certificaat en de sleutel ervan in één PEM-bestand en een Secret:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+Wijzig daarna `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+Verhoog `config-hash` zodat HAProxy herstart, stel daarna de ConfigMap in zoals hierboven en herstart de replica's.
+
+De redirect behoudt de poort van het verzoek: dat past bij een load balancer op poort 80 en 443, maar op de NodePorts stuurt deze `http://host:30081` door naar `https://host:30081`. Laat zonder load balancer ervoor de redirectregel weg en geef gebruikers het adres `https://...:30443`.
+
+### Getest op Kubernetes
+
+Op Kubernetes 1.37 met drie replica's en HAProxy die HTTPS beëindigt zoals hierboven, met `OVERLEAF_SITE_URL` op `https://` en `OVERLEAF_SECURE_COOKIE`: gebruikers activeerden hun account via `https://`-links, logden in met een sessiecookie gemarkeerd als `Secure`, uploadden en compileerden projecten waarbij de PDF werd opgehaald, bleven op hun replica, openden de WebSocket van de editor (`wss`), en kloonden en pushten met Git via HTTPS. `http://`-verzoeken op de NodePort werden doorgestuurd naar `https://` met dezelfde poort, zoals hierboven beschreven.

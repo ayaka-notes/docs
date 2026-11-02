@@ -1,0 +1,67 @@
+---
+title: Synchronizacja z Gitea
+description: Umożliwienie użytkownikom synchronizowania projektów z repozytoriami na Gitea.com lub we własnej instancji Gitea we wdrożeniu Kubernetes.
+icon: mug-hot
+---
+
+Synchronizacja z Gitea działa w usłudze **web** (moduł `gitea-sync`) każdego poda Ayakaleaf Pro. Wymaga [integracji z Git](/pl/on-premises/configuration/kubernetes/integrations/git-integration). Utwórz aplikację OAuth i przeczytaj, co robi każde ustawienie, w [Synchronizacja z Gitea](/pl/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); ta strona opisuje, jak umieścić to w Kubernetes.
+
+| | |
+| --- | --- |
+| Usługa | web (moduł `gitea-sync`), w każdym podzie Ayakaleaf Pro; odczytywane przy starcie web |
+| Pod → Gitea | REST API `GITEA_SYNC_URL` (domyślnie `https://gitea.com/api/v1`), za każdym razem, gdy użytkownik łączy konto, importuje, eksportuje lub synchronizuje |
+| Przeglądarka → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` w celu połączenia konta, a następnie z powrotem do `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | brak: nie ma webhooka, instancja nie musi być osiągalna z Gitea |
+| Przechowywane dane | tokeny dostępu i odświeżania Gitea użytkownika, zaszyfrowane, w MongoDB |
+| Zadania okresowe | brak: synchronizacja odbywa się, gdy użytkownik kliknie |
+
+### Konfiguracja
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` oraz StatefulSet git-bridge z [Integracja z Git](/pl/on-premises/configuration/kubernetes/integrations/git-integration) muszą być skonfigurowane: bez nich ustawienia konta i edytor ukrywają synchronizację z Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` szyfruje tokeny dostępu i odświeżania Gitea użytkowników w MongoDB. Każda replika musi używać tej samej wartości, a późniejsza jej zmiana zmusza każdego użytkownika do ponownego połączenia Gitea.
+</Step>
+
+<Step title="Prywatne CA (opcjonalnie)">
+Jeśli Twoja instancja Gitea ma certyfikat z Twojego własnego CA, dodaj CA do Secret `overleaf-certs` zamontowanego w `/var/lib/overleaf/certs` (zobacz [Certyfikaty i inne pliki](/pl/on-premises/configuration/kubernetes#certificates-and-other-files)) i ustaw `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` w ConfigMap.
+</Step>
+
+<Step title="Zastosuj, zrestartuj i sprawdź">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Dowolny status HTTP oznacza, że Gitea jest osiągalna z danego poda; `000` oznacza, że nie jest.
+</Step>
+</Steps>
+
+### Kilka replik
+
+Poza współdzielonym `GITEA_TOKEN_CIPHER_PASSWORD` nic dodatkowego. Synchronizacja zakłada blokadę w Redis, współdzieloną z pozostałymi synchronizacjami Git, więc dwie repliki nigdy nie synchronizują tego samego projektu jednocześnie.
+
+### Przetestowano na Kubernetes
+
+Wobec prawdziwej instancji Gitea 1.23 pod `GITEA_SYNC_URL`, na Kubernetes 1.37 z jedną repliką i włączoną integracją z Git, nasze testy end-to-end dla synchronizacji z Gitea przechodzą pomyślnie (39 przypadków): łączenie i rozłączanie konta przez OAuth2 Gitea, odświeżanie wygasającego tokenu dostępu i cofnięte uprawnienia, eksport do nowego prywatnego repozytorium lub repozytorium organizacji, import repozytorium, pull i push, scalenia, konflikty, usunięte gałęzie i gałęzie po force-push, pliki binarne, zmiany nazw i usunięcia oraz uprawnienia właścicieli, edytorów i osób przeglądających.

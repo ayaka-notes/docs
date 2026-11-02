@@ -1,0 +1,64 @@
+---
+title: reCAPTCHA
+description: Kubernetes dağıtımında oturum açmayı, kaydı ve parola sıfırlamayı Google reCAPTCHA ile koruyun.
+icon: robot
+---
+
+**web** hizmeti (`login-register` modülü), e-postayla oturum açmada, LDAP ile oturum açmada, kayıtta ve parola sıfırlamada bir reCAPTCHA v2 (görünmez) ister. Anahtarı oluşturmak ve her ayarın ne yaptığını öğrenmek için [reCAPTCHA](/tr/on-premises/configuration/overleaf-toolkit/authentication/recaptcha) sayfasına bakın; bu sayfa bunu Kubernetes'e uygular.
+
+| | |
+| --- | --- |
+| Hizmet | web, her Ayakaleaf Pro pod'unda; web başlarken okunur |
+| Pod → Google | denetlenen her istekte `RECAPTCHA_ENDPOINT` (varsayılan `https://www.google.com/recaptcha/api/siteverify`) |
+| Tarayıcı → Google | `www.recaptcha.net` adresinden gelen widget betiği |
+| Durum | Redis'teki hız sınırları; şifrelenmiş bir çerezdeki "bu tarayıcı zaten geçti" cihaz geçmişi |
+| Periyodik işler | yok |
+
+### Yapılandırma
+
+<Steps>
+<Step title="Site anahtarını ConfigMap'e koyun">
+```yaml
+  RECAPTCHA_SITE_KEY: <site key>
+  # optional
+  # RECAPTCHA_ENDPOINT: https://www.recaptcha.net/recaptcha/api/siteverify
+  # CAPTCHA_TRUSTED_USERS: robot@example.com
+```
+
+Site anahtarı herkese açıktır: her oturum açma sayfası onu gösterir.
+</Step>
+
+<Step title="Gizli anahtarı ve cihaz geçmişi anahtarını Secret'a koyun">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "RECAPTCHA_SECRET_KEY":"<secret key>",
+  "DEVICE_HISTORY_SECRET":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+Her iki anahtarı birlikte ayarlayın: site anahtarı olup gizli anahtar olmadığında her denetim başarısız olur ve hiç kimse parolayla oturum açamaz, kaydolamaz veya parola sıfırlayamaz. `DEVICE_HISTORY_SECRET` 64 onaltılık (hex) karakter olmalıdır; konteyner bunu oluşturmaz.
+</Step>
+
+<Step title="Uygulayın ve yeniden başlatın">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Ardından her pod'un uç noktaya erişebildiğini kontrol edin. Pod'lar her bağlantı denemesinde yaklaşık bir saniye sonra vazgeçer ve denetimi yapılamayan bir oturum açma hatayla başarısız olur:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://www.google.com/recaptcha/api/siteverify
+done
+```
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+Tüm replikalar `DEVICE_HISTORY_SECRET` değerini paylaşmalıdır; bu değer Secret'ta olduğunda bu sağlanır. Farklı değerlerle, bir replikada denetimi geçen bir tarayıcı başka bir replikada captcha'yı yeniden alır. Hız sınırları tüm replikalar genelinde Redis'te sayılır.
+
+### Kubernetes üzerinde test edildi
+
+Google'ın doğrulama uç noktasının bir taklidine karşı (`overleaf-certs` içinden `NODE_EXTRA_CA_CERTS` aracılığıyla güvenilen), Kubernetes 1.37 üzerinde reCAPTCHA için uçtan uca testlerimiz başarılı oldu (13 vaka): tek replikada oturum açma, kayıt ve parola sıfırlamanın her birinin captcha olmadan veya başarısız bir captcha ile reddedilmesi ve başarılı bir captcha ile kabul edilmesi, `DEVICE_HISTORY_SECRET` kaynaklı cihaz geçmişinin bir tarayıcının captcha'yı atlamasına izin vermesi ve `CAPTCHA_TRUSTED_USERS`; HAProxy arkasında üç replikada captcha ile LDAP oturum açma.

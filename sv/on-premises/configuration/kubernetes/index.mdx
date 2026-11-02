@@ -1,0 +1,90 @@
+---
+title: Kubernetes
+description: Konfigurera en Kubernetes-driftsättning - var inställningar, hemligheter och filer placeras, och en sida per funktion.
+icon: dharmachakra
+---
+
+En Kubernetes-driftsättning läser samma miljövariabler som Toolkit. Där en Toolkit-sida säger ”lägg till detta i `config/variables.env`” lägger du värdet i ConfigMap `overleaf-env`, eller i Secret `overleaf-secrets` när det är ett lösenord, en nyckel eller en token. Starta sedan om:
+
+```bash
+kubectl -n overleaf apply -f 30-config.yaml        # after editing the ConfigMap
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+kubectl -n overleaf rollout restart deployment/overleaf
+```
+
+Värden i `config/overleaf.rc` är Toolkit-inställningar, inte miljövariabler; avsnittet Frågor och svar i slutet av den här sidan beskriver vad som ersätter dem.
+
+### Funktioner
+
+Varje funktion i Toolkit-konfigurationen har en sida här med dess tjänster, inställningar, nätverksvägar, bakgrundsjobb, vad som ändras med flera repliker och hur den har testats:
+
+| Funktion | Tjänster i podden | Utöver ConfigMap och Secret |
+| --- | --- | --- |
+| [Autentisering](/sv/on-premises/configuration/kubernetes/authentication): [OIDC](/sv/on-premises/configuration/kubernetes/authentication/oidc-authentication), [SAML](/sv/on-premises/configuration/kubernetes/authentication/saml-authentication), [LDAP](/sv/on-premises/configuration/kubernetes/authentication/ldap-authentication), [Offentlig åtkomst](/sv/on-premises/configuration/kubernetes/authentication/public-access), [reCAPTCHA](/sv/on-premises/configuration/kubernetes/authentication/recaptcha), [Lösenordsbegränsningar](/sv/on-premises/configuration/kubernetes/authentication/password-restrictions) | web | klienthemligheter, IdP-certifikatet, LDAP-CA:n |
+| [Sandlådekompilering](/sv/on-premises/configuration/kubernetes/sandboxed-compiles) | clsi | Docker Engine och TeX Live-avbildningarna på varje nod |
+| [Import och export med Pandoc](/sv/on-premises/configuration/kubernetes/pandoc-import-and-export) | clsi, web | Pandoc-avbildningen i Docker på varje nod |
+| [Git-integration](/sv/on-premises/configuration/kubernetes/integrations/git-integration) | git-bridge (egen pod), web, history-v1 | StatefulSet för git-bridge och två Services |
+| Synkronisering med [GitHub](/sv/on-premises/configuration/kubernetes/integrations/github-synchronisation), [GitLab](/sv/on-premises/configuration/kubernetes/integrations/gitlab-synchronisation), [Gitea](/sv/on-premises/configuration/kubernetes/integrations/gitea-synchronisation) | web | Git-integration |
+| [Dropbox-synkronisering](/sv/on-premises/configuration/kubernetes/integrations/dropbox-synchronisation) | web, third-party-datastore, document-updater | Git-integration, webhooken nåbar från internet, databasindex |
+| Integration med [Zotero](/sv/on-premises/configuration/kubernetes/integrations/zotero-integration), [Mendeley](/sv/on-premises/configuration/kubernetes/integrations/mendeley-integration) | web | chifferlösenordet i Secret |
+| [MCP-server](/sv/on-premises/configuration/kubernetes/integrations/mcp-server) | web | Git-integration |
+| [AI-integration](/sv/on-premises/configuration/kubernetes/integrations/ai-integration) | web, linked-url-proxy | – |
+| [Overleaf Import API](/sv/on-premises/configuration/kubernetes/integrations/overleaf-import-api) | web, linked-url-proxy | – |
+| [Mallar](/sv/on-premises/configuration/kubernetes/templates) | web, filestore | S3 för flera repliker |
+| [Extern URL](/sv/on-premises/configuration/kubernetes/external-url) | linked-url-proxy | offentliga nodadresser i `OVERLEAF_LINKED_URL_BLOCKED_NETWORKS` |
+| [Loggning](/sv/on-premises/configuration/kubernetes/logging) | alla tjänster | en volym på `/var/log/overleaf` för att behålla loggar |
+| [TLS-proxy](/sv/on-premises/configuration/kubernetes/tls-proxy) | din ingress eller lastbalanserare | TLS avslutas framför poddarna |
+| [Varumärkesanpassning](/sv/on-premises/configuration/kubernetes/branding) | web | – |
+| [Lokalisering](/sv/on-premises/configuration/kubernetes/localization) | web | ett värdnamn per språk |
+| [E-postleverans](/sv/on-premises/configuration/kubernetes/email-delivery) | web | – |
+| [Redis](/sv/on-premises/configuration/kubernetes/redis) | alla tjänster med aktivt tillstånd | – |
+| [S3](/sv/on-premises/configuration/kubernetes/s3) | history-v1, filestore | en S3-tjänst, krävs för flera repliker |
+| [Lägga till LaTeX-hjälp för användare](/sv/on-premises/configuration/kubernetes/adding-latex-user-help) | web | poddarna måste nå wikin |
+| [Horisontell skalning](/sv/on-premises/configuration/kubernetes/horizontal-scaling) | alla | S3, en lastbalanserare med sticky sessions |
+
+### Certifikat och andra filer
+
+Vissa funktioner tar en filsökväg i stället för ett värde: SAML-certifikaten (`OVERLEAF_SAML_IDP_CERT`, ...), LDAP-CA:n (`OVERLEAF_LDAP_TLS_OPTS_CA_PATH`) eller en privat CA för en egenhostad GitHub Enterprise, GitLab eller Gitea (`NODE_EXTRA_CA_CERTS`). Lägg filerna i en Secret och montera den där Toolkit-sidorna förväntar sig dem, `/var/lib/overleaf/certs`:
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem --from-file=ca.pem
+```
+
+```yaml title="40-overleaf.yaml (additions)"
+          volumeMounts:
+            # ...
+            - name: certs
+              mountPath: /var/lib/overleaf/certs
+              readOnly: true
+      volumes:
+        # ...
+        - name: certs
+          secret:
+            secretName: overleaf-certs
+```
+
+Hänvisa sedan till dem via sökväg i ConfigMap, till exempel `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`, och starta om.
+
+<Warning>
+
+<strong>Chifferlösenord.</strong> Ange varje `*_CIPHER_PASSWORD` för de funktioner du använder i Secret. Annars genererar vissa funktioner en nyckelfil på datavolymen vid första användningen: med en replik fungerar det tills volymen går förlorad, med flera repliker skulle varje replik kryptera med en annan nyckel.
+
+</Warning>
+
+### Frågor och svar
+
+<Accordion title="Vilka Toolkit-inställningar från `config/overleaf.rc` behöver jag?">
+
+<strong>Svar:</strong> Ingen av dem läses av Ayakaleaf Pro. Deras motsvarigheter i Kubernetes:
+
+| `config/overleaf.rc`                         | Kubernetes                                                        |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `OVERLEAF_LISTEN_IP`, `OVERLEAF_PORT`        | Service (NodePort) eller din ingress                              |
+| `SIBLING_CONTAINERS_ENABLED`                 | `SANDBOXED_COMPILES*` i ConfigMap, Docker-socketen i podden       |
+| `GIT_BRIDGE_ENABLED`                         | [Git-integration](/sv/on-premises/configuration/kubernetes/integrations/git-integration)                             |
+| `MONGO_ENABLED`, `REDIS_ENABLED`, `MONGO_URL`, `REDIS_HOST` | StatefulSets eller dina hanterade tjänster, `OVERLEAF_MONGO_URL` och `OVERLEAF_REDIS_HOST` |
+| `REDIS_AOF_PERSISTENCE`                      | `--appendonly yes` i `20-redis.yaml`                              |
+| `NGINX_ENABLED`, `TLS_*`                     | din ingress eller lastbalanserare                                 |
+
+</Accordion>

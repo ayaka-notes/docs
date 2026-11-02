@@ -1,0 +1,67 @@
+---
+title: Synchronizace s GitLabem
+description: Umožněte uživatelům synchronizovat jejich projekty s repozitáři na GitLab.com nebo na vlastním GitLabu v nasazení na Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+Synchronizace s GitLabem běží ve službě **web** (modul `gitlab-sync`) každého podu Ayakaleaf Pro. Vyžaduje [integraci s Gitem](/cs/on-premises/configuration/kubernetes/integrations/git-integration). Vytvořte OAuth aplikaci a přečtěte si, co jednotlivá nastavení dělají, v části [Synchronizace s GitLabem](/cs/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); tato stránka to přenáší do Kubernetes.
+
+| | |
+| --- | --- |
+| Služba | web (modul `gitlab-sync`) v každém podu Ayakaleaf Pro; načítá se při startu webu |
+| Pod → GitLab | REST API z `GITLAB_SYNC_URL` (výchozí `https://gitlab.com/api/v4`), kdykoli uživatel propojuje, importuje, exportuje nebo synchronizuje |
+| Prohlížeč → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` pro propojení účtu, poté zpět na `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | žádné: žádný webhook, instance nemusí být z GitLabu dostupná |
+| Uložená data | přístupové a obnovovací tokeny uživatele ke GitLabu, šifrované, v MongoDB |
+| Periodické úlohy | žádné: synchronizace proběhne, když uživatel klikne |
+
+### Konfigurace
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` a StatefulSet git-bridge z [integrace s Gitem](/cs/on-premises/configuration/kubernetes/integrations/git-integration) musí být nasazeny: bez nich nastavení účtu i editor synchronizaci s GitLabem skryjí.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` šifruje přístupové a obnovovací tokeny uživatelů ke GitLabu v MongoDB. Všechny repliky musí používat stejnou hodnotu a její pozdější změna donutí všechny uživatele propojit GitLab znovu.
+</Step>
+
+<Step title="Soukromá CA (volitelné)">
+Pokud má váš GitLab certifikát od vaší vlastní CA, přidejte CA do Secretu `overleaf-certs` připojeného do `/var/lib/overleaf/certs` (viz [Certifikáty a další soubory](/cs/on-premises/configuration/kubernetes#certificates-and-other-files)) a v ConfigMapu nastavte `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`.
+</Step>
+
+<Step title="Použití, restart a kontrola">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Jakýkoli stavový kód HTTP znamená, že GitLab je z daného podu dostupný; `000` znamená, že není.
+</Step>
+</Steps>
+
+### Více replik
+
+Kromě sdíleného `GITLAB_TOKEN_CIPHER_PASSWORD` nic dalšího. Synchronizace si v Redisu vezme zámek sdílený s ostatními synchronizacemi Gitu, takže dvě repliky nikdy nesynchronizují stejný projekt současně. Obnovení tokenu uživatele ke GitLabu si rovněž bere zámek v Redisu, takže jej dvě repliky neobnovují ve stejnou chvíli.
+
+### Testováno na Kubernetes
+
+Proti napodobenině vlastního GitLabu na `GITLAB_SYNC_URL` (důvěryhodné díky `NODE_EXTRA_CA_CERTS` z `overleaf-certs`), na Kubernetes 1.37 s jednou replikou a zapnutou integrací s Gitem, procházejí naše end-to-end testy synchronizace s GitLabem (40 případů): propojení a zrušení propojení účtu, obnovení přístupového tokenu, jehož platnost vyprší, a odvolané tokeny, export do nového soukromého nebo skupinového projektu, import repozitáře, pull a push, merge, konflikty, smazané větve a větve po force pushi, binární soubory, přejmenování a mazání a co mohou dělat vlastníci, editoři a čtenáři.

@@ -1,0 +1,56 @@
+---
+title: Mendeley Entegrasyonu
+description: Kubernetes dağıtımında kullanıcıların Mendeley kitaplıklarından bir .bib dosyası içe aktarmasını sağlayın.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Mendeley içe aktarma, her Ayakaleaf Pro pod'unun **web** hizmetinde (`tpr-webmodule` modülü) çalışır. Mendeley uygulamasını [Mendeley Entegrasyonu](/tr/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration) sayfasında anlatıldığı gibi `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback` yönlendirme URL'si ile kaydedin, ardından Kubernetes'i aşağıdaki gibi yapılandırın.
+
+| | |
+| --- | --- |
+| Hizmet | web, her Ayakaleaf Pro pod'unda; web başlarken okunur |
+| Pod → Mendeley | Bir kullanıcı Mendeley'i bağladığında ya da bir dosyayı içe aktardığında veya yenilediğinde `https://api.mendeley.com` (OAuth token'ı ve API) |
+| Tarayıcı → Mendeley | `https://api.mendeley.com/oauth/authorize`, ardından yönlendirme URL'sine geri dönüş |
+| Mendeley → Overleaf | yok: örneğin internetten erişilebilir olması gerekmez |
+| Depolanan veriler | kullanıcının Mendeley token'ları, şifrelenmiş olarak MongoDB'de |
+| Periyodik işler | yok: bir dosya yalnızca kullanıcı istediğinde yenilenir |
+
+### Yapılandırma
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+Uygulama kimliğini tırnak içine alın: bu bir sayıdır ve ConfigMap yalnızca dize tutar. `ENABLED_LINKED_FILE_TYPES`, kurulumdaki değerin yerine geçer; mevcut türleri koruyun ve `mendeley` ekleyin (ikisini birlikte kullanıyorsanız `zotero` da ekleyin).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD`, kullanıcıların Mendeley token'larını MongoDB'de şifreler. Bu değer olmadan her pod, kendi `/var/lib/overleaf/data` dizininde bir anahtar dosyası oluşturur. [Birden fazla replika](/tr/on-premises/configuration/kubernetes/horizontal-scaling) ile bu durumda her düğümün farklı bir anahtarı olur ve başka bir replika tarafından hizmet verilen kullanıcı bağlı Mendeley hesabını kullanamaz. Bunu ilk kullanıcı Mendeley'i bağlamadan önce ayarlayın: daha sonra değiştirmek her kullanıcının Mendeley'i yeniden bağlamasını gerektirir.
+</Step>
+
+<Step title="Uygulayın ve yeniden başlatın">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+Secret'ta `MENDELEY_CIPHER_PASSWORD` değerini ayarlayın, yukarıya bakın. Mendeley token'ları, Zotero anahtarlarıyla aynı kod tarafından şifrelenir: parola olmadan, bir replikada içe aktarılan dosya başka bir replikada yenilenemez; bunu [Zotero](/tr/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas) ile gördük. OAuth `state` değeri Redis'teki oturumda tutulur; böylece geri çağırma herhangi bir replikaya ulaşabilir.
+
+### Kubernetes üzerinde test edildi
+
+api.mendeley.com'un bir taklidine karşı (`overleaf-certs` içinden `NODE_EXTRA_CA_CERTS` aracılığıyla güvenilen), HAProxy arkasında üç replikalı Kubernetes 1.37 üzerinde, Mendeley için uçtan uca testlerimiz başarılı oldu (18 vaka): OAuth 2.0 ile bağlama ve bağlantıyı kaldırma, kitaplığı ve grupları bir `.bib` dosyasına içe aktarma, dosyayı yenileme, süresi dolmak üzere olan bir erişim token'ını yenileme, iptal edilmiş token'lar, yeniden bağlanma isteği, kaynakçaların ortak çalışanlar için aranabilir olması, yalnızca içe aktaranın yenileyebilmesi, API hataları ve Mendeley'e yavaş bağlantılar.

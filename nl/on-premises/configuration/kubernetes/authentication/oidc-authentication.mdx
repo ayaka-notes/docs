@@ -1,0 +1,129 @@
+---
+title: OIDC-authenticatie
+description: Laat gebruikers inloggen via een OpenID Connect-provider op een Kubernetes-implementatie.
+icon: id-card-clip
+---
+
+OIDC-login wordt afgehandeld door de **web**-service (de module `authentication`) in elke Ayakaleaf Pro-pod. Er is geen achtergrondtaak en geen aparte pod. De providerkant (client, redirect-URI's, admin-claim) is hetzelfde als bij de Toolkit, dus richt eerst je OpenID Provider (OP) in met [OIDC-authenticatie](/nl/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication) en zet de waarden daarna in Kubernetes zoals hieronder.
+
+### Waar wat draait
+
+| | |
+| --- | --- |
+| Service | web, in elke Ayakaleaf Pro-pod; instellingen worden gelezen wanneer web start |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` en `OVERLEAF_OIDC_USER_INFO_URL`, bij elke login |
+| Browser → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`, en `OVERLEAF_OIDC_LOGOUT_URL` bij uitloggen |
+| OP → Overleaf | geen: de OP stuurt de browser alleen terug |
+| Inlogstatus | de sessie in Redis, gedeeld door alle replica's |
+| Periodieke taken | geen |
+
+### Configuratie
+
+<Steps>
+<Step title="Registreer Overleaf bij de OP">
+Sta deze adressen toe in je OP, opgebouwd uit `OVERLEAF_SITE_URL`:
+
+| Doel | URI |
+| --- | --- |
+| Redirect-URI (login) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| Post-logout-redirect-URI | `${OVERLEAF_SITE_URL}` |
+| Post-logout-redirect-URI, na het koppelen van een bestaand account | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Zoek de vijf URL's op in het discovery-document van de OP zoals beschreven in [De waarden vinden met het discovery-document](/nl/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document).
+</Step>
+
+<Step title="Voeg de instellingen toe aan de ConfigMap">
+Voeg toe aan `overleaf-env` (`30-config.yaml`, of `60-config.yaml` voor [meerdere replica's](/nl/on-premises/configuration/kubernetes/horizontal-scaling)):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` accepteert een door spaties gescheiden lijst, bijvoorbeeld `ldap oidc`. Zie [Omgevingsvariabelen](/nl/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables) voor elke `OVERLEAF_OIDC_*`-instelling; ze gaan allemaal in de ConfigMap, behalve het client secret.
+
+<Warning>
+
+Zet `"true"` en `"false"` tussen aanhalingstekens: een ConfigMap bevat alleen strings. Een sleutel die op `""` is gezet, is niet hetzelfde als een ontbrekende sleutel: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` schakelt het aanmaken van accounts bij de eerste login uit, terwijl het weglaten van de sleutel elk domein toestaat.
+
+</Warning>
+</Step>
+
+<Step title="Zet het client secret in de Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Vertrouw een privé-CA (optioneel)">
+Als het certificaat van de OP afkomstig is van je eigen CA, voeg de CA dan toe aan de Secret `overleaf-certs` die is gemount op `/var/lib/overleaf/certs` (zie [Certificaten en andere bestanden](/nl/on-premises/configuration/kubernetes#certificates-and-other-files)) en laat Node.js ernaar verwijzen:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Toepassen en herstarten">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Controleer daarna of elke pod het token-endpoint bereikt. De pods roepen het aan, niet de browser, dus een firewall- of DNS-probleem wordt alleen hier zichtbaar:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Elke HTTP-status (`405` voor een GET) betekent dat het endpoint bereikbaar is; `000` betekent dat het niet bereikbaar is.
+</Step>
+</Steps>
+
+### Meerdere replica's
+
+Niets extra's. De `state`-waarde van een login en het ID-token dat voor uitloggen wordt gebruikt, worden bewaard in de sessie, die in Redis staat, zodat de callback werkt op welke replica hem ook ontvangt.
+
+### Getest op Kubernetes
+
+Met goauthentik als OP, op Kubernetes 1.37 met drie replica's achter HAProxy, slagen onze end-to-endtests voor OIDC (35 gevallen): inloggen, en uitloggen via de OP; de beheerderstoewijzing per groep, per e-mail en per enkele waarde, en zonder toewijzing; naam en beheerdersvlag bijgewerkt bij elke login; accounts koppelen en ontkoppelen; wachtwoordherstel en wachtwoordwijzigingen van OIDC-accounts; geschorste accounts; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; en OIDC in combinatie met openbare toegang.
+
+### Vragen en antwoorden
+
+<Accordion title="Inloggen mislukt met „Unable to verify authorization request state”">
+
+<strong>Antwoord:</strong> De browser heeft de sessiecookie niet teruggestuurd met de callback. Op Kubernetes zijn de gebruikelijke oorzaken:
+
+* `OVERLEAF_SECURE_COOKIE` is ingesteld, maar gebruikers openen de site via gewone HTTP, zodat de browser de cookie nooit opslaat. Elke waarde van `OVERLEAF_SECURE_COOKIE`, zelfs `"false"`, schakelt beveiligde cookies in; verwijder in plaats daarvan de sleutel.
+* De site wordt geopend onder een ander adres dan `OVERLEAF_SITE_URL`.
+* Achter HTTPS stuurt je ingress of load balancer geen `X-Forwarded-Proto: https`, of ontbreekt het adres ervan in `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="Waar zie ik waarom een login is mislukt?">
+
+<strong>Antwoord:</strong> In het web-log van de pod die het verzoek heeft afgehandeld, niet in `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Controleer bij meerdere replica's elke `overleaf-N`.
+
+</Accordion>

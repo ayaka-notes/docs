@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Підключіть розгортання на Kubernetes до Redis із паролем і зберігайте дані Redis за допомогою AOF-персистентності.
+icon: memory
+---
+
+Кожна служба Ayakaleaf Pro, яка зберігає оперативний стан, використовує один сервер Redis: web (сесії, обмеження частоти), real-time, document-updater (правки, ще не збережені в MongoDB), project-history (черга історії) і third-party-datastore (черга Dropbox). Інсталяція запускає його як StatefulSet `redis` з розділу [3. Розгортання MongoDB і Redis](/uk/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis); про Toolkit див. [Redis](/uk/on-premises/configuration/overleaf-toolkit/redis).
+
+| | |
+| --- | --- |
+| Служби | web, real-time, document-updater, project-history, history-v1, third-party-datastore у кожному поді Ayakaleaf Pro |
+| Налаштування | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (за замовчуванням `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| Не підтримується | Redis Sentinel і Redis Cluster: лише один сервер |
+
+### Автентифікація за паролем
+
+<Steps>
+<Step title="Збережіть пароль">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Запустіть Redis із ним">
+У `20-redis.yaml` передайте контейнеру пароль і передайте його `redis-server`:
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes замінює `$(REDIS_PASS)` значенням із Secret. Перевірка готовності (`tcpSocket`) змін не потребує.
+</Step>
+
+<Step title="Застосування та перезапуск">
+Спершу зупиніть Ayakaleaf Pro, щоб жодна правка не загубилася між двома перезапусками:
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Для керованого Redis задайте в ConfigMap його адресу в `OVERLEAF_REDIS_HOST` (і `REDIS_HOST`), пароль, як описано вище, і `OVERLEAF_REDIS_TLS: "true"`, якщо він вимагає TLS.
+
+### AOF-персистентність
+
+Інсталяція вже запускає Redis з `--appendonly yes` — відповідником `REDIS_AOF_PERSISTENCE=true` з Toolkit — і зберігає його дані на томі `data-redis-0`. Щоб перевести наявний Redis без AOF, виконайте кроки зі [сторінки Toolkit](/uk/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence), використовуючи `kubectl -n overleaf exec -it redis-0 -- redis-cli` замість `docker exec`, а потім додайте `--appendonly yes` до аргументів.
+
+### Кілька реплік
+
+Усі репліки мають використовувати той самий Redis: у ньому зберігаються сесії, правки, яких ще немає в MongoDB, і блокування, що не дають двом реплікам обробляти той самий проєкт одночасно.
+
+### Перевірено на Kubernetes
+
+На Kubernetes 1.37 з однією реплікою Redis, запущений із `--requirepass $(REDIS_PASS)` із Secret `redis-auth`, як описано вище, відхиляв `redis-cli` без пароля (`NOAUTH`), а з `OVERLEAF_REDIS_PASS` і `REDIS_PASSWORD` в `overleaf-secrets` наші наскрізні тести проходили для launchpad (13 випадків) і для редагування з відстеженням змін, коментарями та анонімним спільним доступом (22 випадки), які проходять через web, real-time, document-updater і project-history; жодна служба не записала в журнал помилку автентифікації Redis. Усі інші тести Kubernetes на цих сторінках виконувалися з Redis StatefulSet з інсталяції, з AOF-персистентністю та без пароля.

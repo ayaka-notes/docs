@@ -1,0 +1,67 @@
+---
+title: E-postleverans
+description: Skicka aktiverings-, inbjudnings- och lösenordsåterställningsmejl från en Kubernetes-driftsättning.
+icon: paper-plane-top
+---
+
+Tjänsten **web** skickar alla mejl (aktivering, projektinbjudningar, lösenordsåterställning) från varje Ayakaleaf Pro-pod. Inställningarna är desamma som i Toolkit, se [E-postleverans](/sv/on-premises/configuration/overleaf-toolkit/email-delivery).
+
+| | |
+| --- | --- |
+| Tjänst | web, i varje Ayakaleaf Pro-pod; läses när web startar |
+| Pod → utsidan | din SMTP-server (`OVERLEAF_EMAIL_SMTP_HOST`), eller Amazon SES-API:et i `OVERLEAF_EMAIL_AWS_SES_REGION` |
+| Tillstånd | hastighetsbegränsningen för utskick i Redis |
+| Periodiska jobb | inga |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_EMAIL_FROM_ADDRESS: no-reply@example.com
+  OVERLEAF_EMAIL_SMTP_HOST: smtp.example.com
+  OVERLEAF_EMAIL_SMTP_PORT: "587"
+  OVERLEAF_EMAIL_SMTP_SECURE: "false"
+  OVERLEAF_EMAIL_SMTP_USER: no-reply@example.com
+  # optional
+  # OVERLEAF_EMAIL_REPLY_TO: support@example.com
+  # OVERLEAF_EMAIL_SMTP_IGNORE_TLS: "false"
+  # OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH: "true"
+```
+
+`OVERLEAF_EMAIL_FROM_ADDRESS` aktiverar utskick. Ange den bara tillsammans med SMTP-servern (eller SES): med enbart avsändaren försöker Ayakaleaf Pro använda en SMTP-server inne i podden, och varje mejl misslyckas. Utan den skickas inga mejl, de skrivs bara till `web.log`.
+
+`OVERLEAF_EMAIL_SMTP_SECURE`, `OVERLEAF_EMAIL_SMTP_IGNORE_TLS` och `OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH` läses som JSON, så använd `"true"` eller `"false"`: ett värde som `yes` stoppar alla tjänster i podden vid start.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_EMAIL_SMTP_PASS":"<SMTP password>"}}'
+```
+
+För Amazon SES-API:et lägger du i stället `OVERLEAF_EMAIL_AWS_SES_ACCESS_KEY_ID` och `OVERLEAF_EMAIL_AWS_SES_SECRET_KEY` här, och `OVERLEAF_EMAIL_DRIVER: ses` och `OVERLEAF_EMAIL_AWS_SES_REGION` i ConfigMap.
+</Step>
+
+<Step title="Tillämpa, starta om och testa">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Skicka ett mejl för lösenordsåterställning till dig själv från inloggningssidan. Om det inte kommer fram kontrollerar du att SMTP-servern går att nå från poddarna och tittar i web-loggen:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- bash -c 'echo > /dev/tcp/smtp.example.com/587 && echo reachable'
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "email|smtp" /var/log/overleaf/web.log | tail
+```
+</Step>
+</Steps>
+
+### Flera repliker
+
+Inget extra. Varje replik skickar med samma inställningar, och hastighetsbegränsningen för utskick räknas i Redis över alla repliker. Om din SMTP-server bara accepterar kända avsändare tillåter du de adresser som poddarna lämnar klustret med (vanligtvis nodernas).
+
+### Testat på Kubernetes
+
+Med Mailpit som SMTP-server, på Kubernetes 1.37 med en replik, klarar våra end-to-end-tester som skickar mejl sig: aktiveringsmejlet för ett konto som en administratör skapar, aktiveringsmejlet för en självregistrering begränsad till domäner, mejlet för lösenordsåterställning, mejlet som meddelar en användare att kontot har raderats, samt vad som händer när SMTP-servern nekar ett aktiverings- eller raderingsmejl: kontot skapas eller raderas ändå, och aktiveringsmejlet kan skickas igen senare. Med `OVERLEAF_EMAIL_FROM_ADDRESS` och ingen SMTP-värd misslyckades en begäran om lösenordsåterställning med ett fel, och `web.log` visade ”error sending message”, som beskrivs ovan.

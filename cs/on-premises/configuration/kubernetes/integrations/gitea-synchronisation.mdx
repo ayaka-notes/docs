@@ -1,0 +1,67 @@
+---
+title: Synchronizace s Gitea
+description: Umožněte uživatelům v nasazení na Kubernetes synchronizovat projekty s repozitáři na Gitea.com nebo ve vaší vlastní Gitea.
+icon: mug-hot
+---
+
+Synchronizace s Gitea běží ve službě **web** (modul `gitea-sync`) každého podu Ayakaleaf Pro. Vyžaduje [integraci s Gitem](/cs/on-premises/configuration/kubernetes/integrations/git-integration). Aplikaci OAuth vytvořte a co jednotlivá nastavení dělají, si přečtěte na stránce [Synchronizace s Gitea](/cs/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); tato stránka popisuje, jak to vložit do Kubernetes.
+
+| | |
+| --- | --- |
+| Služba | web (modul `gitea-sync`), v každém podu Ayakaleaf Pro; načítá se při spuštění služby web |
+| Pod → Gitea | REST API na `GITEA_SYNC_URL` (výchozí `https://gitea.com/api/v1`), kdykoli uživatel propojuje, importuje, exportuje nebo synchronizuje |
+| Prohlížeč → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` pro propojení účtu, poté zpět na `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | nic: žádný webhook, instance nemusí být z Gitea dostupná |
+| Uložená data | přístupové a obnovovací tokeny Gitea uživatele, šifrované, v MongoDB |
+| Periodické úlohy | žádné: synchronizace proběhne, když uživatel klikne |
+
+### Konfigurace
+
+<Steps>
+<Step title="ConfigMapa">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+Musí být nastaveno `GIT_BRIDGE_ENABLED: "true"` a StatefulSet git-bridge ze stránky [Integrace s Gitem](/cs/on-premises/configuration/kubernetes/integrations/git-integration): bez nich nastavení účtu i editor synchronizaci s Gitea skryjí.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` šifruje přístupové a obnovovací tokeny Gitea uživatelů v MongoDB. Všechny repliky musí používat stejnou hodnotu a její pozdější změna přiměje všechny uživatele propojit Gitea znovu.
+</Step>
+
+<Step title="Soukromá CA (volitelné)">
+Pokud má vaše Gitea certifikát od vaší vlastní CA, přidejte CA do Secretu `overleaf-certs` připojeného do `/var/lib/overleaf/certs` (viz [Certifikáty a další soubory](/cs/on-premises/configuration/kubernetes#certificates-and-other-files)) a v ConfigMapě nastavte `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`.
+</Step>
+
+<Step title="Aplikujte, restartujte a ověřte">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Jakýkoli stavový kód HTTP znamená, že Gitea je z daného podu dostupná; `000` znamená, že dostupná není.
+</Step>
+</Steps>
+
+### Více replik
+
+Kromě sdíleného `GITEA_TOKEN_CIPHER_PASSWORD` není potřeba nic dalšího. Synchronizace získá zámek v Redisu, sdílený s ostatními synchronizacemi Gitu, takže dvě repliky nikdy nesynchronizují stejný projekt současně.
+
+### Otestováno na Kubernetes
+
+Proti skutečné Gitea 1.23 na `GITEA_SYNC_URL`, na Kubernetes 1.37 s jednou replikou a zapnutou integrací s Gitem, procházejí naše end-to-end testy pro synchronizaci s Gitea (39 případů): propojení a odpojení účtu přes OAuth2 Gitea, obnovení přístupového tokenu s omezenou platností a odvolaná oprávnění, export do nového soukromého repozitáře nebo repozitáře organizace, import repozitáře, pull a push, merge, konflikty, smazané a force-pushnuté větve, binární soubory, přejmenování a mazání a to, co smějí dělat vlastníci, editoři a čtenáři.

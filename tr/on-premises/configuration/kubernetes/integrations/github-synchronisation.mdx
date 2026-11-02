@@ -1,0 +1,67 @@
+---
+title: GitHub Senkronizasyonu
+description: Kubernetes dağıtımında kullanıcıların projelerini GitHub veya GitHub Enterprise depolarıyla senkronize etmesini sağlayın.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub Senkronizasyonu, her Ayakaleaf Pro pod'unun **web** hizmetinde (`github-sync` modülü) çalışır. [Git entegrasyonu](/tr/on-premises/configuration/kubernetes/integrations/git-integration) gerektirir. OAuth uygulamasını oluşturmak ve her ayarın ne işe yaradığını öğrenmek için [GitHub Senkronizasyonu](/tr/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation) sayfasına bakın; bu sayfa bunu Kubernetes'e uygular.
+
+| | |
+| --- | --- |
+| Hizmet | web (`github-sync` modülü), her Ayakaleaf Pro pod'unda; web başlarken okunur |
+| Pod → GitHub | Bir kullanıcı hesap bağladığında, içe aktardığında, dışa aktardığında veya senkronize ettiğinde `https://api.github.com` (REST ve GraphQL) ya da `GITHUB_SYNC_URL` API'si |
+| Tarayıcı → GitHub | Hesap bağlamak için `https://github.com/login/oauth/authorize`, ardından `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` adresine geri dönüş |
+| GitHub → Overleaf | yok: webhook yoktur, örneğin GitHub'dan erişilebilir olması gerekmez |
+| Depolanan veriler | kullanıcının GitHub erişim token'ları, şifrelenmiş olarak MongoDB'de |
+| Periyodik işler | yok: senkronizasyon kullanıcı tıkladığında gerçekleşir |
+
+### Yapılandırma
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` ve [Git entegrasyonu](/tr/on-premises/configuration/kubernetes/integrations/git-integration) sayfasındaki git-bridge StatefulSet'i mevcut olmalıdır: bunlar olmadan hesap ayarları ve düzenleyici GitHub Senkronizasyonunu gizler.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD`, kullanıcıların GitHub erişim token'larını MongoDB'de şifreler. Her replika aynı değeri kullanmalıdır; bu değeri daha sonra değiştirmek, her kullanıcının GitHub'ı yeniden bağlamasını gerektirir.
+</Step>
+
+<Step title="Özel CA (isteğe bağlı)">
+GitHub'ınız kendi CA'nızdan alınmış bir sertifika kullanıyorsa, CA'yı `/var/lib/overleaf/certs` konumuna bağlanan `overleaf-certs` Secret'ına ekleyin (bkz. [Sertifikalar ve diğer dosyalar](/tr/on-premises/configuration/kubernetes#sertifikalar-ve-diğer-dosyalar)) ve ConfigMap'te `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` değerini ayarlayın.
+</Step>
+
+<Step title="Uygulayın, yeniden başlatın ve kontrol edin">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Herhangi bir HTTP durum kodu, GitHub'a o pod'dan erişilebildiği anlamına gelir; `000` erişilemediği anlamına gelir.
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+Paylaşılan `GITHUB_TOKEN_CIPHER_PASSWORD` dışında ek bir şey gerekmez. Bir senkronizasyon, diğer Git senkronizasyonlarıyla paylaşılan bir Redis kilidi alır; böylece iki replika hiçbir zaman aynı projeyi aynı anda senkronize etmez.
+
+### Kubernetes üzerinde test edildi
+
+github.com ve REST ile GraphQL API'lerinin bir taklidine karşı (`overleaf-certs` içinden `NODE_EXTRA_CA_CERTS` aracılığıyla güvenilen), tek replikalı ve Git entegrasyonu açık Kubernetes 1.37 üzerinde, GitHub Senkronizasyonu için uçtan uca testlerimiz başarılı oldu (31 vaka): hesabı bağlama ve bağlantısını kaldırma, iptal edilmiş token'lar, bir projeyi yeni bir özel veya organizasyon deposuna dışa aktarma, bir depoyu içe aktarma (yükleme sınırını aşan durumda da), çekme ve gönderme, birleştirmeler, çakışmalar ve elle birleştirmeler, silinmiş ve zorla gönderilmiş dallar, ikili dosyalar, yeniden adlandırmalar ve silmeler, gönderme erişiminin kaybedilmesi ve sahiplerin, düzenleyicilerin ve görüntüleyicilerin neler yapabileceği.

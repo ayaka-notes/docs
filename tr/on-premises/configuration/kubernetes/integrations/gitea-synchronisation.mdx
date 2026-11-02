@@ -1,0 +1,67 @@
+---
+title: Gitea Senkronizasyonu
+description: Kubernetes dağıtımında kullanıcıların projelerini Gitea.com'daki veya kendi Gitea'nızdaki depolarla senkronize etmesini sağlayın.
+icon: mug-hot
+---
+
+Gitea Senkronizasyonu, her Ayakaleaf Pro pod'unun **web** hizmetinde (`gitea-sync` modülü) çalışır. [Git entegrasyonu](/tr/on-premises/configuration/kubernetes/integrations/git-integration) gerektirir. OAuth uygulamasını oluşturmak ve her ayarın ne işe yaradığını öğrenmek için [Gitea Senkronizasyonu](/tr/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation) sayfasına bakın; bu sayfa bunu Kubernetes'e uygular.
+
+| | |
+| --- | --- |
+| Hizmet | web (`gitea-sync` modülü), her Ayakaleaf Pro pod'unda; web başlarken okunur |
+| Pod → Gitea | Bir kullanıcı hesap bağladığında, içe aktardığında, dışa aktardığında veya senkronize ettiğinde `GITEA_SYNC_URL` (varsayılan `https://gitea.com/api/v1`) REST API'si |
+| Tarayıcı → Gitea | Hesap bağlamak için `${GITEA_SYNC_URL}/login/oauth/authorize`, ardından `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` adresine geri dönüş |
+| Gitea → Overleaf | yok: webhook yoktur, örneğin Gitea'dan erişilebilir olması gerekmez |
+| Depolanan veriler | kullanıcının Gitea erişim ve yenileme token'ları, şifrelenmiş olarak MongoDB'de |
+| Periyodik işler | yok: senkronizasyon kullanıcı tıkladığında gerçekleşir |
+
+### Yapılandırma
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` ve [Git entegrasyonu](/tr/on-premises/configuration/kubernetes/integrations/git-integration) sayfasındaki git-bridge StatefulSet'i mevcut olmalıdır: bunlar olmadan hesap ayarları ve düzenleyici Gitea Senkronizasyonunu gizler.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD`, kullanıcıların Gitea erişim ve yenileme token'larını MongoDB'de şifreler. Her replika aynı değeri kullanmalıdır; bu değeri daha sonra değiştirmek, her kullanıcının Gitea'yı yeniden bağlamasını gerektirir.
+</Step>
+
+<Step title="Özel CA (isteğe bağlı)">
+Gitea'nız kendi CA'nızdan alınmış bir sertifika kullanıyorsa, CA'yı `/var/lib/overleaf/certs` konumuna bağlanan `overleaf-certs` Secret'ına ekleyin (bkz. [Sertifikalar ve diğer dosyalar](/tr/on-premises/configuration/kubernetes#sertifikalar-ve-diğer-dosyalar)) ve ConfigMap'te `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` değerini ayarlayın.
+</Step>
+
+<Step title="Uygulayın, yeniden başlatın ve kontrol edin">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Herhangi bir HTTP durum kodu, Gitea'ya o pod'dan erişilebildiği anlamına gelir; `000` erişilemediği anlamına gelir.
+</Step>
+</Steps>
+
+### Birden fazla replika
+
+Paylaşılan `GITEA_TOKEN_CIPHER_PASSWORD` dışında ek bir şey gerekmez. Bir senkronizasyon, diğer Git senkronizasyonlarıyla paylaşılan bir Redis kilidi alır; böylece iki replika hiçbir zaman aynı projeyi aynı anda senkronize etmez.
+
+### Kubernetes üzerinde test edildi
+
+`GITEA_SYNC_URL` adresindeki gerçek bir Gitea 1.23'e karşı, tek replikalı ve Git entegrasyonu açık Kubernetes 1.37 üzerinde, Gitea Senkronizasyonu için uçtan uca testlerimiz başarılı oldu (39 vaka): Gitea'nın OAuth2'si üzerinden hesabı bağlama ve bağlantısını kaldırma, süresi dolan erişim token'ını yenileme ve iptal edilmiş yetkiler, yeni bir özel veya organizasyon deposuna dışa aktarma, bir depoyu içe aktarma, çekme ve gönderme, birleştirmeler, çakışmalar, silinmiş ve zorla gönderilmiş dallar, ikili dosyalar, yeniden adlandırmalar ve silmeler ve sahiplerin, düzenleyicilerin ve görüntüleyicilerin neler yapabileceği.

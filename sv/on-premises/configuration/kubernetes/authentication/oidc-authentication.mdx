@@ -1,0 +1,129 @@
+---
+title: OIDC-autentisering
+description: Låt användare logga in via en OpenID Connect-leverantör i en Kubernetes-driftsättning.
+icon: id-card-clip
+---
+
+OIDC-inloggning hanteras av tjänsten **web** (modulen `authentication`) i varje Ayakaleaf Pro-pod. Den har inget bakgrundsjobb och ingen separat pod. Leverantörssidan (klient, omdirigerings-URI:er, administratörsanspråk) är densamma som i Toolkit, så konfigurera först din OpenID Provider (OP) enligt [OIDC-autentisering](/sv/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication) och lägg sedan in värdena i Kubernetes enligt nedan.
+
+### Var saker körs
+
+| | |
+| --- | --- |
+| Tjänst | web, i varje Ayakaleaf Pro-pod; inställningarna läses när web startar |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` och `OVERLEAF_OIDC_USER_INFO_URL`, vid varje inloggning |
+| Webbläsare → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`, och `OVERLEAF_OIDC_LOGOUT_URL` vid utloggning |
+| OP → Overleaf | inget: OP:n omdirigerar bara webbläsaren tillbaka |
+| Inloggningstillstånd | sessionen i Redis, delad av alla repliker |
+| Periodiska jobb | inga |
+
+### Konfiguration
+
+<Steps>
+<Step title="Registrera Overleaf hos OP:n">
+Tillåt följande adresser i din OP, byggda utifrån `OVERLEAF_SITE_URL`:
+
+| Syfte | URI |
+| --- | --- |
+| Omdirigerings-URI (inloggning) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| Omdirigerings-URI efter utloggning | `${OVERLEAF_SITE_URL}` |
+| Omdirigerings-URI efter utloggning, efter länkning av ett befintligt konto | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Hitta de fem URL:erna i OP:ns discovery-dokument enligt beskrivningen i [Hitta värdena med discovery-dokumentet](/sv/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#hitta-värdena-med-discovery-dokumentet).
+</Step>
+
+<Step title="Lägg till inställningarna i ConfigMap">
+Lägg till i `overleaf-env` (`30-config.yaml`, eller `60-config.yaml` för [flera repliker](/sv/on-premises/configuration/kubernetes/horizontal-scaling)):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` tar en mellanslagsseparerad lista, till exempel `ldap oidc`. Se [Miljövariabler](/sv/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#miljövariabler) för alla `OVERLEAF_OIDC_*`-inställningar; alla läggs i ConfigMap utom klienthemligheten.
+
+<Warning>
+
+Citera `"true"` och `"false"`: en ConfigMap innehåller bara strängar. En nyckel som är satt till `""` är inte samma sak som en saknad nyckel: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` stänger av kontoskapande vid första inloggningen, medan en utelämnad nyckel tillåter alla domäner.
+
+</Warning>
+</Step>
+
+<Step title="Lägg klienthemligheten i Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Lita på en privat CA (valfritt)">
+Om OP:ns certifikat kommer från din egen CA lägger du till CA:n i Secret `overleaf-certs` som är monterad på `/var/lib/overleaf/certs` (se [Certifikat och andra filer](/sv/on-premises/configuration/kubernetes#certifikat-och-andra-filer)) och pekar Node.js på den:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Tillämpa och starta om">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Kontrollera sedan att varje pod når token-slutpunkten. Det är poddarna som anropar den, inte webbläsaren, så ett brandväggs- eller DNS-problem syns bara här:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Vilken HTTP-status som helst (`405` för en GET) betyder att slutpunkten går att nå; `000` betyder att den inte gör det.
+</Step>
+</Steps>
+
+### Flera repliker
+
+Inget extra. Värdet `state` för en inloggning och ID-token som används vid utloggning sparas i sessionen, som finns i Redis, så callback-anropet fungerar på vilken replik som än tar emot det.
+
+### Testat på Kubernetes
+
+Med goauthentik som OP, på Kubernetes 1.37 med tre repliker bakom HAProxy, klarar våra end-to-end-tester för OIDC sig (35 fall): inloggning, och utloggning via OP:n; administratörsmappning via grupp, via e-post och via ett enskilt värde, samt utan mappning; namn och administratörsflagga som uppdateras vid varje inloggning; länkning och avlänkning av konton; lösenordsåterställning och lösenordsändringar för OIDC-konton; avstängda konton; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; samt OIDC tillsammans med offentlig åtkomst.
+
+### Frågor och svar
+
+<Accordion title="Inloggningen misslyckas med ”Unable to verify authorization request state”">
+
+<strong>Svar:</strong> Webbläsaren skickade inte tillbaka sessionscookien med callback-anropet. På Kubernetes är de vanligaste orsakerna:
+
+* `OVERLEAF_SECURE_COOKIE` är satt, men användarna öppnar webbplatsen över vanlig HTTP, så webbläsaren sparar aldrig cookien. Vilket värde som helst på `OVERLEAF_SECURE_COOKIE`, även `"false"`, aktiverar säkra cookies; ta bort nyckeln i stället.
+* Webbplatsen öppnas under en annan adress än `OVERLEAF_SITE_URL`.
+* Bakom HTTPS skickar din ingress eller lastbalanserare inte `X-Forwarded-Proto: https`, eller så saknas dess adress i `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="Var ser jag varför en inloggning misslyckades?">
+
+<strong>Svar:</strong> I web-loggen för den pod som hanterade förfrågan, inte i `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Med flera repliker kontrollerar du varje `overleaf-N`.
+
+</Accordion>

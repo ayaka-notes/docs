@@ -1,0 +1,56 @@
+---
+title: Integrace se Zotero
+description: Umožněte uživatelům importovat soubor .bib z jejich knihovny Zotero v nasazení na Kubernetes.
+icon: z
+---
+
+Import ze Zotero běží ve službě **web** (modul `tpr-webmodule`) každého podu Ayakaleaf Pro. Zaregistrujte OAuth klienta Zotero podle části [Integrace se Zotero](/cs/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration) s callback URL `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback` a poté nakonfigurujte Kubernetes podle níže uvedeného postupu.
+
+| | |
+| --- | --- |
+| Služba | web v každém podu Ayakaleaf Pro; načítá se při startu webu |
+| Pod → Zotero | `https://www.zotero.org/oauth/*` a `https://api.zotero.org`, když uživatel propojuje Zotero nebo importuje či obnovuje soubor |
+| Prohlížeč → Zotero | `https://www.zotero.org/oauth/authorize`, poté zpět na callback URL |
+| Zotero → Overleaf | žádné: instance nemusí být dostupná z internetu |
+| Uložená data | klíč uživatele k Zotero, šifrovaný, v MongoDB |
+| Periodické úlohy | žádné: soubor se obnoví jen tehdy, když o to uživatel požádá |
+
+### Konfigurace
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES` nahrazuje hodnotu z instalace; ponechte typy, které již máte, a přidejte `zotero` (a `mendeley`, pokud používáte obojí).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD` šifruje klíče uživatelů k Zotero v MongoDB. Bez něj si každý pod vygeneruje soubor s klíčem ve svém vlastním `/var/lib/overleaf/data`. S [více replikami](/cs/on-premises/configuration/kubernetes/horizontal-scaling) má pak každý uzel jiný klíč a uživatel obsluhovaný jinou replikou nemůže svůj propojený účet Zotero použít. Nastavte jej dříve, než první uživatel propojí Zotero: pozdější změna donutí všechny uživatele propojit Zotero znovu.
+</Step>
+
+<Step title="Použití a restart">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Více replik
+
+Nastavte `ZOTERO_CIPHER_PASSWORD` v Secretu, viz výše. Bez něj nelze soubor importovaný na jedné replice obnovit na jiné: obnovení selže s chybou „The remote service produced an error“, protože soubor s klíčem dané repliky nedokáže dešifrovat klíč uživatele k Zotero. S heslem v Secretu to funguje na každé replice; oba případy jsme otestovali importem na `overleaf-0` a obnovením na `overleaf-1`. OAuth handshake uchovává svůj stav v relaci v Redisu, takže callback může dorazit na kteroukoli repliku.
+
+### Testováno na Kubernetes
+
+Proti napodobenině www.zotero.org a api.zotero.org (důvěryhodné díky `NODE_EXTRA_CA_CERTS` z `overleaf-certs`), na Kubernetes 1.37 se třemi replikami za HAProxy, procházejí naše end-to-end testy Zotero (18 případů): propojení přes OAuth 1.0a a zrušení propojení, import knihovny a skupin do souboru `.bib`, jeho obnovení, odvolání klíče v Zotero, výzva k opětovnému propojení, citace vyhledatelné pro spolupracovníky, obnovit může pouze ten, kdo importoval, chyby API a pomalá připojení k Zotero.

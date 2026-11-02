@@ -63,6 +63,18 @@ När säkerhetskopieringen har slutförts **utan fel** behöver du starta contai
 
 MongoDB levereras med ett kommandoradsverktyg som heter [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/) och som kan användas för att säkerhetskopiera användar- och projektdata som lagras i databasen.
 
+Med containern `sharelatex` stoppad och containern `mongo` fortfarande igång dumpar du databasen `sharelatex` till en fil på värden, och återställer den på samma sätt (`--drop` ersätter de befintliga samlingarna):
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Data i Overleafs filsystem
 
 För Toolkit-driftsättningar anges sökvägen där dina icke-redigerbara filer lagras i `config/overleaf.rc` med miljövariabeln `OVERLEAF_DATA_PATH`, men beroende på när din instans skapades kan den vara `data/sharelatex`.
@@ -192,3 +204,37 @@ Följande mappar har ytterligare markeringar:
          * buffring av filuppladdningar (uppladdning av binärfiler/nytt projekt från zip)
       3. projectHistories (e)
          * tillfälliga filer för migreringar av fullständig projekthistorik
+
+### Frågor och svar
+
+<Accordion title="MongoDB-data är skadade eller delvis raderade och jag har ingen säkerhetskopia. Vad kan jag göra?">
+
+<strong>Svar:</strong> Containern `mongo` lagrar inga data själv: databasen finns i `data/mongo` (`MONGO_DATA_PATH` i `config/overleaf.rc`). Om bara containern är trasig tar du bort den med `bin/docker-compose rm -sf mongo` och kör `bin/up -d` för att skapa den igen.
+
+Om MongoDB inte kan starta eftersom dess filer är skadade eller saknas är den sista utvägen MongoDB:s egen [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/). Den kastar skadade data och skapar tomma stubbfiler för saknade filer, så räkna med dataförlust. Stoppa allt och kopiera datakatalogen först, och kör sedan reparationen med samma image som din `mongo`-container (`MONGO_IMAGE` och `MONGO_VERSION` i `config/overleaf.rc`, `mongo:8.0` som standard):
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+Om reparationen behövde ändra data startar MongoDB inte längre som medlem i en replikuppsättning, och Toolkit kör den som en sådan (`--replSet overleaf`): `bin/logs mongo` visar `This instance has been repaired and may contain modified replicated data`. Starta då de reparerade filerna utan `--replSet`, dumpa dem och återställ dumpen till en ny databas:
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+Återställ sedan `mongo-backup.gz` med kommandot `mongorestore` i [MongoDB](#mongodb) ovan.
+
+Om MongoDB-data är helt borta kan Ayakaleaf Pro inte återskapa projekten. Användare, projektlistan, mappträd, dokumentens aktuella text och historikens index lagras alla i MongoDB. `data/overleaf/data/history` innehåller fortfarande uppladdade filer och historikinnehåll, lagrade under innehållshashar (`overleaf-project-blobs`) och som gzippade JSON-historikblock (`overleaf-chunks`), men det finns inget verktyg som gör om dem till projekt. Du kan bara söka i dem för hand.
+
+</Accordion>

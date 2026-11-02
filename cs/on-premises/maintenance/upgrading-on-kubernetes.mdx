@@ -1,0 +1,136 @@
+---
+title: Upgrade na Kubernetes
+description: Upgradujte nasazení Ayakaleaf Pro na Kubernetes s jednou replikou nebo s více replikami.
+icon: arrow-up-from-square
+---
+
+Upgrade nahrazuje tag obrazu. Nová verze při startu migruje databázi a tyto migrace musí proběhnout **jednou, z jednoho podu, zatímco neběží žádný starší pod**. Na Kubernetes to vylučuje prostý rolling update škálovaného StatefulSetu.
+
+<Danger>
+
+Před každým upgradem pořiďte [konzistentní zálohu](/cs/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) se zastaveným Ayakaleaf Pro. Přečtěte si [poznámky k vydání](/cs/on-premises/release-notes), kde najdete kroky pro verzi, na kterou upgradujete.
+
+</Danger>
+
+Než začnete, stáhněte na každém uzlu, na kterém běží Ayakaleaf Pro, pomocí `sudo docker pull` všechny obrazy TeX Live, které uvádí nová verze nebo vaše nová konfigurace.
+
+<Tabs>
+<Tab title="Jedna replika">
+
+<Steps>
+<Step title="Zastavte Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Zálohujte">
+MongoDB, z libovolného člena:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Datový svazek, přes krátce žijící pod, který jej připojí (spustí se na uzlu svazku):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Totéž proveďte se svazkem git-bridge (`data-git-bridge-0`) a uschovejte si kopii Secretu `overleaf-secrets`. Pokud vaše úložiště podporuje [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), snapshot svazků poslouží stejně.
+</Step>
+
+<Step title="Změňte verzi a spusťte">
+Nastavte nový tag v `40-overleaf.yaml` (a v `45-git-bridge.yaml`, který musí používat stejný tag) a poté:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment používá `strategy: Recreate`, takže ani při změně tagu nikdy neběží dvě verze současně.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Více replik">
+
+Pro nastavení z [horizontálního škálování](/cs/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="Zastavte všechny repliky">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Zálohujte">
+MongoDB stejně jako na kartě pro jednu repliku, své buckety S3 nástroji svého poskytovatele, svazek git-bridge (`data-git-bridge-0`) a Secrety. Adresáře `/srv/overleaf-ha` replik obsahují pouze výstup kompilací a nepotřebují zálohu.
+</Step>
+
+<Step title="Spusťte jednu repliku s novou verzí">
+Nastavte nový tag v `70-overleaf.yaml` a `75-git-bridge.yaml` a `replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Ověřte, že se můžete přihlásit, otevřít projekt a zkompilovat jej.
+</Step>
+
+<Step title="Spusťte ostatní repliky">
+Znovu nastavte `replicas: 3` a použijte konfiguraci. `OrderedReady` je spustí jednu po druhé.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Neměňte obraz běžícího škálovaného StatefulSetu pomocí `kubectl set image` ani `kubectl apply`: rolling update by spustil novou verzi a její migrace, zatímco starší repliky ještě obsluhují uživatele. Změny konfigurace bez nové verze lze bez problémů provést jako rolling restart: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB a Redis
+
+Upgradujte je odděleně od Ayakaleaf Pro. U MongoDB postupujte podle části [Aktualizace MongoDB](/cs/on-premises/maintenance/updating-mongodb) (vždy o jednu hlavní verzi, po každém kroku `featureCompatibilityVersion`); replica set převezme nový obraz po jednotlivých členech, když změníte obraz v `10-mongo.yaml`, protože StatefulSet postupně nahradí `mongo-2`, `mongo-1` a `mongo-0`.
+
+### Návrat k předchozí verzi
+
+Zastavte Ayakaleaf Pro jako výše, obnovte MongoDB z archivu (`mongorestore --drop --archive --gzip`) a svazky nebo buckety ze zálohy, nastavte starý tag a znovu spusťte. Migrace nové verze jinak vrátit nelze.
+
+### Q\&A
+
+<Accordion title="Replika zůstává nepřipravená a ostatní repliky se nikdy nespustí">
+
+<strong>Odpověď:</strong> S `podManagementPolicy: OrderedReady` se `overleaf-1` spustí až poté, co je `overleaf-0` připraven, a rolling update nenahradí pod, který se nikdy nestal připraveným. Poté, co odstraníte příčinu, například chybné nastavení v ConfigMapu, smažte zaseknutý pod, aby jej StatefulSet znovu vytvořil z aktuální šablony:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Na to jsme narazili na našem testovacím clusteru poté, co nastavení bránilo `overleaf-0` stát se připraveným; smazání podu umožnilo spustit všechny tři repliky.
+
+</Accordion>
