@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: Compile LaTeX in TeX Live containers on the nodes of a Kubernetes cluster.
+icon: gear-code
+---
+
+Compiles are run by the **clsi** service inside every Ayakaleaf Pro pod. With sandboxed compiles on, clsi asks the **Docker Engine of the node** the pod runs on to start a TeX Live container for each compile, and hands it the project's directory by its path on that node. How sandboxing works and which images exist is described in [Sandboxed Compiles](/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Service | clsi (compiles), web (the image list in the compiler settings), in every Ayakaleaf Pro pod |
+| Node | Docker Engine and every image of `ALL_TEX_LIVE_DOCKER_IMAGES`, on every node that can run Ayakaleaf Pro |
+| Pod mounts | `/var/run/docker.sock`, and the compile, output and cache directories as `hostPath` volumes |
+| Periodic jobs | clsi deletes compile directories not used for a day, and every hour removes old TeX Live containers from the node's Docker |
+
+### Configuration
+
+The installation sets everything up: Docker and the images on the nodes in [0. Prepare the nodes](/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), the settings in [4. Personalizing your instance](/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) and the volumes in [5. Deploy Ayakaleaf Pro](/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). The settings, all in the ConfigMap:
+
+| Variable | Value |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | node path of the volume mounted at `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | node path of the volume mounted at `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | node path of the volume mounted at `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | the images, as on the Toolkit |
+
+### Adding a TeX Live version
+
+<Steps>
+<Step title="Pull the image on every node">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+The Toolkit pulls the images itself; on Kubernetes nobody does. Pull into **Docker**, not with `crictl`: clsi asks Docker for the image. A compile with an image that is missing on the node fails.
+</Step>
+
+<Step title="List it in the ConfigMap and restart">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+A node added to the cluster later needs Docker and all the images before Ayakaleaf Pro runs there. Label such nodes and keep Ayakaleaf Pro on them with a `nodeSelector` if not every node qualifies.
+
+### Several replicas
+
+Each replica compiles on its own node and keeps the compile output there, so a user must stay on the replica that compiled, which the load balancer's sticky cookie ensures. Never run two replicas on the same node: they would share the node's compile directories. The [Horizontal scaling](/on-premises/configuration/kubernetes/horizontal-scaling) setup prevents this with `podAntiAffinity`.
+
+The TeX Live containers run beside the pod, outside its memory limit and outside the scheduler's view. Leave memory free on the nodes for them, see [0. Prepare the nodes](/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Tested on Kubernetes
+
+On Kubernetes 1.37 with three replicas behind HAProxy, one per node, and TeX Live 2026 and 2025 pulled into Docker on every node, our end-to-end tests for sandboxed compiles pass (7 cases): a new project compiles to a PDF, the compiler settings offer both images and switch between them, XeLaTeX with fontspec, LaTeX errors and recompiling after the fix, stopping a running compile, and SyncTeX in both directions. A load test with 12 users compiling a 600-page document at the same time ran 4 compiles per node, see [What to expect](/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

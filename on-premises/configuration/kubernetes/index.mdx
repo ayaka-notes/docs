@@ -1,0 +1,90 @@
+---
+title: Kubernetes
+description: Configure a Kubernetes deployment - where settings, secrets and files go, and one page per feature.
+icon: dharmachakra
+---
+
+A Kubernetes deployment reads the same environment variables as the Toolkit. Where a Toolkit page says "add this to `config/variables.env`", put the value into the ConfigMap `overleaf-env`, or into the Secret `overleaf-secrets` when it is a password, key or token. Then restart:
+
+```bash
+kubectl -n overleaf apply -f 30-config.yaml        # after editing the ConfigMap
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+kubectl -n overleaf rollout restart deployment/overleaf
+```
+
+Values in `config/overleaf.rc` are Toolkit settings, not environment variables; the Q\&A at the end of this page says what replaces them.
+
+### Features
+
+Each feature of the Toolkit configuration has a page here with its services, settings, network paths, background jobs, what changes with several replicas, and how it was tested:
+
+| Feature | Services in the pod | Beyond the ConfigMap and Secret |
+| --- | --- | --- |
+| [Authentication](/on-premises/configuration/kubernetes/authentication): [OIDC](/on-premises/configuration/kubernetes/authentication/oidc-authentication), [SAML](/on-premises/configuration/kubernetes/authentication/saml-authentication), [LDAP](/on-premises/configuration/kubernetes/authentication/ldap-authentication), [Public Access](/on-premises/configuration/kubernetes/authentication/public-access), [reCAPTCHA](/on-premises/configuration/kubernetes/authentication/recaptcha), [Password restrictions](/on-premises/configuration/kubernetes/authentication/password-restrictions) | web | client secrets, the IdP certificate, the LDAP CA |
+| [Sandboxed Compiles](/on-premises/configuration/kubernetes/sandboxed-compiles) | clsi | Docker Engine and the TeX Live images on every node |
+| [Pandoc Import and Export](/on-premises/configuration/kubernetes/pandoc-import-and-export) | clsi, web | the Pandoc image in Docker on every node |
+| [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration) | git-bridge (own pod), web, history-v1 | the git-bridge StatefulSet and two Services |
+| [GitHub](/on-premises/configuration/kubernetes/integrations/github-synchronisation), [GitLab](/on-premises/configuration/kubernetes/integrations/gitlab-synchronisation), [Gitea](/on-premises/configuration/kubernetes/integrations/gitea-synchronisation) Synchronisation | web | Git integration |
+| [Dropbox Synchronisation](/on-premises/configuration/kubernetes/integrations/dropbox-synchronisation) | web, third-party-datastore, document-updater | Git integration, the webhook reachable from the internet, database indexes |
+| [Zotero](/on-premises/configuration/kubernetes/integrations/zotero-integration), [Mendeley](/on-premises/configuration/kubernetes/integrations/mendeley-integration) Integration | web | the cipher password in the Secret |
+| [MCP Server](/on-premises/configuration/kubernetes/integrations/mcp-server) | web | Git integration |
+| [AI Integration](/on-premises/configuration/kubernetes/integrations/ai-integration) | web, linked-url-proxy | – |
+| [Overleaf Import API](/on-premises/configuration/kubernetes/integrations/overleaf-import-api) | web, linked-url-proxy | – |
+| [Templates](/on-premises/configuration/kubernetes/templates) | web, filestore | S3 for several replicas |
+| [External URL](/on-premises/configuration/kubernetes/external-url) | linked-url-proxy | public node addresses in `OVERLEAF_LINKED_URL_BLOCKED_NETWORKS` |
+| [Logging](/on-premises/configuration/kubernetes/logging) | every service | a volume at `/var/log/overleaf` to keep logs |
+| [TLS proxy](/on-premises/configuration/kubernetes/tls-proxy) | your ingress or load balancer | TLS ends in front of the pods |
+| [Branding](/on-premises/configuration/kubernetes/branding) | web | – |
+| [Localization](/on-premises/configuration/kubernetes/localization) | web | one host name per language |
+| [Email delivery](/on-premises/configuration/kubernetes/email-delivery) | web | – |
+| [Redis](/on-premises/configuration/kubernetes/redis) | every service with live state | – |
+| [S3](/on-premises/configuration/kubernetes/s3) | history-v1, filestore | an S3 service, required for several replicas |
+| [Adding LaTeX user help](/on-premises/configuration/kubernetes/adding-latex-user-help) | web | the pods must reach the wiki |
+| [Horizontal scaling](/on-premises/configuration/kubernetes/horizontal-scaling) | all | S3, a load balancer with sticky sessions |
+
+### Certificates and other files
+
+Some features take a file path instead of a value: the SAML certificates (`OVERLEAF_SAML_IDP_CERT`, ...), the LDAP CA (`OVERLEAF_LDAP_TLS_OPTS_CA_PATH`), or a private CA for a self-hosted GitHub Enterprise, GitLab or Gitea (`NODE_EXTRA_CA_CERTS`). Put the files into a Secret and mount it where the Toolkit pages expect them, `/var/lib/overleaf/certs`:
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem --from-file=ca.pem
+```
+
+```yaml title="40-overleaf.yaml (additions)"
+          volumeMounts:
+            # ...
+            - name: certs
+              mountPath: /var/lib/overleaf/certs
+              readOnly: true
+      volumes:
+        # ...
+        - name: certs
+          secret:
+            secretName: overleaf-certs
+```
+
+Then refer to them by path in the ConfigMap, for example `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`, and restart.
+
+<Warning>
+
+<strong>Cipher passwords.</strong> Set every `*_CIPHER_PASSWORD` of the features you use in the Secret. Some features otherwise generate a key file in the data volume on first use: with one replica that works until the volume is lost, with several replicas each replica would encrypt with a different key.
+
+</Warning>
+
+### Q\&A
+
+<Accordion title="Which Toolkit settings from `config/overleaf.rc` do I need?">
+
+<strong>Answer:</strong> None of them are read by Ayakaleaf Pro. Their Kubernetes counterparts:
+
+| `config/overleaf.rc`                         | Kubernetes                                                        |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `OVERLEAF_LISTEN_IP`, `OVERLEAF_PORT`        | the Service (NodePort) or your ingress                            |
+| `SIBLING_CONTAINERS_ENABLED`                 | `SANDBOXED_COMPILES*` in the ConfigMap, Docker socket in the pod  |
+| `GIT_BRIDGE_ENABLED`                         | [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration)                             |
+| `MONGO_ENABLED`, `REDIS_ENABLED`, `MONGO_URL`, `REDIS_HOST` | the StatefulSets or your managed services, `OVERLEAF_MONGO_URL` and `OVERLEAF_REDIS_HOST` |
+| `REDIS_AOF_PERSISTENCE`                      | `--appendonly yes` in `20-redis.yaml`                             |
+| `NGINX_ENABLED`, `TLS_*`                     | your ingress or load balancer                                     |
+
+</Accordion>

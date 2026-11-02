@@ -1,0 +1,87 @@
+---
+title: TLS proxy
+description: Serve a Kubernetes deployment over HTTPS through an ingress, a load balancer or HAProxy.
+icon: lock
+---
+
+Inside the pod, the container's nginx serves plain HTTP on port 80. HTTPS ends in front of the pods: in your ingress controller, your cloud load balancer, or HAProxy as in [Horizontal scaling](/on-premises/configuration/kubernetes/horizontal-scaling). The Toolkit's NGINX proxy (`bin/init --tls`, `NGINX_*` and `TLS_*` in `overleaf.rc`) has no counterpart; see [TLS proxy](/on-premises/configuration/overleaf-toolkit/tls-proxy) for the Toolkit.
+
+| | |
+| --- | --- |
+| Service | your ingress or load balancer; web reads the settings below when it starts |
+| Browser → proxy | HTTPS on 443, including the editor's WebSocket |
+| Proxy → pods | plain HTTP to port 80 of the pods |
+| Periodic jobs | none (certificate renewal is your proxy's business) |
+
+### What the proxy must do
+
+* Pass WebSockets (`/socket.io`).
+* Allow requests of 10 minutes (long compiles) and request bodies of 50 MB (uploads), or `MAX_UPLOAD_SIZE`.
+* Keep its idle keep-alive timeout towards the pods below 65 seconds, the timeout of the nginx in the pod.
+* Send `X-Forwarded-For` and `X-Forwarded-Proto: https`.
+* With several replicas, keep a user on one replica, see [Horizontal scaling](/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Without `X-Forwarded-Proto: https` from a trusted address, Ayakaleaf Pro thinks requests arrive over HTTP and does not set its secure session cookie: logins then fail. Set `OVERLEAF_SECURE_COOKIE` only when users really reach the site over HTTPS; any value turns it on, also `"false"`.
+
+### HAProxy example
+
+To terminate HTTPS in the HAProxy DaemonSet of [Horizontal scaling](/on-premises/configuration/kubernetes/horizontal-scaling), put the certificate and its key into one PEM file and a Secret:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+Then change `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+Bump `config-hash` so that HAProxy restarts, then set the ConfigMap as above and restart the replicas.
+
+The redirect keeps the port of the request: it suits a load balancer on ports 80 and 443, but on the NodePorts it sends `http://host:30081` to `https://host:30081`. Without a load balancer in front, leave the redirect line out and give users the `https://...:30443` address.
+
+### Tested on Kubernetes
+
+On Kubernetes 1.37 with three replicas and HAProxy terminating HTTPS as above, with `OVERLEAF_SITE_URL` on `https://` and `OVERLEAF_SECURE_COOKIE`: users activated through `https://` links, logged in with a session cookie marked `Secure`, uploaded and compiled projects with the PDF fetched, stayed on their replica, opened the editor's WebSocket (`wss`), and cloned and pushed with Git over HTTPS. `http://` requests on the NodePort were redirected to `https://` with the same port, as described above.

@@ -1,0 +1,67 @@
+---
+title: Gitea Synchronisation
+description: Let users sync their projects with repositories on Gitea.com or your own Gitea on a Kubernetes deployment.
+icon: mug-hot
+---
+
+Gitea Synchronisation runs in the **web** service (the `gitea-sync` module) of every Ayakaleaf Pro pod. It needs the [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration). Create the OAuth application and read what each setting does in [Gitea Synchronisation](/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); this page puts it into Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (`gitea-sync` module), in every Ayakaleaf Pro pod; read when web starts |
+| Pod → Gitea | the REST API of `GITEA_SYNC_URL` (default `https://gitea.com/api/v1`), whenever a user links, imports, exports or syncs |
+| Browser → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` to link an account, then back to `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | none: no webhook, the instance does not need to be reachable from Gitea |
+| Stored data | the user's Gitea access and refresh tokens, encrypted, in MongoDB |
+| Periodic jobs | none: syncing happens when a user clicks |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` and the git-bridge StatefulSet from [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration) must be in place: without them the account settings and the editor hide Gitea Synchronisation.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` encrypts the users' Gitea access and refresh tokens in MongoDB. Every replica must use the same value, and changing it later makes every user link Gitea again.
+</Step>
+
+<Step title="Private CA (optional)">
+If your Gitea has a certificate from your own CA, add the CA to the Secret `overleaf-certs` mounted at `/var/lib/overleaf/certs` (see [Certificates and other files](/on-premises/configuration/kubernetes#certificates-and-other-files)) and set `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` in the ConfigMap.
+</Step>
+
+<Step title="Apply, restart and check">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Any HTTP status means Gitea is reachable from that pod; `000` means it is not.
+</Step>
+</Steps>
+
+### Several replicas
+
+Nothing extra beyond the shared `GITEA_TOKEN_CIPHER_PASSWORD`. A sync takes a lock in Redis, shared with the other Git synchronisations, so two replicas never sync the same project at once.
+
+### Tested on Kubernetes
+
+Against a real Gitea 1.23 at `GITEA_SYNC_URL`, on Kubernetes 1.37 with one replica and the Git integration on, our end-to-end tests for Gitea Synchronisation pass (39 cases): linking and unlinking the account through Gitea's OAuth2, refreshing the expiring access token and revoked grants, exporting into a new private or organization repository, importing a repository, pulling and pushing, merges, conflicts, deleted and force-pushed branches, binary files, renames and deletions, and what owners, editors and viewers may do.

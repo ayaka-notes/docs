@@ -1,0 +1,67 @@
+---
+title: GitHub Synchronisation
+description: Let users sync their projects with GitHub or GitHub Enterprise repositories on a Kubernetes deployment.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub Synchronisation runs in the **web** service (the `github-sync` module) of every Ayakaleaf Pro pod. It needs the [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration). Create the OAuth application and read what each setting does in [GitHub Synchronisation](/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); this page puts it into Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (`github-sync` module), in every Ayakaleaf Pro pod; read when web starts |
+| Pod → GitHub | `https://api.github.com` (REST and GraphQL), or the API of `GITHUB_SYNC_URL`, whenever a user links, imports, exports or syncs |
+| Browser → GitHub | `https://github.com/login/oauth/authorize` to link an account, then back to `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | none: no webhook, the instance does not need to be reachable from GitHub |
+| Stored data | the user's GitHub access tokens, encrypted, in MongoDB |
+| Periodic jobs | none: syncing happens when a user clicks |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` and the git-bridge StatefulSet from [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration) must be in place: without them the account settings and the editor hide GitHub Synchronisation.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` encrypts the users' GitHub access tokens in MongoDB. Every replica must use the same value, and changing it later makes every user link GitHub again.
+</Step>
+
+<Step title="Private CA (optional)">
+If your GitHub has a certificate from your own CA, add the CA to the Secret `overleaf-certs` mounted at `/var/lib/overleaf/certs` (see [Certificates and other files](/on-premises/configuration/kubernetes#certificates-and-other-files)) and set `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` in the ConfigMap.
+</Step>
+
+<Step title="Apply, restart and check">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Any HTTP status means GitHub is reachable from that pod; `000` means it is not.
+</Step>
+</Steps>
+
+### Several replicas
+
+Nothing extra beyond the shared `GITHUB_TOKEN_CIPHER_PASSWORD`. A sync takes a lock in Redis, shared with the other Git synchronisations, so two replicas never sync the same project at once.
+
+### Tested on Kubernetes
+
+Against a mock of github.com and its REST and GraphQL APIs (trusted through `NODE_EXTRA_CA_CERTS` from `overleaf-certs`), on Kubernetes 1.37 with one replica and the Git integration on, our end-to-end tests for GitHub Synchronisation pass (31 cases): linking and unlinking the account, revoked tokens, exporting a project into a new private or organization repository, importing a repository (also over the upload limit), pulling and pushing, merges, conflicts and manual merges, deleted and force-pushed branches, binary files, renames and deletions, losing push access, and what owners, editors and viewers may do.

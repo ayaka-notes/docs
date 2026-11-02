@@ -1,0 +1,67 @@
+---
+title: GitLab Synchronisation
+description: Let users sync their projects with repositories on GitLab.com or a self-managed GitLab on a Kubernetes deployment.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+GitLab Synchronisation runs in the **web** service (the `gitlab-sync` module) of every Ayakaleaf Pro pod. It needs the [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration). Create the OAuth application and read what each setting does in [GitLab Synchronisation](/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); this page puts it into Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (`gitlab-sync` module), in every Ayakaleaf Pro pod; read when web starts |
+| Pod → GitLab | the REST API of `GITLAB_SYNC_URL` (default `https://gitlab.com/api/v4`), whenever a user links, imports, exports or syncs |
+| Browser → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` to link an account, then back to `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | none: no webhook, the instance does not need to be reachable from GitLab |
+| Stored data | the user's GitLab access and refresh tokens, encrypted, in MongoDB |
+| Periodic jobs | none: syncing happens when a user clicks |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` and the git-bridge StatefulSet from [Git integration](/on-premises/configuration/kubernetes/integrations/git-integration) must be in place: without them the account settings and the editor hide GitLab Synchronisation.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` encrypts the users' GitLab access and refresh tokens in MongoDB. Every replica must use the same value, and changing it later makes every user link GitLab again.
+</Step>
+
+<Step title="Private CA (optional)">
+If your GitLab has a certificate from your own CA, add the CA to the Secret `overleaf-certs` mounted at `/var/lib/overleaf/certs` (see [Certificates and other files](/on-premises/configuration/kubernetes#certificates-and-other-files)) and set `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` in the ConfigMap.
+</Step>
+
+<Step title="Apply, restart and check">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Any HTTP status means GitLab is reachable from that pod; `000` means it is not.
+</Step>
+</Steps>
+
+### Several replicas
+
+Nothing extra beyond the shared `GITLAB_TOKEN_CIPHER_PASSWORD`. A sync takes a lock in Redis, shared with the other Git synchronisations, so two replicas never sync the same project at once. Refreshing a user's GitLab token also takes a Redis lock, so two replicas do not refresh it at the same time.
+
+### Tested on Kubernetes
+
+Against a mock of a self-managed GitLab at `GITLAB_SYNC_URL` (trusted through `NODE_EXTRA_CA_CERTS` from `overleaf-certs`), on Kubernetes 1.37 with one replica and the Git integration on, our end-to-end tests for GitLab Synchronisation pass (40 cases): linking and unlinking the account, refreshing an expiring access token and revoked tokens, exporting into a new private or group project, importing a repository, pulling and pushing, merges, conflicts, deleted and force-pushed branches, binary files, renames and deletions, and what owners, editors and viewers may do.
