@@ -1,0 +1,136 @@
+---
+title: Kubernetes でのアップグレード
+description: レプリカが 1 つの場合も複数の場合も、Ayakaleaf Pro の Kubernetes デプロイをアップグレードします。
+icon: arrow-up-from-square
+---
+
+アップグレードではイメージのタグを置き換えます。新しいバージョンは起動時にデータベースをマイグレーションしますが、このマイグレーションは**古い Pod が 1 つも動作していない状態で、1 つの Pod から 1 回だけ**実行する必要があります。そのため Kubernetes では、スケールした StatefulSet の単純なローリングアップデートは使用できません。
+
+<Danger>
+
+アップグレードの前には毎回、Ayakaleaf Pro を停止した状態で[一貫性のあるバックアップ](/ja/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)を取得してください。アップグレード先のバージョンの手順については[リリースノート](/ja/on-premises/release-notes)を確認してください。
+
+</Danger>
+
+開始する前に、Ayakaleaf Pro を実行するすべてのノードで、新しいバージョンまたは新しい設定に列挙されている TeX Live イメージを `sudo docker pull` でプルしておいてください。
+
+<Tabs>
+<Tab title="レプリカ 1 つ">
+
+<Steps>
+<Step title="Ayakaleaf Pro を停止する">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="バックアップする">
+MongoDB は任意のメンバーからバックアップします。
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+データボリュームは、それをマウントする短命な Pod（ボリュームのあるノードに配置されます）を通じてバックアップします。
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+git-bridge のボリューム（`data-git-bridge-0`）についても同様に行い、Secret `overleaf-secrets` のコピーも保管してください。ストレージが [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/) をサポートしている場合は、ボリュームのスナップショットでも同じことができます。
+</Step>
+
+<Step title="バージョンを変更して起動する">
+`40-overleaf.yaml`（および同じタグを使う必要がある `45-git-bridge.yaml`）に新しいタグを設定してから、次を実行します。
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment は `strategy: Recreate` を使用しているため、タグを変更しても 2 つのバージョンが同時に動作することはありません。
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="複数のレプリカ">
+
+[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)の構成を対象としています。
+
+<Steps>
+<Step title="すべてのレプリカを停止する">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="バックアップする">
+MongoDB はレプリカ 1 つのタブと同様に、S3 バケットはプロバイダーのツールでバックアップし、git-bridge のボリューム（`data-git-bridge-0`）と Secret もバックアップします。レプリカの `/srv/overleaf-ha` にはコンパイル出力しかないため、バックアップは不要です。
+</Step>
+
+<Step title="新しいバージョンでレプリカを 1 つ起動する">
+`70-overleaf.yaml` と `75-git-bridge.yaml` に新しいタグを設定し、`replicas: 1` にします。
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+ログインし、プロジェクトを開いてコンパイルできることを確認してください。
+</Step>
+
+<Step title="残りのレプリカを起動する">
+再度 `replicas: 3` に設定して適用します。`OrderedReady` により、レプリカは 1 つずつ順に起動します。
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+実行中のスケールした StatefulSet のイメージを `kubectl set image` や `kubectl apply` で変更しないでください。ローリングアップデートにより、古いレプリカがまだユーザーにサービスを提供している間に新しいバージョンとそのマイグレーションが開始されてしまいます。新しいバージョンを伴わない設定変更であれば、ローリング再起動で問題ありません: `kubectl -n overleaf rollout restart statefulset/overleaf`。
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB と Redis
+
+これらは Ayakaleaf Pro とは別にアップグレードします。MongoDB については [MongoDB の更新](/ja/on-premises/maintenance/updating-mongodb)に従ってください（メジャーバージョンを 1 つずつ上げ、各ステップの後に `featureCompatibilityVersion` を設定）。`10-mongo.yaml` のイメージを変更すると、StatefulSet が `mongo-2`、`mongo-1`、`mongo-0` を順に置き換えるため、レプリカセットはメンバー 1 つずつ新しいイメージに移行します。
+
+### ロールバック
+
+上記のとおり Ayakaleaf Pro を停止し、アーカイブから MongoDB を（`mongorestore --drop --archive --gzip`）、バックアップからボリュームまたはバケットを復元し、古いタグを設定して再度起動します。新しいバージョンのマイグレーションは、これ以外の方法では元に戻せません。
+
+### Q\&A
+
+<Accordion title="あるレプリカが準備完了にならず、他のレプリカが起動しない">
+
+<strong>回答：</strong> `podManagementPolicy: OrderedReady` では、`overleaf-1` は `overleaf-0` の準備が完了してから起動し、ローリングアップデートは一度も準備完了にならなかった Pod を置き換えません。原因（たとえば ConfigMap の誤った設定）を修正した後、StatefulSet が現在のテンプレートから再作成するように、停止している Pod を削除してください。
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+テストクラスターでは、ある設定によって `overleaf-0` が準備完了にならなかった後にこの問題が発生しました。Pod を削除すると、3 つのレプリカすべてが起動しました。
+
+</Accordion>

@@ -1,0 +1,100 @@
+---
+title: 0. 準備節點
+description: 在節點上安裝 Docker Engine、containerd 與 kubeadm，並拉取 TeX Live 映像檔。
+icon: server
+---
+
+Ayakaleaf Pro 會在[沙箱化](/zh-TW/on-premises/configuration/overleaf-toolkit/sandboxed-compiles)的 TeX Live 容器中編譯 LaTeX。它會透過所在機器的 Docker socket 自行啟動這些容器。在 Kubernetes 上，這表示：
+
+* 每個可執行 Ayakaleaf Pro Pod 的節點都已安裝並執行 **Docker Engine**；
+* 您設定的每個 TeX Live 映像檔，都已在這些節點上拉取**至 Docker 中**。
+
+kubelet 可以繼續使用 containerd：Docker Engine 隨附 `containerd.io`，兩者使用同一個常駐程式，只是位於不同的命名空間。
+
+<Warning>
+
+沒有 Docker 的代管節點集區（大多數 EKS、GKE 與 AKS 的預設值）無法執行沙箱編譯。請使用可以安裝 Docker Engine 的節點集區，或為這類節點加上標籤，並使用 `nodeSelector` 讓 Ayakaleaf Pro 只在其上執行。
+
+</Warning>
+
+以下步驟適用於 Ubuntu 24.04 以及以 kubeadm 建立的叢集。如果您的叢集已經存在，請在將執行 Ayakaleaf Pro 的節點上執行步驟 1、2 與 5。
+
+<Steps>
+<Step title="核心模組與 sysctl">
+```bash
+printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+sudo modprobe overlay && sudo modprobe br_netfilter
+printf 'net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1\n' \
+  | sudo tee /etc/sysctl.d/99-k8s.conf
+sudo sysctl --system
+sudo swapoff -a   # and comment out swap in /etc/fstab
+```
+</Step>
+
+<Step title="Docker Engine">
+依照 [0. 設定 Docker](/zh-TW/on-premises/installation/using-the-toolkit/0.-setup-docker) 從 Docker 的套件庫安裝 Docker Engine。不需要 Compose 外掛程式。這也會一併安裝 `containerd.io`。
+</Step>
+
+<Step title="供 kubelet 使用的 containerd">
+來自 Docker 套件庫的 `containerd.io` 套件已關閉 CRI 外掛程式。請寫入完整的預設設定（會啟用該外掛程式），並將其切換為 systemd cgroup：
+
+```bash wrap
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+# containerd 2.x writes config_path = '' and ignores /etc/containerd/certs.d without this
+sudo sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|" /etc/containerd/config.toml
+sudo systemctl restart containerd docker
+```
+</Step>
+
+<Step title="kubeadm、kubelet 與 kubectl">
+請依照 [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/) 操作，然後以 `kubeadm init` 與 `kubeadm join` 建立叢集並安裝網路外掛程式。例如使用 flannel：
+
+```yaml title="kubeadm-config.yaml"
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+networking:
+  podSubnet: 10.244.0.0/16   # flannel's default
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+# Compile containers are started by Docker, outside the kubelet's accounting: keep memory for them
+systemReserved:
+  memory: 300Mi
+kubeReserved:
+  memory: 200Mi
+```
+
+```bash
+sudo kubeadm init --config kubeadm-config.yaml
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+```
+
+叢集也需要一個預設的 StorageClass。測試用叢集可使用 [local-path-provisioner](https://github.com/rancher/local-path-provisioner)；正式環境請使用您平台的區塊儲存（Longhorn、Ceph、雲端 CSI 驅動程式）。
+</Step>
+
+<Step title="TeX Live 映像檔">
+在**每個**可執行 Ayakaleaf Pro 的節點上，使用 Docker 拉取您將列於 `ALL_TEX_LIVE_DOCKER_IMAGES` 中的 TeX Live 映像檔，例如：
+
+```bash
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+`crictl pull` 或 `ctr` 在此無濟於事：Ayakaleaf Pro 是向 Docker 要求映像檔。完整映像檔相當大（每個約 28 GB）；清單請參閱[沙箱編譯](/zh-TW/on-premises/configuration/overleaf-toolkit/sandboxed-compiles)。初次測試時，使用 `ghcr.io/ayaka-notes/texlive-basic:2026.1`（約 630 MB，最精簡的 TeX Live）就已足夠。
+</Step>
+</Steps>
+
+### Q\&A
+
+<Accordion title="我可以在沒有 Docker 的節點上執行 Ayakaleaf Pro 嗎？">
+
+<strong>回答：</strong>只有在設定 `SANDBOXED_COMPILES=false` 時才可以。此時編譯會在 Ayakaleaf Pro 容器內以其內建的小型 TeX Live 執行，而 LaTeX 文件可以讀寫該容器能存取的一切。我們不建議這麼做；請參閱[沙箱編譯](/zh-TW/on-premises/configuration/overleaf-toolkit/sandboxed-compiles)。
+
+</Accordion>
+
+<Accordion title="編譯會計入 Pod 的記憶體限制嗎？">
+
+<strong>回答：</strong>不會。TeX Live 容器由節點的 Docker 啟動，位於 Pod 之外，也不在 kubelet 的視野內。請在節點上為它們保留可用記憶體，例如如上所述使用 `systemReserved`，並且不要讓其他 Pod 塞滿節點。
+
+</Accordion>

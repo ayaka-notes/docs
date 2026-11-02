@@ -1,0 +1,129 @@
+---
+title: OIDC 인증
+description: Kubernetes 배포에서 사용자가 OpenID Connect 공급자를 통해 로그인하도록 합니다.
+icon: id-card-clip
+---
+
+OIDC 로그인은 모든 Ayakaleaf Pro 파드 내부의 **web** 서비스(`authentication` 모듈)가 처리합니다. 백그라운드 작업이나 별도의 파드는 없습니다. 공급자 측 설정(클라이언트, 리디렉션 URI, 관리자 클레임)은 Toolkit과 동일하므로, 먼저 [OIDC 인증](/ko/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication)에 따라 OpenID Provider(OP)를 설정한 다음, 아래와 같이 값을 Kubernetes에 넣으세요.
+
+### 실행 위치
+
+| | |
+| --- | --- |
+| 서비스 | web, 모든 Ayakaleaf Pro 파드에서 실행. 설정은 web이 시작될 때 읽음 |
+| 파드 → OP | `OVERLEAF_OIDC_TOKEN_URL` 및 `OVERLEAF_OIDC_USER_INFO_URL`, 로그인할 때마다 |
+| 브라우저 → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`, 로그아웃 시 `OVERLEAF_OIDC_LOGOUT_URL` |
+| OP → Overleaf | 없음: OP는 브라우저를 다시 리디렉션할 뿐임 |
+| 로그인 상태 | Redis의 세션, 모든 레플리카가 공유 |
+| 주기적 작업 | 없음 |
+
+### 구성
+
+<Steps>
+<Step title="OP에 Overleaf 등록하기">
+`OVERLEAF_SITE_URL`을 기반으로 한 다음 주소를 OP에서 허용하세요.
+
+| 용도 | URI |
+| --- | --- |
+| 리디렉션 URI(로그인) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| 로그아웃 후 리디렉션 URI | `${OVERLEAF_SITE_URL}` |
+| 기존 계정 연결 후 로그아웃 리디렉션 URI | `${OVERLEAF_SITE_URL}/user/settings` |
+
+[디스커버리 문서로 값 찾기](/ko/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document)에 설명된 대로 OP의 디스커버리 문서에서 다섯 개의 URL을 찾으세요.
+</Step>
+
+<Step title="ConfigMap에 설정 추가하기">
+`overleaf-env`(`30-config.yaml`, 또는 [여러 레플리카](/ko/on-premises/configuration/kubernetes/horizontal-scaling)의 경우 `60-config.yaml`)에 추가하세요.
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH`는 공백으로 구분된 목록을 받습니다. 예: `ldap oidc`. 모든 `OVERLEAF_OIDC_*` 설정은 [환경 변수](/ko/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables)를 참고하세요. 클라이언트 시크릿을 제외한 모든 설정은 ConfigMap에 넣습니다.
+
+<Warning>
+
+`"true"`와 `"false"`는 따옴표로 감싸세요. ConfigMap은 문자열만 담을 수 있습니다. `""`로 설정된 키는 키가 없는 것과 다릅니다. `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""`는 최초 로그인 시 계정 생성을 끄지만, 키를 생략하면 모든 도메인을 허용합니다.
+
+</Warning>
+</Step>
+
+<Step title="클라이언트 시크릿을 Secret에 넣기">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="사설 CA 신뢰하기(선택 사항)">
+OP의 인증서가 자체 CA에서 발급된 경우, 해당 CA를 `/var/lib/overleaf/certs`에 마운트된 Secret `overleaf-certs`에 추가하고([인증서 및 기타 파일](/ko/on-premises/configuration/kubernetes#certificates-and-other-files) 참고) Node.js가 이를 가리키도록 설정하세요.
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="적용 및 재시작">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+그런 다음 모든 파드가 토큰 엔드포인트에 접근할 수 있는지 확인하세요. 이 엔드포인트는 브라우저가 아니라 파드가 호출하므로, 방화벽이나 DNS 문제는 여기서만 드러납니다.
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+어떤 HTTP 상태 코드든(GET의 경우 `405`) 엔드포인트에 접근할 수 있다는 뜻이며, `000`은 접근할 수 없다는 뜻입니다.
+</Step>
+</Steps>
+
+### 여러 레플리카
+
+추가 작업이 없습니다. 로그인의 `state` 값과 로그아웃에 사용되는 ID 토큰은 Redis에 있는 세션에 보관되므로, 어느 레플리카가 콜백을 받더라도 동작합니다.
+
+### Kubernetes에서의 테스트
+
+goauthentik를 OP로 사용하고 HAProxy 뒤에 세 개의 레플리카를 둔 Kubernetes 1.37 환경에서, OIDC에 대한 엔드투엔드 테스트(35개 케이스)가 통과했습니다. 테스트 항목은 로그인 및 OP를 통한 로그아웃, 그룹·이메일·단일 값에 따른 관리자 매핑과 매핑 없음, 로그인할 때마다 이름과 관리자 플래그 갱신, 계정 연결 및 연결 해제, OIDC 계정의 비밀번호 재설정과 비밀번호 변경, 정지된 계정, `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`, `OVERLEAF_DISABLE_LOCAL_LOGIN`, 그리고 공개 접근과 함께 사용하는 OIDC입니다.
+
+### Q\&A
+
+<Accordion title="“Unable to verify authorization request state” 오류와 함께 로그인이 실패합니다">
+
+<strong>답변:</strong> 브라우저가 콜백과 함께 세션 쿠키를 다시 보내지 않았습니다. Kubernetes에서 흔한 원인은 다음과 같습니다.
+
+* `OVERLEAF_SECURE_COOKIE`가 설정되어 있지만 사용자가 일반 HTTP로 사이트를 열어서 브라우저가 쿠키를 저장하지 않습니다. `OVERLEAF_SECURE_COOKIE`는 `"false"`를 포함한 어떤 값이든 secure 쿠키를 켭니다. 대신 키를 제거하세요.
+* 사이트를 `OVERLEAF_SITE_URL`과 다른 주소로 열었습니다.
+* HTTPS 환경에서 인그레스나 로드 밸런서가 `X-Forwarded-Proto: https`를 보내지 않거나, 그 주소가 `OVERLEAF_TRUSTED_PROXY_IPS`에 없습니다.
+
+</Accordion>
+
+<Accordion title="로그인이 실패한 이유는 어디에서 확인하나요?">
+
+<strong>답변:</strong> `kubectl logs`가 아니라 해당 요청을 처리한 파드의 web 로그에서 확인합니다.
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+레플리카가 여러 개인 경우 각 `overleaf-N`을 확인하세요.
+
+</Accordion>

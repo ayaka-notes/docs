@@ -1,0 +1,67 @@
+---
+title: メール配信
+description: Kubernetes デプロイから、アクティベーション、招待、パスワードリセットのメールを送信します。
+icon: paper-plane-top
+---
+
+**web** サービスは、すべてのメール（アクティベーション、プロジェクトへの招待、パスワードリセット）を各 Ayakaleaf Pro Pod から送信します。設定は Toolkit と同じです。[メール配信](/ja/on-premises/configuration/overleaf-toolkit/email-delivery) を参照してください。
+
+| | |
+| --- | --- |
+| サービス | web、すべての Ayakaleaf Pro Pod 内。web の起動時に読み込まれます |
+| Pod → 外部 | SMTP サーバー（`OVERLEAF_EMAIL_SMTP_HOST`）、または `OVERLEAF_EMAIL_AWS_SES_REGION` の Amazon SES API |
+| 状態 | Redis 内の送信レート制限 |
+| 定期ジョブ | なし |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_EMAIL_FROM_ADDRESS: no-reply@example.com
+  OVERLEAF_EMAIL_SMTP_HOST: smtp.example.com
+  OVERLEAF_EMAIL_SMTP_PORT: "587"
+  OVERLEAF_EMAIL_SMTP_SECURE: "false"
+  OVERLEAF_EMAIL_SMTP_USER: no-reply@example.com
+  # optional
+  # OVERLEAF_EMAIL_REPLY_TO: support@example.com
+  # OVERLEAF_EMAIL_SMTP_IGNORE_TLS: "false"
+  # OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH: "true"
+```
+
+`OVERLEAF_EMAIL_FROM_ADDRESS` を設定するとメール送信が有効になります。必ず SMTP サーバー（または SES）と一緒に設定してください。送信元アドレスだけを設定すると、Ayakaleaf Pro は Pod 内の SMTP サーバーに接続しようとし、すべてのメールが失敗します。設定しない場合、メールは送信されず、`web.log` に書き込まれるだけです。
+
+`OVERLEAF_EMAIL_SMTP_SECURE`、`OVERLEAF_EMAIL_SMTP_IGNORE_TLS`、`OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH` は JSON として読み込まれるため、`"true"` または `"false"` を使用してください。`yes` のような値を設定すると、起動時に Pod のすべてのサービスが停止します。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_EMAIL_SMTP_PASS":"<SMTP password>"}}'
+```
+
+Amazon SES API を使用する場合は、代わりに `OVERLEAF_EMAIL_AWS_SES_ACCESS_KEY_ID` と `OVERLEAF_EMAIL_AWS_SES_SECRET_KEY` をここに設定し、`OVERLEAF_EMAIL_DRIVER: ses` と `OVERLEAF_EMAIL_AWS_SES_REGION` を ConfigMap に設定します。
+</Step>
+
+<Step title="適用、再起動、テスト">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+ログインページから自分宛てにパスワードリセットのメールを送信してみてください。届かない場合は、Pod から SMTP サーバーに到達できるかを確認し、web ログを確認します。
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- bash -c 'echo > /dev/tcp/smtp.example.com/587 && echo reachable'
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "email|smtp" /var/log/overleaf/web.log | tail
+```
+</Step>
+</Steps>
+
+### 複数のレプリカ
+
+追加の作業は不要です。すべてのレプリカが同じ設定で送信し、送信レート制限はすべてのレプリカをまたいで Redis でカウントされます。SMTP サーバーが既知の送信元しか受け付けない場合は、Pod がクラスター外に出る際のアドレス（通常はノードのアドレス）を許可してください。
+
+### Kubernetes でのテスト結果
+
+Mailpit を SMTP サーバーとして使用し、Kubernetes 1.37 上でレプリカ 1 つの構成で、メールを送信するエンドツーエンドテストに合格しました。対象は、管理者が作成したアカウントのアクティベーションメール、ドメインを限定したセルフ登録のアクティベーションメール、パスワードリセットのメール、アカウントが削除されたことをユーザーに伝えるメール、そして SMTP サーバーがアクティベーションメールや削除通知メールを拒否した場合の動作です（アカウントはそれでも作成・削除され、アクティベーションメールは後で再送できます）。`OVERLEAF_EMAIL_FROM_ADDRESS` を設定して SMTP ホストを設定しなかった場合、上記のとおり、パスワードリセットのリクエストはエラーで失敗し、`web.log` には "error sending message" と表示されました。

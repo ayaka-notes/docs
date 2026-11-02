@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: LaTeX in TeX Live-Containern auf den Knoten eines Kubernetes-Clusters kompilieren.
+icon: gear-code
+---
+
+Kompilierungen werden vom **clsi**-Dienst in jedem Ayakaleaf Pro-Pod ausgeführt. Bei aktivierten Sandboxed Compiles weist clsi die **Docker Engine des Knotens**, auf dem der Pod läuft, an, für jede Kompilierung einen TeX Live-Container zu starten, und übergibt ihm das Projektverzeichnis über dessen Pfad auf diesem Knoten. Wie das Sandboxing funktioniert und welche Images es gibt, ist unter [Sandboxed Compiles](/de/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) beschrieben.
+
+| | |
+| --- | --- |
+| Dienst | clsi (Kompilierungen), web (die Image-Liste in den Compiler-Einstellungen), in jedem Ayakaleaf Pro-Pod |
+| Knoten | Docker Engine und jedes Image aus `ALL_TEX_LIVE_DOCKER_IMAGES`, auf jedem Knoten, der Ayakaleaf Pro ausführen kann |
+| Pod-Mounts | `/var/run/docker.sock` sowie die Kompilierungs-, Ausgabe- und Cache-Verzeichnisse als `hostPath`-Volumes |
+| Periodische Jobs | clsi löscht Kompilierungsverzeichnisse, die einen Tag lang nicht verwendet wurden, und entfernt stündlich alte TeX Live-Container aus dem Docker des Knotens |
+
+### Konfiguration
+
+Die Installation richtet alles ein: Docker und die Images auf den Knoten in [0. Knoten vorbereiten](/de/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), die Einstellungen in [4. Ihre Instanz personalisieren](/de/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) und die Volumes in [5. Ayakaleaf Pro bereitstellen](/de/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Die Einstellungen, alle in der ConfigMap:
+
+| Variable | Wert |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | Knotenpfad des unter `/var/lib/overleaf/data/compiles` eingebundenen Volumes |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | Knotenpfad des unter `/var/lib/overleaf/data/output` eingebundenen Volumes |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | Knotenpfad des unter `/var/lib/overleaf/data/cache` eingebundenen Volumes |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | die Images, wie beim Toolkit |
+
+### Eine TeX Live-Version hinzufügen
+
+<Steps>
+<Step title="Das Image auf jedem Knoten pullen">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Das Toolkit pullt die Images selbst; auf Kubernetes übernimmt das niemand. Pullen Sie in **Docker**, nicht mit `crictl`: clsi fragt Docker nach dem Image. Eine Kompilierung mit einem Image, das auf dem Knoten fehlt, schlägt fehl.
+</Step>
+
+<Step title="In der ConfigMap eintragen und neu starten">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Ein später zum Cluster hinzugefügter Knoten benötigt Docker und alle Images, bevor Ayakaleaf Pro dort läuft. Versehen Sie solche Knoten mit einem Label und halten Sie Ayakaleaf Pro mit einem `nodeSelector` auf ihnen, wenn nicht jeder Knoten geeignet ist.
+
+### Mehrere Replikate
+
+Jedes Replikat kompiliert auf seinem eigenen Knoten und bewahrt die Kompilierungsausgabe dort auf, daher muss ein Benutzer auf dem Replikat bleiben, das kompiliert hat; dafür sorgt das Sticky-Cookie des Load Balancers. Betreiben Sie nie zwei Replikate auf demselben Knoten: Sie würden sich die Kompilierungsverzeichnisse des Knotens teilen. Das Setup für die [Horizontale Skalierung](/de/on-premises/configuration/kubernetes/horizontal-scaling) verhindert dies mit `podAntiAffinity`.
+
+Die TeX Live-Container laufen neben dem Pod, außerhalb seines Speicherlimits und außerhalb der Sicht des Schedulers. Lassen Sie auf den Knoten Speicher für sie frei, siehe [0. Knoten vorbereiten](/de/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Auf Kubernetes getestet
+
+Auf Kubernetes 1.37 mit drei Replikaten hinter HAProxy, einem pro Knoten, und TeX Live 2026 und 2025 in Docker auf jedem Knoten bestehen unsere End-to-End-Tests für Sandboxed Compiles (7 Fälle): Ein neues Projekt wird zu einem PDF kompiliert, die Compiler-Einstellungen bieten beide Images an und wechseln zwischen ihnen, XeLaTeX mit fontspec, LaTeX-Fehler und erneutes Kompilieren nach der Korrektur, Abbrechen einer laufenden Kompilierung sowie SyncTeX in beide Richtungen. Ein Lasttest mit 12 Benutzern, die gleichzeitig ein 600-seitiges Dokument kompilierten, führte 4 Kompilierungen pro Knoten aus, siehe [Was Sie erwarten können](/de/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

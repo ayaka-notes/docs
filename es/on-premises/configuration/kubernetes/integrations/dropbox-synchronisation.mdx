@@ -1,0 +1,101 @@
+---
+title: Sincronización con Dropbox
+description: Permite que los usuarios sincronicen sus proyectos con una carpeta de su Dropbox en un despliegue de Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.svg
+---
+
+La sincronización con Dropbox usa tres partes de cada pod de Ayakaleaf Pro, y las tres solo arrancan con `DROPBOX_ENABLED: "true"`:
+
+* **web** (el módulo `dropbox`): la vinculación, el diálogo de Dropbox del proyecto y el webhook al que llama Dropbox.
+* **third-party-datastore**: un servicio propio dentro del pod que procesa la cola de cambios que hay que enviar a Dropbox u obtener de él.
+* **document-updater**: con Dropbox activado, escribe en segundo plano los cambios del editor en MongoDB, unos minutos después de que todos hayan salido de un proyecto; solo entonces pasan a Dropbox.
+
+Crea la aplicación de Dropbox y consulta cómo funciona la sincronización en [Sincronización con Dropbox](/es/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation); esta página explica cómo trasladarlo a Kubernetes.
+
+| | |
+| --- | --- |
+| Servicios | web (módulo `dropbox`), third-party-datastore y document-updater, en cada pod de Ayakaleaf Pro |
+| Dropbox → Overleaf | `POST ${OVERLEAF_SITE_URL}/dropbox/webhook` desde internet, firmado con el secreto de la aplicación |
+| Pod → Dropbox | `https://api.dropboxapi.com` y `https://content.dropboxapi.com` |
+| Navegador → Dropbox | `https://www.dropbox.com/oauth2/authorize` y, después, de vuelta a `${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback` |
+| Estado | la cola de cambios pendientes y sus bloqueos en Redis; el estado de sincronización en MongoDB (`dropboxEntities`, `dropboxProjects`) |
+| Trabajo en segundo plano | third-party-datastore comprueba su cola cada segundo; document-updater escribe los proyectos que nadie ha tenido abiertos durante 3 minutos |
+
+### Configuración
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  DROPBOX_ENABLED: "true"
+  DROPBOX_APP_KEY: <app key>
+  DROPBOX_APP_NAME: Overleaf      # the folder name under Apps/ in Dropbox
+  # optional: send the requests to Dropbox through an HTTP proxy
+  # DROPBOX_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` y el StatefulSet de git-bridge de [Integración con Git](/es/on-premises/configuration/kubernetes/integrations/git-integration) deben estar en marcha: sin ellos, la configuración de la cuenta oculta la sección de sincronización de proyectos.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "DROPBOX_APP_SECRET":"<app secret>",
+  "DROPBOX_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`DROPBOX_TOKEN_CIPHER_PASSWORD` cifra los tokens de Dropbox de los usuarios en MongoDB. Todas las réplicas deben usar el mismo valor, y cambiarlo más adelante obliga a todos los usuarios a volver a vincular Dropbox.
+</Step>
+
+<Step title="Crea los índices de la base de datos">
+Ejecuta una vez los comandos de índices de [Crear los índices de la base de datos](/es/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation#create-the-database-indexes), en el primario del conjunto de réplicas:
+
+```bash wrap
+kubectl -n overleaf exec -i mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' <<'EOF'
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+EOF
+```
+</Step>
+
+<Step title="Aplica y reinicia">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf exec deploy/overleaf -- tail -n 5 /var/log/overleaf/third-party-datastore.log
+```
+
+`third-party-datastore.log` solo existe cuando `DROPBOX_ENABLED` es `"true"`.
+</Step>
+
+<Step title="Abre el webhook a internet">
+Dropbox debe poder llegar a `${OVERLEAF_SITE_URL}/dropbox/webhook` desde internet. Si tu ingress o balanceador de carga solo permite algunas rutas o redes desde el exterior, permite esta; es la única ruta a la que llama Dropbox. Compruébalo desde fuera del clúster:
+
+```bash
+curl "https://overleaf.example.com/dropbox/webhook?challenge=test"   # prints: test
+```
+
+Después, añade el webhook en la App Console de Dropbox como se describe en la página del Toolkit.
+</Step>
+</Steps>
+
+### Varias réplicas
+
+No hace falta nada más aparte de compartir `DROPBOX_TOKEN_CIPHER_PASSWORD`:
+
+* El webhook puede llegar a cualquier réplica. Solo pone el cambio en la cola en Redis.
+* Todas las réplicas ejecutan third-party-datastore, y cada una trabaja sobre la cola compartida. La cola de un usuario se toma con un bloqueo en Redis, de modo que solo una réplica envía u obtiene a la vez los cambios de un usuario determinado.
+* El document-updater de cada réplica escribe en segundo plano los proyectos inactivos. Cada proyecto se toma de una lista compartida en Redis, por lo que se escribe una sola vez.
+
+### Probado en Kubernetes
+
+Contra una simulación de la API de Dropbox, en Kubernetes 1.37 con tres réplicas detrás de HAProxy, nuestras pruebas de extremo a extremo para la sincronización con Dropbox se superan (59 casos): vinculación y desvinculación; envío a Dropbox de proyectos, ediciones, archivos binarios, cambios de nombre, movimientos y eliminaciones, incluida una edición del editor que llega mediante la escritura en segundo plano después de cerrar el proyecto, sin compilar ni usar "sync now"; aplicación de los cambios hechos en Dropbox mediante el webhook (desafío de verificación y comprobación de firma), proyectos nuevos a partir de carpetas nuevas, carpetas de proyecto eliminadas; proyectos con el mismo nombre; el diálogo de Dropbox del editor y "sync now" con su límite de frecuencia; reintentos, límites de frecuencia y tiempos de espera de Dropbox; cuentas desvinculadas cuando Dropbox está lleno, rechaza el token o está suspendido; cuentas de Overleaf suspendidas; y la respuesta del webhook cuando third-party-datastore no está disponible.

@@ -1,0 +1,45 @@
+---
+title: 新增 LaTeX 使用者說明
+description: 在 Kubernetes 部署中，於 /learn 下提供來自 MediaWiki 網站的 LaTeX 說明頁面。
+icon: graduation-cap
+---
+
+`/learn` 頁面由每個 Ayakaleaf Pro pod 的 **web** 服務（`learn` 模組）提供，內容來自 `WIKI_URL` 所設定之 wiki 的快取。此模組的功能以及哪些 wiki 可以使用，請參閱[新增 LaTeX 使用者說明](/zh-TW/on-premises/configuration/overleaf-toolkit/adding-latex-user-help)。
+
+| | |
+| --- | --- |
+| 服務 | web（`learn` 模組），位於每個 Ayakaleaf Pro pod 中 |
+| Pod → 外部 | `WIKI_URL`（預設為 `https://learnwiki.overleaf.com`）：首次啟動時下載所有頁面，之後當使用者在超過 `WIKI_MAX_CACHE_AGE` 後開啟某頁面時，會再次下載該頁面 |
+| 瀏覽器 → 外部 | 頁面中的圖片，直接從 `WIKI_URL` 載入 |
+| 儲存的資料 | 資料磁碟區上 `/var/lib/overleaf/data/learnPages` 中的頁面快取 |
+| 定期工作 | 無：頁面會在使用者開啟時重新整理 |
+
+### 設定
+
+```yaml title="30-config.yaml (additions)"
+  OVERLEAF_PROXY_LEARN: "true"
+  # optional: your own MediaWiki
+  # WIKI_URL: https://wiki.example.com
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf --timeout=30m
+```
+
+<Warning>
+
+在啟用此模組後的首次啟動時，web 服務會先下載整個 wiki 才開始接受請求，這需要數分鐘。在此之前 pod 會一直處於未就緒狀態，因此請在 `rollout status --timeout` 以及您新增的任何 startup 或 liveness 探針中預留這段時間。之後的啟動會重複使用資料磁碟區上的快取。
+
+</Warning>
+
+首次啟動時，在快取尚未存在之前，pod 必須能連線至 `WIKI_URL`：若無法連線，web 服務會在啟動時失敗，並在 pod 內不斷重新啟動，導致 pod 永遠無法就緒。請關閉此模組，或允許 pod 對外連線至該 wiki。快取建立之後，即使 wiki 無法連線，pod 仍會啟動並提供快取的頁面。
+
+### 多個副本
+
+每個副本都會在其節點的磁碟上保留自己的快取，因此每個副本在首次啟動時都會下載 wiki；若使用 `podManagementPolicy: OrderedReady`，它們會依序逐一下載。在另一個副本上的頁面重新整理之前，使用者可能會在該副本上看到版本略有不同的頁面。
+
+### 在 Kubernetes 上的測試
+
+在 Kubernetes 1.37 上，以三個副本置於 HAProxy 之後，每個副本於首次啟動時將 `https://learnwiki.overleaf.com` 下載至其節點的快取中，我們針對 `/learn` 的端對端測試全數通過（12 個案例）：頁首的 Documentation 連結、歡迎訊息與編輯器的 Help 選單、目錄側邊欄、wiki 內的頁面、連結與重新導向、從 wiki 載入的圖片、未知頁面回傳 404、未啟用公開存取時須登入，以及在 `WIKI_URL` 改為無法連線的位址後，仍從快取提供過期的頁面。在快取為空且 `WIKI_URL` 指向拒絕連線的位址時啟動，pod 維持未就緒且未重新啟動，而其中的 web 服務在三分鐘內啟動並失敗了 77 次。

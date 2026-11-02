@@ -1,0 +1,112 @@
+---
+title: Authentification LDAP
+description: Permettre aux utilisateurs de se connecter avec leur compte LDAP ou Active Directory sur un déploiement Kubernetes.
+icon: address-book
+---
+
+La connexion LDAP est gérée par le service **web** (le module `authentication`) à l'intérieur de chaque pod Ayakaleaf Pro. Contrairement à OIDC et SAML, les pods communiquent eux-mêmes avec l'annuaire. Configurez le côté annuaire comme décrit dans [Authentification LDAP](/fr/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication), puis reportez les valeurs dans Kubernetes comme ci-dessous.
+
+### Où les composants s'exécutent
+
+| | |
+| --- | --- |
+| Service | web, dans chaque pod Ayakaleaf Pro ; les paramètres et la CA sont lus au démarrage de web |
+| Pod → serveur LDAP | `OVERLEAF_LDAP_URL` : une nouvelle connexion à chaque connexion d'utilisateur, et à chaque recherche de contacts si `OVERLEAF_LDAP_CONTACTS_FILTER` est défini |
+| Navigateur → Overleaf | `GET`/`POST ${OVERLEAF_SITE_URL}/ldap/login` |
+| État de connexion | la session et les limites de débit dans Redis, partagées par tous les réplicas |
+| Tâches périodiques | aucune |
+
+### Configuration
+
+<Steps>
+<Step title="Permettre aux pods d'atteindre l'annuaire">
+Chaque pod qui exécute Ayakaleaf Pro ouvre les connexions LDAP. Si un pare-feu ou une NetworkPolicy protège l'annuaire, autorisez les adresses avec lesquelles les pods sortent du cluster : généralement les adresses des nœuds, ou votre passerelle de sortie (egress gateway).
+
+L'image ne contient pas `ldapsearch`. Pour exécuter la [vérification de la recherche](/fr/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#check-the-search) depuis l'intérieur du cluster, utilisez un pod jetable :
+
+```bash wrap
+kubectl -n overleaf run ldapsearch --rm -i --restart=Never --image=alpine:3.22 -- sh -c \
+  "apk add -q openldap-clients && ldapsearch -x -H ldap://ldap.example.com:389 \
+   -D cn=ldapservice,ou=users,dc=example,dc=com -w '<password of ldapservice>' \
+   -b ou=users,dc=example,dc=com '(cn=alice)' dn"
+```
+
+Il doit afficher exactement un `dn:`.
+</Step>
+
+<Step title="Ajouter les paramètres à la ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: ldap
+  OVERLEAF_LDAP_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_LDAP_URL: ldap://ldap.example.com:389
+  OVERLEAF_LDAP_BIND_DN: cn=ldapservice,ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_BASE: ou=users,dc=example,dc=com
+  OVERLEAF_LDAP_SEARCH_FILTER: (cn={{username}})
+  OVERLEAF_LDAP_EMAIL_ATT: mail
+  OVERLEAF_LDAP_NAME_ATT: name
+  OVERLEAF_LDAP_IS_ADMIN_ATT: memberOf
+  OVERLEAF_LDAP_IS_ADMIN_ATT_VALUE: cn=Admins,ou=groups,dc=example,dc=com
+  OVERLEAF_LDAP_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Tous les paramètres `OVERLEAF_LDAP_*` sont répertoriés dans [Variables d'environnement](/fr/on-premises/configuration/overleaf-toolkit/authentication/ldap-authentication#environment-variables). Ils vont tous dans la ConfigMap, à l'exception du mot de passe de liaison (bind). Mettez entre guillemets `"true"`, `"false"`, les valeurs JSON telles que `OVERLEAF_LDAP_SEARCH_ATTRIBUTES: '["mail", "cn"]'`, ainsi que les valeurs qui commencent par `*`.
+</Step>
+
+<Step title="Placer le mot de passe de liaison dans le Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_LDAP_BIND_CREDENTIALS":"<password of ldapservice>"}}'
+```
+</Step>
+
+<Step title="LDAPS ou STARTTLS avec votre propre CA (facultatif)">
+Placez la CA dans le Secret `overleaf-certs` monté sur `/var/lib/overleaf/certs` (voir [Certificats et autres fichiers](/fr/on-premises/configuration/kubernetes#certificates-and-other-files)) et indiquez son chemin :
+
+```yaml
+  OVERLEAF_LDAP_URL: ldaps://ldap.example.com:636
+  OVERLEAF_LDAP_TLS_OPTS_CA_PATH: /var/lib/overleaf/certs/ldap-ca.pem
+```
+
+Cette liste de CA remplace les CA du système pour les connexions LDAP. Elle est lue au démarrage de web.
+</Step>
+
+<Step title="Appliquer et redémarrer">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+</Step>
+</Steps>
+
+### Plusieurs réplicas
+
+Rien de plus que le pare-feu de l'étape 1 : chaque réplica se connecte à l'annuaire de son côté, et le résultat de la connexion est enregistré dans la session dans Redis.
+
+### Testé sur Kubernetes
+
+Avec l'outpost LDAP de goauthentik comme annuaire, sur Kubernetes 1.37 avec trois réplicas derrière HAProxy, nos tests de bout en bout pour LDAP réussissent (26 cas) : le premier administrateur créé depuis le launchpad se connectant via LDAP, la connexion avec le mot de passe de liaison issu du Secret, le refus des mauvais mots de passe et des utilisateurs inconnus, l'attribution du rôle d'administrateur par groupe et sans correspondance, la mise à jour du nom et du statut d'administrateur à chaque connexion (un seul attribut de nom, ou prénom et nom), les contacts de l'annuaire, la déconnexion, les règles de mot de passe pour les comptes LDAP, les comptes suspendus, et la connexion LDAP avec reCAPTCHA.
+
+### Questions-réponses
+
+<Accordion title="La connexion LDAP échoue sur certains pods seulement">
+
+<strong>Réponse :</strong> L'annuaire n'est pas joignable depuis tous les nœuds. Vérifiez depuis chaque pod :
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- bash -c 'echo > /dev/tcp/ldap.example.com/389 && echo "$HOSTNAME ok"'
+done
+```
+
+</Accordion>
+
+<Accordion title="Où voir pourquoi une connexion a échoué ?">
+
+<strong>Réponse :</strong> Dans le journal web du pod qui a traité la connexion :
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i ldap /var/log/overleaf/web.log | tail
+```
+
+</Accordion>

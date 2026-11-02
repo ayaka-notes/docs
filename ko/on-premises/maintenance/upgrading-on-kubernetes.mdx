@@ -1,0 +1,136 @@
+---
+title: Kubernetes에서 업그레이드
+description: 레플리카가 하나이든 여러 개이든 Ayakaleaf Pro의 Kubernetes 배포를 업그레이드합니다.
+icon: arrow-up-from-square
+---
+
+업그레이드는 이미지 태그를 교체합니다. 새 버전은 시작할 때 데이터베이스를 마이그레이션하며, 이 마이그레이션은 **이전 버전의 파드가 실행되지 않는 상태에서 하나의 파드에서 한 번만** 실행되어야 합니다. 따라서 Kubernetes에서는 확장된 StatefulSet의 단순한 롤링 업데이트를 사용할 수 없습니다.
+
+<Danger>
+
+업그레이드할 때마다 Ayakaleaf Pro를 중지한 상태에서 [일관된 백업](/ko/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)을 수행하세요. 업그레이드할 버전에 필요한 단계는 [릴리스 노트](/ko/on-premises/release-notes)를 읽어 보세요.
+
+</Danger>
+
+시작하기 전에 Ayakaleaf Pro를 실행하는 모든 노드에서, 새 버전이나 새 구성에 나열된 TeX Live 이미지를 `sudo docker pull`로 pull하세요.
+
+<Tabs>
+<Tab title="레플리카 하나">
+
+<Steps>
+<Step title="Ayakaleaf Pro 중지">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="백업">
+MongoDB는 아무 멤버에서나 백업합니다.
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+데이터 볼륨은 이를 마운트하는 단기 파드를 통해 백업합니다(파드는 볼륨이 있는 노드에 배치됨).
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+git-bridge의 볼륨(`data-git-bridge-0`)도 같은 방법으로 백업하고, Secret `overleaf-secrets`의 사본을 보관하세요. 스토리지가 [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/)를 지원한다면 볼륨 스냅샷으로도 같은 효과를 얻을 수 있습니다.
+</Step>
+
+<Step title="버전 변경 및 시작">
+`40-overleaf.yaml`(그리고 같은 태그를 사용해야 하는 `45-git-bridge.yaml`)에 새 태그를 설정한 다음:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment는 `strategy: Recreate`를 사용하므로 태그가 변경되어도 두 버전이 동시에 실행되지 않습니다.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="여러 레플리카">
+
+[수평 확장](/ko/on-premises/configuration/kubernetes/horizontal-scaling)의 구성을 기준으로 합니다.
+
+<Steps>
+<Step title="모든 레플리카 중지">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="백업">
+MongoDB는 레플리카 하나 탭과 같이, S3 버킷은 제공업체의 도구로, git-bridge의 볼륨(`data-git-bridge-0`)과 Secret도 백업하세요. 레플리카의 `/srv/overleaf-ha`에는 컴파일 출력만 있으므로 백업할 필요가 없습니다.
+</Step>
+
+<Step title="새 버전으로 레플리카 하나 시작">
+`70-overleaf.yaml`과 `75-git-bridge.yaml`에 새 태그를 설정하고 `replicas: 1`로 설정하세요.
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+로그인하고, 프로젝트를 열고, 컴파일할 수 있는지 확인하세요.
+</Step>
+
+<Step title="나머지 레플리카 시작">
+다시 `replicas: 3`으로 설정하고 적용하세요. `OrderedReady`가 레플리카를 하나씩 차례로 시작합니다.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+실행 중인 확장된 StatefulSet의 이미지를 `kubectl set image`나 `kubectl apply`로 변경하지 마세요. 롤링 업데이트가 이전 레플리카가 아직 사용자에게 서비스하는 동안 새 버전과 그 마이그레이션을 시작하게 됩니다. 새 버전 없이 구성만 변경하는 경우에는 롤링 재시작을 사용해도 됩니다: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB와 Redis
+
+MongoDB와 Redis는 Ayakaleaf Pro와 별도로 업그레이드하세요. MongoDB의 경우 [MongoDB 업데이트](/ko/on-premises/maintenance/updating-mongodb)를 따르세요(한 번에 메이저 버전 하나씩, 각 단계 후 `featureCompatibilityVersion` 설정). `10-mongo.yaml`에서 이미지를 변경하면 StatefulSet이 `mongo-2`, `mongo-1`, `mongo-0`을 차례로 교체하므로 레플리카 세트는 한 번에 멤버 하나씩 새 이미지를 적용합니다.
+
+### 롤백
+
+위와 같이 Ayakaleaf Pro를 중지하고, 아카이브에서 MongoDB를 복원하고(`mongorestore --drop --archive --gzip`), 백업에서 볼륨 또는 버킷을 복원한 다음, 이전 태그를 설정하고 다시 시작하세요. 그 외의 방법으로는 새 버전의 마이그레이션을 되돌릴 수 없습니다.
+
+### Q\&A
+
+<Accordion title="레플리카 하나가 준비 상태가 되지 않고, 나머지 레플리카가 시작되지 않습니다">
+
+<strong>답변:</strong> `podManagementPolicy: OrderedReady`에서는 `overleaf-0`이 준비된 후에만 `overleaf-1`이 시작되며, 롤링 업데이트는 준비 상태가 된 적 없는 파드를 교체하지 않습니다. ConfigMap의 잘못된 설정 등 원인을 해결한 후, StatefulSet이 현재 템플릿으로 다시 생성하도록 멈춘 파드를 삭제하세요.
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+테스트 클러스터에서 한 설정 때문에 `overleaf-0`이 준비 상태가 되지 못했을 때 이 문제를 겪었으며, 파드를 삭제하자 세 레플리카가 모두 시작되었습니다.
+
+</Accordion>

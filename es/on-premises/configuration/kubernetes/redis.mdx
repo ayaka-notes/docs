@@ -1,0 +1,66 @@
+---
+title: Redis
+description: Conecta un despliegue de Kubernetes a Redis con una contraseña y conserva los datos de Redis con persistencia AOF.
+icon: memory
+---
+
+Todos los servicios de Ayakaleaf Pro que mantienen estado en vivo usan el mismo servidor Redis: web (sesiones, límites de frecuencia), real-time, document-updater (ediciones aún no guardadas en MongoDB), project-history (cola del historial) y third-party-datastore (cola de Dropbox). La instalación lo ejecuta como el StatefulSet `redis` de [3. Desplegar MongoDB y Redis](/es/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis); consulta [Redis](/es/on-premises/configuration/overleaf-toolkit/redis) para el Toolkit.
+
+| | |
+| --- | --- |
+| Servicios | web, real-time, document-updater, project-history, history-v1, third-party-datastore, en cada pod de Ayakaleaf Pro |
+| Ajustes | `OVERLEAF_REDIS_HOST`, `OVERLEAF_REDIS_PORT` (por defecto `6379`), `OVERLEAF_REDIS_PASS`, `OVERLEAF_REDIS_TLS` |
+| No compatible | Redis Sentinel y Redis Cluster: solo un servidor |
+
+### Autenticación por contraseña
+
+<Steps>
+<Step title="Guardar la contraseña">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="Iniciar Redis con ella">
+En `20-redis.yaml`, proporciona la contraseña al contenedor y pásala a `redis-server`:
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes sustituye `$(REDIS_PASS)` por el valor del Secret. La sonda de disponibilidad (`tcpSocket`) no necesita cambios.
+</Step>
+
+<Step title="Aplicar y reiniciar">
+Detén primero Ayakaleaf Pro, para que no se pierda ninguna edición entre los dos reinicios:
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+Para un Redis gestionado, establece en el ConfigMap `OVERLEAF_REDIS_HOST` (y `REDIS_HOST`) con su dirección, la contraseña como se indica arriba y `OVERLEAF_REDIS_TLS: "true"` si requiere TLS.
+
+### Persistencia AOF
+
+La instalación ya inicia Redis con `--appendonly yes`, el equivalente de `REDIS_AOF_PERSISTENCE=true` del Toolkit, y conserva sus datos en el volumen `data-redis-0`. Para cambiar un Redis existente sin AOF, sigue los pasos de la [página del Toolkit](/es/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence) con `kubectl -n overleaf exec -it redis-0 -- redis-cli` en lugar de `docker exec` y, después, añade `--appendonly yes` a los args.
+
+### Varias réplicas
+
+Todas las réplicas deben usar el mismo Redis: contiene las sesiones, las ediciones que aún no están en MongoDB y los bloqueos que impiden que dos réplicas procesen el mismo proyecto a la vez.
+
+### Probado en Kubernetes
+
+En Kubernetes 1.37 con una réplica, Redis iniciado con `--requirepass $(REDIS_PASS)` desde el Secret `redis-auth` como se indica arriba rechazó `redis-cli` sin la contraseña (`NOAUTH`), y con `OVERLEAF_REDIS_PASS` y `REDIS_PASSWORD` en `overleaf-secrets` nuestras pruebas de extremo a extremo se superaron para el launchpad (13 casos) y para la edición con control de cambios, comentarios y uso compartido anónimo (22 casos), que pasan por web, real-time, document-updater y project-history; ningún servicio registró un error de autenticación de Redis. Todas las demás pruebas de Kubernetes de estas páginas se ejecutaron contra el StatefulSet de Redis de la instalación, con persistencia AOF y sin contraseña.

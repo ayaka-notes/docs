@@ -1,0 +1,66 @@
+---
+title: Redis
+description: パスワード付きで Kubernetes デプロイを Redis に接続し、AOF 永続化で Redis のデータを保持します。
+icon: memory
+---
+
+ライブな状態を保持する Ayakaleaf Pro のサービスはすべて、1 台の Redis サーバーを使用します: web（セッション、レート制限）、real-time、document-updater（まだ MongoDB に保存されていない編集）、project-history（履歴キュー）、third-party-datastore（Dropbox キュー）。インストール時には [3. MongoDB と Redis のデプロイ](/ja/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis)の StatefulSet `redis` として実行されます。Toolkit については [Redis](/ja/on-premises/configuration/overleaf-toolkit/redis) を参照してください。
+
+| | |
+| --- | --- |
+| サービス | web、real-time、document-updater、project-history、history-v1、third-party-datastore、すべての Ayakaleaf Pro Pod 内 |
+| 設定 | `OVERLEAF_REDIS_HOST`、`OVERLEAF_REDIS_PORT`（デフォルトは `6379`）、`OVERLEAF_REDIS_PASS`、`OVERLEAF_REDIS_TLS` |
+| 非サポート | Redis Sentinel と Redis Cluster: サーバーは 1 台のみ |
+
+### パスワード認証
+
+<Steps>
+<Step title="パスワードを保存する">
+```bash
+REDIS_PASS=$(openssl rand -hex 24)
+kubectl -n overleaf create secret generic redis-auth --from-literal=password="$REDIS_PASS"
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_REDIS_PASS":"'"$REDIS_PASS"'","REDIS_PASSWORD":"'"$REDIS_PASS"'"}}'
+```
+</Step>
+
+<Step title="パスワード付きで Redis を起動する">
+`20-redis.yaml` で、コンテナにパスワードを渡し、それを `redis-server` に渡します。
+
+```yaml title="20-redis.yaml (changes)"
+        - name: redis
+          image: redis:7.4
+          env:
+            - name: REDIS_PASS
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+          args: [--appendonly, "yes", --requirepass, $(REDIS_PASS)]
+```
+
+Kubernetes は `$(REDIS_PASS)` を Secret の値で置き換えます。readiness プローブ（`tcpSocket`）は変更不要です。
+</Step>
+
+<Step title="適用と再起動">
+2 回の再起動の間に編集が失われないよう、先に Ayakaleaf Pro を停止します。
+
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0     # or statefulset/overleaf
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+kubectl -n overleaf scale deployment/overleaf --replicas=1     # or the replica count you run
+```
+</Step>
+</Steps>
+
+マネージド Redis を使う場合は、ConfigMap の `OVERLEAF_REDIS_HOST`（および `REDIS_HOST`）にそのアドレスを設定し、パスワードは上記のとおり設定します。TLS が必要な場合は `OVERLEAF_REDIS_TLS: "true"` も設定してください。
+
+### AOF 永続化
+
+インストール時点で Redis は `--appendonly yes`（Toolkit の `REDIS_AOF_PERSISTENCE=true` に相当）で起動され、データはボリューム `data-redis-0` に保持されます。AOF なしで動作している既存の Redis を切り替えるには、`docker exec` の代わりに `kubectl -n overleaf exec -it redis-0 -- redis-cli` を使って [Toolkit のページ](/ja/on-premises/configuration/overleaf-toolkit/redis#enabling-append-only-file-persistence)の手順に従い、その後 args に `--appendonly yes` を追加してください。
+
+### 複数のレプリカ
+
+すべてのレプリカが同じ Redis を使用する必要があります。Redis には、セッション、まだ MongoDB に保存されていない編集、そして 2 つのレプリカが同じプロジェクトを同時に処理しないようにするロックが保持されています。
+
+### Kubernetes でのテスト
+
+Kubernetes 1.37 上でレプリカ 1 つの状態で、上記のように Secret `redis-auth` から `--requirepass $(REDIS_PASS)` を指定して起動した Redis は、パスワードなしの `redis-cli` を拒否しました（`NOAUTH`）。また、`overleaf-secrets` に `OVERLEAF_REDIS_PASS` と `REDIS_PASSWORD` を設定した状態で、launchpad（13 ケース）と、変更履歴の追跡・コメント・匿名共有を伴う編集（22 ケース）のエンドツーエンドテストに合格しました。これらは web、real-time、document-updater、project-history を経由します。Redis の認証エラーを記録したサービスはありませんでした。これらのページにあるその他の Kubernetes テストはすべて、インストール時の Redis StatefulSet（AOF 永続化あり、パスワードなし）に対して実行しました。

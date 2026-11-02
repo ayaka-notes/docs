@@ -1,0 +1,116 @@
+---
+title: SAML 認証
+description: Kubernetes デプロイで、ユーザーが SAML 2.0 ID プロバイダー経由でログインできるようにします。
+icon: building-columns
+---
+
+SAML ログインは、各 Ayakaleaf Pro Pod 内の **web** サービス（`authentication` モジュール）が処理します。バックグラウンドジョブや別の Pod はありません。ID プロバイダー（IdP）は [SAML 認証](/ja/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication) のとおりに設定し、その値と IdP 証明書を以下の手順で Kubernetes に設定します。
+
+### 各処理の実行場所
+
+| | |
+| --- | --- |
+| サービス | web、すべての Ayakaleaf Pro Pod 内。設定と IdP 証明書は web の起動時に読み込まれます |
+| Pod → IdP | なし：SAML メッセージはすべてブラウザを経由します |
+| ブラウザ → IdP | `OVERLEAF_SAML_ENTRYPOINT`（ログイン）、`OVERLEAF_SAML_LOGOUT_URL`（ログアウト） |
+| ブラウザ → Overleaf | `POST ${OVERLEAF_SITE_URL}/saml/login/callback`（ACS）、`/saml/logout/callback`、`/saml/meta`（SP メタデータ） |
+| ファイル | IdP 証明書、および任意で Overleaf 自身の鍵と証明書。Secret `overleaf-certs` から読み込まれます |
+| 定期ジョブ | なし |
+
+### 設定
+
+<Steps>
+<Step title="IdP に Overleaf を登録する">
+| IdP の設定 | 値 |
+| --- | --- |
+| ACS URL（assertion consumer service） | `${OVERLEAF_SITE_URL}/saml/login/callback`、HTTP-POST バインディング |
+| シングルログアウト URL | `${OVERLEAF_SITE_URL}/saml/logout/callback` |
+| Audience / SP エンティティ ID | `OVERLEAF_SAML_ISSUER` に設定した値 |
+
+これらの設定場所は [goauthentik の手順](/ja/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#step-by-step-goauthentik) で確認できます。
+</Step>
+
+<Step title="IdP 証明書を Secret `overleaf-certs` に格納する">
+Toolkit は証明書を `data/overleaf/certs/` から読み込みます。Kubernetes では、[証明書とその他のファイル](/ja/on-premises/configuration/kubernetes#certificates-and-other-files) で説明しているように、`/var/lib/overleaf/certs` にマウントされる Secret `overleaf-certs` から読み込まれます。
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem
+```
+
+Secret がすでに存在する場合は、代わりにファイルを追加します。すべての `--from-file` を指定して削除・再作成するか、`kubectl -n overleaf edit secret overleaf-certs` を使用してください。
+
+`OVERLEAF_SAML_IDP_CERT` にはパスを指定します。証明書のロールオーバー中はパスの JSON リストを指定します。PEM テキストそのものは指定できません。
+</Step>
+
+<Step title="ConfigMap に設定を追加する">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: saml
+  OVERLEAF_SAML_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_SAML_ENTRYPOINT: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_LOGOUT_URL: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_ISSUER: overleaf
+  OVERLEAF_SAML_IDP_CERT: /var/lib/overleaf/certs/idp_cert.pem
+  OVERLEAF_SAML_WANT_ASSERTIONS_SIGNED: "true"
+  OVERLEAF_SAML_WANT_AUTHN_RESPONSE_SIGNED: "true"
+  OVERLEAF_SAML_USER_ID_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_EMAIL_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+  OVERLEAF_SAML_FIRST_NAME_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+  OVERLEAF_SAML_LAST_NAME_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_IS_ADMIN_FIELD: http://schemas.xmlsoap.org/claims/Group
+  OVERLEAF_SAML_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_SAML_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+すべての `OVERLEAF_SAML_*` 設定は [環境変数](/ja/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#environment-variables) に一覧があります。いずれもそれ自体はシークレットではないため、すべて ConfigMap に設定します。鍵ファイル（`OVERLEAF_SAML_PRIVATE_KEY`、`OVERLEAF_SAML_DECRYPTION_PVK`）は `overleaf-certs` に格納し、ConfigMap にはそのパスを設定します。
+
+<Warning>
+
+`"true"`、`"false"`、および `OVERLEAF_SAML_AUTHN_CONTEXT: '["urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"]'` のような JSON 値は引用符で囲んでください。有効なブール値や JSON 値でない設定があると、Pod は Ready と報告されたまま SAML ストラテジーの読み込みに失敗し、SAML 経由のログインが失敗します。変更のたびに `web.log` を確認してください（下記の Q\&A を参照）。
+
+</Warning>
+</Step>
+
+<Step title="適用して再起動する">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+IdP 証明書と鍵は web の起動時に読み込まれるため、`overleaf-certs` に新しい証明書を入れた場合もこの再起動が必要です。
+</Step>
+</Steps>
+
+### 複数のレプリカ
+
+IdP はクロスサイトの `POST` でユーザーを ACS URL に戻します。ブラウザはこのリクエストに `SameSite=Lax` の Cookie を付けないため、リクエストには Overleaf のセッション Cookie も、Chrome や Edge ではロードバランサーのスティッキー Cookie も含まれず、どのレプリカに届くかわかりません。デフォルト設定ではこれは問題になりません。リクエストを受け取ったレプリカが Redis にセッションを作成し、以降はロードバランサーがユーザーをそのレプリカに留めます。
+
+<Warning>
+
+複数のレプリカを実行する場合は、`OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` を未設定のままにしてください（デフォルトは `never`）。`always` または `ifPresent` にすると、各レプリカは IdP に送信したリクエストを自身のメモリに記憶するため、別のレプリカに届いたレスポンスは "InResponseTo is not valid" で拒否され、ユーザーは `/saml/login/callback` に留まってしまいます。3 つのレプリカと `always` でのテストでは、19 の SAML テストケースのうち 12 件がこの理由で失敗しましたが、デフォルトではすべて合格しました。レプリカが 1 つの場合は、`always` でも SAML ログインは成功します。
+
+</Warning>
+
+### Kubernetes でのテスト結果
+
+goauthentik を IdP として使用し（HTTP-POST バインディング、署名付きアサーションとレスポンス）、Kubernetes 1.37 上で HAProxy の背後に 3 つのレプリカを配置した構成で、SAML のエンドツーエンドテストに合格しました（19 ケース）。対象は、launchpad で作成した最初の管理者の SAML 経由でのログイン、`overleaf-certs` の IdP 証明書を使ったログイン、アカウントの作成と再ログイン、グループによる管理者マッピングとマッピングなしの場合、ログインごとの名前と管理者フラグの更新、IdP 経由のログアウト、SAML アカウントのパスワードルール、停止されたアカウントです。`OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` はデフォルトのままにしました。
+
+### Q\&A
+
+<Accordion title="SAML 経由でログインするとすぐに「Something went wrong」と表示される">
+
+<strong>回答：</strong>SAML ストラテジーの読み込みに失敗しています。Pod はそれでも Ready になるため、各 Pod の web ログを確認してください。
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "saml|passport" /var/log/overleaf/web.log | tail
+```
+
+よくある原因は、`OVERLEAF_SAML_IDP_CERT` が `overleaf-certs` に含まれていないファイルを指している、ブール値が `"true"` または `"false"` になっていない、JSON が無効である、のいずれかです。`EXTERNAL_AUTH` に複数の方式を指定している場合、このようなエラーは SAML より後の方式（`ldap`、`saml`、`oidc` の順）も無効にします。
+
+</Accordion>
+
+<Accordion title="IdP から Overleaf へ、または Overleaf から IdP への到達は必要ですか？">
+
+<strong>回答：</strong>ログインとログアウトについては、どちらも不要です。IdP と Overleaf は、ユーザーのブラウザを介してのみメッセージをやり取りします。IdP をメタデータ URL で設定した場合にのみ、IdP が `${OVERLEAF_SITE_URL}/saml/meta` をダウンロードします。
+
+</Accordion>

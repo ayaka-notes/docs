@@ -1,0 +1,123 @@
+---
+title: 5. Ayakaleaf Pro 배포
+description: Ayakaleaf Pro 파드, 데이터 볼륨, NodePort Service를 배포합니다.
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+첫 시작 시 데이터베이스 마이그레이션이 실행되며 1~2분 정도 걸립니다. `/status`가 응답하면 파드가 준비된 것이며, 그런 다음 `OVERLEAF_SITE_URL`을 여세요.
+
+### 매니페스트가 이렇게 구성된 이유
+
+* <strong>데이터 볼륨.</strong> `/var/lib/overleaf` 아래의 모든 것(프로젝트 파일, 기록, 업로드)은 PVC에 저장됩니다. local-path와 같은 노드 로컬 스토리지를 사용하면 데이터는 한 노드에 머물며, 네트워크 블록 스토리지를 사용하면 파드가 노드 간에 이동할 수 있습니다.
+* <strong>컴파일 볼륨과 Docker 소켓.</strong> Ayakaleaf Pro는 노드의 Docker에 TeX Live 컨테이너를 시작하도록 요청하고, 프로젝트의 컴파일 디렉터리를 **노드상의 경로로** 전달합니다. 따라서 이 디렉터리들은 `hostPath` 볼륨이며, 그 경로는 `SANDBOXED_COMPILES_HOST_DIR_*`에 반복됩니다. 내용은 임시 데이터이므로 백업할 필요가 없습니다.
+* <strong>`enableServiceLinks: false`.</strong> Kubernetes는 네임스페이스의 모든 Service에 대해 Docker 스타일 변수를 각 파드에 추가합니다. Service `redis`는 `REDIS_PORT=tcp://10.x.x.x:6379`가 되고, Service `git-bridge`는 `GIT_BRIDGE_PORT=tcp://...`가 됩니다. 일부 Overleaf 서비스는 이런 이름의 변수를 읽습니다. 이 파드에서는 `OVERLEAF_REDIS_*`와 ConfigMap의 설정이 우선하지만, git-bridge는 `GIT_BRIDGE_PORT`를 포트로 받아들여 중지됩니다([Git 연동](/ko/on-premises/configuration/kubernetes/integrations/git-integration) 참조). 링크를 비활성화하면 환경이 직접 설정한 값으로만 유지됩니다.
+* <strong>`Recreate`.</strong> 두 파드가 같은 데이터 볼륨을 사용하거나 동시에 마이그레이션을 실행해서는 안 됩니다.
+* <strong>외부 노출.</strong> NodePort Service는 모든 노드의 포트 `30080`에서 응답합니다. 프로덕션에서는 앞단에 인그레스 컨트롤러나 로드 밸런서를 두고 그곳에서 TLS를 종료하세요. WebSocket, 10분의 요청 타임아웃(긴 컴파일), 50 MB 업로드를 허용해야 하며, `X-Forwarded-For`와 `X-Forwarded-Proto`를 전달해야 합니다.

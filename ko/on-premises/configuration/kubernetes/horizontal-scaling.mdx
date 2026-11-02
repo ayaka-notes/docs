@@ -1,0 +1,374 @@
+---
+title: 수평 확장
+description: 스티키 세션을 지원하는 로드 밸런서 뒤에서 여러 Ayakaleaf Pro 레플리카를 실행합니다.
+icon: layer-group
+---
+
+레플리카 하나는 모든 컴파일에 노드 하나의 CPU를 사용합니다. vCPU 2개인 테스트 노드에서 동시에 여섯 개를 컴파일하면 하나를 컴파일할 때보다 세 배 오래 걸렸고, 그동안 다른 노드는 유휴 상태였습니다. 여러 레플리카를 사용하면 사용자와 그 컴파일이 노드들에 분산됩니다.
+
+이 구성은 Overleaf의 [수평 확장](/ko/on-premises/maintenance/horizontal-scaling) 설계를 Kubernetes에 맞게 옮긴 것입니다.
+
+| 요구 사항                                         | 이 구성에서                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------- |
+| 공유 MongoDB 및 Redis                            | 설치 시 사용한 `10-mongo.yaml` 및 `20-redis.yaml`             |
+| 공유 시크릿                                      | [2단계](/ko/on-premises/installation/using-kubernetes/2.-create-the-namespace-and-secrets)의 Secret `overleaf-secrets`에 이미 포함되어 있음 |
+| **S3**에 저장되는 프로젝트 파일과 히스토리(NFS 아님)       | 모든 S3 서비스, [S3](/ko/on-premises/configuration/kubernetes/s3) 참고. 해당 페이지에서는 클러스터 내 예시로 Garage 사용 |
+| 컴파일과 업로드를 위한 레플리카별 로컬 디스크   | 각 노드의 `hostPath` `/srv/overleaf-ha`                            |
+| 지속적 라우팅, WebSocket, 10분 타임아웃, 50 MB 업로드 | Overleaf 샘플 구성을 사용하는 HAProxy                |
+| 한 레플리카 옆에서 싱글톤으로 실행되는 git-bridge       | `overleaf-0`을 형제(sibling)로 두는 git-bridge                           |
+
+<Warning>
+
+처음부터 S3를 계획하세요. 이미 볼륨에 파일을 보관하고 있는 인스턴스는 먼저 [S3 마이그레이션](/ko/on-premises/maintenance/s3-migration)이 필요합니다. 이 구성은 5단계의 Deployment를 대체합니다. StatefulSet을 적용하기 전에 Deployment를 삭제하세요(`kubectl delete -f 40-overleaf.yaml`).
+
+</Warning>
+
+<Steps>
+<Step title="S3 스토리지">
+[S3](/ko/on-premises/configuration/kubernetes/s3)에 설명된 대로 사용 중인 S3 서비스나 클러스터 내 Garage로 버킷 세 개와 사용자 두 명을 설정하고, 키 네 개를 Secret `overleaf-s3`에 넣으세요. 아래 구성은 해당 페이지의 Garage 예시를 사용합니다.
+</Step>
+
+<Step title="구성">
+이 ConfigMap은 `30-config.yaml`을 대체합니다. S3와 git-bridge를 추가하고 `OVERLEAF_SITE_URL`이 로드 밸런서를 가리키도록 합니다.
+
+```yaml title="60-config.yaml" wrap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: overleaf-env
+  namespace: overleaf
+data:
+  OVERLEAF_APP_NAME: Ayakaleaf Pro
+  OVERLEAF_SITE_URL: http://192.0.2.10:30081      # the load balancer (HAProxy) URL
+  OVERLEAF_ADMIN_EMAIL: admin@example.com
+  # Emails: add the sender and the SMTP server together, see Email delivery
+  OVERLEAF_MONGO_URL: mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf
+  OVERLEAF_REDIS_HOST: redis
+  REDIS_HOST: redis
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url
+  ENABLE_CONVERSIONS: "true"
+  EMAIL_CONFIRMATION_DISABLED: "true"
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16   # HAProxy runs in the pod CIDR
+  # Sandboxed compiles, node paths: each replica owns /srv/overleaf-ha on its node
+  SANDBOXED_COMPILES: "true"
+  SANDBOXED_COMPILES_SIBLING_CONTAINERS: "true"
+  DOCKER_RUNNER: "true"
+  SANDBOXED_COMPILES_HOST_DIR_COMPILES: /srv/overleaf-ha/data/compiles
+  SANDBOXED_COMPILES_HOST_DIR_OUTPUT: /srv/overleaf-ha/data/output
+  SANDBOXED_COMPILES_HOST_DIR_CACHE: /srv/overleaf-ha/data/cache
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+  # S3 (required for more than one replica); keys are in the Secret overleaf-s3
+  OVERLEAF_FILESTORE_BACKEND: s3
+  OVERLEAF_FILESTORE_TEMPLATE_FILES_BUCKET_NAME: overleaf-template-files
+  OVERLEAF_FILESTORE_S3_ENDPOINT: http://garage:3900
+  OVERLEAF_FILESTORE_S3_PATH_STYLE: "true"
+  OVERLEAF_FILESTORE_S3_REGION: garage
+  OVERLEAF_HISTORY_BACKEND: s3
+  OVERLEAF_HISTORY_PROJECT_BLOBS_BUCKET: overleaf-project-blobs
+  OVERLEAF_HISTORY_CHUNKS_BUCKET: overleaf-chunks
+  OVERLEAF_HISTORY_S3_ENDPOINT: http://garage:3900
+  OVERLEAF_HISTORY_S3_PATH_STYLE: "true"
+  OVERLEAF_HISTORY_S3_REGION: garage
+  # Git integration: one git-bridge, its sibling is overleaf-0
+  GIT_BRIDGE_ENABLED: "true"
+  GIT_BRIDGE_HOST: 10.96.100.80      # the git-bridge Service's fixed ClusterIP, see 75-git-bridge.yaml
+  GIT_BRIDGE_PORT: "8000"
+```
+</Step>
+
+<Step title="레플리카">
+```yaml title="70-overleaf.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf-hl
+  namespace: overleaf
+spec:
+  clusterIP: None            # stable DNS per replica: overleaf-0.overleaf-hl, ...
+  selector:
+    app: overleaf-ha
+  ports:
+    - {name: http, port: 80}
+    - {name: web, port: 3000}       # git-bridge API (sibling only)
+    - {name: history, port: 3100}   # history-v1, used by git-bridge via V1_HISTORY_URL
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  serviceName: overleaf-hl
+  replicas: 3
+  # OrderedReady: overleaf-0 runs the migrations alone before the next replica starts
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: overleaf-ha
+  template:
+    metadata:
+      labels:
+        app: overleaf-ha
+    spec:
+      terminationGracePeriodSeconds: 60
+      # Keep the environment to the ConfigMap and Secrets: no REDIS_PORT=tcp://..., GIT_BRIDGE_PORT=tcp://...
+      enableServiceLinks: false
+      affinity:
+        podAntiAffinity:            # one replica per node: each uses that node's Docker and disk
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: overleaf-ha
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Each replica hands out history URLs with its own stable name, so git-bridge can reach them
+            - name: V1_HISTORY_URL
+              value: http://$(POD_NAME).overleaf-hl.overleaf.svc.cluster.local:3100/api
+          envFrom:
+            - configMapRef: {name: overleaf-env}
+            - secretRef: {name: overleaf-secrets}
+            - secretRef: {name: overleaf-s3}
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet: {path: /status, port: 80}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 500m, memory: 1536Mi}
+            limits: {memory: 3Gi}
+          volumeMounts:
+            - {name: local, mountPath: /var/lib/overleaf}
+            - {name: docker-sock, mountPath: /var/run/docker.sock}
+      volumes:
+        # Local disk for ephemeral files (compiles, output, uploads); the HOST_DIR_* paths are under it
+        - name: local
+          hostPath: {path: /srv/overleaf-ha, type: DirectoryOrCreate}
+        - name: docker-sock
+          hostPath: {path: /var/run/docker.sock, type: Socket}
+```
+
+* <strong>Deployment가 아닌 StatefulSet.</strong> 각 레플리카는 로드 밸런서 쿠키와 git-bridge가 참조하는 고정된 이름(`overleaf-0`, `overleaf-1`, ...)을 받으며, `OrderedReady`는 `overleaf-0`을 먼저 단독으로 시작하므로 데이터베이스 마이그레이션은 하나의 레플리카만 실행합니다.
+* <strong>노드당 레플리카 하나.</strong> 각 레플리카는 자신의 노드에 있는 Docker를 통해 컴파일을 시작하고, 컴파일 결과를 해당 노드의 `/srv/overleaf-ha`에 보관합니다.
+* <strong>레플리카별 `V1_HISTORY_URL`.</strong> 각 레플리카는 자신의 이름으로 히스토리 링크를 제공하므로 git-bridge가 여기에 접근할 수 있습니다.
+</Step>
+
+<Step title="git-bridge">
+```yaml title="75-git-bridge.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  # Fixed ClusterIP (inside the service CIDR): the sharelatex image's nginx proxies /git/ with
+  # `resolver 127.0.0.11` (Docker's DNS), which does not exist in Kubernetes, so GIT_BRIDGE_HOST is this IP
+  clusterIP: 10.96.100.80
+  selector:
+    app: git-bridge
+  ports:
+    - {name: http, port: 8000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  serviceName: git-bridge
+  replicas: 1
+  selector:
+    matchLabels:
+      app: git-bridge
+  template:
+    metadata:
+      labels:
+        app: git-bridge
+    spec:
+      # Service "git-bridge" would inject GIT_BRIDGE_PORT=tcp://..., which git-bridge reads as its port
+      enableServiceLinks: false
+      containers:
+        - name: git-bridge
+          image: ghcr.io/ayaka-notes/overleaf-pro/git-bridge:6.3.2   # same version as the sharelatex image
+          command: ["/server-pro-start.sh"]
+          securityContext:
+            runAsUser: 0
+          env:
+            - {name: GIT_BRIDGE_API_BASE_URL, value: "http://overleaf-0.overleaf-hl.overleaf.svc.cluster.local:3000/api/v0/"}
+            - {name: GIT_BRIDGE_OAUTH2_SERVER, value: "http://overleaf-0.overleaf-hl.overleaf.svc.cluster.local"}
+            - {name: GIT_BRIDGE_POSTBACK_BASE_URL, value: "http://git-bridge.overleaf.svc.cluster.local:8000"}
+            - {name: GIT_BRIDGE_ROOT_DIR, value: /data/git-bridge}
+          ports:
+            - containerPort: 8000
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data/git-bridge}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+```
+
+`GIT_BRIDGE_HOST`가 고정 IP 주소인 이유는 [Git 연동](/ko/on-premises/configuration/kubernetes/integrations/git-integration)을 참고하세요.
+</Step>
+
+<Step title="로드 밸런서">
+HAProxy 구성은 Overleaf의 샘플에서 다섯 가지를 변경한 것입니다. `/project/<id>/mcp`를 `/git/`처럼 `overleaf-0`으로 라우팅([MCP 서버](/ko/on-premises/configuration/kubernetes/integrations/mcp-server#several-replicas) 참고), 포트 `8080`의 일반 HTTP(이미지가 root가 아닌 사용자로 실행되므로 containerd에서 포트 80에 바인딩할 수 없음), 클러스터 DNS를 통한 서버 탐색(파드 IP는 재시작할 때마다 바뀜), 모든 노드가 응답하도록 하는 DaemonSet, 그리고 기본값 `roundrobin` 대신 `balance leastconn`(아래 Q\&A 참고)입니다.
+
+```yaml title="80-haproxy.yaml" wrap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-config
+  namespace: overleaf
+data:
+  haproxy.cfg: |
+    global
+      log stdout format raw local0 info
+
+    resolvers kubedns
+      parse-resolv-conf
+      hold valid 10s
+
+    defaults
+      mode                    http
+      # New sessions go to the replica with the fewest open connections (editors keep a WebSocket open)
+      balance                 leastconn
+      option                  httpchk HEAD /status
+      http-check              expect status 200
+      default-server          check resolvers kubedns init-addr none
+      log                     global
+      option                  httplog
+      # Reroute to a different backend if the sticky one is down
+      option                  redispatch 1
+      retries                 3
+      # Sticky session for 24h of inactivity -- compile output is deleted after 24h
+      cookie                  server-pro-ha insert maxidle 24h
+      timeout queue           1m
+      timeout connect         15s
+      timeout client          1m
+      # Allow slow compiles -- hard-coded limit in clsi is 10min
+      timeout server          10m
+      # Disconnect the editor after 23h
+      timeout tunnel          23h
+      # Lower than NGINX_KEEPALIVE_TIMEOUT (65s) in the sharelatex container
+      timeout http-keep-alive 60s
+
+    listen overleaf
+      bind :8080
+      option forwardfor
+      # When TLS ends in front of HAProxy, also pass:  http-request set-header X-Forwarded-Proto https
+      # git requests go to the git-bridge sibling
+      use-server overleaf-0 if { path_beg /git/ }
+      # MCP clients send no cookie: keep compile, log and PDF download on one replica
+      use-server overleaf-0 if { path_reg ^/project/[0-9a-f]{24}/mcp(/|$) }
+      http-response add-header X-Served-By %s
+      stats enable
+      stats uri /haproxy
+      server overleaf-0 overleaf-0.overleaf-hl.overleaf.svc.cluster.local:80 cookie overleaf-0
+      server overleaf-1 overleaf-1.overleaf-hl.overleaf.svc.cluster.local:80 cookie overleaf-1
+      server overleaf-2 overleaf-2.overleaf-hl.overleaf.svc.cluster.local:80 cookie overleaf-2
+---
+apiVersion: apps/v1
+# DaemonSet: one HAProxy per node, so the NodePort answers on every node with externalTrafficPolicy
+# Local. The cookie holds the replica name, so stickiness works whichever HAProxy a request hits.
+kind: DaemonSet
+metadata:
+  name: haproxy
+  namespace: overleaf
+spec:
+  selector:
+    matchLabels:
+      app: haproxy
+  template:
+    metadata:
+      labels:
+        app: haproxy
+      annotations:
+        config-hash: "1"   # bump to restart after editing the ConfigMap
+    spec:
+      containers:
+        - name: haproxy
+          image: haproxy:lts-alpine
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: haproxy
+  namespace: overleaf
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local    # keep the client IP (no SNAT); only nodes running HAProxy answer
+  selector:
+    app: haproxy
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+```
+
+```bash
+kubectl delete -f 40-overleaf.yaml --ignore-not-found
+kubectl apply -f 60-config.yaml -f 70-overleaf.yaml -f 75-git-bridge.yaml -f 80-haproxy.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+curl -sI http://192.0.2.10:30081/login | grep -i x-served-by
+```
+
+`externalTrafficPolicy: Local`은 사용자의 IP 주소를 `X-Forwarded-For`에 유지합니다.
+</Step>
+
+<Step title="TLS">
+[TLS 프록시](/ko/on-premises/configuration/kubernetes/tls-proxy)에 설명된 대로 HAProxy에서 HTTPS를 종료한 다음, `60-config.yaml`에서 `OVERLEAF_SITE_URL`을 `https://` 주소로 설정하고 `OVERLEAF_SECURE_COOKIE: "true"`를 설정하세요.
+</Step>
+</Steps>
+
+### 예상 결과
+
+각각 vCPU 2개와 4 GB 메모리를 가진 노드 세 대에서 레플리카 세 개를 테스트했으며, MongoDB, Redis, Garage, git-bridge, HAProxy도 같은 노드에서 실행했습니다.
+
+* 사용자 12명이 600페이지 문서를 동시에 컴파일: 12명 모두 컴파일하고 PDF를 가져왔으며, 레플리카당 사용자 4명이었습니다. 한 라운드에 8~18초가 걸렸습니다. 각 노드는 최소 1.3 GB의 사용 가능한 메모리를 유지했습니다.
+* 모든 사용자는 하나의 레플리카에 머무릅니다(쿠키 `server-pro-ha`). 컴파일한 레플리카에서 가져와야 하는 PDF 다운로드도 마찬가지입니다. 에디터의 WebSocket을 포함하여 HTTPS에서도 동일합니다.
+* 레플리카가 중지되면 HAProxy가 이를 다운으로 표시할 때까지 약 15~20초 동안 해당 사용자에게 오류가 발생합니다. 그 후 사용자는 다른 레플리카로 이동하며, 세션이 Redis에 있으므로 로그인 상태가 유지됩니다.
+
+### Q\&A
+
+<Accordion title="왜 `balance leastconn`을 사용하나요?">
+
+<strong>답변:</strong> Overleaf의 샘플(`roundrobin`, 노드당 HAProxy 하나)로 테스트했을 때 신규 사용자 12명이 세 레플리카에 8명, 3명, 1명으로 배분되었고, 가장 바쁜 레플리카 때문에 가장 느린 사용자는 29초를 기다렸습니다. 열린 연결이 가장 적은 레플리카를 선호하는 `leastconn`(각 에디터는 WebSocket을 열어 둠)으로 같은 테스트를 하자 4명, 4명, 4명으로 배분되었고 18초가 걸렸습니다. 스티키 동작은 쿠키에서 오므로 변하지 않습니다.
+
+</Accordion>
+
+<Accordion title="HAProxy 대신 인그레스 컨트롤러를 사용할 수 있나요?">
+
+<strong>답변:</strong> 네. 쿠키를 기준으로 고정된 레플리카로 라우팅하고, WebSocket을 지원하며, 10분의 요청 시간과 50 MB 업로드를 허용하고, keep-alive 타임아웃을 65초 미만으로 유지하며, `X-Forwarded-For`와 `X-Forwarded-Proto`를 보내고, `/git/`과 `/project/<id>/mcp`를 `overleaf-0`으로 보낸다면 사용할 수 있습니다. 모든 요청을 분산하는 Service가 아니라 레플리카 자체의 이름(`overleaf-N.overleaf-hl`)으로 라우팅하세요.
+
+</Accordion>
+
+<Accordion title="네 번째 레플리카는 어떻게 추가하나요?">
+
+<strong>답변:</strong> Docker와 TeX Live 이미지가 있는 노드를 추가하고, `70-overleaf.yaml`에서 `replicas: 4`로 설정한 다음, HAProxy 구성에 `server overleaf-3 ...` 줄을 추가하세요(그리고 HAProxy가 재시작되도록 `config-hash`를 올리세요).
+
+</Accordion>

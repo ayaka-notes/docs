@@ -1,0 +1,67 @@
+---
+title: Synchronisation GitHub
+description: Permettez aux utilisateurs de synchroniser leurs projets avec des dépôts GitHub ou GitHub Enterprise sur un déploiement Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+La synchronisation GitHub s'exécute dans le service **web** (le module `github-sync`) de chaque pod Ayakaleaf Pro. Elle nécessite l'[intégration Git](/fr/on-premises/configuration/kubernetes/integrations/git-integration). Créez l'application OAuth et découvrez le rôle de chaque paramètre dans [Synchronisation GitHub](/fr/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation) ; cette page en décrit la mise en œuvre dans Kubernetes.
+
+| | |
+| --- | --- |
+| Service | web (module `github-sync`), dans chaque pod Ayakaleaf Pro ; lu au démarrage de web |
+| Pod → GitHub | `https://api.github.com` (REST et GraphQL), ou l'API de `GITHUB_SYNC_URL`, chaque fois qu'un utilisateur lie son compte, importe, exporte ou synchronise |
+| Navigateur → GitHub | `https://github.com/login/oauth/authorize` pour lier un compte, puis retour vers `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | aucun : pas de webhook, l'instance n'a pas besoin d'être accessible depuis GitHub |
+| Données stockées | les jetons d'accès GitHub de l'utilisateur, chiffrés, dans MongoDB |
+| Tâches périodiques | aucune : la synchronisation a lieu lorsqu'un utilisateur clique |
+
+### Configuration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` et le StatefulSet git-bridge décrits dans [Intégration Git](/fr/on-premises/configuration/kubernetes/integrations/git-integration) doivent être en place : sans eux, les paramètres du compte et l'éditeur masquent la synchronisation GitHub.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` chiffre les jetons d'accès GitHub des utilisateurs dans MongoDB. Toutes les répliques doivent utiliser la même valeur, et la modifier ultérieurement oblige chaque utilisateur à lier à nouveau GitHub.
+</Step>
+
+<Step title="Autorité de certification privée (facultatif)">
+Si votre GitHub utilise un certificat émis par votre propre autorité de certification, ajoutez celle-ci au Secret `overleaf-certs` monté sur `/var/lib/overleaf/certs` (voir [Certificats et autres fichiers](/fr/on-premises/configuration/kubernetes#certificates-and-other-files)) et définissez `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` dans le ConfigMap.
+</Step>
+
+<Step title="Appliquer, redémarrer et vérifier">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Tout code de statut HTTP signifie que GitHub est accessible depuis ce pod ; `000` signifie qu'il ne l'est pas.
+</Step>
+</Steps>
+
+### Plusieurs répliques
+
+Rien de plus que le `GITHUB_TOKEN_CIPHER_PASSWORD` partagé. Une synchronisation prend un verrou dans Redis, partagé avec les autres synchronisations Git, de sorte que deux répliques ne synchronisent jamais le même projet en même temps.
+
+### Testé sur Kubernetes
+
+Face à une simulation de github.com et de ses API REST et GraphQL (approuvée via `NODE_EXTRA_CA_CERTS` depuis `overleaf-certs`), sur Kubernetes 1.37 avec une réplique et l'intégration Git activée, nos tests de bout en bout de la synchronisation GitHub réussissent (31 cas) : liaison et déliaison du compte, jetons révoqués, export d'un projet vers un nouveau dépôt privé ou d'organisation, import d'un dépôt (y compris au-delà de la limite de téléversement), récupération (pull) et envoi (push), fusions, conflits et fusions manuelles, branches supprimées et réécrites par push forcé, fichiers binaires, renommages et suppressions, perte de l'accès en push, et ce que les propriétaires, éditeurs et lecteurs peuvent faire.

@@ -63,6 +63,18 @@ Ayakaleaf Pro 将数据存储在三个不同的位置：
 
 MongoDB 附带一个名为 [mongodump](https://docs.mongodb.com/manual/reference/program/mongodump/) 的命令行工具，可用于备份数据库中存储的用户和项目数据。
 
+在 `sharelatex` 容器已停止、`mongo` 容器仍在运行的情况下，将 `sharelatex` 数据库导出到宿主机上的文件，并以同样的方式恢复（`--drop` 会替换现有的集合）：
+
+```bash wrap
+# Toolkit
+bin/docker-compose exec -T mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+bin/docker-compose exec -T mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+
+# Docker Compose (container name mongo)
+docker exec -i mongo mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker exec -i mongo mongorestore --archive --gzip --drop < mongo-backup.gz
+```
+
 ### Overleaf 文件系统数据
 
 对于 Toolkit 部署，不可编辑文件的存储路径通过 `config/overleaf.rc` 中的 `OVERLEAF_DATA_PATH` 环境变量指定，但根据实例创建时间的不同，它也可能是 `data/sharelatex`。
@@ -192,3 +204,37 @@ new-server$ docker start sharelatex
          * 文件上传的缓冲区（二进制文件/从 zip 新建项目的上传）
       3. projectHistories (e)
          * 完整项目历史迁移的临时文件
+
+### 问答
+
+<Accordion title="MongoDB 数据已损坏或部分被删除，而且我没有备份。我该怎么办？">
+
+<strong>回答：</strong>`mongo` 容器本身不保存任何数据：数据库位于 `data/mongo`（即 `config/overleaf.rc` 中的 `MONGO_DATA_PATH`）。如果只是容器损坏，请使用 `bin/docker-compose rm -sf mongo` 将其删除，然后运行 `bin/up -d` 重新创建。
+
+如果 MongoDB 因文件损坏或丢失而无法启动，最后的手段是使用 MongoDB 自带的 [`mongod --repair`](https://www.mongodb.com/docs/v8.0/tutorial/recover-data-following-unexpected-shutdown/)。它会丢弃损坏的数据，并为丢失的文件创建空的占位文件，因此可能会造成数据丢失。请先停止所有服务并复制数据目录，然后使用与 `mongo` 容器相同的镜像（`config/overleaf.rc` 中的 `MONGO_IMAGE` 和 `MONGO_VERSION`，默认为 `mongo:8.0`）运行修复：
+
+```bash
+# In the Toolkit directory
+bin/stop
+sudo cp -a data/mongo data/mongo-original   # keep this copy untouched
+docker run --rm -v "$PWD/data/mongo:/data/db" mongo:8.0 mongod --dbpath /data/db --repair
+bin/up -d
+```
+
+如果修复过程中修改了数据，MongoDB 将无法再以副本集成员的身份启动，而 Toolkit 正是以副本集成员方式（`--replSet overleaf`）运行它的：`bin/logs mongo` 会显示 `This instance has been repaired and may contain modified replicated data`。此时，请在不带 `--replSet` 的情况下启动修复后的文件，将其导出，然后将导出的数据恢复到新数据库中：
+
+```bash
+bin/stop
+docker run -d --name mongo-repaired -v "$PWD/data/mongo:/data/db" mongo:8.0
+# wait a few seconds for mongod to start
+docker exec mongo-repaired mongodump --db sharelatex --archive --gzip > mongo-backup.gz
+docker rm -f mongo-repaired
+sudo mv data/mongo data/mongo-repaired
+bin/up -d   # starts with a new, empty data/mongo
+```
+
+然后使用上文 [MongoDB](#mongodb) 中的 `mongorestore` 命令恢复 `mongo-backup.gz`。
+
+如果 MongoDB 数据已完全丢失，Ayakaleaf Pro 无法重建项目。用户、项目列表、文件夹树、文档的当前文本以及历史记录索引都存储在 MongoDB 中。`data/overleaf/data/history` 中仍保存着上传的文件和历史记录内容，它们以内容哈希（`overleaf-project-blobs`）以及 gzip 压缩的 JSON 历史记录块（`overleaf-chunks`）的形式存储，但没有任何工具可以将它们还原为项目。你只能手动搜索这些文件。
+
+</Accordion>

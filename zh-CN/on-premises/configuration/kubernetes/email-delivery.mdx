@@ -1,0 +1,67 @@
+---
+title: 邮件发送
+description: 从 Kubernetes 部署发送激活、邀请和密码重置邮件。
+icon: paper-plane-top
+---
+
+**web** 服务从每个 Ayakaleaf Pro Pod 发送所有邮件（激活、项目邀请、密码重置）。这些设置与 Toolkit 中相同，参见[邮件发送](/zh-CN/on-premises/configuration/overleaf-toolkit/email-delivery)。
+
+| | |
+| --- | --- |
+| 服务 | web，位于每个 Ayakaleaf Pro Pod 中；在 web 启动时读取 |
+| Pod → 外部 | 你的 SMTP 服务器（`OVERLEAF_EMAIL_SMTP_HOST`），或 `OVERLEAF_EMAIL_AWS_SES_REGION` 的 Amazon SES API |
+| 状态 | Redis 中的发送速率限制 |
+| 定期任务 | 无 |
+
+### 配置
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  OVERLEAF_EMAIL_FROM_ADDRESS: no-reply@example.com
+  OVERLEAF_EMAIL_SMTP_HOST: smtp.example.com
+  OVERLEAF_EMAIL_SMTP_PORT: "587"
+  OVERLEAF_EMAIL_SMTP_SECURE: "false"
+  OVERLEAF_EMAIL_SMTP_USER: no-reply@example.com
+  # optional
+  # OVERLEAF_EMAIL_REPLY_TO: support@example.com
+  # OVERLEAF_EMAIL_SMTP_IGNORE_TLS: "false"
+  # OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH: "true"
+```
+
+`OVERLEAF_EMAIL_FROM_ADDRESS` 用于开启邮件发送。请仅在同时设置了 SMTP 服务器（或 SES）时设置它：如果只设置发件人，Ayakaleaf Pro 会尝试使用 Pod 内的 SMTP 服务器，导致每封邮件都发送失败。如果不设置它，邮件不会被发送，而只会写入 `web.log`。
+
+`OVERLEAF_EMAIL_SMTP_SECURE`、`OVERLEAF_EMAIL_SMTP_IGNORE_TLS` 和 `OVERLEAF_EMAIL_SMTP_TLS_REJECT_UNAUTH` 会按 JSON 读取，因此请使用 `"true"` 或 `"false"`：诸如 `yes` 之类的值会使 Pod 的所有服务在启动时停止。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_EMAIL_SMTP_PASS":"<SMTP password>"}}'
+```
+
+如果使用 Amazon SES API，请改为在此处放入 `OVERLEAF_EMAIL_AWS_SES_ACCESS_KEY_ID` 和 `OVERLEAF_EMAIL_AWS_SES_SECRET_KEY`，并将 `OVERLEAF_EMAIL_DRIVER: ses` 和 `OVERLEAF_EMAIL_AWS_SES_REGION` 放入 ConfigMap。
+</Step>
+
+<Step title="应用、重启并测试">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+在登录页面给自己发送一封密码重置邮件。如果没有收到，请检查 Pod 是否能访问 SMTP 服务器，并查看 web 日志：
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- bash -c 'echo > /dev/tcp/smtp.example.com/587 && echo reachable'
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "email|smtp" /var/log/overleaf/web.log | tail
+```
+</Step>
+</Steps>
+
+### 多个副本
+
+无需额外操作。每个副本都使用相同的设置发送邮件，发送速率限制在 Redis 中跨所有副本统计。如果你的 SMTP 服务器只接受已知的发件方，请放行 Pod 离开集群时使用的地址（通常是节点的地址）。
+
+### 在 Kubernetes 上的测试
+
+以 Mailpit 作为 SMTP 服务器，在 Kubernetes 1.37 上使用一个副本，我们发送邮件的端到端测试全部通过：管理员创建的账户的激活邮件、限定域名的自助注册的激活邮件、密码重置邮件、通知用户其账户已被删除的邮件，以及 SMTP 服务器拒绝激活或删除邮件时的行为：账户仍会被创建或删除，并且之后可以再次发送激活邮件。在设置了 `OVERLEAF_EMAIL_FROM_ADDRESS` 但没有 SMTP 主机时，密码重置请求因错误而失败，`web.log` 中显示 "error sending message"，与上文所述一致。

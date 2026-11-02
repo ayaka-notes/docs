@@ -1,0 +1,67 @@
+---
+title: GitLab-Synchronisierung
+description: Ermöglichen Sie Benutzern, ihre Projekte in einem Kubernetes-Deployment mit Repositorys auf GitLab.com oder einem selbst verwalteten GitLab zu synchronisieren.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+Die GitLab-Synchronisierung läuft im **web**-Dienst (dem Modul `gitlab-sync`) jedes Ayakaleaf Pro-Pods. Sie benötigt die [Git-Integration](/de/on-premises/configuration/kubernetes/integrations/git-integration). Wie Sie die OAuth-Anwendung erstellen und was die einzelnen Einstellungen bewirken, lesen Sie unter [GitLab-Synchronisierung](/de/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); diese Seite überträgt das auf Kubernetes.
+
+| | |
+| --- | --- |
+| Dienst | web (Modul `gitlab-sync`), in jedem Ayakaleaf Pro-Pod; wird beim Start von web gelesen |
+| Pod → GitLab | die REST-API von `GITLAB_SYNC_URL` (Standard `https://gitlab.com/api/v4`), sobald ein Benutzer verknüpft, importiert, exportiert oder synchronisiert |
+| Browser → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` zum Verknüpfen eines Kontos, danach zurück zu `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | keine: kein Webhook, die Instanz muss von GitLab aus nicht erreichbar sein |
+| Gespeicherte Daten | die GitLab-Zugriffs- und Refresh-Token der Benutzer, verschlüsselt, in MongoDB |
+| Periodische Jobs | keine: synchronisiert wird, wenn ein Benutzer klickt |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` und das git-bridge-StatefulSet aus der [Git-Integration](/de/on-premises/configuration/kubernetes/integrations/git-integration) müssen vorhanden sein: Ohne sie blenden die Kontoeinstellungen und der Editor die GitLab-Synchronisierung aus.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` verschlüsselt die GitLab-Zugriffs- und Refresh-Token der Benutzer in MongoDB. Jedes Replikat muss denselben Wert verwenden, und eine spätere Änderung zwingt alle Benutzer, GitLab erneut zu verknüpfen.
+</Step>
+
+<Step title="Private CA (optional)">
+Wenn Ihr GitLab ein Zertifikat Ihrer eigenen CA verwendet, fügen Sie die CA dem Secret `overleaf-certs` hinzu, das unter `/var/lib/overleaf/certs` eingebunden ist (siehe [Zertifikate und andere Dateien](/de/on-premises/configuration/kubernetes#certificates-and-other-files)), und setzen Sie `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` in der ConfigMap.
+</Step>
+
+<Step title="Anwenden, neu starten und prüfen">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Jeder HTTP-Status bedeutet, dass GitLab von diesem Pod aus erreichbar ist; `000` bedeutet, dass es nicht erreichbar ist.
+</Step>
+</Steps>
+
+### Mehrere Replikate
+
+Außer dem gemeinsamen `GITLAB_TOKEN_CIPHER_PASSWORD` ist nichts weiter nötig. Eine Synchronisierung setzt eine Sperre in Redis, die mit den anderen Git-Synchronisierungen geteilt wird, sodass zwei Replikate nie gleichzeitig dasselbe Projekt synchronisieren. Auch das Erneuern des GitLab-Tokens eines Benutzers setzt eine Redis-Sperre, sodass zwei Replikate es nicht gleichzeitig erneuern.
+
+### Auf Kubernetes getestet
+
+Gegen einen Mock eines selbst verwalteten GitLab unter `GITLAB_SYNC_URL` (vertraut über `NODE_EXTRA_CA_CERTS` aus `overleaf-certs`) bestehen auf Kubernetes 1.37 mit einem Replikat und aktivierter Git-Integration unsere End-to-End-Tests für die GitLab-Synchronisierung (40 Fälle): Verknüpfen und Trennen des Kontos, Erneuern eines ablaufenden Zugriffstokens und widerrufene Token, Export in ein neues privates oder Gruppenprojekt, Import eines Repositorys, Pull und Push, Merges, Konflikte, gelöschte und per Force-Push überschriebene Branches, Binärdateien, Umbenennungen und Löschungen sowie die Befugnisse von Besitzern, Bearbeitern und Betrachtern.

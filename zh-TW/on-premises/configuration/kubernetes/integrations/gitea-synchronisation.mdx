@@ -1,0 +1,67 @@
+---
+title: Gitea 同步
+description: 在 Kubernetes 部署中，讓使用者將專案與 Gitea.com 或您自己的 Gitea 上的儲存庫同步。
+icon: mug-hot
+---
+
+Gitea 同步在每個 Ayakaleaf Pro pod 的 **web** 服務（`gitea-sync` 模組）中執行。它需要 [Git 整合](/zh-TW/on-premises/configuration/kubernetes/integrations/git-integration)。請在 [Gitea 同步](/zh-TW/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation)中建立 OAuth 應用程式並了解各項設定的作用；本頁說明如何將其放入 Kubernetes。
+
+| | |
+| --- | --- |
+| 服務 | web（`gitea-sync` 模組），位於每個 Ayakaleaf Pro pod 中；於 web 啟動時讀取 |
+| Pod → Gitea | `GITEA_SYNC_URL`（預設為 `https://gitea.com/api/v1`）的 REST API，每當使用者連結、匯入、匯出或同步時 |
+| 瀏覽器 → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` 用於連結帳號，然後返回 `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | 無：沒有 webhook，執行個體不需要能從 Gitea 連線 |
+| 儲存的資料 | 使用者的 Gitea 存取權杖與重新整理權杖，經加密後存放於 MongoDB |
+| 定期工作 | 無：同步會在使用者點選時進行 |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+必須已設定 `GIT_BRIDGE_ENABLED: "true"` 並部署 [Git 整合](/zh-TW/on-premises/configuration/kubernetes/integrations/git-integration)中的 git-bridge StatefulSet：若缺少這些，帳號設定與編輯器會隱藏 Gitea 同步。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` 用於加密 MongoDB 中使用者的 Gitea 存取權杖與重新整理權杖。每個副本都必須使用相同的值，且之後變更此值會讓每位使用者都必須重新連結 Gitea。
+</Step>
+
+<Step title="私有 CA（選用）">
+若您的 Gitea 使用由您自己的 CA 簽發的憑證，請將該 CA 加入掛載於 `/var/lib/overleaf/certs` 的 Secret `overleaf-certs`（請參閱[憑證與其他檔案](/zh-TW/on-premises/configuration/kubernetes#certificates-and-other-files)），並在 ConfigMap 中設定 `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`。
+</Step>
+
+<Step title="套用、重新啟動並檢查">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+任何 HTTP 狀態碼都表示該 pod 可以連線至 Gitea；`000` 則表示無法連線。
+</Step>
+</Steps>
+
+### 多個副本
+
+除了共用的 `GITEA_TOKEN_CIPHER_PASSWORD` 之外，不需要額外處理。同步時會在 Redis 中取得鎖定（與其他 Git 同步共用），因此兩個副本永遠不會同時同步同一個專案。
+
+### 在 Kubernetes 上的測試
+
+針對位於 `GITEA_SYNC_URL` 的真實 Gitea 1.23，在 Kubernetes 1.37 上以一個副本並啟用 Git 整合進行測試，我們針對 Gitea 同步的端對端測試全數通過（39 個案例）：透過 Gitea 的 OAuth2 連結與取消連結帳號、重新整理即將到期的存取權杖以及已撤銷的授權、匯出至新的私人或組織儲存庫、匯入儲存庫、pull 與 push、合併、衝突、已刪除與被強制 push 的分支、二進位檔案、重新命名與刪除，以及擁有者、編輯者與檢視者可執行的操作。

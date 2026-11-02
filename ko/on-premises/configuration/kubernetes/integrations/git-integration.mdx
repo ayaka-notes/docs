@@ -1,0 +1,144 @@
+---
+title: Git 연동
+description: Kubernetes에서 Ayakaleaf Pro와 함께 git-bridge를 실행합니다.
+icon: code-branch
+---
+
+Git 연동은 별도의 git-bridge 서비스를 실행합니다. 사용자는 `${OVERLEAF_SITE_URL}/git/<project id>`를 통해 클론하고 푸시합니다. Ayakaleaf Pro 파드는 이 요청을 git-bridge로 전달하고, git-bridge는 프로젝트 콘텐츠와 히스토리를 위해 파드를 다시 호출합니다. 이 기능을 켜면 [MCP 서버](/ko/on-premises/configuration/overleaf-toolkit/integrations/mcp-server)도 활성화되며, GitHub, GitLab, Gitea 및 Dropbox 동기화에 필요합니다.
+
+이 페이지는 [Kubernetes 사용](/ko/on-premises/installation/using-kubernetes)의 단일 레플리카 설치를 확장합니다. 여러 레플리카의 경우 [수평 확장](/ko/on-premises/configuration/kubernetes/horizontal-scaling)을 참고하세요.
+
+| | |
+| --- | --- |
+| 서비스 | 자체 파드(StatefulSet)의 **git-bridge**. 모든 Ayakaleaf Pro 파드에서: nginx(`/git/` 전달), web(Git 토큰, 프로젝트의 Git 페이지, git-bridge가 호출하는 API), history-v1(파일 콘텐츠) |
+| Git 클라이언트 → Overleaf | `${OVERLEAF_SITE_URL}/git/<project id>`, 사용자 이름은 `git`, 비밀번호는 Git 인증 토큰 |
+| Ayakaleaf Pro 파드 ↔ git-bridge | nginx → Service `git-bridge`. git-bridge → `overleaf-internal`을 통해 web의 API(포트 3000) 및 history-v1(포트 3100) |
+| 저장 데이터 | git-bridge 볼륨에 클론된 프로젝트마다 하나의 git 저장소 |
+| 주기적 작업 | git-bridge의 매시간 스왑 작업. 스왑 저장소가 구성된 경우에만 저장소를 이동함(`GIT_BRIDGE_SWAPSTORE_TYPE`, 기본값 `noop`) |
+
+<Steps>
+<Step title="git-bridge 배포하기">
+```yaml title="45-git-bridge.yaml" wrap
+# Internal Service for git-bridge: web's API (3000) and history-v1 (3100) of the Overleaf pod.
+# Keep it ClusterIP: the NodePort Service would publish these internal ports on every node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf-internal
+  namespace: overleaf
+spec:
+  selector:
+    app: overleaf
+  ports:
+    - {name: web, port: 3000}
+    - {name: history, port: 3100}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  # Fixed ClusterIP inside your service CIDR, used as GIT_BRIDGE_HOST: the image's nginx proxies
+  # /git/ with Docker's DNS resolver (127.0.0.11), which does not exist in Kubernetes.
+  clusterIP: 10.96.100.80
+  selector:
+    app: git-bridge
+  ports:
+    - {name: http, port: 8000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: git-bridge
+  namespace: overleaf
+spec:
+  serviceName: git-bridge
+  replicas: 1                     # git-bridge must run as a singleton
+  selector:
+    matchLabels:
+      app: git-bridge
+  template:
+    metadata:
+      labels:
+        app: git-bridge
+    spec:
+      # The Service "git-bridge" would inject GIT_BRIDGE_PORT=tcp://..., which git-bridge uses as its port
+      enableServiceLinks: false
+      containers:
+        - name: git-bridge
+          image: ghcr.io/ayaka-notes/overleaf-pro/git-bridge:6.3.2   # same tag as overleaf-pro
+          command: ["/server-pro-start.sh"]
+          securityContext:
+            runAsUser: 0
+          env:
+            - {name: GIT_BRIDGE_API_BASE_URL, value: "http://overleaf-internal.overleaf.svc.cluster.local:3000/api/v0/"}
+            - {name: GIT_BRIDGE_OAUTH2_SERVER, value: "http://overleaf.overleaf.svc.cluster.local"}
+            - {name: GIT_BRIDGE_POSTBACK_BASE_URL, value: "http://git-bridge.overleaf.svc.cluster.local:8000"}
+            - {name: GIT_BRIDGE_ROOT_DIR, value: /data/git-bridge}
+          ports:
+            - containerPort: 8000
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data/git-bridge}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+`10.96.100.80`은 클러스터 서비스 CIDR 내부의 사용 가능한 주소여야 합니다(kubeadm의 기본값은 `10.96.0.0/12`).
+</Step>
+
+<Step title="Ayakaleaf Pro가 git-bridge를 가리키도록 설정하기">
+`30-config.yaml`에 추가하세요.
+
+```yaml title="30-config.yaml (additions)"
+  GIT_BRIDGE_ENABLED: "true"
+  GIT_BRIDGE_HOST: "10.96.100.80"     # the fixed ClusterIP of the Service git-bridge
+  GIT_BRIDGE_PORT: "8000"
+  V1_HISTORY_URL: http://overleaf-internal.overleaf.svc.cluster.local:3100/api
+```
+
+```bash
+kubectl apply -f 45-git-bridge.yaml -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf
+kubectl -n overleaf rollout status statefulset/git-bridge
+```
+</Step>
+
+<Step title="프로젝트 클론하기">
+**Account Settings**에서 Git 인증 토큰을 만든 다음 실행하세요.
+
+```bash
+git clone http://192.0.2.10:30080/git/<project id>
+```
+
+사용자 이름으로 `git`을, 비밀번호로 토큰을 사용하세요.
+</Step>
+</Steps>
+
+### 매니페스트가 이렇게 구성된 이유
+
+* <strong>`GIT_BRIDGE_HOST`로 사용하는 고정 ClusterIP.</strong> Ayakaleaf Pro 이미지 내부의 nginx는 Docker 내장 DNS인 `127.0.0.11`로 설정된 resolver를 사용해 `/git/`을 전달합니다. Kubernetes에는 그 주소에 DNS 서버가 없으므로, `git-bridge` 같은 호스트 이름은 `502`로 실패하고 `/var/log/nginx/error.log`에 "git-bridge could not be resolved"가 기록됩니다. IP 주소는 조회가 필요 없습니다.
+* <strong>`overleaf-internal`.</strong> git-bridge는 Ayakaleaf Pro 파드의 포트 `3000`(web API)과 `3100`(히스토리)이 필요합니다. 별도의 ClusterIP Service는 이 포트들을 클러스터 내부에 유지합니다. NodePort Service에 추가하면 모든 노드에 공개됩니다.
+* <strong>`enableServiceLinks: false`.</strong> Service `git-bridge`가 있으면 Kubernetes가 파드에 `GIT_BRIDGE_PORT=tcp://10.96.100.80:8000`을 추가합니다. git-bridge는 `GIT_BRIDGE_PORT`를 수신 포트로 읽으므로 `MalformedJsonException ... path $.port`와 함께 중지됩니다.
+* <strong>자체 볼륨을 가진 레플리카 하나.</strong> git-bridge는 클론된 프로젝트마다 git 저장소를 디스크에 보관하며, 두 개가 동시에 실행되어서는 안 됩니다. 볼륨을 백업하세요.
+
+### Kubernetes에서의 테스트
+
+HAProxy 뒤에 세 개의 레플리카를 두고 git-bridge를 `overleaf-0`의 형제로 둔 Kubernetes 1.37 환경에서, Git 연동에 대한 엔드투엔드 테스트(19개 케이스)가 통과했으며, nginx가 `GIT_BRIDGE_HOST`와 `GIT_BRIDGE_PORT`를 사용해야 하도록 git-bridge를 포트 8001로 옮긴 경우에도 통과했습니다. 테스트 항목은 계정 설정의 Git 토큰, 에디터의 클론 명령, 클론·푸시·풀, 바이너리 파일과 폴더, 이름 변경과 삭제, 오래된 푸시의 거부, 역할에 따른 접근(초대된 편집자와 링크를 통한 편집자는 푸시 가능, 뷰어와 리뷰어는 클론만 가능, 접근 권한이 없는 사용자는 거부), 잘못되거나 삭제된 토큰의 거부, nginx 뒤에 유지되는 git-bridge 내부 경로, 그리고 정지된 계정입니다. Git 인증 토큰 자체(생성, 목록, 사용자별 한도, 삭제, 만료, git-bridge가 web에 요청하는 확인, 정지 및 삭제된 계정의 토큰)는 레플리카 하나에서 통과했습니다(16개 케이스).
+
+### Q\&A
+
+<Accordion title="`git clone`이 502를 반환합니다.">
+
+<strong>답변:</strong> `GIT_BRIDGE_HOST`를 확인하세요. 위에서 설명한 대로 git-bridge Service의 이름이 아니라 IP 주소여야 합니다. `kubectl -n overleaf exec deploy/overleaf -- tail /var/log/nginx/error.log`에서 원인을 확인할 수 있습니다.
+
+</Accordion>

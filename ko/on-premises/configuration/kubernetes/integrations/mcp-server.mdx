@@ -1,0 +1,38 @@
+---
+title: MCP 서버
+description: Kubernetes 배포에서 프로젝트의 MCP 서버를 통해 AI 클라이언트를 프로젝트에 연결합니다.
+icon: plug
+---
+
+각 프로젝트의 MCP 서버는 모든 Ayakaleaf Pro 파드의 **web** 서비스(`mcp-server` 모듈)에서 실행됩니다. [Git 연동](/ko/on-premises/configuration/kubernetes/integrations/git-integration)과 함께 제공되며 자체 설정은 없습니다. Claude Code, Codex 및 기타 클라이언트를 연결하는 방법은 [MCP 서버](/ko/on-premises/configuration/overleaf-toolkit/integrations/mcp-server)에 설명되어 있습니다.
+
+| | |
+| --- | --- |
+| 서비스 | web, 모든 Ayakaleaf Pro 파드에 포함 |
+| 활성화 조건 | `GIT_BRIDGE_ENABLED: "true"` 및 git-bridge StatefulSet, [Git 연동](/ko/on-premises/configuration/kubernetes/integrations/git-integration) 참조 |
+| 외부 → Overleaf | AI 클라이언트가 Git 인증 토큰과 함께 `POST ${OVERLEAF_SITE_URL}/project/<id>/mcp` 요청; PDF 다운로드 링크는 `${OVERLEAF_SITE_URL}/project/<id>/mcp/download/` 아래에 있음 |
+| 파드 → 외부 | 없음 |
+| 상태 | 요청 간 상태 없음; 컴파일 출력은 컴파일한 파드에 남음 |
+| 주기적 작업 | 없음 |
+
+### 구성
+
+[Git 연동](/ko/on-premises/configuration/kubernetes/integrations/git-integration)을 설정하세요. 그러면 MCP 서버는 `${OVERLEAF_SITE_URL}/project/<project id>/mcp`에 위치하며, 이 주소는 AI 클라이언트가 실행되는 곳에서 접근할 수 있어야 합니다.
+
+### 여러 레플리카
+
+MCP를 통한 컴파일은 요청을 받은 레플리카에서 실행되며, 그 로그와 PDF는 해당 레플리카에만 존재합니다. AI 클라이언트는 쿠키를 보내지 않으므로 로드 밸런서가 다음 요청(`get_compile_log` 또는 PDF 다운로드 링크)을 다른 레플리카로 보낼 수 있으며, 이 경우 "failed to fetch output file from CLSI" 또는 404가 응답됩니다. 추가 규칙 없이 레플리카 세 개로 테스트했을 때 로그 요청 6건 중 5건, 다운로드 4건 중 3건이 이런 방식으로 실패했습니다.
+
+`/git/`과 마찬가지로 프로젝트의 모든 MCP 요청을 하나의 레플리카로 라우팅하세요. [수평 확장](/ko/on-premises/configuration/kubernetes/horizontal-scaling)의 HAProxy를 사용하는 경우:
+
+```text
+      use-server overleaf-0 if { path_reg ^/project/[0-9a-f]{24}/mcp(/|$) }
+```
+
+그러면 MCP 컴파일은 모두 `overleaf-0`의 노드에서 실행됩니다. 다른 인그레스 컨트롤러를 사용하는 경우 `/project/<id>/mcp` 경로와 그 하위 경로 전체를 하나의 레플리카 고유 이름(`overleaf-0.overleaf-hl`)으로 라우팅하세요.
+
+이 규칙을 적용한 후 동일한 테스트(쿠키 없이 컴파일 1회, 로그 요청 6건, PDF 다운로드 4건)는 매번 성공했습니다.
+
+### Kubernetes에서의 테스트
+
+HAProxy 뒤에 레플리카 세 개를 둔 Kubernetes 1.37에서 MCP 서버에 대한 엔드 투 엔드 테스트가 통과했습니다(37개 케이스). 테스트 항목은 도구 목록 조회, 잘못되었거나 삭제되었거나 접근 권한이 없는 토큰의 거부, 컴파일 및 로그 읽기, 단어 수, 프로젝트 설정 및 기록, PDF 다운로드 링크, 열려 있는 편집기에 실시간으로 표시되고 Git 클론으로 pull되는 파일 편집, 댓글, 역할별 접근, 컴파일 및 설정 요청 속도 제한, 정지된 계정입니다. 이 요청들은 브라우저 세션에서 왔으므로 로드 밸런서가 하나의 레플리카로 유지했습니다. 쿠키가 없는 클라이언트의 경우 [여러 레플리카](#several-replicas)를 참조하세요.

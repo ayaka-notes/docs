@@ -1,0 +1,136 @@
+---
+title: Mise à niveau sur Kubernetes
+description: Mettez à niveau un déploiement Kubernetes d'Ayakaleaf Pro, avec une ou plusieurs répliques.
+icon: arrow-up-from-square
+---
+
+Une mise à niveau remplace le tag de l'image. La nouvelle version migre la base de données au démarrage, et ces migrations doivent s'exécuter **une seule fois, depuis un seul pod, alors qu'aucun pod plus ancien n'est en cours d'exécution**. Sur Kubernetes, cela exclut une simple mise à jour progressive (rolling update) d'un StatefulSet mis à l'échelle.
+
+<Danger>
+
+Effectuez une [sauvegarde cohérente](/fr/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) avant chaque mise à niveau, avec Ayakaleaf Pro arrêté. Consultez les [notes de version](/fr/on-premises/release-notes) pour connaître les étapes propres à la version vers laquelle vous effectuez la mise à niveau.
+
+</Danger>
+
+Avant de commencer, sur chaque nœud qui exécute Ayakaleaf Pro, récupérez avec `sudo docker pull` toute image TeX Live listée par la nouvelle version ou par votre nouvelle configuration.
+
+<Tabs>
+<Tab title="Une réplique">
+
+<Steps>
+<Step title="Arrêter Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Sauvegarder">
+MongoDB, depuis n'importe quel membre :
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Le volume de données, via un pod éphémère qui le monte (il est planifié sur le nœud du volume) :
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Faites de même pour le volume de git-bridge (`data-git-bridge-0`), et conservez une copie du Secret `overleaf-secrets`. Si votre stockage prend en charge les [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), un instantané des volumes produit le même résultat.
+</Step>
+
+<Step title="Changer la version et démarrer">
+Définissez le nouveau tag dans `40-overleaf.yaml` (et dans `45-git-bridge.yaml`, qui doit utiliser le même tag), puis :
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Le Deployment utilise `strategy: Recreate` ; même avec un tag modifié, deux versions ne s'exécutent donc jamais en même temps.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Plusieurs répliques">
+
+Pour la configuration décrite dans [Mise à l'échelle horizontale](/fr/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="Arrêter toutes les répliques">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Sauvegarder">
+MongoDB comme dans l'onglet à une réplique, vos buckets S3 avec les outils de votre fournisseur, le volume de git-bridge (`data-git-bridge-0`) et les Secrets. Le répertoire `/srv/overleaf-ha` des répliques ne contient que les résultats de compilation et ne nécessite aucune sauvegarde.
+</Step>
+
+<Step title="Démarrer une réplique avec la nouvelle version">
+Définissez le nouveau tag dans `70-overleaf.yaml` et `75-git-bridge.yaml`, ainsi que `replicas: 1` :
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Vérifiez que vous pouvez vous connecter, ouvrir un projet et compiler.
+</Step>
+
+<Step title="Démarrer les autres répliques">
+Redéfinissez `replicas: 3` et appliquez. `OrderedReady` les démarre l'une après l'autre.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Ne modifiez pas l'image d'un StatefulSet mis à l'échelle en cours d'exécution avec `kubectl set image` ou `kubectl apply` : la mise à jour progressive démarrerait la nouvelle version, et ses migrations, alors que des répliques plus anciennes servent encore les utilisateurs. Les modifications de configuration sans nouvelle version peuvent être appliquées par un redémarrage progressif : `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB et Redis
+
+Mettez-les à niveau séparément d'Ayakaleaf Pro. Pour MongoDB, suivez [Mettre à jour MongoDB](/fr/on-premises/maintenance/updating-mongodb) (une version majeure à la fois, `featureCompatibilityVersion` après chaque étape) ; un replica set adopte la nouvelle image un membre à la fois lorsque vous modifiez l'image dans `10-mongo.yaml`, car le StatefulSet remplace successivement `mongo-2`, `mongo-1` et `mongo-0`.
+
+### Revenir en arrière
+
+Arrêtez Ayakaleaf Pro comme ci-dessus, restaurez MongoDB à partir de l'archive (`mongorestore --drop --archive --gzip`) et les volumes ou buckets à partir de la sauvegarde, définissez l'ancien tag et redémarrez. Il n'existe pas d'autre moyen d'annuler les migrations de la nouvelle version.
+
+### Q\&A
+
+<Accordion title="Une réplique reste non prête, et les autres répliques ne démarrent jamais">
+
+<strong>Réponse :</strong> Avec `podManagementPolicy: OrderedReady`, `overleaf-1` ne démarre qu'une fois `overleaf-0` prêt, et une mise à jour progressive ne remplace pas un pod qui n'est jamais devenu prêt. Après avoir corrigé la cause, par exemple un paramètre erroné dans le ConfigMap, supprimez le pod bloqué afin que le StatefulSet le recrée à partir du modèle actuel :
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Nous avons rencontré ce cas sur notre cluster de test après qu'un paramètre a empêché `overleaf-0` de devenir prêt ; la suppression du pod a permis aux trois répliques de démarrer.
+
+</Accordion>

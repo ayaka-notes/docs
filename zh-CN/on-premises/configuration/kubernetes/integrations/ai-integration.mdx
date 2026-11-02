@@ -1,0 +1,65 @@
+---
+title: AI 集成
+description: 在 Kubernetes 部署中配置 AI 聊天、LaTeX 错误建议、配额和搜索服务。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+AI 助手和 LaTeX 错误助手运行在每个 Ayakaleaf Pro Pod 的 **web** 服务（`workbench` 和 `error-assistant` 模块）中。每项设置的作用、用户访问权限和配额请参见 [AI 集成](/zh-CN/on-premises/configuration/overleaf-toolkit/integrations/ai-integration)；本页介绍如何将其放入 Kubernetes。
+
+| | |
+| --- | --- |
+| 服务 | web，位于每个 Ayakaleaf Pro Pod 中；在 web 启动时读取。`web_fetch` 工具通过同一 Pod 中的 linked-url-proxy 进行访问 |
+| Pod → 外部 | `AI_BASE_URL`；开启搜索时还有 `WEB_SEARCH_URL`（默认为 `https://api.tavily.com/search`）和 `DOCS_MCP_URL`；模型通过 `web_fetch` 读取的页面 |
+| 外部 → Overleaf | 无 |
+| 状态 | Redis 中的令牌配额计数器，由所有副本共享；聊天记录保存在浏览器中 |
+| 定期任务 | 无 |
+
+### 配置
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+`AI_ENABLED` 必须严格为 `"true"`。只有当 `AI_ENABLED`、`AI_BASE_URL`、`AI_MODEL` 和 `AI_API_KEY` 全部设置后，助手才会出现。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="应用、重启并从每个 Pod 检查网关">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+任何 HTTP 状态码都表示网关可以访问；`000` 表示无法访问。
+</Step>
+</Steps>
+
+`web_fetch` 工具与[外部 URL](/zh-CN/on-premises/configuration/kubernetes/external-url) 文件通过同一个代理获取页面，因此 `OVERLEAF_LINKED_URL_*` 设置同样会限制模型可以读取的内容。
+
+### 多个副本
+
+无需额外操作。令牌配额在 Redis 中统计，因此用户的用量在每个副本上都相同，管理员的重置也会在所有副本上生效。
+
+### 在 Kubernetes 上的测试
+
+针对 OpenAI 兼容网关、Tavily 和 GitBook MCP 端点的模拟服务（通过来自 `overleaf-certs` 的 `NODE_EXTRA_CA_CERTS` 信任），在 Kubernetes 1.37 上，我们的端到端测试全部通过：对于在 HAProxy 之后的三个副本上运行的 AI 助手（31 个用例），包括带工具调用和编辑建议的聊天、网页和文档搜索、通过受 `OVERLEAF_LINKED_URL_ALLOWED_RESOURCES` 限制的 linked-url-proxy 读取网页、图片和 PDF 附件、用户同意、在 Redis 中统计的令牌配额、为某个用户和整个实例关闭 AI，以及与网关的慢速连接；对于在一个副本上运行的错误助手（15 个用例），包括修复建议、用户同意、共享的令牌配额以及关闭 AI。

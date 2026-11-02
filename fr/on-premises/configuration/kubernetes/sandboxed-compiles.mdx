@@ -1,0 +1,64 @@
+---
+title: Compilations isolées (Sandboxed Compiles)
+description: Compilez du LaTeX dans des conteneurs TeX Live sur les nœuds d'un cluster Kubernetes.
+icon: gear-code
+---
+
+Les compilations sont exécutées par le service **clsi** dans chaque pod Ayakaleaf Pro. Lorsque les compilations isolées sont activées, clsi demande au **Docker Engine du nœud** sur lequel s'exécute le pod de démarrer un conteneur TeX Live pour chaque compilation, et lui transmet le répertoire du projet via son chemin sur ce nœud. Le fonctionnement de l'isolation et les images disponibles sont décrits dans [Compilations isolées](/fr/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Service | clsi (compilations), web (la liste des images dans les paramètres du compilateur), dans chaque pod Ayakaleaf Pro |
+| Nœud | Docker Engine et chaque image de `ALL_TEX_LIVE_DOCKER_IMAGES`, sur chaque nœud pouvant exécuter Ayakaleaf Pro |
+| Montages du pod | `/var/run/docker.sock`, et les répertoires de compilation, de sortie et de cache en tant que volumes `hostPath` |
+| Tâches périodiques | clsi supprime les répertoires de compilation inutilisés depuis un jour et, toutes les heures, retire les anciens conteneurs TeX Live du Docker du nœud |
+
+### Configuration
+
+L'installation met tout en place : Docker et les images sur les nœuds dans [0. Préparer les nœuds](/fr/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), les paramètres dans [4. Personnaliser votre instance](/fr/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) et les volumes dans [5. Déployer Ayakaleaf Pro](/fr/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Les paramètres, tous dans le ConfigMap :
+
+| Variable | Valeur |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | chemin sur le nœud du volume monté sur `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | chemin sur le nœud du volume monté sur `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | chemin sur le nœud du volume monté sur `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | les images, comme avec le Toolkit |
+
+### Ajouter une version de TeX Live
+
+<Steps>
+<Step title="Récupérer l'image sur chaque nœud">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Le Toolkit récupère lui-même les images ; sur Kubernetes, personne ne le fait. Récupérez-les dans **Docker**, et non avec `crictl` : clsi demande l'image à Docker. Une compilation avec une image absente du nœud échoue.
+</Step>
+
+<Step title="L'ajouter au ConfigMap et redémarrer">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Un nœud ajouté ultérieurement au cluster a besoin de Docker et de toutes les images avant qu'Ayakaleaf Pro ne s'y exécute. Si tous les nœuds ne remplissent pas ces conditions, étiquetez ceux qui les remplissent et maintenez Ayakaleaf Pro sur ces nœuds avec un `nodeSelector`.
+
+### Plusieurs répliques
+
+Chaque réplique compile sur son propre nœud et y conserve le résultat de compilation ; un utilisateur doit donc rester sur la réplique qui a compilé, ce que garantit le cookie de persistance (sticky) de l'équilibreur de charge. N'exécutez jamais deux répliques sur le même nœud : elles partageraient les répertoires de compilation du nœud. La configuration de [Mise à l'échelle horizontale](/fr/on-premises/configuration/kubernetes/horizontal-scaling) l'empêche avec `podAntiAffinity`.
+
+Les conteneurs TeX Live s'exécutent à côté du pod, en dehors de sa limite de mémoire et hors de la vue de l'ordonnanceur. Laissez de la mémoire libre sur les nœuds pour eux, voir [0. Préparer les nœuds](/fr/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Testé sur Kubernetes
+
+Sur Kubernetes 1.37 avec trois répliques derrière HAProxy, une par nœud, et TeX Live 2026 et 2025 récupérés dans Docker sur chaque nœud, nos tests de bout en bout des compilations isolées réussissent (7 cas) : un nouveau projet se compile en PDF, les paramètres du compilateur proposent les deux images et permettent de passer de l'une à l'autre, XeLaTeX avec fontspec, erreurs LaTeX et recompilation après correction, arrêt d'une compilation en cours, et SyncTeX dans les deux sens. Un test de charge avec 12 utilisateurs compilant simultanément un document de 600 pages a exécuté 4 compilations par nœud, voir [À quoi s'attendre](/fr/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

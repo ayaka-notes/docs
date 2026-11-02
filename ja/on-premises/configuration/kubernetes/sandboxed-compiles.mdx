@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: Kubernetes クラスターのノード上の TeX Live コンテナで LaTeX をコンパイルします。
+icon: gear-code
+---
+
+コンパイルは、すべての Ayakaleaf Pro Pod 内の **clsi** サービスが実行します。Sandboxed Compiles を有効にすると、clsi は Pod が動作している**ノードの Docker Engine** に、コンパイルごとに TeX Live コンテナを起動するよう要求し、プロジェクトのディレクトリをそのノード上のパスで渡します。サンドボックス化の仕組みと利用可能なイメージについては [Sandboxed Compiles](/ja/on-premises/configuration/overleaf-toolkit/sandboxed-compiles) で説明しています。
+
+| | |
+| --- | --- |
+| サービス | clsi（コンパイル）、web（コンパイラー設定のイメージ一覧）、すべての Ayakaleaf Pro Pod 内 |
+| ノード | Ayakaleaf Pro を実行できるすべてのノード上の Docker Engine と `ALL_TEX_LIVE_DOCKER_IMAGES` のすべてのイメージ |
+| Pod のマウント | `/var/run/docker.sock`、および `hostPath` ボリュームとしてのコンパイル、出力、キャッシュの各ディレクトリ |
+| 定期ジョブ | clsi は 1 日使われていないコンパイルディレクトリを削除し、1 時間ごとにノードの Docker から古い TeX Live コンテナを削除する |
+
+### 設定
+
+インストールですべてが設定されます。ノード上の Docker とイメージは [0. ノードの準備](/ja/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)、設定は [4. インスタンスのカスタマイズ](/ja/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)、ボリュームは [5. Ayakaleaf Pro のデプロイ](/ja/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro)で行います。設定はすべて ConfigMap にあります。
+
+| 変数 | 値 |
+| --- | --- |
+| `SANDBOXED_COMPILES`、`SANDBOXED_COMPILES_SIBLING_CONTAINERS`、`DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | `/var/lib/overleaf/data/compiles` にマウントされたボリュームのノード上のパス |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | `/var/lib/overleaf/data/output` にマウントされたボリュームのノード上のパス |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | `/var/lib/overleaf/data/cache` にマウントされたボリュームのノード上のパス |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`、`ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`、`TEX_LIVE_DOCKER_IMAGE` | イメージ。Toolkit と同じ |
+
+### TeX Live バージョンの追加
+
+<Steps>
+<Step title="すべてのノードでイメージをプルする">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit はイメージを自動でプルしますが、Kubernetes では誰もプルしません。`crictl` ではなく **Docker** にプルしてください。clsi は Docker にイメージを要求します。ノードに存在しないイメージでのコンパイルは失敗します。
+</Step>
+
+<Step title="ConfigMap に追加して再起動する">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+後からクラスターに追加したノードでは、Ayakaleaf Pro をそこで実行する前に Docker とすべてのイメージが必要です。すべてのノードが条件を満たしているわけではない場合は、該当ノードにラベルを付け、`nodeSelector` で Ayakaleaf Pro をそれらのノードに限定してください。
+
+### 複数のレプリカ
+
+各レプリカはそれぞれのノードでコンパイルし、コンパイル出力をそこに保持します。そのため、ユーザーはコンパイルしたレプリカにとどまる必要があり、これはロードバランサーのスティッキー Cookie によって保証されます。同じノードで 2 つのレプリカを実行しないでください。ノードのコンパイルディレクトリを共有してしまいます。[水平スケーリング](/ja/on-premises/configuration/kubernetes/horizontal-scaling)の構成では、`podAntiAffinity` でこれを防いでいます。
+
+TeX Live コンテナは Pod の横で実行され、Pod のメモリ制限の対象外であり、スケジューラーからも見えません。ノードにはそのためのメモリを空けておいてください。[0. ノードの準備](/ja/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)を参照してください。
+
+### Kubernetes でのテスト
+
+Kubernetes 1.37 上で HAProxy の背後にノードごとに 1 つずつ計 3 つのレプリカを置き、すべてのノードの Docker に TeX Live 2026 と 2025 をプルした状態で、Sandboxed Compiles のエンドツーエンドテスト（7 ケース）に合格しています。対象は、新規プロジェクトの PDF へのコンパイル、コンパイラー設定で両方のイメージが提示され切り替えられること、fontspec を使った XeLaTeX、LaTeX エラーと修正後の再コンパイル、実行中のコンパイルの停止、双方向の SyncTeX です。12 人のユーザーが 600 ページのドキュメントを同時にコンパイルする負荷テストでは、ノードあたり 4 つのコンパイルが実行されました。[期待できる性能](/ja/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect)を参照してください。

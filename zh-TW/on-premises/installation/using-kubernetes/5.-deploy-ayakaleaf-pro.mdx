@@ -1,0 +1,123 @@
+---
+title: 5. 部署 Ayakaleaf Pro
+description: 部署 Ayakaleaf Pro Pod、其資料磁碟區以及 NodePort Service。
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+第一次啟動時會執行資料庫遷移，約需一到兩分鐘。當 `/status` 有回應時，Pod 即已就緒；接著開啟 `OVERLEAF_SITE_URL`。
+
+### 為什麼 manifest 是這個樣子
+
+* <strong>資料磁碟區。</strong>`/var/lib/overleaf` 下的所有內容（專案檔案、歷史記錄、上傳檔案）都存放在 PVC 上。使用 local-path 等節點本機儲存時，資料會固定在單一節點上；使用網路區塊儲存時，Pod 則可以在節點之間移動。
+* <strong>編譯磁碟區與 Docker socket。</strong>Ayakaleaf Pro 會要求節點的 Docker 啟動 TeX Live 容器，並**以其在節點上的路徑**將專案的編譯目錄傳給它。因此這些目錄是 `hostPath` 磁碟區，其路徑也重複列在 `SANDBOXED_COMPILES_HOST_DIR_*` 中。其內容為暫存資料，不需要備份。
+* <strong>`enableServiceLinks: false`。</strong>Kubernetes 會為命名空間中的每個 Service，在每個 Pod 中加入 Docker 風格的變數：Service `redis` 會變成 `REDIS_PORT=tcp://10.x.x.x:6379`，Service `git-bridge` 則變成 `GIT_BRIDGE_PORT=tcp://...`。部分 Overleaf 服務會讀取這些名稱的變數。在此 Pod 中，來自 `OVERLEAF_REDIS_*` 與 ConfigMap 的設定會優先，但 git-bridge 會將 `GIT_BRIDGE_PORT` 當作其連接埠而停止運作（請參閱 [Git 整合](/zh-TW/on-premises/configuration/kubernetes/integrations/git-integration)）。關閉這些連結可讓環境只包含您所設定的內容。
+* <strong>`Recreate`。</strong>兩個 Pod 絕不能同時使用同一個資料磁碟區或同時執行遷移。
+* <strong>對外公開。</strong>NodePort Service 會在每個節點的連接埠 `30080` 上回應。在正式環境中，請在前方放置您的 Ingress 控制器或負載平衡器並在該處終止 TLS；它必須允許 WebSocket、10 分鐘的請求逾時（長時間編譯）與 50 MB 的上傳，並傳遞 `X-Forwarded-For` 與 `X-Forwarded-Proto`。
