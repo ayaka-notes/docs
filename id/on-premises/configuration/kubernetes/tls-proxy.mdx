@@ -1,0 +1,87 @@
+---
+title: Proxy TLS
+description: Sajikan deployment Kubernetes melalui HTTPS lewat ingress, load balancer, atau HAProxy.
+icon: lock
+---
+
+Di dalam pod, nginx milik kontainer menyajikan HTTP biasa di port 80. HTTPS berakhir di depan pod: di ingress controller Anda, load balancer cloud Anda, atau HAProxy seperti di [Penskalaan horizontal](/id/on-premises/configuration/kubernetes/horizontal-scaling). Proxy NGINX milik Toolkit (`bin/init --tls`, `NGINX_*` dan `TLS_*` di `overleaf.rc`) tidak memiliki padanan; lihat [Proxy TLS](/id/on-premises/configuration/overleaf-toolkit/tls-proxy) untuk Toolkit.
+
+| | |
+| --- | --- |
+| Layanan | ingress atau load balancer Anda; web membaca pengaturan di bawah saat dimulai |
+| Browser → proxy | HTTPS di port 443, termasuk WebSocket editor |
+| Proxy → pod | HTTP biasa ke port 80 pod |
+| Tugas berkala | tidak ada (pembaruan sertifikat adalah urusan proxy Anda) |
+
+### Yang harus dilakukan proxy
+
+* Meneruskan WebSocket (`/socket.io`).
+* Mengizinkan permintaan selama 10 menit (kompilasi panjang) dan body permintaan sebesar 50 MB (unggahan), atau `MAX_UPLOAD_SIZE`.
+* Menjaga batas waktu idle keep-alive ke arah pod di bawah 65 detik, batas waktu nginx di dalam pod.
+* Mengirim `X-Forwarded-For` dan `X-Forwarded-Proto: https`.
+* Dengan beberapa replika, mempertahankan pengguna di satu replika, lihat [Penskalaan horizontal](/id/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Tanpa `X-Forwarded-Proto: https` dari alamat tepercaya, Ayakaleaf Pro mengira permintaan datang melalui HTTP dan tidak mengatur cookie sesi aman: login kemudian gagal. Atur `OVERLEAF_SECURE_COOKIE` hanya jika pengguna benar-benar mengakses situs melalui HTTPS; nilai apa pun akan mengaktifkannya, termasuk `"false"`.
+
+### Contoh HAProxy
+
+Untuk mengakhiri HTTPS di DaemonSet HAProxy dari [Penskalaan horizontal](/id/on-premises/configuration/kubernetes/horizontal-scaling), masukkan sertifikat dan kuncinya ke dalam satu file PEM dan sebuah Secret:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+Kemudian ubah `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+Naikkan `config-hash` agar HAProxy dimulai ulang, lalu atur ConfigMap seperti di atas dan mulai ulang replika.
+
+Redirect mempertahankan port dari permintaan: cocok untuk load balancer di port 80 dan 443, tetapi di NodePort, redirect ini mengirim `http://host:30081` ke `https://host:30081`. Tanpa load balancer di depan, hilangkan baris redirect dan berikan alamat `https://...:30443` kepada pengguna.
+
+### Diuji di Kubernetes
+
+Di Kubernetes 1.37 dengan tiga replika dan HAProxy yang mengakhiri HTTPS seperti di atas, dengan `OVERLEAF_SITE_URL` pada `https://` dan `OVERLEAF_SECURE_COOKIE`: pengguna diaktifkan melalui tautan `https://`, masuk dengan cookie sesi bertanda `Secure`, mengunggah dan mengompilasi proyek dengan PDF yang berhasil diambil, tetap berada di replikanya, membuka WebSocket editor (`wss`), serta melakukan clone dan push dengan Git melalui HTTPS. Permintaan `http://` di NodePort diarahkan ke `https://` dengan port yang sama, seperti dijelaskan di atas.

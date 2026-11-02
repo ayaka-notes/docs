@@ -1,0 +1,67 @@
+---
+title: المزامنة مع Gitea
+description: اسمح للمستخدمين بمزامنة مشاريعهم مع مستودعات على Gitea.com أو على Gitea الخاص بك في نشر على Kubernetes.
+icon: mug-hot
+---
+
+تعمل المزامنة مع Gitea في خدمة **web** (وحدة `gitea-sync`) في كل Pod من Pods ‏Ayakaleaf Pro. وتحتاج إلى [التكامل مع Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration). أنشئ تطبيق OAuth واقرأ ما يفعله كل إعداد في [المزامنة مع Gitea](/ar/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation)؛ أما هذه الصفحة فتشرح وضعها في Kubernetes.
+
+| | |
+| --- | --- |
+| الخدمة | web (وحدة `gitea-sync`)، في كل Pod من Pods ‏Ayakaleaf Pro؛ تُقرأ عند بدء تشغيل web |
+| Pod → Gitea | واجهة REST البرمجية لـ `GITEA_SYNC_URL` (القيمة الافتراضية `https://gitea.com/api/v1`)، كلما ربط مستخدم حسابه أو استورد أو صدّر أو زامن |
+| المتصفح → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` لربط حساب، ثم العودة إلى `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | لا شيء: لا يوجد webhook، ولا يلزم أن تكون النسخة قابلة للوصول من Gitea |
+| البيانات المخزنة | رموز الوصول (access tokens) ورموز التحديث (refresh tokens) الخاصة بـ Gitea للمستخدم، مشفّرة، في MongoDB |
+| المهام الدورية | لا توجد: تحدث المزامنة عندما ينقر المستخدم |
+
+### الإعداد
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+يجب أن يكون `GIT_BRIDGE_ENABLED: "true"` والـ StatefulSet الخاص بـ git-bridge من [التكامل مع Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration) جاهزين: فبدونهما تُخفي إعدادات الحساب والمحرر خيار المزامنة مع Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+يشفّر `GITEA_TOKEN_CIPHER_PASSWORD` رموز الوصول ورموز التحديث الخاصة بـ Gitea للمستخدمين في MongoDB. يجب أن تستخدم كل نسخة متماثلة القيمة نفسها، وتغييرها لاحقًا يجعل كل المستخدمين يعيدون ربط Gitea.
+</Step>
+
+<Step title="جهة شهادات خاصة (اختياري)">
+إذا كانت لدى Gitea الخاص بك شهادة صادرة عن جهة شهادات (CA) خاصة بك، فأضف جهة الشهادات إلى الـ Secret ‏`overleaf-certs` المركّب على `/var/lib/overleaf/certs` (راجع [الشهادات والملفات الأخرى](/ar/on-premises/configuration/kubernetes#الشهادات-والملفات-الأخرى)) واضبط `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` في الـ ConfigMap.
+</Step>
+
+<Step title="طبّق التغييرات وأعد التشغيل وتحقّق">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+أي رمز حالة HTTP يعني أنه يمكن الوصول إلى Gitea من ذلك الـ Pod؛ أما `000` فيعني أنه لا يمكن الوصول إليه.
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+لا حاجة إلى شيء إضافي سوى `GITEA_TOKEN_CIPHER_PASSWORD` المشترك. تأخذ المزامنة قفلًا في Redis، مشتركًا مع عمليات مزامنة Git الأخرى، لذا لا تزامن نسختان متماثلتان المشروع نفسه في الوقت نفسه أبدًا.
+
+### الاختبار على Kubernetes
+
+مقابل Gitea 1.23 حقيقي على `GITEA_SYNC_URL`، على Kubernetes 1.37 مع نسخة متماثلة واحدة وتفعيل التكامل مع Git، نجحت اختباراتنا الشاملة للمزامنة مع Gitea ‏(39 حالة): ربط الحساب وإلغاء ربطه عبر OAuth2 الخاص بـ Gitea، وتحديث رمز الوصول المنتهي الصلاحية والتفويضات الملغاة، والتصدير إلى مستودع خاص جديد أو مستودع مؤسسة، واستيراد مستودع، والسحب والدفع، وعمليات الدمج، والتعارضات، والفروع المحذوفة والمدفوعة قسرًا (force-pushed)، والملفات الثنائية، وإعادة التسمية والحذف، وما يمكن للمالكين والمحررين والمشاهدين فعله.

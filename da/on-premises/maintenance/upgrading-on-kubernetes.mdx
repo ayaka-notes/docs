@@ -1,0 +1,136 @@
+---
+title: Opgradering på Kubernetes
+description: Opgradér en Kubernetes-installation af Ayakaleaf Pro med én eller flere replikaer.
+icon: arrow-up-from-square
+---
+
+En opgradering udskifter image-tagget. Den nye version migrerer databasen, når den starter, og disse migreringer skal køre **én gang, fra én pod, mens ingen ældre pod kører**. På Kubernetes udelukker det en almindelig rolling update af et skaleret StatefulSet.
+
+<Danger>
+
+Tag en [konsistent sikkerhedskopi](/da/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) før hver opgradering, med Ayakaleaf Pro stoppet. Læs [release notes](/da/on-premises/release-notes) for trin til den version, du opgraderer til.
+
+</Danger>
+
+Før du starter, skal du på hver node, der kører Ayakaleaf Pro, pulle de TeX Live-images, som den nye version eller din nye konfiguration angiver, med `sudo docker pull`.
+
+<Tabs>
+<Tab title="Én replika">
+
+<Steps>
+<Step title="Stop Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Sikkerhedskopiér">
+MongoDB, fra et vilkårligt medlem:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Datavolumet, via en kortlivet pod, der monterer det (den havner på volumets node):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Gør det samme for git-bridges volume (`data-git-bridge-0`), og gem en kopi af Secret'et `overleaf-secrets`. Hvis din lagring understøtter [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), gør et snapshot af volumes det samme.
+</Step>
+
+<Step title="Skift versionen, og start">
+Sæt det nye tag i `40-overleaf.yaml` (og i `45-git-bridge.yaml`, som skal bruge det samme tag), og kør derefter:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment'et bruger `strategy: Recreate`, så selv et ændret tag aldrig kører to versioner på samme tid.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Flere replikaer">
+
+Til opsætningen under [Horisontal skalering](/da/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="Stop alle replikaer">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Sikkerhedskopiér">
+MongoDB som i fanen med én replika, dine S3-buckets med din udbyders værktøjer, git-bridges volume (`data-git-bridge-0`) og Secrets. Replikaernes `/srv/overleaf-ha` indeholder kun kompileringsoutput og kræver ingen sikkerhedskopi.
+</Step>
+
+<Step title="Start én replika med den nye version">
+Sæt det nye tag i `70-overleaf.yaml` og `75-git-bridge.yaml` samt `replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Kontrollér, at du kan logge ind, åbne et projekt og kompilere.
+</Step>
+
+<Step title="Start de andre replikaer">
+Sæt `replicas: 3` igen, og anvend. `OrderedReady` starter dem én efter én.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Ændr ikke imaget for et kørende skaleret StatefulSet med `kubectl set image` eller `kubectl apply`: rolling update'en ville starte den nye version og dens migreringer, mens ældre replikaer stadig betjener brugere. Konfigurationsændringer uden en ny version er fine som en rolling restart: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB og Redis
+
+Opgradér dem separat fra Ayakaleaf Pro. For MongoDB skal du følge [Opdatering af MongoDB](/da/on-premises/maintenance/updating-mongodb) (én hovedversion ad gangen, `featureCompatibilityVersion` efter hvert trin); et replikasæt tager det nye image ét medlem ad gangen, når du ændrer imaget i `10-mongo.yaml`, fordi StatefulSet'et udskifter `mongo-2`, `mongo-1` og `mongo-0` på skift.
+
+### Tilbagerulning
+
+Stop Ayakaleaf Pro som ovenfor, gendan MongoDB fra arkivet (`mongorestore --drop --archive --gzip`) og volumes eller buckets fra sikkerhedskopien, sæt det gamle tag, og start igen. Den nye versions migreringer kan ikke fortrydes på anden vis.
+
+### Spørgsmål og svar
+
+<Accordion title="En replika forbliver ikke klar, og de andre replikaer starter aldrig">
+
+<strong>Svar:</strong> Med `podManagementPolicy: OrderedReady` starter `overleaf-1` først, når `overleaf-0` er klar, og en rolling update udskifter ikke en pod, der aldrig blev klar. Når du har rettet årsagen, for eksempel en forkert indstilling i ConfigMap'et, skal du slette den fastlåste pod, så StatefulSet'et opretter den igen ud fra den aktuelle skabelon:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Vi stødte på dette i vores testcluster, efter at en indstilling forhindrede `overleaf-0` i at blive klar; sletning af poden fik alle tre replikaer til at starte.
+
+</Accordion>

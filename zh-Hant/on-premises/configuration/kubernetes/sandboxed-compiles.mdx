@@ -1,0 +1,64 @@
+---
+title: 沙箱編譯（Sandboxed Compiles）
+description: 在 Kubernetes 叢集的節點上，於 TeX Live 容器中編譯 LaTeX。
+icon: gear-code
+---
+
+編譯由每個 Ayakaleaf Pro Pod 中的 **clsi** 服務執行。啟用沙箱編譯後，clsi 會要求 Pod 所在 **節點的 Docker Engine** 為每次編譯啟動一個 TeX Live 容器，並以專案目錄在該節點上的路徑將其交給容器。沙箱的運作方式以及有哪些映像檔，請參閱[沙箱編譯](/zh-Hant/on-premises/configuration/overleaf-toolkit/sandboxed-compiles)。
+
+| | |
+| --- | --- |
+| 服務 | clsi（編譯）、web（編譯器設定中的映像檔清單），位於每個 Ayakaleaf Pro Pod 中 |
+| 節點 | Docker Engine 以及 `ALL_TEX_LIVE_DOCKER_IMAGES` 中的每個映像檔，位於每個可執行 Ayakaleaf Pro 的節點上 |
+| Pod 掛載 | `/var/run/docker.sock`，以及以 `hostPath` 磁碟區掛載的編譯、輸出與快取目錄 |
+| 定期工作 | clsi 會刪除超過一天未使用的編譯目錄，並每小時從節點的 Docker 中移除舊的 TeX Live 容器 |
+
+### 設定
+
+安裝過程已完成所有設定：Docker 與節點上的映像檔位於 [0. 準備節點](/zh-Hant/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)，各項設定位於 [4. 個人化您的執行個體](/zh-Hant/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)，磁碟區則位於 [5. 部署 Ayakaleaf Pro](/zh-Hant/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro)。各項設定皆位於 ConfigMap 中：
+
+| 變數 | 值 |
+| --- | --- |
+| `SANDBOXED_COMPILES`、`SANDBOXED_COMPILES_SIBLING_CONTAINERS`、`DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | 掛載於 `/var/lib/overleaf/data/compiles` 之磁碟區在節點上的路徑 |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | 掛載於 `/var/lib/overleaf/data/output` 之磁碟區在節點上的路徑 |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | 掛載於 `/var/lib/overleaf/data/cache` 之磁碟區在節點上的路徑 |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`、`ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`、`TEX_LIVE_DOCKER_IMAGE` | 映像檔，與 Toolkit 相同 |
+
+### 新增 TeX Live 版本
+
+<Steps>
+<Step title="在每個節點上拉取映像檔">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit 會自行拉取映像檔；在 Kubernetes 上則沒有任何元件會代勞。請拉取到 **Docker** 中，而不要使用 `crictl`：clsi 是向 Docker 要求映像檔。若節點上缺少編譯所用的映像檔，編譯將會失敗。
+</Step>
+
+<Step title="將其列入 ConfigMap 並重新啟動">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+之後加入叢集的節點，必須先具備 Docker 與所有映像檔，Ayakaleaf Pro 才能在其上執行。若並非每個節點都符合條件，請為符合條件的節點加上標籤，並以 `nodeSelector` 讓 Ayakaleaf Pro 只在這些節點上執行。
+
+### 多個副本
+
+每個副本都在各自的節點上編譯，並將編譯輸出保留在該節點上，因此使用者必須持續連線到執行編譯的副本，這由負載平衡器的黏性 Cookie 確保。切勿在同一個節點上執行兩個副本：它們會共用該節點的編譯目錄。[水平擴展](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling) 的設定以 `podAntiAffinity` 防止這種情況。
+
+TeX Live 容器在 Pod 旁邊執行，不受 Pod 記憶體限制的約束，排程器也看不到它們。請在節點上為它們保留可用的記憶體，請參閱 [0. 準備節點](/zh-Hant/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)。
+
+### 在 Kubernetes 上的測試
+
+我們在 Kubernetes 1.37 上以三個副本置於 HAProxy 之後（每個節點一個），並在每個節點的 Docker 中拉取 TeX Live 2026 與 2025，執行沙箱編譯的端對端測試，全部通過（7 個案例）：新專案編譯為 PDF、編譯器設定提供兩個映像檔並可在兩者之間切換、搭配 fontspec 的 XeLaTeX、LaTeX 錯誤以及修正後重新編譯、停止執行中的編譯，以及雙向 SyncTeX。在 12 位使用者同時編譯一份 600 頁文件的負載測試中，每個節點執行 4 次編譯，請參閱[預期效能](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect)。

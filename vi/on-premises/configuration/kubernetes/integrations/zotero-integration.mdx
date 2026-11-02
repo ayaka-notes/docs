@@ -1,0 +1,56 @@
+---
+title: Tích hợp Zotero
+description: Cho phép người dùng nhập tệp .bib từ thư viện Zotero của họ trên một bản triển khai Kubernetes.
+icon: z
+---
+
+Tính năng nhập từ Zotero chạy trong dịch vụ **web** (mô-đun `tpr-webmodule`) của mọi pod Ayakaleaf Pro. Hãy đăng ký OAuth client Zotero như trong [Tích hợp Zotero](/vi/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration), với URL callback `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback`, sau đó cấu hình Kubernetes như bên dưới.
+
+| | |
+| --- | --- |
+| Dịch vụ | web, trong mọi pod Ayakaleaf Pro; được đọc khi web khởi động |
+| Pod → Zotero | `https://www.zotero.org/oauth/*` và `https://api.zotero.org`, khi người dùng liên kết Zotero hoặc nhập hay làm mới một tệp |
+| Trình duyệt → Zotero | `https://www.zotero.org/oauth/authorize`, sau đó quay lại URL callback |
+| Zotero → Overleaf | không có: phiên bản không cần truy cập được từ internet |
+| Dữ liệu được lưu trữ | khóa Zotero của người dùng, đã được mã hóa, trong MongoDB |
+| Tác vụ định kỳ | không có: một tệp chỉ được làm mới khi người dùng yêu cầu |
+
+### Cấu hình
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES` thay thế giá trị từ quá trình cài đặt; hãy giữ các loại bạn đã có và thêm `zotero` (và `mendeley`, nếu bạn dùng cả hai).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD` mã hóa các khóa Zotero của người dùng trong MongoDB. Nếu không có nó, mỗi pod sẽ tự tạo một tệp khóa trong `/var/lib/overleaf/data` của riêng mình. Với [nhiều replica](/vi/on-premises/configuration/kubernetes/horizontal-scaling), khi đó mỗi node sẽ có một khóa khác nhau, và người dùng được phục vụ bởi replica khác không thể dùng tài khoản Zotero đã liên kết của họ. Hãy đặt giá trị này trước khi người dùng đầu tiên liên kết Zotero: việc thay đổi nó sau đó sẽ buộc mọi người dùng phải liên kết lại Zotero.
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Hãy đặt `ZOTERO_CIPHER_PASSWORD` trong Secret, xem ở trên. Nếu không có nó, một tệp được nhập trên một replica không thể được làm mới trên replica khác: việc làm mới thất bại với thông báo "The remote service produced an error", vì tệp khóa của replica đó không thể giải mã khóa Zotero của người dùng. Khi có mật khẩu trong Secret, tính năng hoạt động trên mọi replica; chúng tôi đã kiểm thử cả hai trường hợp bằng cách nhập trên `overleaf-0` và làm mới trên `overleaf-1`. Quá trình bắt tay OAuth giữ trạng thái của nó trong phiên trong Redis, nên callback có thể tới bất kỳ replica nào.
+
+### Đã kiểm thử trên Kubernetes
+
+Với một bản mô phỏng www.zotero.org và api.zotero.org (được tin cậy thông qua `NODE_EXTRA_CA_CERTS` từ `overleaf-certs`), trên Kubernetes 1.37 với ba replica phía sau HAProxy, các bài kiểm thử end-to-end của chúng tôi cho Zotero đều đạt (18 trường hợp): liên kết qua OAuth 1.0a và hủy liên kết, nhập thư viện và các nhóm vào một tệp `.bib`, làm mới tệp đó, thu hồi khóa trên Zotero, yêu cầu liên kết lại, tài liệu tham khảo có thể tìm kiếm được đối với các cộng tác viên, chỉ người nhập mới được làm mới, lỗi API, và kết nối chậm tới Zotero.

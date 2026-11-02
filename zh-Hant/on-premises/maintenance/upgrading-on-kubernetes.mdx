@@ -1,0 +1,136 @@
+---
+title: 在 Kubernetes 上升級
+description: 升級 Ayakaleaf Pro 的 Kubernetes 部署，無論是單一副本或多個副本。
+icon: arrow-up-from-square
+---
+
+升級會替換映像檔標籤。新版本會在啟動時遷移資料庫，而這些遷移必須**只執行一次、由單一 Pod 執行，且執行時沒有任何舊版 Pod 在運作**。在 Kubernetes 上，這表示無法對已擴展的 StatefulSet 進行單純的滾動更新。
+
+<Danger>
+
+每次升級前，請在停止 Ayakaleaf Pro 的狀態下進行[一致性備份](/zh-Hant/on-premises/maintenance/data-and-backups#performing-a-consistent-backup)。請閱讀[版本說明](/zh-Hant/on-premises/release-notes)，了解您要升級到的版本有哪些步驟。
+
+</Danger>
+
+開始之前，請在每個執行 Ayakaleaf Pro 的節點上，以 `sudo docker pull` 拉取新版本或新設定中列出的所有 TeX Live 映像檔。
+
+<Tabs>
+<Tab title="單一副本">
+
+<Steps>
+<Step title="停止 Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="備份">
+MongoDB，可從任一成員執行：
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+資料磁碟區，透過一個掛載它的短暫 Pod（該 Pod 會被排程到磁碟區所在的節點）：
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+對 git-bridge 的磁碟區（`data-git-bridge-0`）進行相同的操作，並保留一份 Secret `overleaf-secrets` 的副本。如果您的儲存支援 [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/)，也可以為磁碟區建立快照來達到相同效果。
+</Step>
+
+<Step title="變更版本並啟動">
+在 `40-overleaf.yaml` 中設定新的標籤（`45-git-bridge.yaml` 也必須使用相同的標籤），然後執行：
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment 使用 `strategy: Recreate`，因此即使變更了標籤，也絕不會同時執行兩個版本。
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="多個副本">
+
+適用於[水平擴展](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling)中的設定。
+
+<Steps>
+<Step title="停止所有副本">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="備份">
+依照單一副本分頁中的方式備份 MongoDB，使用您供應商的工具備份 S3 儲存桶，並備份 git-bridge 的磁碟區（`data-git-bridge-0`）與各個 Secret。各副本的 `/srv/overleaf-ha` 只保存編譯輸出，不需要備份。
+</Step>
+
+<Step title="以新版本啟動一個副本">
+在 `70-overleaf.yaml` 與 `75-git-bridge.yaml` 中設定新的標籤，並設定 `replicas: 1`：
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+確認您可以登入、開啟專案並進行編譯。
+</Step>
+
+<Step title="啟動其他副本">
+再次設定 `replicas: 3` 並套用。`OrderedReady` 會依序逐一啟動它們。
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+請勿使用 `kubectl set image` 或 `kubectl apply` 變更執行中且已擴展之 StatefulSet 的映像檔：滾動更新會在舊副本仍為使用者提供服務時啟動新版本及其遷移。不涉及新版本的設定變更，則可以透過滾動重新啟動套用：`kubectl -n overleaf rollout restart statefulset/overleaf`。
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB 與 Redis
+
+請將它們與 Ayakaleaf Pro 分開升級。MongoDB 請依照[更新 MongoDB](/zh-Hant/on-premises/maintenance/updating-mongodb) 操作（一次升級一個主要版本，每個步驟後設定 `featureCompatibilityVersion`）；當您變更 `10-mongo.yaml` 中的映像檔時，複本集會逐一讓成員採用新映像檔，因為 StatefulSet 會依序替換 `mongo-2`、`mongo-1` 與 `mongo-0`。
+
+### 回復
+
+依上述方式停止 Ayakaleaf Pro，從封存檔還原 MongoDB（`mongorestore --drop --archive --gzip`），並從備份還原磁碟區或儲存桶，接著設定舊的標籤並重新啟動。除此之外，無法復原新版本的遷移。
+
+### Q\&A
+
+<Accordion title="某個副本一直未就緒，其他副本也始終沒有啟動">
+
+<strong>回答：</strong>使用 `podManagementPolicy: OrderedReady` 時，`overleaf-1` 只會在 `overleaf-0` 就緒後才啟動，而滾動更新不會替換從未就緒的 Pod。在修正原因（例如 ConfigMap 中的錯誤設定）之後，請刪除卡住的 Pod，讓 StatefulSet 依目前的範本重新建立它：
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+我們曾在測試叢集上遇到這種情況：某項設定讓 `overleaf-0` 無法就緒；刪除該 Pod 後，三個副本都順利啟動。
+
+</Accordion>

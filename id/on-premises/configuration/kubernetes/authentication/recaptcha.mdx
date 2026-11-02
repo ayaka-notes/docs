@@ -1,0 +1,64 @@
+---
+title: reCAPTCHA
+description: Lindungi login, pendaftaran, dan reset kata sandi dengan Google reCAPTCHA pada deployment Kubernetes.
+icon: robot
+---
+
+Layanan **web** (modul `login-register`) meminta reCAPTCHA v2 (invisible) pada login email, login LDAP, pendaftaran, dan reset kata sandi. Buat kuncinya dan baca apa fungsi setiap pengaturan di [reCAPTCHA](/id/on-premises/configuration/overleaf-toolkit/authentication/recaptcha); halaman ini menerapkannya ke Kubernetes.
+
+| | |
+| --- | --- |
+| Layanan | web, di setiap pod Ayakaleaf Pro; dibaca saat web dimulai |
+| Pod → Google | `RECAPTCHA_ENDPOINT` (default `https://www.google.com/recaptcha/api/siteverify`), pada setiap permintaan yang diperiksa |
+| Browser → Google | skrip widget dari `www.recaptcha.net` |
+| Status | batas laju di Redis; riwayat perangkat "browser ini sudah lolos" di cookie terenkripsi |
+| Job berkala | tidak ada |
+
+### Konfigurasi
+
+<Steps>
+<Step title="Site key ke ConfigMap">
+```yaml
+  RECAPTCHA_SITE_KEY: <site key>
+  # optional
+  # RECAPTCHA_ENDPOINT: https://www.recaptcha.net/recaptcha/api/siteverify
+  # CAPTCHA_TRUSTED_USERS: robot@example.com
+```
+
+Site key bersifat publik: setiap halaman login menampilkannya.
+</Step>
+
+<Step title="Secret key dan kunci riwayat perangkat ke Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "RECAPTCHA_SECRET_KEY":"<secret key>",
+  "DEVICE_HISTORY_SECRET":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+Atur kedua kunci sekaligus: dengan site key tetapi tanpa secret key, setiap pemeriksaan gagal dan tidak ada yang dapat login dengan kata sandi, mendaftar, atau mereset kata sandi. `DEVICE_HISTORY_SECRET` harus berupa 64 karakter heksadesimal; kontainer tidak membuatnya.
+</Step>
+
+<Step title="Terapkan dan restart">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Lalu periksa apakah setiap pod dapat menjangkau endpoint. Pod menyerah setelah sekitar satu detik per percobaan koneksi, dan login yang pemeriksaannya tidak dapat dilakukan akan gagal dengan error:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://www.google.com/recaptcha/api/siteverify
+done
+```
+</Step>
+</Steps>
+
+### Beberapa replika
+
+Semua replika harus berbagi `DEVICE_HISTORY_SECRET` yang sama, dan hal itu terpenuhi jika nilainya ada di Secret. Dengan nilai yang berbeda, browser yang sudah lolos di satu replika akan mendapat captcha lagi di replika lain. Batas laju dihitung di Redis untuk semua replika.
+
+### Diuji di Kubernetes
+
+Terhadap tiruan (mock) endpoint verifikasi Google (dipercaya melalui `NODE_EXTRA_CA_CERTS` dari `overleaf-certs`), di Kubernetes 1.37, pengujian end-to-end kami untuk reCAPTCHA lulus (13 kasus): pada satu replika, login, pendaftaran, dan reset kata sandi masing-masing ditolak tanpa captcha atau dengan captcha yang gagal dan diterima dengan captcha yang lolos, riwayat perangkat dari `DEVICE_HISTORY_SECRET` yang memungkinkan browser melewati captcha, dan `CAPTCHA_TRUSTED_USERS`; pada tiga replika di belakang HAProxy, login LDAP dengan captcha.

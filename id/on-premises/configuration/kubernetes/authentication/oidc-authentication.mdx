@@ -1,0 +1,129 @@
+---
+title: Autentikasi OIDC
+description: Izinkan pengguna login melalui penyedia OpenID Connect pada deployment Kubernetes.
+icon: id-card-clip
+---
+
+Login OIDC ditangani oleh layanan **web** (modul `authentication`) di dalam setiap pod Ayakaleaf Pro. Login ini tidak memiliki job latar belakang maupun pod terpisah. Sisi penyedia (client, redirect URI, klaim admin) sama seperti di Toolkit, jadi siapkan OpenID Provider (OP) Anda dengan [Autentikasi OIDC](/id/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication) terlebih dahulu, lalu masukkan nilainya ke Kubernetes seperti di bawah ini.
+
+### Di mana semuanya berjalan
+
+| | |
+| --- | --- |
+| Layanan | web, di setiap pod Ayakaleaf Pro; pengaturan dibaca saat web dimulai |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` dan `OVERLEAF_OIDC_USER_INFO_URL`, pada setiap login |
+| Browser → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`, dan `OVERLEAF_OIDC_LOGOUT_URL` saat logout |
+| OP → Overleaf | tidak ada: OP hanya mengarahkan browser kembali |
+| Status login | sesi di Redis, dibagi oleh semua replika |
+| Job berkala | tidak ada |
+
+### Konfigurasi
+
+<Steps>
+<Step title="Daftarkan Overleaf di OP">
+Izinkan alamat-alamat berikut di OP Anda, yang dibentuk dari `OVERLEAF_SITE_URL`:
+
+| Tujuan | URI |
+| --- | --- |
+| Redirect URI (login) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| Post-logout redirect URI | `${OVERLEAF_SITE_URL}` |
+| Post-logout redirect URI, setelah menautkan akun yang sudah ada | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Temukan kelima URL di dokumen discovery milik OP seperti dijelaskan di [Menemukan nilai dengan dokumen discovery](/id/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document).
+</Step>
+
+<Step title="Tambahkan pengaturan ke ConfigMap">
+Tambahkan ke `overleaf-env` (`30-config.yaml`, atau `60-config.yaml` untuk [beberapa replika](/id/on-premises/configuration/kubernetes/horizontal-scaling)):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` menerima daftar yang dipisahkan spasi, misalnya `ldap oidc`. Lihat [Variabel Lingkungan](/id/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables) untuk setiap pengaturan `OVERLEAF_OIDC_*`; semuanya masuk ke ConfigMap kecuali client secret.
+
+<Warning>
+
+Beri tanda kutip pada `"true"` dan `"false"`: ConfigMap hanya menyimpan string. Kunci yang diatur ke `""` tidak sama dengan kunci yang tidak ada: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` menonaktifkan pembuatan akun pada login pertama, sedangkan menghilangkan kunci tersebut mengizinkan semua domain.
+
+</Warning>
+</Step>
+
+<Step title="Masukkan client secret ke Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Percayai CA privat (opsional)">
+Jika sertifikat OP berasal dari CA Anda sendiri, tambahkan CA tersebut ke Secret `overleaf-certs` yang di-mount di `/var/lib/overleaf/certs` (lihat [Sertifikat dan file lainnya](/id/on-premises/configuration/kubernetes#sertifikat-dan-file-lainnya)) dan arahkan Node.js ke sana:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Terapkan dan restart">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Lalu periksa apakah setiap pod dapat menjangkau endpoint token. Pod yang memanggilnya, bukan browser, sehingga masalah firewall atau DNS hanya muncul di sini:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Status HTTP apa pun (`405` untuk GET) berarti endpoint dapat dijangkau; `000` berarti tidak.
+</Step>
+</Steps>
+
+### Beberapa replika
+
+Tidak ada yang perlu ditambahkan. Nilai `state` dari sebuah login dan ID token yang digunakan untuk logout disimpan di sesi, yang berada di Redis, sehingga callback berfungsi di replika mana pun yang menerimanya.
+
+### Diuji di Kubernetes
+
+Dengan goauthentik sebagai OP, di Kubernetes 1.37 dengan tiga replika di belakang HAProxy, pengujian end-to-end kami untuk OIDC lulus (35 kasus): login, dan logout melalui OP; pemetaan admin berdasarkan grup, berdasarkan email, dan berdasarkan satu nilai, serta tanpa pemetaan; nama dan flag admin yang diperbarui pada setiap login; menautkan dan melepas tautan akun; reset kata sandi dan perubahan kata sandi akun OIDC; akun yang ditangguhkan; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; serta OIDC bersama dengan akses publik.
+
+### Tanya Jawab
+
+<Accordion title="Login gagal dengan “Unable to verify authorization request state”">
+
+<strong>Jawaban:</strong> Browser tidak mengirim kembali cookie sesi bersama callback. Di Kubernetes, penyebab yang umum adalah:
+
+* `OVERLEAF_SECURE_COOKIE` diatur, tetapi pengguna membuka situs melalui HTTP biasa, sehingga browser tidak pernah menyimpan cookie. Nilai `OVERLEAF_SECURE_COOKIE` apa pun, bahkan `"false"`, mengaktifkan secure cookie; hapus kuncinya sebagai gantinya.
+* Situs dibuka dengan alamat selain `OVERLEAF_SITE_URL`.
+* Di balik HTTPS, ingress atau load balancer Anda tidak mengirim `X-Forwarded-Proto: https`, atau alamatnya tidak ada di `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="Di mana saya dapat melihat mengapa login gagal?">
+
+<strong>Jawaban:</strong> Di log web dari pod yang melayani permintaan tersebut, bukan di `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Dengan beberapa replika, periksa setiap `overleaf-N`.
+
+</Accordion>

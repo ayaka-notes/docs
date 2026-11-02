@@ -1,0 +1,101 @@
+---
+title: المزامنة مع Dropbox
+description: اسمح للمستخدمين بمزامنة مشاريعهم مع مجلد في Dropbox الخاص بهم في نشر على Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/dropbox.svg
+---
+
+تستخدم المزامنة مع Dropbox ثلاثة أجزاء من كل Pod من Pods ‏Ayakaleaf Pro، ولا تبدأ الأجزاء الثلاثة إلا مع `DROPBOX_ENABLED: "true"`:
+
+* **web** (وحدة `dropbox`): الربط، ونافذة Dropbox الخاصة بالمشروع، والـ webhook الذي يستدعيه Dropbox.
+* **third-party-datastore**: خدمة مستقلة داخل الـ Pod تعالج قائمة انتظار التغييرات المراد إرسالها إلى Dropbox أو جلبها منه.
+* **document-updater**: مع تفعيل Dropbox، يكتب تغييرات المحرر إلى MongoDB في الخلفية، بعد بضع دقائق من مغادرة الجميع للمشروع؛ وعندها فقط تُرسل إلى Dropbox.
+
+أنشئ تطبيق Dropbox واقرأ كيف تعمل المزامنة في [المزامنة مع Dropbox](/ar/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation)؛ أما هذه الصفحة فتشرح وضعها في Kubernetes.
+
+| | |
+| --- | --- |
+| الخدمات | web (وحدة `dropbox`)، وthird-party-datastore، وdocument-updater، في كل Pod من Pods ‏Ayakaleaf Pro |
+| Dropbox → Overleaf | `POST ${OVERLEAF_SITE_URL}/dropbox/webhook` من الإنترنت، موقّع بسر التطبيق |
+| Pod → Dropbox | `https://api.dropboxapi.com` و`https://content.dropboxapi.com` |
+| المتصفح → Dropbox | `https://www.dropbox.com/oauth2/authorize`، ثم العودة إلى `${OVERLEAF_SITE_URL}/user/dropbox/oauth/callback` |
+| الحالة | قائمة انتظار التغييرات المعلّقة وأقفالها في Redis؛ وحالة المزامنة في MongoDB ‏(`dropboxEntities`، `dropboxProjects`) |
+| العمل في الخلفية | تفحص third-party-datastore قائمة انتظارها كل ثانية؛ ويكتب document-updater المشاريع التي لم يفتحها أحد منذ 3 دقائق |
+
+### الإعداد
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  DROPBOX_ENABLED: "true"
+  DROPBOX_APP_KEY: <app key>
+  DROPBOX_APP_NAME: Overleaf      # the folder name under Apps/ in Dropbox
+  # optional: send the requests to Dropbox through an HTTP proxy
+  # DROPBOX_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+يجب أن يكون `GIT_BRIDGE_ENABLED: "true"` والـ StatefulSet الخاص بـ git-bridge من [التكامل مع Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration) جاهزين: فبدونهما تُخفي إعدادات الحساب قسم مزامنة المشاريع.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "DROPBOX_APP_SECRET":"<app secret>",
+  "DROPBOX_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+يشفّر `DROPBOX_TOKEN_CIPHER_PASSWORD` رموز Dropbox الخاصة بالمستخدمين في MongoDB. يجب أن تستخدم كل نسخة متماثلة القيمة نفسها، وتغييرها لاحقًا يجعل كل المستخدمين يعيدون ربط Dropbox.
+</Step>
+
+<Step title="أنشئ فهارس قاعدة البيانات">
+شغّل أوامر الفهارس من [إنشاء فهارس قاعدة البيانات](/ar/on-premises/configuration/overleaf-toolkit/integrations/dropbox-synchronisation#create-the-database-indexes) مرة واحدة، على العقدة الأساسية (primary) في مجموعة النسخ المتماثلة (replica set):
+
+```bash wrap
+kubectl -n overleaf exec -i mongo-0 -- mongosh --quiet \
+  'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' <<'EOF'
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'dropbox.id': 1 },
+  { name: 'overleaf.userId_1_dropbox.id_1', unique: true,
+    partialFilterExpression: { 'dropbox.id': { $exists: true } } })
+db.dropboxEntities.createIndex(
+  { 'overleaf.userId': 1, 'overleaf.id': 1 },
+  { name: 'overleaf.userId_1_overleaf.id_1', unique: true,
+    partialFilterExpression: { 'overleaf.id': { $exists: true } } })
+db.dropboxEntities.createIndex({ 'overleaf.userId': 1, 'dropbox.pathLower': 'hashed' })
+db.dropboxProjects.createIndex({ userId: 1, projectId: 1 }, { name: 'projectId_userId_1', unique: true })
+db.dropboxProjects.createIndex({ userId: 1, dropboxId: 1 }, { name: 'userId_dropboxId_1', unique: true })
+EOF
+```
+</Step>
+
+<Step title="طبّق التغييرات وأعد التشغيل">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf exec deploy/overleaf -- tail -n 5 /var/log/overleaf/third-party-datastore.log
+```
+
+لا يوجد `third-party-datastore.log` إلا عندما تكون قيمة `DROPBOX_ENABLED` هي `"true"`.
+</Step>
+
+<Step title="افتح الـ webhook على الإنترنت">
+يجب أن يصل Dropbox إلى `${OVERLEAF_SITE_URL}/dropbox/webhook` من الإنترنت. إذا كان الـ Ingress أو موازن الأحمال لديك لا يسمح إلا ببعض المسارات أو الشبكات من الخارج، فاسمح بهذا المسار؛ فهو المسار الوحيد الذي يستدعيه Dropbox. تحقّق منه من خارج الكتلة:
+
+```bash
+curl "https://overleaf.example.com/dropbox/webhook?challenge=test"   # prints: test
+```
+
+ثم أضف الـ webhook في Dropbox App Console كما هو موضح في صفحة Toolkit.
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+لا حاجة إلى شيء إضافي سوى `DROPBOX_TOKEN_CIPHER_PASSWORD` المشترك:
+
+* قد يصل الـ webhook إلى أي نسخة متماثلة. فهو يكتفي بإضافة التغيير إلى قائمة الانتظار في Redis.
+* تشغّل كل نسخة متماثلة third-party-datastore، وتعمل كل منها على قائمة الانتظار المشتركة. تُؤخذ قائمة انتظار المستخدم بقفل في Redis، لذا لا ترسل تغييرات مستخدم معيّن أو تجلبها إلا نسخة متماثلة واحدة في كل مرة.
+* يكتب document-updater في كل نسخة متماثلة المشاريع الخاملة في الخلفية. يُؤخذ كل مشروع من قائمة مشتركة في Redis، لذا يُكتب مرة واحدة.
+
+### الاختبار على Kubernetes
+
+مقابل نسخة محاكاة (mock) لواجهة Dropbox البرمجية، على Kubernetes 1.37 مع ثلاث نسخ متماثلة خلف HAProxy، نجحت اختباراتنا الشاملة للمزامنة مع Dropbox ‏(59 حالة): الربط وإلغاء الربط؛ وإرسال المشاريع والتعديلات والملفات الثنائية وإعادة التسمية والنقل والحذف إلى Dropbox، بما في ذلك تعديل من المحرر يصل عبر الكتابة في الخلفية بعد إغلاق المشروع، دون ترجمة أو "sync now"؛ وتطبيق التغييرات التي أُجريت في Dropbox عبر الـ webhook (تحدي التحقق وفحص التوقيع)، والمشاريع الجديدة من مجلدات جديدة، ومجلدات المشاريع المحذوفة؛ والمشاريع ذات الاسم نفسه؛ ونافذة Dropbox في المحرر و"sync now" مع حد المعدّل الخاص به؛ وإعادة المحاولة وحدود المعدّل والمهلات لدى Dropbox؛ وإلغاء ربط الحسابات عندما يكون Dropbox ممتلئًا أو يرفض الرمز أو يكون الحساب معلّقًا؛ وحسابات Overleaf المعلّقة؛ واستجابة الـ webhook عندما تكون third-party-datastore متوقفة.

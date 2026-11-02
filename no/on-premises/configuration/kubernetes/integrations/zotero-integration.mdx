@@ -1,0 +1,56 @@
+---
+title: Zotero-integrasjon
+description: La brukere importere en .bib-fil fra Zotero-biblioteket sitt i en Kubernetes-distribusjon.
+icon: z
+---
+
+Zotero-import kjører i **web**-tjenesten (modulen `tpr-webmodule`) i hver Ayakaleaf Pro-pod. Registrer Zotero-OAuth-klienten som beskrevet i [Zotero-integrasjon](/no/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration), med callback-URL-en `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback`, og konfigurer deretter Kubernetes som nedenfor.
+
+| | |
+| --- | --- |
+| Tjeneste | web, i hver Ayakaleaf Pro-pod; leses når web starter |
+| Pod → Zotero | `https://www.zotero.org/oauth/*` og `https://api.zotero.org`, når en bruker kobler til Zotero eller importerer eller oppdaterer en fil |
+| Nettleser → Zotero | `https://www.zotero.org/oauth/authorize`, deretter tilbake til callback-URL-en |
+| Zotero → Overleaf | ingen: instansen trenger ikke å være tilgjengelig fra internett |
+| Lagrede data | brukerens Zotero-nøkkel, kryptert, i MongoDB |
+| Periodiske jobber | ingen: en fil oppdateres bare når en bruker ber om det |
+
+### Konfigurasjon
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES` erstatter verdien fra installasjonen; behold typene du allerede har, og legg til `zotero` (og `mendeley` hvis du bruker begge).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD` krypterer brukernes Zotero-nøkler i MongoDB. Uten den genererer hver pod en nøkkelfil i sin egen `/var/lib/overleaf/data`. Med [flere replikaer](/no/on-premises/configuration/kubernetes/horizontal-scaling) har da hver node en annen nøkkel, og en bruker som betjenes av en annen replika, kan ikke bruke den tilkoblede Zotero-kontoen sin. Angi den før den første brukeren kobler til Zotero: hvis du endrer den senere, må alle brukere koble til Zotero på nytt.
+</Step>
+
+<Step title="Bruk og start på nytt">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Flere replikaer
+
+Angi `ZOTERO_CIPHER_PASSWORD` i Secret-en, se ovenfor. Uten den kan en fil som er importert på én replika, ikke oppdateres på en annen: oppdateringen mislykkes med «The remote service produced an error», fordi nøkkelfilen til den replikaen ikke kan dekryptere brukerens Zotero-nøkkel. Med passordet i Secret-en fungerer det på alle replikaer; vi testet begge tilfellene ved å importere på `overleaf-0` og oppdatere på `overleaf-1`. OAuth-håndtrykket lagrer tilstanden sin i økten i Redis, så callbacken kan nå hvilken som helst replika.
+
+### Testet på Kubernetes
+
+Mot en etterligning av www.zotero.org og api.zotero.org (klarert via `NODE_EXTRA_CA_CERTS` fra `overleaf-certs`), på Kubernetes 1.37 med tre replikaer bak HAProxy, består ende-til-ende-testene våre for Zotero (18 tilfeller): tilkobling via OAuth 1.0a og frakobling, import av biblioteket og grupper til en `.bib`-fil, oppdatering av den, tilbakekalling av nøkkelen på Zotero, forespørsel om å koble til på nytt, referanser som er søkbare for samarbeidspartnerne, at bare den som importerte kan oppdatere, API-feil og trege tilkoblinger til Zotero.

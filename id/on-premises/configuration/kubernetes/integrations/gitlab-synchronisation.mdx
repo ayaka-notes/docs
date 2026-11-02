@@ -1,0 +1,67 @@
+---
+title: Sinkronisasi GitLab
+description: Izinkan pengguna menyinkronkan proyek mereka dengan repositori di GitLab.com atau GitLab yang dikelola sendiri pada deployment Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+Sinkronisasi GitLab berjalan di layanan **web** (modul `gitlab-sync`) pada setiap pod Ayakaleaf Pro. Fitur ini memerlukan [integrasi Git](/id/on-premises/configuration/kubernetes/integrations/git-integration). Buat aplikasi OAuth dan baca fungsi setiap pengaturan di [Sinkronisasi GitLab](/id/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); halaman ini menerapkannya ke Kubernetes.
+
+| | |
+| --- | --- |
+| Layanan | web (modul `gitlab-sync`), di setiap pod Ayakaleaf Pro; dibaca saat web dimulai |
+| Pod → GitLab | REST API dari `GITLAB_SYNC_URL` (default `https://gitlab.com/api/v4`), setiap kali pengguna menautkan, mengimpor, mengekspor, atau menyinkronkan |
+| Browser → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` untuk menautkan akun, lalu kembali ke `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | tidak ada: tanpa webhook, instance tidak perlu dapat dijangkau dari GitLab |
+| Data tersimpan | token akses dan token refresh GitLab pengguna, terenkripsi, di MongoDB |
+| Tugas berkala | tidak ada: sinkronisasi terjadi saat pengguna mengklik |
+
+### Konfigurasi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` dan StatefulSet git-bridge dari [integrasi Git](/id/on-premises/configuration/kubernetes/integrations/git-integration) harus sudah tersedia: tanpa keduanya, pengaturan akun dan editor menyembunyikan Sinkronisasi GitLab.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` mengenkripsi token akses dan token refresh GitLab pengguna di MongoDB. Setiap replika harus menggunakan nilai yang sama, dan mengubahnya di kemudian hari membuat setiap pengguna harus menautkan GitLab lagi.
+</Step>
+
+<Step title="CA privat (opsional)">
+Jika GitLab Anda memiliki sertifikat dari CA Anda sendiri, tambahkan CA tersebut ke Secret `overleaf-certs` yang di-mount di `/var/lib/overleaf/certs` (lihat [Sertifikat dan file lainnya](/id/on-premises/configuration/kubernetes#sertifikat-dan-file-lainnya)) dan atur `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` di ConfigMap.
+</Step>
+
+<Step title="Terapkan, mulai ulang, dan periksa">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Status HTTP apa pun berarti GitLab dapat dijangkau dari pod tersebut; `000` berarti tidak dapat dijangkau.
+</Step>
+</Steps>
+
+### Beberapa replika
+
+Tidak ada yang perlu ditambahkan selain `GITLAB_TOKEN_CIPHER_PASSWORD` yang sama. Sebuah sinkronisasi mengambil lock di Redis, yang dibagi dengan sinkronisasi Git lainnya, sehingga dua replika tidak pernah menyinkronkan proyek yang sama secara bersamaan. Memperbarui token GitLab pengguna juga mengambil lock Redis, sehingga dua replika tidak memperbaruinya pada saat yang sama.
+
+### Diuji di Kubernetes
+
+Terhadap mock GitLab yang dikelola sendiri di `GITLAB_SYNC_URL` (dipercaya melalui `NODE_EXTRA_CA_CERTS` dari `overleaf-certs`), di Kubernetes 1.37 dengan satu replika dan integrasi Git aktif, pengujian end-to-end kami untuk Sinkronisasi GitLab lulus (40 kasus): menautkan dan memutus tautan akun, memperbarui token akses yang akan kedaluwarsa dan token yang dicabut, mengekspor ke proyek privat atau grup baru, mengimpor repositori, pull dan push, merge, konflik, branch yang dihapus dan di-force-push, file biner, penggantian nama dan penghapusan, serta apa yang boleh dilakukan pemilik, editor, dan penampil.

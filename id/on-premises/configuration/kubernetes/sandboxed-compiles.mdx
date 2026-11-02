@@ -1,0 +1,64 @@
+---
+title: Sandboxed Compiles
+description: Kompilasi LaTeX di kontainer TeX Live pada node-node klaster Kubernetes.
+icon: gear-code
+---
+
+Kompilasi dijalankan oleh layanan **clsi** di dalam setiap pod Ayakaleaf Pro. Dengan sandboxed compiles aktif, clsi meminta **Docker Engine pada node** tempat pod berjalan untuk memulai kontainer TeX Live untuk setiap kompilasi, dan memberikan direktori proyek melalui path-nya di node tersebut. Cara kerja sandboxing dan image apa saja yang tersedia dijelaskan di [Sandboxed Compiles](/id/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Layanan | clsi (kompilasi), web (daftar image di pengaturan kompiler), di setiap pod Ayakaleaf Pro |
+| Node | Docker Engine dan setiap image dari `ALL_TEX_LIVE_DOCKER_IMAGES`, di setiap node yang dapat menjalankan Ayakaleaf Pro |
+| Mount pod | `/var/run/docker.sock`, serta direktori kompilasi, output, dan cache sebagai volume `hostPath` |
+| Tugas berkala | clsi menghapus direktori kompilasi yang tidak digunakan selama sehari, dan setiap jam menghapus kontainer TeX Live lama dari Docker di node |
+
+### Konfigurasi
+
+Instalasi menyiapkan semuanya: Docker dan image di node pada [0. Siapkan node](/id/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), pengaturan di [4. Personalisasi instance Anda](/id/on-premises/installation/using-kubernetes/4.-personalizing-your-instance), dan volume di [5. Deploy Ayakaleaf Pro](/id/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Pengaturannya, semuanya di ConfigMap:
+
+| Variabel | Nilai |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | path node dari volume yang di-mount di `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | path node dari volume yang di-mount di `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | path node dari volume yang di-mount di `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | image-image tersebut, sama seperti di Toolkit |
+
+### Menambahkan versi TeX Live
+
+<Steps>
+<Step title="Pull image di setiap node">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit melakukan pull image sendiri; di Kubernetes tidak ada yang melakukannya. Lakukan pull ke **Docker**, bukan dengan `crictl`: clsi meminta image dari Docker. Kompilasi dengan image yang tidak ada di node akan gagal.
+</Step>
+
+<Step title="Cantumkan di ConfigMap dan mulai ulang">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Node yang ditambahkan ke klaster di kemudian hari memerlukan Docker dan semua image sebelum Ayakaleaf Pro berjalan di sana. Beri label pada node tersebut dan pertahankan Ayakaleaf Pro di node itu dengan `nodeSelector` jika tidak semua node memenuhi syarat.
+
+### Beberapa replika
+
+Setiap replika melakukan kompilasi di node-nya sendiri dan menyimpan output kompilasi di sana, sehingga pengguna harus tetap berada di replika yang melakukan kompilasi, yang dijamin oleh cookie sticky load balancer. Jangan pernah menjalankan dua replika di node yang sama: keduanya akan berbagi direktori kompilasi node. Penyiapan [Penskalaan horizontal](/id/on-premises/configuration/kubernetes/horizontal-scaling) mencegah hal ini dengan `podAntiAffinity`.
+
+Kontainer TeX Live berjalan di samping pod, di luar batas memorinya dan di luar pantauan scheduler. Sisakan memori kosong di node untuk kontainer tersebut, lihat [0. Siapkan node](/id/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Diuji di Kubernetes
+
+Di Kubernetes 1.37 dengan tiga replika di belakang HAProxy, satu per node, dan TeX Live 2026 serta 2025 yang di-pull ke Docker di setiap node, pengujian end-to-end kami untuk sandboxed compiles lulus (7 kasus): proyek baru dikompilasi menjadi PDF, pengaturan kompiler menawarkan kedua image dan beralih di antaranya, XeLaTeX dengan fontspec, error LaTeX dan kompilasi ulang setelah perbaikan, menghentikan kompilasi yang sedang berjalan, dan SyncTeX di kedua arah. Uji beban dengan 12 pengguna yang mengompilasi dokumen 600 halaman secara bersamaan menjalankan 4 kompilasi per node, lihat [Apa yang dapat diharapkan](/id/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

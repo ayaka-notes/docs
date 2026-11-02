@@ -1,0 +1,64 @@
+---
+title: reCAPTCHA
+description: Suojaa kirjautuminen, rekisteröityminen ja salasanan palautus Google reCAPTCHAlla Kubernetes-käyttöönotossa.
+icon: robot
+---
+
+**web**-palvelu (`login-register`-moduuli) pyytää reCAPTCHA v2:ta (näkymätön) sähköpostikirjautumisessa, LDAP-kirjautumisessa, rekisteröitymisessä ja salasanan palautuksessa. Luo avain ja lue, mitä kukin asetus tekee, sivulta [reCAPTCHA](/fi/on-premises/configuration/overleaf-toolkit/authentication/recaptcha); tämä sivu vie sen Kubernetesiin.
+
+| | |
+| --- | --- |
+| Palvelu | web, jokaisessa Ayakaleaf Pro -podissa; luetaan, kun web käynnistyy |
+| Pod → Google | `RECAPTCHA_ENDPOINT` (oletus `https://www.google.com/recaptcha/api/siteverify`), jokaisella tarkistettavalla pyynnöllä |
+| Selain → Google | widget-skripti osoitteesta `www.recaptcha.net` |
+| Tila | nopeusrajoitukset Redisissä; ”tämä selain on jo läpäissyt” -laitehistoria salatussa evästeessä |
+| Ajastetut tehtävät | ei mitään |
+
+### Konfiguraatio
+
+<Steps>
+<Step title="Sivustoavain ConfigMapiin">
+```yaml
+  RECAPTCHA_SITE_KEY: <site key>
+  # optional
+  # RECAPTCHA_ENDPOINT: https://www.recaptcha.net/recaptcha/api/siteverify
+  # CAPTCHA_TRUSTED_USERS: robot@example.com
+```
+
+Sivustoavain on julkinen: jokainen kirjautumissivu näyttää sen.
+</Step>
+
+<Step title="Salainen avain ja laitehistorian avain Secretiin">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "RECAPTCHA_SECRET_KEY":"<secret key>",
+  "DEVICE_HISTORY_SECRET":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+Aseta molemmat avaimet yhdessä: jos sivustoavain on asetettu mutta salainen avain puuttuu, jokainen tarkistus epäonnistuu eikä kukaan voi kirjautua salasanalla, rekisteröityä tai palauttaa salasanaa. `DEVICE_HISTORY_SECRET` on oltava 64 heksadesimaalimerkkiä; kontti ei luo sitä.
+</Step>
+
+<Step title="Ota käyttöön ja käynnistä uudelleen">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Tarkista sitten, että jokainen pod tavoittaa päätepisteen. Podit luovuttavat noin sekunnin jälkeen kullakin yhteysyrityksellä, ja kirjautuminen, jonka tarkistusta ei voida tehdä, epäonnistuu virheeseen:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://www.google.com/recaptcha/api/siteverify
+done
+```
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Kaikkien replikoiden on jaettava `DEVICE_HISTORY_SECRET`, minkä ne tekevät, kun se on Secretissä. Eri arvoilla selain, joka läpäisi tarkistuksen yhdellä replikalla, saisi captchan uudelleen toisella. Nopeusrajoitukset lasketaan Redisissä kaikkien replikoiden yli.
+
+### Testattu Kubernetesissa
+
+Googlen vahvistuspäätepisteen jäljitelmää vasten (johon luotettiin `overleaf-certs`-Secretistä tulevan `NODE_EXTRA_CA_CERTS`-asetuksen kautta) Kubernetes 1.37:ssä reCAPTCHAn päästä päähän -testimme menevät läpi (13 tapausta): yhdellä replikalla kirjautuminen, rekisteröityminen ja salasanan palautus kukin hylättynä ilman captchaa tai epäonnistuneella captchalla ja hyväksyttynä läpäistyllä captchalla, `DEVICE_HISTORY_SECRET`-avaimeen perustuva laitehistoria, jonka ansiosta selain voi ohittaa captchan, sekä `CAPTCHA_TRUSTED_USERS`; kolmella replikalla HAProxyn takana LDAP-kirjautuminen captchan kanssa.

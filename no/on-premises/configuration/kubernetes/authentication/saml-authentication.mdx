@@ -1,0 +1,116 @@
+---
+title: SAML-autentisering
+description: La brukere logge inn via en SAML 2.0-identitetsleverandør i en Kubernetes-distribusjon.
+icon: building-columns
+---
+
+SAML-innlogging håndteres av **web**-tjenesten (`authentication`-modulen) i hver Ayakaleaf Pro-pod. Den har ingen bakgrunnsjobb og ingen egen pod. Sett opp identitetsleverandøren (IdP) som i [SAML-autentisering](/no/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication), og legg deretter verdiene og IdP-sertifikatet inn i Kubernetes som vist nedenfor.
+
+### Hvor ting kjører
+
+| | |
+| --- | --- |
+| Tjeneste | web, i hver Ayakaleaf Pro-pod; innstillingene og IdP-sertifikatet leses når web starter |
+| Pod → IdP | ingen: alle SAML-meldinger går via nettleseren |
+| Nettleser → IdP | `OVERLEAF_SAML_ENTRYPOINT` (innlogging), `OVERLEAF_SAML_LOGOUT_URL` (utlogging) |
+| Nettleser → Overleaf | `POST ${OVERLEAF_SITE_URL}/saml/login/callback` (ACS), `/saml/logout/callback`, `/saml/meta` (SP-metadata) |
+| Filer | IdP-sertifikatet, og eventuelt Overleafs egen nøkkel og eget sertifikat, fra Secret-en `overleaf-certs` |
+| Periodiske jobber | ingen |
+
+### Konfigurasjon
+
+<Steps>
+<Step title="Registrer Overleaf hos IdP-en">
+| IdP-innstilling | Verdi |
+| --- | --- |
+| ACS-URL (assertion consumer service) | `${OVERLEAF_SITE_URL}/saml/login/callback`, HTTP-POST-binding |
+| Single logout-URL | `${OVERLEAF_SITE_URL}/saml/logout/callback` |
+| Audience / SP-entitets-ID | verdien du legger inn i `OVERLEAF_SAML_ISSUER` |
+
+[Gjennomgangen for goauthentik](/no/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#step-by-step-goauthentik) viser hvor disse finnes.
+</Step>
+
+<Step title="Legg IdP-sertifikatet inn i Secret-en `overleaf-certs`">
+Toolkit leser sertifikatet fra `data/overleaf/certs/`. På Kubernetes kommer det fra Secret-en `overleaf-certs`, montert på `/var/lib/overleaf/certs` som beskrevet i [Sertifikater og andre filer](/no/on-premises/configuration/kubernetes#sertifikater-og-andre-filer):
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem
+```
+
+Hvis Secret-en allerede finnes, legger du filen til i den i stedet: slett og opprett den på nytt med hver `--from-file`, eller bruk `kubectl -n overleaf edit secret overleaf-certs`.
+
+`OVERLEAF_SAML_IDP_CERT` tar en sti, eller en JSON-liste med stier under et sertifikatbytte. Den tar ikke selve PEM-teksten.
+</Step>
+
+<Step title="Legg innstillingene til i ConfigMap-en">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: saml
+  OVERLEAF_SAML_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_SAML_ENTRYPOINT: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_LOGOUT_URL: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_ISSUER: overleaf
+  OVERLEAF_SAML_IDP_CERT: /var/lib/overleaf/certs/idp_cert.pem
+  OVERLEAF_SAML_WANT_ASSERTIONS_SIGNED: "true"
+  OVERLEAF_SAML_WANT_AUTHN_RESPONSE_SIGNED: "true"
+  OVERLEAF_SAML_USER_ID_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_EMAIL_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+  OVERLEAF_SAML_FIRST_NAME_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+  OVERLEAF_SAML_LAST_NAME_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_IS_ADMIN_FIELD: http://schemas.xmlsoap.org/claims/Group
+  OVERLEAF_SAML_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_SAML_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Alle `OVERLEAF_SAML_*`-innstillinger er oppført i [Miljøvariabler](/no/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#environment-variables). Alle går inn i ConfigMap-en: ingen av dem er en hemmelighet i seg selv. Nøkkelfiler (`OVERLEAF_SAML_PRIVATE_KEY`, `OVERLEAF_SAML_DECRYPTION_PVK`) legges i `overleaf-certs`, og ConfigMap-en inneholder stiene deres.
+
+<Warning>
+
+Sett anførselstegn rundt `"true"`, `"false"` og JSON-verdier som `OVERLEAF_SAML_AUTHN_CONTEXT: '["urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"]'`. En innstilling som ikke er en gyldig boolsk verdi eller JSON-verdi, gjør at SAML-strategien ikke lastes, mens poden fortsatt rapporterer at den er klar; innlogging via SAML feiler da. Sjekk `web.log` etter hver endring, se Q\&A nedenfor.
+
+</Warning>
+</Step>
+
+<Step title="Bruk og start på nytt">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+IdP-sertifikatet og nøklene leses når web starter, så et nytt sertifikat i `overleaf-certs` krever også denne omstarten.
+</Step>
+</Steps>
+
+### Flere replikaer
+
+IdP-en sender brukeren tilbake til ACS-URL-en med en `POST` på tvers av nettsteder. Nettlesere sender ikke `SameSite=Lax`-informasjonskapsler med den, så forespørselen har verken Overleafs sesjonsinformasjonskapsel eller, i Chrome og Edge, lastbalansererens sticky-informasjonskapsel, og den kan havne på hvilken som helst replika. Med standardinnstillingene spiller dette ingen rolle: replikaen som mottar den, oppretter sesjonen i Redis, og lastbalansereren holder brukeren der fra da av.
+
+<Warning>
+
+La `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` være uangitt (standard er `never`) når du kjører flere replikaer. Med `always` eller `ifPresent` husker hver replika forespørslene den sendte til IdP-en i sitt eget minne, og et svar som havner på en annen replika, avvises med «InResponseTo is not valid»: brukeren blir stående på `/saml/login/callback`. I testen vår med tre replikaer og `always` feilet 12 av de 19 SAML-testtilfellene på denne måten, mens alle bestod med standardverdien. Med én replika består SAML-innloggingene også med `always`.
+
+</Warning>
+
+### Testet på Kubernetes
+
+Med goauthentik som IdP (HTTP-POST-binding, signerte assertions og svar), på Kubernetes 1.37 med tre replikaer bak HAProxy, består ende-til-ende-testene våre for SAML (19 tilfeller): den første administratoren fra launchpad som logger inn via SAML, innlogging med IdP-sertifikatet fra `overleaf-certs`, opprettelse av konto og ny innlogging, administratortilordning etter gruppe og uten tilordning, navn og administratorflagg oppdatert ved hver innlogging, utlogging via IdP-en, passordregler for SAML-kontoer, og suspenderte kontoer. `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` ble stående på standardverdien.
+
+### Q\&A
+
+<Accordion title="Innlogging via SAML viser «Something went wrong» med en gang">
+
+<strong>Svar:</strong> SAML-strategien ble ikke lastet. Poden blir likevel klar, så se i web-loggen til hver pod:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "saml|passport" /var/log/overleaf/web.log | tail
+```
+
+Vanlige årsaker: `OVERLEAF_SAML_IDP_CERT` peker på en fil som ikke finnes i `overleaf-certs`, en boolsk verdi som ikke er `"true"` eller `"false"`, eller ugyldig JSON. Når `EXTERNAL_AUTH` lister opp flere metoder, slår en slik feil også av metodene etter SAML (`ldap`, deretter `saml`, deretter `oidc`).
+
+</Accordion>
+
+<Accordion title="Må IdP-en kunne nå Overleaf, eller Overleaf IdP-en?">
+
+<strong>Svar:</strong> Ingen av delene, for innlogging og utlogging: IdP-en og Overleaf utveksler bare meldinger via brukerens nettleser. Bare hvis du konfigurerer IdP-en med en metadata-URL, laster den ned `${OVERLEAF_SITE_URL}/saml/meta`.
+
+</Accordion>

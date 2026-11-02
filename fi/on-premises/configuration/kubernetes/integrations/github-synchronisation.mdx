@@ -1,0 +1,67 @@
+---
+title: GitHub-synkronointi
+description: Anna käyttäjien synkronoida projektinsa GitHub- tai GitHub Enterprise -repositorioiden kanssa Kubernetes-käyttöönotossa.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+GitHub-synkronointi toimii jokaisen Ayakaleaf Pro -podin **web**-palvelussa (`github-sync`-moduuli). Se edellyttää [Git-integraatiota](/fi/on-premises/configuration/kubernetes/integrations/git-integration). Luo OAuth-sovellus ja lue, mitä kukin asetus tekee, sivulta [GitHub-synkronointi](/fi/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); tämä sivu kertoo, miten se otetaan käyttöön Kubernetesissa.
+
+| | |
+| --- | --- |
+| Palvelu | web (`github-sync`-moduuli), jokaisessa Ayakaleaf Pro -podissa; luetaan, kun web käynnistyy |
+| Pod → GitHub | `https://api.github.com` (REST ja GraphQL) tai `GITHUB_SYNC_URL`-osoitteen API aina, kun käyttäjä linkittää, tuo, vie tai synkronoi |
+| Selain → GitHub | `https://github.com/login/oauth/authorize` tilin linkittämiseksi, sitten takaisin osoitteeseen `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | ei mitään: ei webhookia, instanssin ei tarvitse olla tavoitettavissa GitHubista |
+| Tallennetut tiedot | käyttäjän GitHub-käyttöoikeustunnukset salattuina MongoDB:ssä |
+| Ajastetut tehtävät | ei mitään: synkronointi tapahtuu, kun käyttäjä napsauttaa |
+
+### Konfigurointi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` ja [Git-integraation](/fi/on-premises/configuration/kubernetes/integrations/git-integration) git-bridge-StatefulSet on oltava käytössä: ilman niitä tiliasetukset ja editori piilottavat GitHub-synkronoinnin.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` salaa käyttäjien GitHub-käyttöoikeustunnukset MongoDB:ssä. Jokaisen replikan on käytettävä samaa arvoa, ja sen muuttaminen myöhemmin pakottaa jokaisen käyttäjän linkittämään GitHubin uudelleen.
+</Step>
+
+<Step title="Yksityinen CA (valinnainen)">
+Jos GitHubillasi on oman CA:si myöntämä varmenne, lisää CA Secretiin `overleaf-certs`, joka on liitetty polkuun `/var/lib/overleaf/certs` (katso [Varmenteet ja muut tiedostot](/fi/on-premises/configuration/kubernetes#varmenteet-ja-muut-tiedostot)), ja aseta ConfigMapiin `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`.
+</Step>
+
+<Step title="Ota käyttöön, käynnistä uudelleen ja tarkista">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Mikä tahansa HTTP-tilakoodi tarkoittaa, että GitHub on tavoitettavissa kyseisestä podista; `000` tarkoittaa, ettei se ole.
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Mitään ylimääräistä ei tarvita jaetun `GITHUB_TOKEN_CIPHER_PASSWORD`-arvon lisäksi. Synkronointi ottaa Redisiin lukon, joka on yhteinen muiden Git-synkronointien kanssa, joten kaksi replikaa ei koskaan synkronoi samaa projektia samanaikaisesti.
+
+### Testattu Kubernetesissa
+
+github.comin ja sen REST- ja GraphQL-rajapintojen mallitoteutusta vasten (johon luotetaan `overleaf-certs`-Secretin `NODE_EXTRA_CA_CERTS`-asetuksen kautta), Kubernetes 1.37:ssä yhdellä replikalla ja Git-integraatio käytössä, GitHub-synkronoinnin päästä päähän -testimme menevät läpi (31 tapausta): tilin linkittäminen ja linkityksen poistaminen, peruutetut tunnukset, projektin vienti uuteen yksityiseen tai organisaation repositorioon, repositorion tuonti (myös latausrajan ylittävän), pull ja push, yhdistämiset, ristiriidat ja manuaaliset yhdistämiset, poistetut ja pakotetusti pushatut haarat, binääritiedostot, uudelleennimeämiset ja poistot, push-oikeuden menettäminen sekä se, mitä omistajat, muokkaajat ja katselijat saavat tehdä.

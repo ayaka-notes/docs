@@ -1,0 +1,129 @@
+---
+title: OIDC-todennus
+description: Anna käyttäjien kirjautua OpenID Connect -palveluntarjoajan kautta Kubernetes-käyttöönotossa.
+icon: id-card-clip
+---
+
+OIDC-kirjautumisen hoitaa **web**-palvelu (`authentication`-moduuli) jokaisessa Ayakaleaf Pro -podissa. Sillä ei ole taustatehtävää eikä erillistä podia. Palveluntarjoajan puoli (asiakas, uudelleenohjaus-URI:t, ylläpitäjäväite) on sama kuin Toolkitissa, joten määritä ensin OpenID-palveluntarjoajasi (OP) sivun [OIDC-todennus](/fi/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication) mukaisesti ja vie sitten arvot Kubernetesiin alla kuvatulla tavalla.
+
+### Missä mikin toimii
+
+| | |
+| --- | --- |
+| Palvelu | web, jokaisessa Ayakaleaf Pro -podissa; asetukset luetaan, kun web käynnistyy |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` ja `OVERLEAF_OIDC_USER_INFO_URL`, jokaisella kirjautumisella |
+| Selain → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`, ja uloskirjautuessa `OVERLEAF_OIDC_LOGOUT_URL` |
+| OP → Overleaf | ei mitään: OP vain ohjaa selaimen takaisin |
+| Kirjautumistila | istunto Redisissä, jaettuna kaikkien replikoiden kesken |
+| Ajastetut tehtävät | ei mitään |
+
+### Konfiguraatio
+
+<Steps>
+<Step title="Rekisteröi Overleaf OP:hen">
+Salli OP:ssäsi nämä osoitteet, jotka muodostetaan `OVERLEAF_SITE_URL`-arvosta:
+
+| Tarkoitus | URI |
+| --- | --- |
+| Uudelleenohjaus-URI (kirjautuminen) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| Uloskirjautumisen jälkeinen uudelleenohjaus-URI | `${OVERLEAF_SITE_URL}` |
+| Uloskirjautumisen jälkeinen uudelleenohjaus-URI olemassa olevan tilin linkittämisen jälkeen | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Etsi viisi URL-osoitetta OP:n discovery-dokumentista kohdan [Arvojen etsiminen discovery-dokumentin avulla](/fi/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document) mukaisesti.
+</Step>
+
+<Step title="Lisää asetukset ConfigMapiin">
+Lisää `overleaf-env`-ConfigMapiin (`30-config.yaml`, tai [useille replikoille](/fi/on-premises/configuration/kubernetes/horizontal-scaling) `60-config.yaml`):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` ottaa välilyönnein erotetun luettelon, esimerkiksi `ldap oidc`. Kaikki `OVERLEAF_OIDC_*`-asetukset löydät kohdasta [Ympäristömuuttujat](/fi/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables); ne kaikki menevät ConfigMapiin asiakassalaisuutta lukuun ottamatta.
+
+<Warning>
+
+Lainausmerkitse `"true"` ja `"false"`: ConfigMap sisältää vain merkkijonoja. Arvoon `""` asetettu avain ei ole sama asia kuin puuttuva avain: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` estää tilin luomisen ensimmäisellä kirjautumisella, kun taas avaimen pois jättäminen sallii kaikki verkkotunnukset.
+
+</Warning>
+</Step>
+
+<Step title="Vie asiakassalaisuus Secretiin">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Luota yksityiseen CA:han (valinnainen)">
+Jos OP:n varmenne on peräisin omasta CA:staasi, lisää CA Secretiin `overleaf-certs`, joka on liitetty polkuun `/var/lib/overleaf/certs` (katso [Varmenteet ja muut tiedostot](/fi/on-premises/configuration/kubernetes#varmenteet-ja-muut-tiedostot)), ja osoita Node.js siihen:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Ota käyttöön ja käynnistä uudelleen">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Tarkista sitten, että jokainen pod tavoittaa token-päätepisteen. Sitä kutsuvat podit, eivät selain, joten palomuuri- tai DNS-ongelma näkyy vain täällä:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Mikä tahansa HTTP-tila (`405` GET-pyynnölle) tarkoittaa, että päätepiste on tavoitettavissa; `000` tarkoittaa, että ei ole.
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Mitään ylimääräistä ei tarvita. Kirjautumisen `state`-arvo ja uloskirjautumiseen käytettävä ID-token säilytetään istunnossa, joka on Redisissä, joten takaisinkutsu toimii millä tahansa replikalla, joka sen vastaanottaa.
+
+### Testattu Kubernetesissa
+
+Kun OP:na oli goauthentik, Kubernetes 1.37:ssä kolmella replikalla HAProxyn takana, OIDC:n päästä päähän -testimme menevät läpi (35 tapausta): kirjautuminen ja uloskirjautuminen OP:n kautta; ylläpitäjäoikeuksien määritys ryhmän, sähköpostin ja yksittäisen arvon perusteella sekä ilman määritystä; nimen ja ylläpitäjälipun päivitys jokaisella kirjautumisella; tilien linkittäminen ja linkityksen poistaminen; OIDC-tilien salasanan palautus ja salasanan vaihto; jäädytetyt tilit; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; sekä OIDC yhdessä julkisen pääsyn kanssa.
+
+### Kysymyksiä ja vastauksia
+
+<Accordion title="Kirjautuminen epäonnistuu virheellä ”Unable to verify authorization request state”">
+
+<strong>Vastaus:</strong> Selain ei lähettänyt istuntoevästettä takaisin takaisinkutsun mukana. Kubernetesissa tavalliset syyt ovat:
+
+* `OVERLEAF_SECURE_COOKIE` on asetettu, mutta käyttäjät avaavat sivuston pelkän HTTP:n kautta, joten selain ei koskaan tallenna evästettä. Mikä tahansa `OVERLEAF_SECURE_COOKIE`-arvo, jopa `"false"`, ottaa suojatut evästeet käyttöön; poista sen sijaan koko avain.
+* Sivusto avataan eri osoitteessa kuin `OVERLEAF_SITE_URL`.
+* HTTPS:n takana ingress tai kuormantasaaja ei lähetä otsaketta `X-Forwarded-Proto: https`, tai sen osoite puuttuu muuttujasta `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="Mistä näen, miksi kirjautuminen epäonnistui?">
+
+<strong>Vastaus:</strong> Pyynnön käsitelleen podin web-lokista, ei komennolla `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Useilla replikoilla tarkista jokainen `overleaf-N`.
+
+</Accordion>

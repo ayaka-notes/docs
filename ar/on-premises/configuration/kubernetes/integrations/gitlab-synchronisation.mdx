@@ -1,0 +1,67 @@
+---
+title: المزامنة مع GitLab
+description: اسمح للمستخدمين بمزامنة مشاريعهم مع مستودعات على GitLab.com أو على GitLab مُدار ذاتيًا في نشر قائم على Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+تعمل المزامنة مع GitLab داخل خدمة **web** (الوحدة `gitlab-sync`) في كل pod من Ayakaleaf Pro. وهي تتطلب [تكامل Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration). أنشئ تطبيق OAuth واطّلع على وظيفة كل إعداد في [المزامنة مع GitLab](/ar/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation)؛ أما هذه الصفحة فتشرح تطبيقها على Kubernetes.
+
+| | |
+| --- | --- |
+| الخدمة | web (الوحدة `gitlab-sync`)، في كل pod من Ayakaleaf Pro؛ تُقرأ عند بدء تشغيل web |
+| Pod → GitLab | واجهة REST API الخاصة بـ `GITLAB_SYNC_URL` (الافتراضي `https://gitlab.com/api/v4`)، كلما قام مستخدم بالربط أو الاستيراد أو التصدير أو المزامنة |
+| المتصفح ← GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` لربط الحساب، ثم العودة إلى `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | لا شيء: لا يوجد webhook، ولا يلزم أن يكون المثيل قابلًا للوصول من GitLab |
+| البيانات المخزّنة | رموز الوصول والتحديث (access and refresh tokens) الخاصة بالمستخدم في GitLab، مشفّرة، في MongoDB |
+| المهام الدورية | لا شيء: تتم المزامنة عندما ينقر المستخدم |
+
+### الإعداد
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+يجب أن يكون `GIT_BRIDGE_ENABLED: "true"` وكذلك StatefulSet الخاص بـ git-bridge من [تكامل Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration) في مكانهما: فبدونهما تُخفي إعدادات الحساب والمحرّر خيار المزامنة مع GitLab.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+يشفّر `GITLAB_TOKEN_CIPHER_PASSWORD` رموز الوصول والتحديث الخاصة بالمستخدمين في GitLab داخل MongoDB. يجب أن تستخدم كل نسخة متماثلة (replica) القيمة نفسها، وتغييرها لاحقًا يُلزم كل مستخدم بربط GitLab من جديد.
+</Step>
+
+<Step title="مرجع شهادات خاص (اختياري)">
+إذا كان GitLab لديك يستخدم شهادة صادرة عن مرجع شهادات (CA) خاص بك، فأضف هذا المرجع إلى الـ Secret المسمّى `overleaf-certs` المُركَّب في `/var/lib/overleaf/certs` (راجع [الشهادات والملفات الأخرى](/ar/on-premises/configuration/kubernetes#الشهادات-والملفات-الأخرى)) واضبط `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` في الـ ConfigMap.
+</Step>
+
+<Step title="التطبيق وإعادة التشغيل والتحقق">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+أي رمز حالة HTTP يعني أن GitLab قابل للوصول من ذلك الـ pod؛ أما `000` فيعني أنه غير قابل للوصول.
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+لا يلزم أي شيء إضافي سوى `GITLAB_TOKEN_CIPHER_PASSWORD` المشترك. تأخذ كل عملية مزامنة قفلًا في Redis، مشتركًا مع عمليات مزامنة Git الأخرى، لذا لا تقوم نسختان متماثلتان أبدًا بمزامنة المشروع نفسه في الوقت ذاته. كما يأخذ تحديث رمز GitLab الخاص بالمستخدم قفلًا في Redis أيضًا، لذا لا تقوم نسختان متماثلتان بتحديثه في الوقت ذاته.
+
+### الاختبار على Kubernetes
+
+في مقابل محاكاة لـ GitLab مُدار ذاتيًا على `GITLAB_SYNC_URL` (موثوق بها عبر `NODE_EXTRA_CA_CERTS` من `overleaf-certs`)، وعلى Kubernetes 1.37 مع نسخة متماثلة واحدة وتكامل Git مفعّل، تنجح اختباراتنا الشاملة (end-to-end) للمزامنة مع GitLab (40 حالة): ربط الحساب وإلغاء ربطه، وتحديث رمز وصول على وشك الانتهاء والرموز المُلغاة، والتصدير إلى مشروع خاص جديد أو مشروع مجموعة، واستيراد مستودع، والسحب والدفع، وعمليات الدمج، والتعارضات، والفروع المحذوفة والمدفوعة قسرًا (force-pushed)، والملفات الثنائية، وإعادة التسمية والحذف، وما يُسمح للمالكين والمحرّرين والمشاهدين بفعله.

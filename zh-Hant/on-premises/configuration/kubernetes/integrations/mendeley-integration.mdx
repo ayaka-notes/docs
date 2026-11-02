@@ -1,0 +1,56 @@
+---
+title: Mendeley 整合
+description: 在 Kubernetes 部署中，讓使用者從其 Mendeley 文獻庫匯入 .bib 檔案。
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Mendeley 匯入在每個 Ayakaleaf Pro Pod 的 **web** 服務（`tpr-webmodule` 模組）中執行。請依照 [Mendeley 整合](/zh-Hant/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration) 註冊 Mendeley 應用程式，重新導向 URL 為 `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`，接著依下列方式設定 Kubernetes。
+
+| | |
+| --- | --- |
+| 服務 | web，位於每個 Ayakaleaf Pro Pod 中；於 web 啟動時讀取 |
+| Pod → Mendeley | 當使用者連結 Mendeley 或匯入、重新整理檔案時，連線至 `https://api.mendeley.com`（OAuth 權杖與 API） |
+| 瀏覽器 → Mendeley | `https://api.mendeley.com/oauth/authorize`，接著返回重新導向 URL |
+| Mendeley → Overleaf | 無：您的執行個體不需要能從網際網路連線 |
+| 儲存的資料 | 使用者的 Mendeley 權杖，經加密後儲存於 MongoDB |
+| 定期工作 | 無：只有在使用者要求時才會重新整理檔案 |
+
+### 設定
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+請為應用程式 ID 加上引號：它是一個數字，而 ConfigMap 只能存放字串。`ENABLED_LINKED_FILE_TYPES` 會取代安裝時設定的值；請保留您現有的類型並加入 `mendeley`（若同時使用 Zotero，也請加入 `zotero`）。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD` 用於加密儲存在 MongoDB 中的使用者 Mendeley 權杖。若未設定，每個 Pod 會在各自的 `/var/lib/overleaf/data` 中產生金鑰檔案。在 [多個副本](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling) 的情況下，每個節點都會有不同的金鑰，由其他副本提供服務的使用者將無法使用其已連結的 Mendeley 帳號。請在第一位使用者連結 Mendeley 之前設定此值：之後若變更，所有使用者都必須重新連結 Mendeley。
+</Step>
+
+<Step title="套用並重新啟動">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### 多個副本
+
+請在 Secret 中設定 `MENDELEY_CIPHER_PASSWORD`，詳見上文。Mendeley 權杖與 Zotero 金鑰使用相同的程式碼加密：若未設定密碼，在某個副本上匯入的檔案將無法在另一個副本上重新整理，正如我們在 [Zotero](/zh-Hant/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas) 中所見。OAuth `state` 保存在 Redis 中的工作階段裡，因此回呼可以抵達任何副本。
+
+### 在 Kubernetes 上的測試
+
+我們在 Kubernetes 1.37 上以三個副本置於 HAProxy 之後，針對模擬的 api.mendeley.com（透過來自 `overleaf-certs` 的 `NODE_EXTRA_CA_CERTS` 信任）執行 Mendeley 的端對端測試，全部通過（18 個案例）：透過 OAuth 2.0 連結與解除連結、將文獻庫與群組匯入 `.bib` 檔案、重新整理該檔案、更新即將過期的存取權杖、已撤銷的權杖、要求重新連結、協作者可搜尋參考文獻、只有匯入者可以重新整理、API 錯誤，以及與 Mendeley 之間的緩慢連線。

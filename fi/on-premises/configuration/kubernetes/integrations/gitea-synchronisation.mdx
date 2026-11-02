@@ -1,0 +1,67 @@
+---
+title: Gitea-synkronointi
+description: Anna käyttäjien synkronoida projektinsa Gitea.comin tai oman Gitea-palvelimesi repositorioiden kanssa Kubernetes-käyttöönotossa.
+icon: mug-hot
+---
+
+Gitea-synkronointi toimii jokaisen Ayakaleaf Pro -podin **web**-palvelussa (`gitea-sync`-moduuli). Se edellyttää [Git-integraatiota](/fi/on-premises/configuration/kubernetes/integrations/git-integration). Luo OAuth-sovellus ja lue, mitä kukin asetus tekee, sivulta [Gitea-synkronointi](/fi/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); tämä sivu vie sen Kubernetesiin.
+
+| | |
+| --- | --- |
+| Palvelu | web (`gitea-sync`-moduuli), jokaisessa Ayakaleaf Pro -podissa; luetaan, kun web käynnistyy |
+| Pod → Gitea | `GITEA_SYNC_URL`-osoitteen REST-API (oletus `https://gitea.com/api/v1`), aina kun käyttäjä linkittää, tuo, vie tai synkronoi |
+| Selain → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` tilin linkittämiseksi, sitten takaisin osoitteeseen `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | ei mitään: ei webhookia, instanssin ei tarvitse olla tavoitettavissa Giteasta |
+| Tallennetut tiedot | käyttäjän Gitea-käyttö- ja päivitystunnisteet salattuina MongoDB:ssä |
+| Ajastetut tehtävät | ei mitään: synkronointi tapahtuu, kun käyttäjä napsauttaa |
+
+### Konfiguraatio
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` ja sivun [Git-integraatio](/fi/on-premises/configuration/kubernetes/integrations/git-integration) git-bridge-StatefulSet on oltava käytössä: ilman niitä tilin asetukset ja editori piilottavat Gitea-synkronoinnin.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` salaa käyttäjien Gitea-käyttö- ja päivitystunnisteet MongoDB:ssä. Jokaisen replikan on käytettävä samaa arvoa, ja sen myöhempi vaihtaminen pakottaa jokaisen käyttäjän linkittämään Gitean uudelleen.
+</Step>
+
+<Step title="Yksityinen CA (valinnainen)">
+Jos Gitea-palvelimellasi on oman CA:si myöntämä varmenne, lisää CA Secretiin `overleaf-certs`, joka on liitetty polkuun `/var/lib/overleaf/certs` (katso [Varmenteet ja muut tiedostot](/fi/on-premises/configuration/kubernetes#varmenteet-ja-muut-tiedostot)), ja aseta ConfigMapiin `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`.
+</Step>
+
+<Step title="Ota käyttöön, käynnistä uudelleen ja tarkista">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Mikä tahansa HTTP-tila tarkoittaa, että Gitea on tavoitettavissa kyseisestä podista; `000` tarkoittaa, että ei ole.
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Jaetun `GITEA_TOKEN_CIPHER_PASSWORD`-arvon lisäksi ei tarvita mitään muuta. Synkronointi varaa Redisistä lukon, joka on yhteinen muiden Git-synkronointien kanssa, joten kaksi replikaa ei koskaan synkronoi samaa projektia samanaikaisesti.
+
+### Testattu Kubernetesissa
+
+Oikeaa Gitea 1.23:a vasten osoitteessa `GITEA_SYNC_URL` Kubernetes 1.37:ssä yhdellä replikalla ja Git-integraatio käytössä Gitea-synkronoinnin päästä päähän -testimme menevät läpi (39 tapausta): tilin linkittäminen ja linkityksen poistaminen Gitean OAuth2:n kautta, vanhenevan käyttötunnisteen päivittäminen ja peruutetut valtuutukset, vienti uuteen yksityiseen tai organisaation repositorioon, repositorion tuonti, pull ja push, yhdistämiset, konfliktit, poistetut ja force-pushatut haarat, binääritiedostot, uudelleennimeämiset ja poistot sekä se, mitä omistajat, muokkaajat ja katselijat voivat tehdä.

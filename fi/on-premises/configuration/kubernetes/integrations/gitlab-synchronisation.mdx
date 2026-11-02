@@ -1,0 +1,67 @@
+---
+title: GitLab-synkronointi
+description: Anna käyttäjien synkronoida projektinsa GitLab.comin tai itse ylläpidetyn GitLabin repositorioiden kanssa Kubernetes-käyttöönotossa.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+GitLab-synkronointi toimii jokaisen Ayakaleaf Pro -podin **web**-palvelussa (`gitlab-sync`-moduuli). Se edellyttää [Git-integraatiota](/fi/on-premises/configuration/kubernetes/integrations/git-integration). Luo OAuth-sovellus ja lue, mitä kukin asetus tekee, sivulta [GitLab-synkronointi](/fi/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); tämä sivu kertoo, miten se otetaan käyttöön Kubernetesissa.
+
+| | |
+| --- | --- |
+| Palvelu | web (`gitlab-sync`-moduuli), jokaisessa Ayakaleaf Pro -podissa; luetaan, kun web käynnistyy |
+| Pod → GitLab | `GITLAB_SYNC_URL`-osoitteen REST API (oletus `https://gitlab.com/api/v4`) aina, kun käyttäjä linkittää, tuo, vie tai synkronoi |
+| Selain → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` tilin linkittämiseksi, sitten takaisin osoitteeseen `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | ei mitään: ei webhookia, instanssin ei tarvitse olla tavoitettavissa GitLabista |
+| Tallennetut tiedot | käyttäjän GitLab-käyttöoikeus- ja päivitystunnukset salattuina MongoDB:ssä |
+| Ajastetut tehtävät | ei mitään: synkronointi tapahtuu, kun käyttäjä napsauttaa |
+
+### Konfigurointi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` ja [Git-integraation](/fi/on-premises/configuration/kubernetes/integrations/git-integration) git-bridge-StatefulSet on oltava käytössä: ilman niitä tiliasetukset ja editori piilottavat GitLab-synkronoinnin.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` salaa käyttäjien GitLab-käyttöoikeus- ja päivitystunnukset MongoDB:ssä. Jokaisen replikan on käytettävä samaa arvoa, ja sen muuttaminen myöhemmin pakottaa jokaisen käyttäjän linkittämään GitLabin uudelleen.
+</Step>
+
+<Step title="Yksityinen CA (valinnainen)">
+Jos GitLabillasi on oman CA:si myöntämä varmenne, lisää CA Secretiin `overleaf-certs`, joka on liitetty polkuun `/var/lib/overleaf/certs` (katso [Varmenteet ja muut tiedostot](/fi/on-premises/configuration/kubernetes#varmenteet-ja-muut-tiedostot)), ja aseta ConfigMapiin `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem`.
+</Step>
+
+<Step title="Ota käyttöön, käynnistä uudelleen ja tarkista">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Mikä tahansa HTTP-tilakoodi tarkoittaa, että GitLab on tavoitettavissa kyseisestä podista; `000` tarkoittaa, ettei se ole.
+</Step>
+</Steps>
+
+### Useita replikoita
+
+Mitään ylimääräistä ei tarvita jaetun `GITLAB_TOKEN_CIPHER_PASSWORD`-arvon lisäksi. Synkronointi ottaa Redisiin lukon, joka on yhteinen muiden Git-synkronointien kanssa, joten kaksi replikaa ei koskaan synkronoi samaa projektia samanaikaisesti. Myös käyttäjän GitLab-tunnuksen päivittäminen ottaa Redis-lukon, joten kaksi replikaa ei päivitä sitä samaan aikaan.
+
+### Testattu Kubernetesissa
+
+`GITLAB_SYNC_URL`-osoitteessa olevan itse ylläpidetyn GitLabin mallitoteutusta vasten (johon luotetaan `overleaf-certs`-Secretin `NODE_EXTRA_CA_CERTS`-asetuksen kautta), Kubernetes 1.37:ssä yhdellä replikalla ja Git-integraatio käytössä, GitLab-synkronoinnin päästä päähän -testimme menevät läpi (40 tapausta): tilin linkittäminen ja linkityksen poistaminen, vanhenevan käyttöoikeustunnuksen päivittäminen ja peruutetut tunnukset, vienti uuteen yksityiseen tai ryhmän projektiin, repositorion tuonti, pull ja push, yhdistämiset, ristiriidat, poistetut ja pakotetusti pushatut haarat, binääritiedostot, uudelleennimeämiset ja poistot sekä se, mitä omistajat, muokkaajat ja katselijat saavat tehdä.

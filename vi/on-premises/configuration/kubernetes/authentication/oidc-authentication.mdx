@@ -1,0 +1,129 @@
+---
+title: Xác thực OIDC
+description: Cho phép người dùng đăng nhập qua một nhà cung cấp OpenID Connect trên triển khai Kubernetes.
+icon: id-card-clip
+---
+
+Đăng nhập OIDC được xử lý bởi dịch vụ **web** (module `authentication`) bên trong mọi pod Ayakaleaf Pro. Nó không có tác vụ nền và không có pod riêng. Phía nhà cung cấp (client, redirect URI, claim quản trị viên) giống như trên Toolkit, vì vậy trước tiên hãy thiết lập OpenID Provider (OP) của bạn theo [Xác thực OIDC](/vi/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication), sau đó đưa các giá trị vào Kubernetes như bên dưới.
+
+### Các thành phần chạy ở đâu
+
+| | |
+| --- | --- |
+| Dịch vụ | web, trong mọi pod Ayakaleaf Pro; các thiết lập được đọc khi web khởi động |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` và `OVERLEAF_OIDC_USER_INFO_URL`, ở mỗi lần đăng nhập |
+| Trình duyệt → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`, và `OVERLEAF_OIDC_LOGOUT_URL` khi đăng xuất |
+| OP → Overleaf | không có: OP chỉ chuyển hướng trình duyệt trở lại |
+| Trạng thái đăng nhập | session trong Redis, dùng chung cho mọi replica |
+| Tác vụ định kỳ | không có |
+
+### Cấu hình
+
+<Steps>
+<Step title="Đăng ký Overleaf tại OP">
+Cho phép các địa chỉ sau trong OP của bạn, được tạo từ `OVERLEAF_SITE_URL`:
+
+| Mục đích | URI |
+| --- | --- |
+| Redirect URI (đăng nhập) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| Post-logout redirect URI | `${OVERLEAF_SITE_URL}` |
+| Post-logout redirect URI, sau khi liên kết một tài khoản có sẵn | `${OVERLEAF_SITE_URL}/user/settings` |
+
+Tìm năm URL trong tài liệu discovery của OP như mô tả trong [Tìm các giá trị bằng tài liệu discovery](/vi/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document).
+</Step>
+
+<Step title="Thêm các thiết lập vào ConfigMap">
+Thêm vào `overleaf-env` (`30-config.yaml`, hoặc `60-config.yaml` khi dùng [nhiều replica](/vi/on-premises/configuration/kubernetes/horizontal-scaling)):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` nhận một danh sách phân tách bằng dấu cách, ví dụ `ldap oidc`. Xem [Biến môi trường](/vi/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables) để biết mọi thiết lập `OVERLEAF_OIDC_*`; tất cả đều được đặt trong ConfigMap, ngoại trừ client secret.
+
+<Warning>
+
+Hãy đặt `"true"` và `"false"` trong dấu nháy: ConfigMap chỉ chứa chuỗi. Một khóa được đặt thành `""` không giống với một khóa bị thiếu: `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` tắt việc tạo tài khoản ở lần đăng nhập đầu tiên, trong khi bỏ khóa này đi sẽ cho phép mọi tên miền.
+
+</Warning>
+</Step>
+
+<Step title="Đưa client secret vào Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="Tin cậy một CA riêng (tùy chọn)">
+Nếu chứng chỉ của OP được cấp bởi CA riêng của bạn, hãy thêm CA vào Secret `overleaf-certs` được mount tại `/var/lib/overleaf/certs` (xem [Chứng chỉ và các tệp khác](/vi/on-premises/configuration/kubernetes#chứng-chỉ-và-các-tệp-khác)) và trỏ Node.js tới nó:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="Áp dụng và khởi động lại">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Sau đó kiểm tra rằng mọi pod đều truy cập được endpoint token. Chính các pod gọi endpoint này, không phải trình duyệt, nên sự cố tường lửa hoặc DNS chỉ lộ ra ở đây:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+Bất kỳ mã trạng thái HTTP nào (`405` cho GET) đều có nghĩa là endpoint truy cập được; `000` nghĩa là không.
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Không cần gì thêm. Giá trị `state` của một lần đăng nhập và ID token dùng để đăng xuất được lưu trong session nằm trên Redis, nên callback hoạt động trên bất kỳ replica nào nhận được nó.
+
+### Đã kiểm thử trên Kubernetes
+
+Với goauthentik làm OP, trên Kubernetes 1.37 với ba replica phía sau HAProxy, các bài kiểm thử end-to-end của chúng tôi cho OIDC đều đạt (35 trường hợp): đăng nhập và đăng xuất qua OP; ánh xạ quản trị viên theo nhóm, theo email và theo một giá trị đơn, và khi không có ánh xạ; cập nhật tên và cờ quản trị viên ở mỗi lần đăng nhập; liên kết và hủy liên kết tài khoản; đặt lại và thay đổi mật khẩu của tài khoản OIDC; tài khoản bị tạm ngưng; `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`; `OVERLEAF_DISABLE_LOCAL_LOGIN`; và OIDC kết hợp với truy cập công khai.
+
+### Hỏi \& Đáp
+
+<Accordion title="Đăng nhập thất bại với lỗi “Unable to verify authorization request state”">
+
+<strong>Trả lời:</strong> Trình duyệt đã không gửi lại cookie session cùng với callback. Trên Kubernetes, các nguyên nhân thường gặp là:
+
+* `OVERLEAF_SECURE_COOKIE` được đặt, nhưng người dùng mở trang qua HTTP thường, nên trình duyệt không bao giờ lưu cookie. Bất kỳ giá trị nào của `OVERLEAF_SECURE_COOKIE`, kể cả `"false"`, đều bật secure cookie; thay vào đó hãy xóa khóa này.
+* Trang được mở dưới một địa chỉ khác với `OVERLEAF_SITE_URL`.
+* Phía sau HTTPS, ingress hoặc load balancer của bạn không gửi `X-Forwarded-Proto: https`, hoặc địa chỉ của nó không có trong `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="Tôi xem lý do đăng nhập thất bại ở đâu?">
+
+<strong>Trả lời:</strong> Trong log web của pod đã phục vụ yêu cầu, không phải trong `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+Khi có nhiều replica, hãy kiểm tra từng `overleaf-N`.
+
+</Accordion>

@@ -1,0 +1,67 @@
+---
+title: المزامنة مع GitHub
+description: اسمح للمستخدمين بمزامنة مشاريعهم مع مستودعات GitHub أو GitHub Enterprise في نشر قائم على Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+تعمل المزامنة مع GitHub داخل خدمة **web** (الوحدة `github-sync`) في كل pod من Ayakaleaf Pro. وهي تتطلب [تكامل Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration). أنشئ تطبيق OAuth واطّلع على وظيفة كل إعداد في [المزامنة مع GitHub](/ar/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation)؛ أما هذه الصفحة فتشرح تطبيقها على Kubernetes.
+
+| | |
+| --- | --- |
+| الخدمة | web (الوحدة `github-sync`)، في كل pod من Ayakaleaf Pro؛ تُقرأ عند بدء تشغيل web |
+| Pod → GitHub | `https://api.github.com` (REST وGraphQL)، أو واجهة API الخاصة بـ `GITHUB_SYNC_URL`، كلما قام مستخدم بالربط أو الاستيراد أو التصدير أو المزامنة |
+| المتصفح ← GitHub | `https://github.com/login/oauth/authorize` لربط الحساب، ثم العودة إلى `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | لا شيء: لا يوجد webhook، ولا يلزم أن يكون المثيل قابلًا للوصول من GitHub |
+| البيانات المخزّنة | رموز الوصول (access tokens) الخاصة بالمستخدم في GitHub، مشفّرة، في MongoDB |
+| المهام الدورية | لا شيء: تتم المزامنة عندما ينقر المستخدم |
+
+### الإعداد
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+يجب أن يكون `GIT_BRIDGE_ENABLED: "true"` وكذلك StatefulSet الخاص بـ git-bridge من [تكامل Git](/ar/on-premises/configuration/kubernetes/integrations/git-integration) في مكانهما: فبدونهما تُخفي إعدادات الحساب والمحرّر خيار المزامنة مع GitHub.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+يشفّر `GITHUB_TOKEN_CIPHER_PASSWORD` رموز الوصول الخاصة بالمستخدمين في GitHub داخل MongoDB. يجب أن تستخدم كل نسخة متماثلة (replica) القيمة نفسها، وتغييرها لاحقًا يُلزم كل مستخدم بربط GitHub من جديد.
+</Step>
+
+<Step title="مرجع شهادات خاص (اختياري)">
+إذا كان GitHub لديك يستخدم شهادة صادرة عن مرجع شهادات (CA) خاص بك، فأضف هذا المرجع إلى الـ Secret المسمّى `overleaf-certs` المُركَّب في `/var/lib/overleaf/certs` (راجع [الشهادات والملفات الأخرى](/ar/on-premises/configuration/kubernetes#الشهادات-والملفات-الأخرى)) واضبط `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` في الـ ConfigMap.
+</Step>
+
+<Step title="التطبيق وإعادة التشغيل والتحقق">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+أي رمز حالة HTTP يعني أن GitHub قابل للوصول من ذلك الـ pod؛ أما `000` فيعني أنه غير قابل للوصول.
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+لا يلزم أي شيء إضافي سوى `GITHUB_TOKEN_CIPHER_PASSWORD` المشترك. تأخذ كل عملية مزامنة قفلًا في Redis، مشتركًا مع عمليات مزامنة Git الأخرى، لذا لا تقوم نسختان متماثلتان أبدًا بمزامنة المشروع نفسه في الوقت ذاته.
+
+### الاختبار على Kubernetes
+
+في مقابل محاكاة لـ github.com وواجهتي REST وGraphQL الخاصتين به (موثوق بها عبر `NODE_EXTRA_CA_CERTS` من `overleaf-certs`)، وعلى Kubernetes 1.37 مع نسخة متماثلة واحدة وتكامل Git مفعّل، تنجح اختباراتنا الشاملة (end-to-end) للمزامنة مع GitHub (31 حالة): ربط الحساب وإلغاء ربطه، والرموز المُلغاة، وتصدير مشروع إلى مستودع خاص جديد أو مستودع مؤسسة، واستيراد مستودع (بما في ذلك ما يتجاوز حدّ الرفع)، والسحب والدفع، وعمليات الدمج، والتعارضات والدمج اليدوي، والفروع المحذوفة والمدفوعة قسرًا (force-pushed)، والملفات الثنائية، وإعادة التسمية والحذف، وفقدان صلاحية الدفع، وما يُسمح للمالكين والمحرّرين والمشاهدين بفعله.

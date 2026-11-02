@@ -1,0 +1,67 @@
+---
+title: GitLab-synkronisering
+description: Lad brugerne synkronisere deres projekter med repositories på GitLab.com eller en selvadministreret GitLab i en Kubernetes-installation.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/gitlab.svg
+---
+
+GitLab-synkronisering kører i **web**-tjenesten (modulet `gitlab-sync`) i hver Ayakaleaf Pro-pod. Den kræver [Git-integrationen](/da/on-premises/configuration/kubernetes/integrations/git-integration). Opret OAuth-applikationen, og læs, hvad hver indstilling gør, under [GitLab-synkronisering](/da/on-premises/configuration/overleaf-toolkit/integrations/gitlab-synchronisation); denne side omsætter det til Kubernetes.
+
+| | |
+| --- | --- |
+| Tjeneste | web (modulet `gitlab-sync`), i hver Ayakaleaf Pro-pod; læses, når web starter |
+| Pod → GitLab | REST-API'et for `GITLAB_SYNC_URL` (standard `https://gitlab.com/api/v4`), hver gang en bruger forbinder, importerer, eksporterer eller synkroniserer |
+| Browser → GitLab | `${GITLAB_SYNC_URL}/oauth/authorize` for at forbinde en konto og derefter tilbage til `${OVERLEAF_SITE_URL}/user/gitlab-sync/oauth2/callback` |
+| GitLab → Overleaf | ingen: ingen webhook, instansen behøver ikke at kunne nås fra GitLab |
+| Lagrede data | brugerens GitLab-adgangs- og refresh-tokens, krypteret, i MongoDB |
+| Periodiske job | ingen: synkronisering sker, når en bruger klikker |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITLAB_SYNC_ENABLED: "true"
+  GITLAB_SYNC_CLIENT_ID: <client ID>
+  # self-managed GitLab: its web address
+  # GITLAB_SYNC_URL: https://gitlab.example.com
+  # optional: send the module's requests to GitLab through an HTTP proxy
+  # GITLAB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` og git-bridge-StatefulSet'et fra [Git-integration](/da/on-premises/configuration/kubernetes/integrations/git-integration) skal være på plads: uden dem skjuler kontoindstillingerne og editoren GitLab-synkronisering.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITLAB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITLAB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITLAB_TOKEN_CIPHER_PASSWORD` krypterer brugernes GitLab-adgangs- og refresh-tokens i MongoDB. Alle replikaer skal bruge den samme værdi, og hvis den ændres senere, skal alle brugere forbinde GitLab igen.
+</Step>
+
+<Step title="Privat CA (valgfrit)">
+Hvis din GitLab har et certifikat fra din egen CA, skal du tilføje CA'en til Secret'et `overleaf-certs`, der er monteret på `/var/lib/overleaf/certs` (se [Certifikater og andre filer](/da/on-premises/configuration/kubernetes#certifikater-og-andre-filer)), og sætte `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap'et.
+</Step>
+
+<Step title="Anvend, genstart og kontrollér">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitlab.com/api/v4/version
+done
+```
+
+Enhver HTTP-status betyder, at GitLab kan nås fra den pod; `000` betyder, at den ikke kan.
+</Step>
+</Steps>
+
+### Flere replikaer
+
+Intet ekstra ud over den fælles `GITLAB_TOKEN_CIPHER_PASSWORD`. En synkronisering tager en lås i Redis, som deles med de andre Git-synkroniseringer, så to replikaer aldrig synkroniserer det samme projekt på samme tid. Fornyelse af en brugers GitLab-token tager også en Redis-lås, så to replikaer ikke fornyer det på samme tid.
+
+### Testet på Kubernetes
+
+Mod en mock af en selvadministreret GitLab på `GITLAB_SYNC_URL` (der stoles på via `NODE_EXTRA_CA_CERTS` fra `overleaf-certs`), på Kubernetes 1.37 med én replika og Git-integrationen slået til, består vores end-to-end-tests for GitLab-synkronisering (40 tilfælde): forbindelse og afbrydelse af kontoen, fornyelse af et udløbende adgangstoken og tilbagekaldte tokens, eksport til et nyt privat projekt eller gruppeprojekt, import af et repository, pull og push, merges, konflikter, slettede og force-pushede branches, binære filer, omdøbninger og sletninger samt hvad ejere, redaktører og læsere må gøre.

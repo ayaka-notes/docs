@@ -1,0 +1,38 @@
+---
+title: MCP Server
+description: 在 Kubernetes 部署中，透過專案的 MCP Server 將 AI 用戶端連接至專案。
+icon: plug
+---
+
+每個專案的 MCP Server 在每個 Ayakaleaf Pro Pod 的 **web** 服務（`mcp-server` 模組）中執行。它隨 [Git 整合](/zh-Hant/on-premises/configuration/kubernetes/integrations/git-integration) 一併提供，本身沒有任何設定。如何連接 Claude Code、Codex 及其他用戶端，請參閱 [MCP Server](/zh-Hant/on-premises/configuration/overleaf-toolkit/integrations/mcp-server)。
+
+| | |
+| --- | --- |
+| 服務 | web，位於每個 Ayakaleaf Pro Pod 中 |
+| 啟用方式 | `GIT_BRIDGE_ENABLED: "true"` 與 git-bridge StatefulSet，請參閱 [Git 整合](/zh-Hant/on-premises/configuration/kubernetes/integrations/git-integration) |
+| 外部 → Overleaf | AI 用戶端使用 Git 驗證權杖發送 `POST ${OVERLEAF_SITE_URL}/project/<id>/mcp`；PDF 下載連結位於 `${OVERLEAF_SITE_URL}/project/<id>/mcp/download/` 之下 |
+| Pod → 外部 | 無 |
+| 狀態 | 請求之間不保留狀態；編譯輸出會留在執行編譯的 Pod 上 |
+| 定期工作 | 無 |
+
+### 設定
+
+請設定 [Git 整合](/zh-Hant/on-premises/configuration/kubernetes/integrations/git-integration)。之後 MCP Server 即位於 `${OVERLEAF_SITE_URL}/project/<project id>/mcp`，且該位址必須能從 AI 用戶端執行的位置連線。
+
+### 多個副本
+
+透過 MCP 進行的編譯會在接收該請求的副本上執行，其日誌與 PDF 只存在於該副本上。AI 用戶端不會傳送 Cookie，因此負載平衡器可能會將下一個請求（`get_compile_log` 或 PDF 下載連結）傳送到另一個副本，而該副本會回應「failed to fetch output file from CLSI」或 404。在我們以三個副本且未加入額外規則的測試中，6 次日誌請求有 5 次失敗、4 次下載有 3 次以這種方式失敗。
+
+請將同一專案的所有 MCP 請求路由到同一個副本，做法與 `/git/` 相同。使用 [水平擴展](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling) 中的 HAProxy 時：
+
+```text
+      use-server overleaf-0 if { path_reg ^/project/[0-9a-f]{24}/mcp(/|$) }
+```
+
+如此一來，所有 MCP 編譯都會在 `overleaf-0` 所在的節點上執行。若使用其他 Ingress 控制器，請將路徑 `/project/<id>/mcp` 及其下的所有路徑路由到某個副本自身的名稱（`overleaf-0.overleaf-hl`）。
+
+套用此規則後，同樣的測試（一次編譯、6 次日誌請求與 4 次 PDF 下載，皆不帶 Cookie）每次都成功。
+
+### 在 Kubernetes 上的測試
+
+我們在 Kubernetes 1.37 上以三個副本置於 HAProxy 之後，執行 MCP Server 的端對端測試，全部通過（37 個案例）：列出工具、拒絕錯誤、已刪除或無存取權的權杖、編譯並讀取日誌、字數統計、專案設定與歷史記錄、PDF 下載連結、編輯檔案（變更會即時顯示在已開啟的編輯器中，並可拉取到 Git 複製中）、留言、依角色的存取權限、編譯與設定的速率限制，以及已停用的帳號。這些請求來自瀏覽器工作階段，因此負載平衡器會將它們保留在同一個副本上；對於不帶 Cookie 的用戶端，請參閱[多個副本](#多個副本)。

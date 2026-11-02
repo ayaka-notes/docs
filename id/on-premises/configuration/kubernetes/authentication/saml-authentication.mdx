@@ -1,0 +1,116 @@
+---
+title: Autentikasi SAML
+description: Izinkan pengguna login melalui penyedia identitas SAML 2.0 pada deployment Kubernetes.
+icon: building-columns
+---
+
+Login SAML ditangani oleh layanan **web** (modul `authentication`) di dalam setiap pod Ayakaleaf Pro. Login ini tidak memiliki job latar belakang maupun pod terpisah. Siapkan penyedia identitas (IdP) seperti pada [Autentikasi SAML](/id/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication), lalu masukkan nilai-nilai dan sertifikat IdP ke Kubernetes seperti di bawah ini.
+
+### Di mana semuanya berjalan
+
+| | |
+| --- | --- |
+| Layanan | web, di setiap pod Ayakaleaf Pro; pengaturan dan sertifikat IdP dibaca saat web dimulai |
+| Pod → IdP | tidak ada: setiap pesan SAML melewati browser |
+| Browser → IdP | `OVERLEAF_SAML_ENTRYPOINT` (login), `OVERLEAF_SAML_LOGOUT_URL` (logout) |
+| Browser → Overleaf | `POST ${OVERLEAF_SITE_URL}/saml/login/callback` (ACS), `/saml/logout/callback`, `/saml/meta` (metadata SP) |
+| File | sertifikat IdP, dan opsional kunci serta sertifikat milik Overleaf sendiri, dari Secret `overleaf-certs` |
+| Job berkala | tidak ada |
+
+### Konfigurasi
+
+<Steps>
+<Step title="Daftarkan Overleaf di IdP">
+| Pengaturan IdP | Nilai |
+| --- | --- |
+| ACS URL (assertion consumer service) | `${OVERLEAF_SITE_URL}/saml/login/callback`, binding HTTP-POST |
+| Single logout URL | `${OVERLEAF_SITE_URL}/saml/logout/callback` |
+| Audience / SP entity ID | nilai yang Anda masukkan ke `OVERLEAF_SAML_ISSUER` |
+
+[Panduan langkah demi langkah goauthentik](/id/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#step-by-step-goauthentik) menunjukkan letak pengaturan ini.
+</Step>
+
+<Step title="Masukkan sertifikat IdP ke Secret `overleaf-certs`">
+Toolkit membaca sertifikat dari `data/overleaf/certs/`. Di Kubernetes, sertifikat berasal dari Secret `overleaf-certs`, yang di-mount di `/var/lib/overleaf/certs` seperti dijelaskan di [Sertifikat dan file lainnya](/id/on-premises/configuration/kubernetes#sertifikat-dan-file-lainnya):
+
+```bash
+kubectl -n overleaf create secret generic overleaf-certs --from-file=idp_cert.pem
+```
+
+Jika Secret sudah ada, tambahkan file ke dalamnya: hapus dan buat ulang dengan setiap `--from-file`, atau gunakan `kubectl -n overleaf edit secret overleaf-certs`.
+
+`OVERLEAF_SAML_IDP_CERT` menerima sebuah path, atau daftar path dalam format JSON selama rotasi sertifikat. Pengaturan ini tidak menerima teks PEM itu sendiri.
+</Step>
+
+<Step title="Tambahkan pengaturan ke ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: saml
+  OVERLEAF_SAML_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_SAML_ENTRYPOINT: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_LOGOUT_URL: https://authentik.example.com/application/saml/overleaf/
+  OVERLEAF_SAML_ISSUER: overleaf
+  OVERLEAF_SAML_IDP_CERT: /var/lib/overleaf/certs/idp_cert.pem
+  OVERLEAF_SAML_WANT_ASSERTIONS_SIGNED: "true"
+  OVERLEAF_SAML_WANT_AUTHN_RESPONSE_SIGNED: "true"
+  OVERLEAF_SAML_USER_ID_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_EMAIL_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+  OVERLEAF_SAML_FIRST_NAME_FIELD: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+  OVERLEAF_SAML_LAST_NAME_FIELD: http://schemas.goauthentik.io/2021/02/saml/username
+  OVERLEAF_SAML_IS_ADMIN_FIELD: http://schemas.xmlsoap.org/claims/Group
+  OVERLEAF_SAML_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_SAML_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+Setiap pengaturan `OVERLEAF_SAML_*` tercantum di [Variabel Lingkungan](/id/on-premises/configuration/overleaf-toolkit/authentication/saml-authentication#environment-variables). Semuanya masuk ke ConfigMap: tidak ada yang merupakan secret itu sendiri. File kunci (`OVERLEAF_SAML_PRIVATE_KEY`, `OVERLEAF_SAML_DECRYPTION_PVK`) masuk ke `overleaf-certs`, dan ConfigMap menyimpan path-nya.
+
+<Warning>
+
+Beri tanda kutip pada `"true"`, `"false"`, dan nilai JSON seperti `OVERLEAF_SAML_AUTHN_CONTEXT: '["urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"]'`. Pengaturan yang bukan boolean atau nilai JSON yang valid membuat strategi SAML gagal dimuat, sementara pod tetap melaporkan siap; login melalui SAML kemudian gagal. Periksa `web.log` setelah setiap perubahan, lihat Tanya Jawab di bawah.
+
+</Warning>
+</Step>
+
+<Step title="Terapkan dan restart">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+Sertifikat dan kunci IdP dibaca saat web dimulai, sehingga sertifikat baru di `overleaf-certs` juga memerlukan restart ini.
+</Step>
+</Steps>
+
+### Beberapa replika
+
+IdP mengembalikan pengguna ke ACS URL dengan `POST` lintas situs. Browser tidak mengirim cookie `SameSite=Lax` bersamanya, sehingga permintaan tersebut tidak membawa cookie sesi Overleaf maupun, di Chrome dan Edge, sticky cookie milik load balancer, dan dapat tiba di replika mana pun. Dengan pengaturan default hal ini tidak masalah: replika yang menerimanya membuat sesi di Redis dan load balancer mempertahankan pengguna di replika tersebut sejak saat itu.
+
+<Warning>
+
+Biarkan `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` tidak diatur (default-nya `never`) saat Anda menjalankan beberapa replika. Dengan `always` atau `ifPresent`, setiap replika mengingat permintaan yang dikirimnya ke IdP di memorinya sendiri, dan respons yang tiba di replika lain ditolak dengan "InResponseTo is not valid": pengguna tertahan di `/saml/login/callback`. Dalam pengujian kami dengan tiga replika dan `always`, 12 dari 19 kasus uji SAML gagal dengan cara ini, sedangkan semuanya lulus dengan nilai default. Dengan satu replika, login SAML juga lulus dengan `always`.
+
+</Warning>
+
+### Diuji di Kubernetes
+
+Dengan goauthentik sebagai IdP (binding HTTP-POST, assertion dan respons yang ditandatangani), di Kubernetes 1.37 dengan tiga replika di belakang HAProxy, pengujian end-to-end kami untuk SAML lulus (19 kasus): admin pertama dari launchpad yang login melalui SAML, login dengan sertifikat IdP dari `overleaf-certs`, pembuatan akun dan login kembali, pemetaan admin berdasarkan grup maupun tanpa pemetaan, nama dan flag admin yang diperbarui pada setiap login, logout melalui IdP, aturan kata sandi untuk akun SAML, dan akun yang ditangguhkan. `OVERLEAF_SAML_VALIDATE_IN_RESPONSE_TO` dibiarkan pada nilai default-nya.
+
+### Tanya Jawab
+
+<Accordion title="Login melalui SAML langsung menampilkan “Something went wrong”">
+
+<strong>Jawaban:</strong> Strategi SAML gagal dimuat. Pod tetap menjadi siap, jadi periksa log web dari setiap pod:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -iE "saml|passport" /var/log/overleaf/web.log | tail
+```
+
+Penyebab umum: `OVERLEAF_SAML_IDP_CERT` mengarah ke file yang tidak ada di `overleaf-certs`, boolean yang bukan `"true"` atau `"false"`, atau JSON yang tidak valid. Jika `EXTERNAL_AUTH` mencantumkan beberapa metode, error seperti ini juga menonaktifkan metode setelah SAML (`ldap`, lalu `saml`, lalu `oidc`).
+
+</Accordion>
+
+<Accordion title="Apakah IdP perlu menjangkau Overleaf, atau Overleaf perlu menjangkau IdP?">
+
+<strong>Jawaban:</strong> Tidak keduanya, untuk login dan logout: IdP dan Overleaf hanya bertukar pesan melalui browser pengguna. Hanya jika Anda mengonfigurasi IdP dengan URL metadata, IdP akan mengunduh `${OVERLEAF_SITE_URL}/saml/meta`.
+
+</Accordion>

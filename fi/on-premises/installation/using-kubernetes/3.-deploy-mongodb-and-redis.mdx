@@ -1,0 +1,217 @@
+---
+title: 3. MongoDB:n ja Redisin käyttöönotto
+description: Aja MongoDB:tä replikajoukkona ja Redisiä pysyvyydellä tai osoita omiin palveluihisi.
+icon: database
+---
+
+Ayakaleaf Pro tarvitsee:
+
+* **MongoDB 8:n** **replikajoukkona** (replica set; se käyttää transaktioita). Kolme jäsentä kolmella solmulla selviää yhden solmun menetyksestä; myös yksi jäsen toimii.
+* **Redis 7:n**, yhden palvelimen AOF-pysyvyydellä. Redis säilyttää muokkaukset, joita ei ole vielä kirjoitettu MongoDB:hen, istunnot sekä Overleaf-palveluiden väliset viestit. Overleaf muodostaa yhteyden yhteen Redis-palvelimeen: Sentineliä ja Redis Clusteria ei tueta.
+
+<Info>
+
+Voit käyttää sen sijaan hallittuja palveluita, kuten MongoDB Atlasta tai pilvipalvelusi Redisiä. Ohita tämä sivu ja aseta `OVERLEAF_MONGO_URL` ja `OVERLEAF_REDIS_HOST` osoittamaan niihin [vaiheessa 4](/fi/on-premises/installation/using-kubernetes/4.-personalizing-your-instance).
+
+</Info>
+
+<Steps>
+<Step title="MongoDB">
+```yaml title="10-mongo.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: overleaf
+spec:
+  clusterIP: None                 # headless: gives mongo-0.mongo, mongo-1.mongo, ...
+  publishNotReadyAddresses: true  # members must resolve each other before the set is initiated
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  namespace: overleaf
+spec:
+  serviceName: mongo
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mongo
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: mongo
+          image: mongo:8.0
+          args:
+            - --replSet=overleaf
+            - --bind_ip_all
+            - --wiredTigerCacheSizeGB=0.25   # default is 50% of (RAM - 1 GB); size it for your nodes
+          # env:
+          #   - name: GLIBC_TUNABLES        # only on kernel 6.19+ (SERVER-121912)
+          #     value: glibc.pthread.rseq=1
+          ports:
+            - containerPort: 27017
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 768Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+# Initiates the replica set once. Safe to re-run: it does nothing when the set exists.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongo-init-replica-set
+  namespace: overleaf
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: mongo:8.0
+          command:
+            - mongosh
+            - --quiet
+            - --host=mongo-0.mongo
+            - --eval
+            - |
+              try {
+                rs.status()
+                print('replica set already initiated')
+              } catch (e) {
+                rs.initiate({
+                  _id: 'overleaf',
+                  members: [
+                    { _id: 0, host: 'mongo-0.mongo.overleaf.svc.cluster.local:27017' },
+                    { _id: 1, host: 'mongo-1.mongo.overleaf.svc.cluster.local:27017' },
+                    { _id: 2, host: 'mongo-2.mongo.overleaf.svc.cluster.local:27017' },
+                  ],
+                })
+              }
+```
+
+```bash
+kubectl apply -f 10-mongo.yaml
+kubectl -n overleaf rollout status statefulset/mongo
+kubectl -n overleaf wait --for=condition=complete job/mongo-init-replica-set --timeout=5m
+kubectl -n overleaf exec mongo-0 -- mongosh --quiet --eval 'rs.status().members.map(m => m.name + " " + m.stateStr)'
+```
+
+Yhden jäsenen pitäisi olla muutaman sekunnin kuluttua `PRIMARY` ja muiden `SECONDARY`. Job yrittää uudelleen, kunnes kaikki jäsenet vastaavat, joten muutama epäonnistunut Job-podi on normaalia.
+
+* Headless-Service tarvitsee asetuksen `publishNotReadyAddresses: true`: jäsenten on löydettävä toisensa nimellä ennen kuin replikajoukko on olemassa.
+* Jäsenet lisätään pysyvillä nimillään (`mongo-0.mongo.overleaf.svc.cluster.local`), ei koskaan podien IP-osoitteilla, jotka muuttuvat jokaisella uudelleenkäynnistyksellä.
+* Yhden jäsenen kokoonpanossa aseta `replicas: 1` ja säilytä Jobissa vain `mongo-0`.
+</Step>
+
+<Step title="Redis">
+```yaml title="20-redis.yaml" wrap
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: overleaf
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: overleaf
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4
+          args: [--appendonly, "yes"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+```
+
+```bash
+kubectl apply -f 20-redis.yaml
+kubectl -n overleaf rollout status statefulset/redis
+```
+</Step>
+</Steps>
+
+### Kysymyksiä ja vastauksia
+
+<Accordion title="MongoDB 8 kaatuu käynnistyessään uudella ytimellä. Miksi?">
+
+<strong>Vastaus:</strong> MongoDB 8 epäonnistuu Linux-ytimellä 6.19 ja sitä uudemmilla ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). Poista kommentointi `GLIBC_TUNABLES`-ympäristömuuttujan kohdalta tiedostossa `10-mongo.yaml`.
+
+</Accordion>
+
+<Accordion title="Kuinka paljon muistia MongoDB tarvitsee?">
+
+<strong>Vastaus:</strong> Oletuksena MongoDB käyttää välimuistiinsa puolet solmun muistista miinus 1 Gt, ja se näkee solmun muistin, ei podin rajaa. Aseta `--wiredTigerCacheSizeGB` solmuillesi sopivaksi; arvolla `0.25` kukin jäsen pysyi noin 200–260 MiB:ssä 4 Gt:n testisolmuillamme.
+
+</Accordion>

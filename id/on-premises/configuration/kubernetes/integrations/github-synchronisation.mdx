@@ -1,0 +1,67 @@
+---
+title: Sinkronisasi GitHub
+description: Izinkan pengguna menyinkronkan proyek mereka dengan repositori GitHub atau GitHub Enterprise pada deployment Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/github.svg
+---
+
+Sinkronisasi GitHub berjalan di layanan **web** (modul `github-sync`) pada setiap pod Ayakaleaf Pro. Fitur ini memerlukan [integrasi Git](/id/on-premises/configuration/kubernetes/integrations/git-integration). Buat aplikasi OAuth dan baca fungsi setiap pengaturan di [Sinkronisasi GitHub](/id/on-premises/configuration/overleaf-toolkit/integrations/github-synchronisation); halaman ini menerapkannya ke Kubernetes.
+
+| | |
+| --- | --- |
+| Layanan | web (modul `github-sync`), di setiap pod Ayakaleaf Pro; dibaca saat web dimulai |
+| Pod → GitHub | `https://api.github.com` (REST dan GraphQL), atau API dari `GITHUB_SYNC_URL`, setiap kali pengguna menautkan, mengimpor, mengekspor, atau menyinkronkan |
+| Browser → GitHub | `https://github.com/login/oauth/authorize` untuk menautkan akun, lalu kembali ke `${OVERLEAF_SITE_URL}/user/github-sync/oauth2/callback` |
+| GitHub → Overleaf | tidak ada: tanpa webhook, instance tidak perlu dapat dijangkau dari GitHub |
+| Data tersimpan | token akses GitHub pengguna, terenkripsi, di MongoDB |
+| Tugas berkala | tidak ada: sinkronisasi terjadi saat pengguna mengklik |
+
+### Konfigurasi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITHUB_SYNC_ENABLED: "true"
+  GITHUB_SYNC_CLIENT_ID: <client ID>
+  # GitHub Enterprise: its web address
+  # GITHUB_SYNC_URL: https://github.example.com
+  # optional: send the module's requests to GitHub through an HTTP proxy
+  # GITHUB_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` dan StatefulSet git-bridge dari [integrasi Git](/id/on-premises/configuration/kubernetes/integrations/git-integration) harus sudah tersedia: tanpa keduanya, pengaturan akun dan editor menyembunyikan Sinkronisasi GitHub.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITHUB_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITHUB_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITHUB_TOKEN_CIPHER_PASSWORD` mengenkripsi token akses GitHub pengguna di MongoDB. Setiap replika harus menggunakan nilai yang sama, dan mengubahnya di kemudian hari membuat setiap pengguna harus menautkan GitHub lagi.
+</Step>
+
+<Step title="CA privat (opsional)">
+Jika GitHub Anda memiliki sertifikat dari CA Anda sendiri, tambahkan CA tersebut ke Secret `overleaf-certs` yang di-mount di `/var/lib/overleaf/certs` (lihat [Sertifikat dan file lainnya](/id/on-premises/configuration/kubernetes#sertifikat-dan-file-lainnya)) dan atur `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` di ConfigMap.
+</Step>
+
+<Step title="Terapkan, mulai ulang, dan periksa">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://api.github.com
+done
+```
+
+Status HTTP apa pun berarti GitHub dapat dijangkau dari pod tersebut; `000` berarti tidak dapat dijangkau.
+</Step>
+</Steps>
+
+### Beberapa replika
+
+Tidak ada yang perlu ditambahkan selain `GITHUB_TOKEN_CIPHER_PASSWORD` yang sama. Sebuah sinkronisasi mengambil lock di Redis, yang dibagi dengan sinkronisasi Git lainnya, sehingga dua replika tidak pernah menyinkronkan proyek yang sama secara bersamaan.
+
+### Diuji di Kubernetes
+
+Terhadap mock github.com beserta API REST dan GraphQL-nya (dipercaya melalui `NODE_EXTRA_CA_CERTS` dari `overleaf-certs`), di Kubernetes 1.37 dengan satu replika dan integrasi Git aktif, pengujian end-to-end kami untuk Sinkronisasi GitHub lulus (31 kasus): menautkan dan memutus tautan akun, token yang dicabut, mengekspor proyek ke repositori privat atau organisasi baru, mengimpor repositori (juga yang melebihi batas unggahan), pull dan push, merge, konflik dan merge manual, branch yang dihapus dan di-force-push, file biner, penggantian nama dan penghapusan, kehilangan akses push, serta apa yang boleh dilakukan pemilik, editor, dan penampil.

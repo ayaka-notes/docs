@@ -1,0 +1,56 @@
+---
+title: Integrasi Mendeley
+description: Izinkan pengguna mengimpor file .bib dari pustaka Mendeley mereka pada deployment Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+Impor Mendeley berjalan di layanan **web** (modul `tpr-webmodule`) pada setiap pod Ayakaleaf Pro. Daftarkan aplikasi Mendeley seperti di [Integrasi Mendeley](/id/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration), dengan URL redirect `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`, lalu konfigurasikan Kubernetes seperti di bawah ini.
+
+| | |
+| --- | --- |
+| Layanan | web, di setiap pod Ayakaleaf Pro; dibaca saat web dimulai |
+| Pod → Mendeley | `https://api.mendeley.com` (token OAuth dan API), saat pengguna menautkan Mendeley atau mengimpor atau memperbarui file |
+| Browser → Mendeley | `https://api.mendeley.com/oauth/authorize`, lalu kembali ke URL redirect |
+| Mendeley → Overleaf | tidak ada: instance tidak perlu dapat dijangkau dari internet |
+| Data tersimpan | token Mendeley pengguna, terenkripsi, di MongoDB |
+| Tugas berkala | tidak ada: file hanya diperbarui saat pengguna memintanya |
+
+### Konfigurasi
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+Beri tanda kutip pada ID aplikasi: nilainya berupa angka, dan ConfigMap hanya menyimpan string. `ENABLED_LINKED_FILE_TYPES` menggantikan nilai dari instalasi; pertahankan jenis yang sudah Anda miliki dan tambahkan `mendeley` (dan `zotero`, jika Anda menggunakan keduanya).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`MENDELEY_CIPHER_PASSWORD` mengenkripsi token Mendeley pengguna di MongoDB. Tanpanya, setiap pod membuat file kunci di `/var/lib/overleaf/data` miliknya sendiri. Dengan [beberapa replika](/id/on-premises/configuration/kubernetes/horizontal-scaling), setiap node kemudian memiliki kunci yang berbeda, dan pengguna yang dilayani oleh replika lain tidak dapat menggunakan akun Mendeley yang telah ditautkannya. Atur nilai ini sebelum pengguna pertama menautkan Mendeley: mengubahnya di kemudian hari membuat setiap pengguna harus menautkan Mendeley lagi.
+</Step>
+
+<Step title="Terapkan dan mulai ulang">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### Beberapa replika
+
+Atur `MENDELEY_CIPHER_PASSWORD` di Secret, lihat di atas. Token Mendeley dienkripsi oleh kode yang sama dengan kunci Zotero: tanpa kata sandi tersebut, file yang diimpor di satu replika tidak dapat diperbarui di replika lain, seperti yang kami lihat pada [Zotero](/id/on-premises/configuration/kubernetes/integrations/zotero-integration#several-replicas). `state` OAuth disimpan di sesi di Redis, sehingga callback dapat mencapai replika mana pun.
+
+### Diuji di Kubernetes
+
+Terhadap mock api.mendeley.com (dipercaya melalui `NODE_EXTRA_CA_CERTS` dari `overleaf-certs`), di Kubernetes 1.37 dengan tiga replika di belakang HAProxy, pengujian end-to-end kami untuk Mendeley lulus (18 kasus): menautkan melalui OAuth 2.0 dan memutus tautan, mengimpor pustaka dan grup ke dalam file `.bib`, memperbaruinya, memperbarui token akses yang akan kedaluwarsa, token yang dicabut, permintaan untuk menautkan lagi, referensi yang dapat dicari oleh kolaborator, hanya pengimpor yang boleh memperbarui, error API, dan koneksi lambat ke Mendeley.

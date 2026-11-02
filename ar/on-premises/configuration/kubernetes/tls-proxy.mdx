@@ -1,0 +1,87 @@
+---
+title: وكيل TLS
+description: قدّم نشرًا قائمًا على Kubernetes عبر HTTPS من خلال ingress أو موازن أحمال أو HAProxy.
+icon: lock
+---
+
+داخل الـ pod، يقدّم nginx الخاص بالحاوية HTTP عاديًا على المنفذ 80. أما HTTPS فينتهي أمام الـ pods: في متحكّم الـ ingress لديك، أو في موازن الأحمال السحابي لديك، أو في HAProxy كما في [التوسّع الأفقي](/ar/on-premises/configuration/kubernetes/horizontal-scaling). لا يوجد مقابل لوكيل NGINX الخاص بـ Toolkit ‏(`bin/init --tls`، و`NGINX_*` و`TLS_*` في `overleaf.rc`)؛ راجع [وكيل TLS](/ar/on-premises/configuration/overleaf-toolkit/tls-proxy) بالنسبة إلى Toolkit.
+
+| | |
+| --- | --- |
+| الخدمة | الـ ingress أو موازن الأحمال لديك؛ وتقرأ web الإعدادات أدناه عند بدء تشغيلها |
+| المتصفح ← الوكيل | HTTPS على المنفذ 443، بما في ذلك WebSocket الخاص بالمحرّر |
+| الوكيل ← الـ pods | HTTP عادي إلى المنفذ 80 في الـ pods |
+| المهام الدورية | لا شيء (تجديد الشهادات من مسؤولية الوكيل لديك) |
+
+### ما يجب على الوكيل فعله
+
+* تمرير اتصالات WebSocket ‏(`/socket.io`).
+* السماح بطلبات مدتها 10 دقائق (عمليات الترجمة الطويلة) وأجسام طلبات بحجم 50 MB (عمليات الرفع)، أو `MAX_UPLOAD_SIZE`.
+* إبقاء مهلة keep-alive للاتصالات الخاملة نحو الـ pods أقل من 65 ثانية، وهي مهلة nginx داخل الـ pod.
+* إرسال `X-Forwarded-For` و`X-Forwarded-Proto: https`.
+* مع عدة نسخ متماثلة، إبقاء المستخدم على نسخة متماثلة واحدة، راجع [التوسّع الأفقي](/ar/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+من دون `X-Forwarded-Proto: https` من عنوان موثوق، يعتقد Ayakaleaf Pro أن الطلبات تصل عبر HTTP ولا يضبط ملف تعريف ارتباط الجلسة الآمن: فتفشل عمليات تسجيل الدخول عندئذٍ. اضبط `OVERLEAF_SECURE_COOKIE` فقط عندما يصل المستخدمون فعلًا إلى الموقع عبر HTTPS؛ فأي قيمة تفعّله، حتى `"false"`.
+
+### مثال على HAProxy
+
+لإنهاء HTTPS في الـ DaemonSet الخاص بـ HAProxy من [التوسّع الأفقي](/ar/on-premises/configuration/kubernetes/horizontal-scaling)، ضع الشهادة ومفتاحها في ملف PEM واحد وفي Secret:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+ثم عدّل `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+غيّر قيمة `config-hash` حتى يُعاد تشغيل HAProxy، ثم اضبط الـ ConfigMap كما هو موضّح أعلاه وأعد تشغيل النسخ المتماثلة.
+
+تحافظ إعادة التوجيه على منفذ الطلب: وهذا يناسب موازن أحمال على المنفذين 80 و443، لكنها على منافذ NodePort ترسل `http://host:30081` إلى `https://host:30081`. ومن دون موازن أحمال في المقدّمة، احذف سطر إعادة التوجيه وأعطِ المستخدمين العنوان `https://...:30443`.
+
+### الاختبار على Kubernetes
+
+على Kubernetes 1.37 مع ثلاث نسخ متماثلة وHAProxy يُنهي HTTPS كما هو موضّح أعلاه، ومع ضبط `OVERLEAF_SITE_URL` على `https://` وضبط `OVERLEAF_SECURE_COOKIE`: فعّل المستخدمون حساباتهم عبر روابط `https://`، وسجّلوا الدخول بملف تعريف ارتباط جلسة مُعلَّم بـ `Secure`، ورفعوا المشاريع وترجموها مع جلب ملف PDF، وبقوا على نسختهم المتماثلة، وفتحوا WebSocket الخاص بالمحرّر (`wss`)، واستنسخوا ودفعوا باستخدام Git عبر HTTPS. أما طلبات `http://` على منفذ NodePort فقد أُعيد توجيهها إلى `https://` مع المنفذ نفسه، كما هو موضّح أعلاه.

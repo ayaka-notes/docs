@@ -1,0 +1,56 @@
+---
+title: Zotero 集成
+description: 在 Kubernetes 部署中让用户从其 Zotero 文献库导入 .bib 文件。
+icon: z
+---
+
+Zotero 导入运行在每个 Ayakaleaf Pro pod 的 **web** 服务（`tpr-webmodule` 模块）中。请按照 [Zotero 集成](/zh-Hans/on-premises/configuration/overleaf-toolkit/integrations/zotero-integration) 中的说明注册 Zotero OAuth 客户端，回调 URL 为 `${OVERLEAF_SITE_URL}/user/zotero/oauth/callback`，然后按如下方式配置 Kubernetes。
+
+| | |
+| --- | --- |
+| 服务 | web，位于每个 Ayakaleaf Pro pod 中；在 web 启动时读取 |
+| Pod → Zotero | 当用户关联 Zotero 或导入、刷新文件时，访问 `https://www.zotero.org/oauth/*` 和 `https://api.zotero.org` |
+| 浏览器 → Zotero | 访问 `https://www.zotero.org/oauth/authorize`，然后返回回调 URL |
+| Zotero → Overleaf | 无：实例无需能从互联网访问 |
+| 存储的数据 | 用户的 Zotero 密钥，加密后存储在 MongoDB 中 |
+| 定期任务 | 无：仅在用户请求时才刷新文件 |
+
+### 配置
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,zotero
+  ZOTERO_CLIENT_ID: <client key>
+  # optional: send the module's requests to Zotero through an HTTP proxy
+  # ZOTERO_PROXY_URL: http://proxy.example.com:3128
+```
+
+`ENABLED_LINKED_FILE_TYPES` 会替换安装时设定的值；请保留你已有的类型并添加 `zotero`（如果两者都使用，还需添加 `mendeley`）。
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "ZOTERO_CLIENT_SECRET":"<client secret>",
+  "ZOTERO_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`ZOTERO_CIPHER_PASSWORD` 用于加密 MongoDB 中用户的 Zotero 密钥。如果不设置，每个 pod 会在其自身的 `/var/lib/overleaf/data` 中生成一个密钥文件。在使用[多个副本](/zh-Hans/on-premises/configuration/kubernetes/horizontal-scaling)时，每个节点的密钥都不同，由其他副本提供服务的用户将无法使用其已关联的 Zotero 账户。请在第一位用户关联 Zotero 之前设置它：之后若更改该值，所有用户都需要重新关联 Zotero。
+</Step>
+
+<Step title="应用并重启">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### 多个副本
+
+请在 Secret 中设置 `ZOTERO_CIPHER_PASSWORD`，见上文。如果不设置，在一个副本上导入的文件无法在另一个副本上刷新：刷新会失败并提示 "The remote service produced an error"，因为该副本的密钥文件无法解密用户的 Zotero 密钥。在 Secret 中设置该密码后，它在每个副本上都能正常工作；我们通过在 `overleaf-0` 上导入并在 `overleaf-1` 上刷新测试了这两种情况。OAuth 握手将其状态保存在 Redis 中的会话里，因此回调可以到达任意副本。
+
+### 在 Kubernetes 上的测试
+
+我们针对 www.zotero.org 和 api.zotero.org 的模拟服务（通过来自 `overleaf-certs` 的 `NODE_EXTRA_CA_CERTS` 信任），在 Kubernetes 1.37 上以三个副本部署于 HAProxy 之后进行测试，Zotero 的端到端测试全部通过（18 个用例）：通过 OAuth 1.0a 关联和取消关联、将文献库和群组导入到 `.bib` 文件、刷新该文件、在 Zotero 上撤销密钥、提示重新关联、协作者可搜索参考文献、仅导入者可以刷新、API 错误，以及与 Zotero 的慢速连接。

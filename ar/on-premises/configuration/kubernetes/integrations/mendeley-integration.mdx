@@ -1,0 +1,56 @@
+---
+title: تكامل Mendeley
+description: اسمح للمستخدمين باستيراد ملف .bib من مكتبتهم في Mendeley في نشر قائم على Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/mendeley.svg
+---
+
+يعمل الاستيراد من Mendeley داخل خدمة **web** (الوحدة `tpr-webmodule`) في كل pod من Ayakaleaf Pro. سجّل تطبيق Mendeley كما هو موضّح في [تكامل Mendeley](/ar/on-premises/configuration/overleaf-toolkit/integrations/mendeley-integration)، مع عنوان إعادة التوجيه `${OVERLEAF_SITE_URL}/user/mendeley/oauth/callback`، ثم اضبط Kubernetes كما يلي.
+
+| | |
+| --- | --- |
+| الخدمة | web، في كل pod من Ayakaleaf Pro؛ تُقرأ عند بدء تشغيل web |
+| Pod → Mendeley | `https://api.mendeley.com` (رمز OAuth وواجهة API)، عندما يربط مستخدم حساب Mendeley أو يستورد ملفًا أو يحدّثه |
+| المتصفح ← Mendeley | `https://api.mendeley.com/oauth/authorize`، ثم العودة إلى عنوان إعادة التوجيه |
+| Mendeley → Overleaf | لا شيء: لا يلزم أن يكون المثيل قابلًا للوصول من الإنترنت |
+| البيانات المخزّنة | رموز Mendeley الخاصة بالمستخدم، مشفّرة، في MongoDB |
+| المهام الدورية | لا شيء: لا يُحدَّث الملف إلا عندما يطلب المستخدم ذلك |
+
+### الإعداد
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (changes)"
+  ENABLED_LINKED_FILE_TYPES: project_file,project_output_file,url,mendeley
+  MENDELEY_CLIENT_ID: "<application ID>"
+  # optional: send the module's requests to Mendeley through an HTTP proxy
+  # MENDELEY_PROXY_URL: http://proxy.example.com:3128
+```
+
+ضع معرّف التطبيق بين علامتي اقتباس: فهو رقم، والـ ConfigMap لا يحتوي إلا على سلاسل نصية. يستبدل `ENABLED_LINKED_FILE_TYPES` القيمة الواردة من التثبيت؛ لذا احتفظ بالأنواع الموجودة لديك وأضف `mendeley` (و`zotero`، إذا كنت تستخدم كليهما).
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "MENDELEY_CLIENT_SECRET":"<secret>",
+  "MENDELEY_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+يشفّر `MENDELEY_CIPHER_PASSWORD` رموز Mendeley الخاصة بالمستخدمين في MongoDB. ومن دونه، يُنشئ كل pod ملف مفتاح في مجلد `/var/lib/overleaf/data` الخاص به. ومع [عدة نسخ متماثلة](/ar/on-premises/configuration/kubernetes/horizontal-scaling) يصبح لكل عقدة مفتاح مختلف، ولا يستطيع المستخدم الذي تخدمه نسخة متماثلة أخرى استخدام حساب Mendeley المرتبط به. اضبطه قبل أن يربط أول مستخدم حساب Mendeley: فتغييره لاحقًا يُلزم كل مستخدم بربط Mendeley من جديد.
+</Step>
+
+<Step title="التطبيق وإعادة التشغيل">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+اضبط `MENDELEY_CIPHER_PASSWORD` في الـ Secret، كما هو موضّح أعلاه. تُشفَّر رموز Mendeley بالشيفرة نفسها التي تُشفَّر بها مفاتيح Zotero: فمن دون كلمة المرور، لا يمكن تحديث ملف مستورد على نسخة متماثلة من نسخة متماثلة أخرى، كما رأينا مع [Zotero](/ar/on-premises/configuration/kubernetes/integrations/zotero-integration#عدة-نسخ-متماثلة). تُحفظ قيمة `state` الخاصة بـ OAuth في الجلسة داخل Redis، لذا يمكن أن يصل الاستدعاء الراجع (callback) إلى أي نسخة متماثلة.
+
+### الاختبار على Kubernetes
+
+في مقابل محاكاة لـ api.mendeley.com (موثوق بها عبر `NODE_EXTRA_CA_CERTS` من `overleaf-certs`)، وعلى Kubernetes 1.37 مع ثلاث نسخ متماثلة خلف HAProxy، تنجح اختباراتنا الشاملة (end-to-end) لـ Mendeley (18 حالة): الربط عبر OAuth 2.0 وإلغاء الربط، واستيراد المكتبة والمجموعات إلى ملف `.bib`، وتحديثه، وتحديث رمز وصول على وشك الانتهاء، والرموز المُلغاة، وطلب الربط من جديد، وإمكانية البحث في المراجع من قِبل المتعاونين، واقتصار التحديث على من قام بالاستيراد، وأخطاء واجهة API، والاتصالات البطيئة بـ Mendeley.

@@ -1,0 +1,129 @@
+---
+title: مصادقة OIDC
+description: اسمح للمستخدمين بتسجيل الدخول عبر موفّر OpenID Connect في نشر على Kubernetes.
+icon: id-card-clip
+---
+
+تتولى خدمة **web** (وحدة `authentication`) تسجيل الدخول عبر OIDC داخل كل Pod من Pods ‏Ayakaleaf Pro. لا توجد لها مهمة في الخلفية ولا Pod منفصل. جانب الموفّر (العميل، وعناوين URI لإعادة التوجيه، وادعاء المسؤول) هو نفسه كما في Toolkit، لذا أعدّ موفّر OpenID ‏(OP) الخاص بك أولًا باتباع [مصادقة OIDC](/ar/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication)، ثم ضع القيم في Kubernetes كما هو موضح أدناه.
+
+### أين تعمل المكوّنات
+
+| | |
+| --- | --- |
+| الخدمة | web، في كل Pod من Pods ‏Ayakaleaf Pro؛ تُقرأ الإعدادات عند بدء تشغيل web |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` و`OVERLEAF_OIDC_USER_INFO_URL`، عند كل تسجيل دخول |
+| المتصفح → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`، و`OVERLEAF_OIDC_LOGOUT_URL` عند تسجيل الخروج |
+| OP → Overleaf | لا شيء: يكتفي الـ OP بإعادة توجيه المتصفح |
+| حالة تسجيل الدخول | الجلسة في Redis، مشتركة بين جميع النسخ المتماثلة |
+| المهام الدورية | لا توجد |
+
+### الإعداد
+
+<Steps>
+<Step title="سجّل Overleaf لدى الـ OP">
+اسمح بهذه العناوين في الـ OP، وهي مبنية على `OVERLEAF_SITE_URL`:
+
+| الغرض | URI |
+| --- | --- |
+| عنوان URI لإعادة التوجيه (تسجيل الدخول) | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| عنوان URI لإعادة التوجيه بعد تسجيل الخروج | `${OVERLEAF_SITE_URL}` |
+| عنوان URI لإعادة التوجيه بعد تسجيل الخروج، بعد ربط حساب موجود | `${OVERLEAF_SITE_URL}/user/settings` |
+
+اعثر على عناوين URL الخمسة في مستند الاكتشاف (discovery document) الخاص بالـ OP كما هو موضح في [العثور على القيم باستخدام مستند الاكتشاف](/ar/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document).
+</Step>
+
+<Step title="أضف الإعدادات إلى الـ ConfigMap">
+أضف ما يلي إلى `overleaf-env` (‏`30-config.yaml`، أو `60-config.yaml` في حالة [عدة نسخ متماثلة](/ar/on-premises/configuration/kubernetes/horizontal-scaling)):
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+يقبل `EXTERNAL_AUTH` قائمة مفصولة بمسافات، مثل `ldap oidc`. راجع [متغيرات البيئة](/ar/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables) لمعرفة كل إعدادات `OVERLEAF_OIDC_*`؛ وكلها توضع في الـ ConfigMap باستثناء سر العميل.
+
+<Warning>
+
+ضع `"true"` و`"false"` بين علامتي اقتباس: فالـ ConfigMap لا يحتوي إلا على سلاسل نصية. المفتاح المضبوط على `""` ليس كالمفتاح المفقود: يؤدي `OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` إلى تعطيل إنشاء الحسابات عند أول تسجيل دخول، بينما يسمح حذف المفتاح بكل النطاقات.
+
+</Warning>
+</Step>
+
+<Step title="ضع سر العميل في الـ Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="الوثوق بجهة شهادات خاصة (اختياري)">
+إذا كانت شهادة الـ OP صادرة عن جهة شهادات (CA) خاصة بك، فأضف جهة الشهادات إلى الـ Secret ‏`overleaf-certs` المركّب على `/var/lib/overleaf/certs` (راجع [الشهادات والملفات الأخرى](/ar/on-premises/configuration/kubernetes#الشهادات-والملفات-الأخرى)) ووجّه Node.js إليها:
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="طبّق التغييرات وأعد التشغيل">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+ثم تحقّق من أن كل Pod يصل إلى نقطة نهاية token. فالـ Pods هي التي تستدعيها، لا المتصفح، لذا لا تظهر مشكلة جدار الحماية أو DNS إلا هنا:
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+أي رمز حالة HTTP (‏`405` لطلب GET) يعني أنه يمكن الوصول إلى نقطة النهاية؛ أما `000` فيعني أنه لا يمكن الوصول إليها.
+</Step>
+</Steps>
+
+### عدة نسخ متماثلة
+
+لا حاجة إلى شيء إضافي. تُحفظ قيمة `state` الخاصة بتسجيل الدخول ورمز ID token المستخدم لتسجيل الخروج في الجلسة، الموجودة في Redis، لذا يعمل الاستدعاء الراجع (callback) على أي نسخة متماثلة تستقبله.
+
+### الاختبار على Kubernetes
+
+مع goauthentik بوصفه الـ OP، على Kubernetes 1.37 مع ثلاث نسخ متماثلة خلف HAProxy، نجحت اختباراتنا الشاملة لـ OIDC ‏(35 حالة): تسجيل الدخول، وتسجيل الخروج عبر الـ OP؛ وربط صلاحية المسؤول حسب المجموعة، وحسب البريد الإلكتروني، وحسب قيمة واحدة، ودون ربط؛ وتحديث الاسم وعلامة المسؤول عند كل تسجيل دخول؛ وربط الحسابات وإلغاء ربطها؛ وإعادة تعيين كلمة المرور وتغيير كلمات مرور حسابات OIDC؛ والحسابات المعلّقة؛ و`OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`؛ و`OVERLEAF_DISABLE_LOCAL_LOGIN`؛ وOIDC مع الوصول العام.
+
+### أسئلة وأجوبة
+
+<Accordion title="يفشل تسجيل الدخول مع الرسالة «Unable to verify authorization request state»">
+
+<strong>الإجابة:</strong> لم يُرسل المتصفح ملف تعريف ارتباط الجلسة مع الاستدعاء الراجع. على Kubernetes، الأسباب المعتادة هي:
+
+* `OVERLEAF_SECURE_COOKIE` مضبوط، لكن المستخدمين يفتحون الموقع عبر HTTP العادي، فلا يخزّن المتصفح ملف تعريف الارتباط أبدًا. أي قيمة لـ `OVERLEAF_SECURE_COOKIE`، حتى `"false"`، تفعّل ملفات تعريف الارتباط الآمنة؛ احذف المفتاح بدلًا من ذلك.
+* يُفتح الموقع تحت عنوان مختلف عن `OVERLEAF_SITE_URL`.
+* خلف HTTPS، لا يرسل الـ Ingress أو موازن الأحمال لديك `X-Forwarded-Proto: https`، أو أن عنوانه غير موجود في `OVERLEAF_TRUSTED_PROXY_IPS`.
+
+</Accordion>
+
+<Accordion title="أين أرى سبب فشل تسجيل الدخول؟">
+
+<strong>الإجابة:</strong> في سجل web الخاص بالـ Pod الذي خدم الطلب، وليس في `kubectl logs`:
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+مع عدة نسخ متماثلة، تحقّق من كل `overleaf-N`.
+
+</Accordion>

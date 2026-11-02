@@ -1,0 +1,65 @@
+---
+title: التكامل مع الذكاء الاصطناعي
+description: اضبط محادثة الذكاء الاصطناعي واقتراحات أخطاء LaTeX والحصص وخدمات البحث في نشر على Kubernetes.
+icon: https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/brands/openai.svg
+---
+
+يعمل مساعد الذكاء الاصطناعي ومساعد أخطاء LaTeX في خدمة **web** (الوحدتان `workbench` و`error-assistant`) في كل Pod من Pods ‏Ayakaleaf Pro. يُشرح ما يفعله كل إعداد، ووصول المستخدمين، والحصص في [التكامل مع الذكاء الاصطناعي](/ar/on-premises/configuration/overleaf-toolkit/integrations/ai-integration)؛ أما هذه الصفحة فتشرح وضعه في Kubernetes.
+
+| | |
+| --- | --- |
+| الخدمة | web، في كل Pod من Pods ‏Ayakaleaf Pro؛ تُقرأ عند بدء تشغيل web. تمر الأداة `web_fetch` عبر linked-url-proxy في الـ Pod نفسه |
+| Pod → الخارج | `AI_BASE_URL`؛ و`WEB_SEARCH_URL` (القيمة الافتراضية `https://api.tavily.com/search`) و`DOCS_MCP_URL` إذا كان البحث مفعّلًا؛ والصفحات التي يقرؤها النموذج باستخدام `web_fetch` |
+| الخارج → Overleaf | لا شيء |
+| الحالة | عدّادات حصص الرموز (tokens) في Redis، مشتركة بين جميع النسخ المتماثلة؛ ويبقى سجل المحادثة في المتصفح |
+| المهام الدورية | لا توجد |
+
+### الإعداد
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)" wrap
+  AI_ENABLED: "true"
+  AI_BASE_URL: https://ai-gateway.example.com/v1
+  AI_MODEL: YOUR_TEXT_MODEL_ID
+  # optional, see the Toolkit page
+  # AI_IMAGE_MODEL: YOUR_IMAGE_CAPABLE_MODEL_ID
+  # AI_PDF_MODEL: YOUR_PDF_CAPABLE_MODEL_ID
+  # AI_TOKEN_QUOTA: "200000"
+  # AI_TOKEN_QUOTA_PERIOD: month
+  # AI_PROXY_URL: http://proxy.example.com:3128
+```
+
+يجب أن تكون قيمة `AI_ENABLED` هي `"true"` بالضبط. لا يظهر المساعد إلا عند ضبط `AI_ENABLED` و`AI_BASE_URL` و`AI_MODEL` و`AI_API_KEY` جميعها.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "AI_API_KEY":"<gateway key>",
+  "TAVILY_API_KEY":"<search key, optional>"}}'
+```
+</Step>
+
+<Step title="طبّق التغييرات وأعد التشغيل وتحقّق من البوابة من كل Pod">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://ai-gateway.example.com/v1/models
+done
+```
+
+أي رمز حالة HTTP يعني أنه يمكن الوصول إلى البوابة؛ أما `000` فيعني أنه لا يمكن الوصول إليها.
+</Step>
+</Steps>
+
+تجلب الأداة `web_fetch` الصفحات عبر الوكيل نفسه المستخدم لملفات [عنوان URL خارجي](/ar/on-premises/configuration/kubernetes/external-url)، لذا تحدّ إعدادات `OVERLEAF_LINKED_URL_*` أيضًا مما يمكن للنموذج قراءته.
+
+### عدة نسخ متماثلة
+
+لا حاجة إلى شيء إضافي. تُحتسب حصة الرموز في Redis، لذا يكون استخدام المستخدم هو نفسه على كل نسخة متماثلة، وتسري إعادة التعيين التي يجريها المسؤول في كل مكان.
+
+### الاختبار على Kubernetes
+
+مقابل نسخ محاكاة (mocks) لبوابة متوافقة مع OpenAI، وTavily، ونقطة نهاية MCP الخاصة بـ GitBook (موثوقة عبر `NODE_EXTRA_CA_CERTS` من `overleaf-certs`)، على Kubernetes 1.37، نجحت اختباراتنا الشاملة: بالنسبة إلى مساعد الذكاء الاصطناعي على ثلاث نسخ متماثلة خلف HAProxy ‏(31 حالة)، المحادثات مع استدعاءات الأدوات والتعديلات المقترحة، والبحث في الويب والوثائق، وقراءة صفحات الويب عبر linked-url-proxy مقيّدةً بـ `OVERLEAF_LINKED_URL_ALLOWED_RESOURCES`، ومرفقات الصور وملفات PDF، والموافقة، وحصة الرموز المحتسبة في Redis، وتعطيل الذكاء الاصطناعي لمستخدم وللنسخة كلها، والاتصالات البطيئة بالبوابة؛ وبالنسبة إلى مساعد الأخطاء على نسخة متماثلة واحدة (15 حالة)، الإصلاحات المقترحة، والموافقة، وحصة الرموز المشتركة، وتعطيل الذكاء الاصطناعي.

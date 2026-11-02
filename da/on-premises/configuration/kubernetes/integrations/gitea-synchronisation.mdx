@@ -1,0 +1,67 @@
+---
+title: Gitea-synkronisering
+description: Lad brugere synkronisere deres projekter med repositories på Gitea.com eller din egen Gitea på en Kubernetes-udrulning.
+icon: mug-hot
+---
+
+Gitea-synkronisering kører i **web**-tjenesten (modulet `gitea-sync`) i hver Ayakaleaf Pro-pod. Den kræver [Git-integrationen](/da/on-premises/configuration/kubernetes/integrations/git-integration). Opret OAuth-applikationen, og læs, hvad hver indstilling gør, i [Gitea-synkronisering](/da/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); denne side lægger det ind i Kubernetes.
+
+| | |
+| --- | --- |
+| Tjeneste | web (modulet `gitea-sync`), i hver Ayakaleaf Pro-pod; læses, når web starter |
+| Pod → Gitea | REST-API'et for `GITEA_SYNC_URL` (standard `https://gitea.com/api/v1`), hver gang en bruger tilknytter, importerer, eksporterer eller synkroniserer |
+| Browser → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` for at tilknytte en konto, derefter tilbage til `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | ingen: ingen webhook, instansen behøver ikke at kunne nås fra Gitea |
+| Lagrede data | brugerens Gitea-adgangs- og refresh-tokens, krypteret, i MongoDB |
+| Periodiske job | ingen: synkronisering sker, når en bruger klikker |
+
+### Konfiguration
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` og git-bridge-StatefulSet'et fra [Git-integration](/da/on-premises/configuration/kubernetes/integrations/git-integration) skal være på plads: uden dem skjuler kontoindstillingerne og editoren Gitea-synkronisering.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` krypterer brugernes Gitea-adgangs- og refresh-tokens i MongoDB. Hver replika skal bruge den samme værdi, og hvis den ændres senere, skal alle brugere tilknytte Gitea igen.
+</Step>
+
+<Step title="Privat CA (valgfrit)">
+Hvis din Gitea har et certifikat fra din egen CA, skal du tilføje CA'en til Secret'en `overleaf-certs`, der er monteret på `/var/lib/overleaf/certs` (se [Certifikater og andre filer](/da/on-premises/configuration/kubernetes#certifikater-og-andre-filer)), og sætte `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` i ConfigMap'en.
+</Step>
+
+<Step title="Anvend, genstart og tjek">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Enhver HTTP-status betyder, at Gitea kan nås fra den pod; `000` betyder, at den ikke kan.
+</Step>
+</Steps>
+
+### Flere replikaer
+
+Intet ekstra ud over den delte `GITEA_TOKEN_CIPHER_PASSWORD`. En synkronisering tager en lås i Redis, delt med de andre Git-synkroniseringer, så to replikaer aldrig synkroniserer det samme projekt samtidig.
+
+### Testet på Kubernetes
+
+Mod en rigtig Gitea 1.23 på `GITEA_SYNC_URL`, på Kubernetes 1.37 med én replika og Git-integrationen slået til, består vores end-to-end-test for Gitea-synkronisering (39 tilfælde): tilknytning og fjernelse af tilknytning af kontoen via Giteas OAuth2, fornyelse af det udløbende adgangstoken og tilbagekaldte tilladelser, eksport til et nyt privat repository eller organisations-repository, import af et repository, pull og push, merges, konflikter, slettede og force-pushede branches, binære filer, omdøbninger og sletninger samt hvad ejere, redaktører og læsere må gøre.

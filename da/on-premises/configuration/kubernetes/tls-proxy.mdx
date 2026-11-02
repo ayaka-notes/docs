@@ -1,0 +1,87 @@
+---
+title: TLS-proxy
+description: Server en Kubernetes-installation over HTTPS via en ingress, en load balancer eller HAProxy.
+icon: lock
+---
+
+Inde i poden serverer containerens nginx almindelig HTTP på port 80. HTTPS termineres foran podsene: i din ingress controller, din cloud-load balancer eller HAProxy som under [Horisontal skalering](/da/on-premises/configuration/kubernetes/horizontal-scaling). Toolkit'ets NGINX-proxy (`bin/init --tls`, `NGINX_*` og `TLS_*` i `overleaf.rc`) har intet modstykke; se [TLS-proxy](/da/on-premises/configuration/overleaf-toolkit/tls-proxy) for Toolkit.
+
+| | |
+| --- | --- |
+| Tjeneste | din ingress eller load balancer; web læser indstillingerne nedenfor, når den starter |
+| Browser → proxy | HTTPS på 443, inklusive editorens WebSocket |
+| Proxy → pods | almindelig HTTP til port 80 på podsene |
+| Periodiske job | ingen (fornyelse af certifikater er din proxys ansvar) |
+
+### Hvad proxyen skal gøre
+
+* Videregive WebSockets (`/socket.io`).
+* Tillade forespørgsler på 10 minutter (lange kompileringer) og request bodies på 50 MB (uploads) eller `MAX_UPLOAD_SIZE`.
+* Holde sin idle keep-alive-timeout mod podsene under 65 sekunder, som er timeouten for nginx i poden.
+* Sende `X-Forwarded-For` og `X-Forwarded-Proto: https`.
+* Med flere replikaer holde en bruger på én replika, se [Horisontal skalering](/da/on-premises/configuration/kubernetes/horizontal-scaling).
+
+### ConfigMap
+
+```yaml
+  OVERLEAF_SITE_URL: https://overleaf.example.com
+  OVERLEAF_SECURE_COOKIE: "true"
+  # loopback plus the network the proxy connects from; 10.244.0.0/16 is flannel's pod network
+  OVERLEAF_TRUSTED_PROXY_IPS: loopback,10.244.0.0/16
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+
+Uden `X-Forwarded-Proto: https` fra en betroet adresse tror Ayakaleaf Pro, at forespørgsler ankommer over HTTP, og sætter ikke sin sikre sessionscookie: logins mislykkes så. Sæt kun `OVERLEAF_SECURE_COOKIE`, når brugerne faktisk når webstedet over HTTPS; enhver værdi slår den til, også `"false"`.
+
+### HAProxy-eksempel
+
+For at terminere HTTPS i HAProxy-DaemonSet'et fra [Horisontal skalering](/da/on-premises/configuration/kubernetes/horizontal-scaling) skal du lægge certifikatet og dets nøgle i én PEM-fil og et Secret:
+
+```bash
+cat certificate.pem key.pem > tls.pem
+kubectl -n overleaf create secret generic haproxy-tls --from-file=tls.pem
+```
+
+Ændr derefter `80-haproxy.yaml`:
+
+```yaml title="80-haproxy.yaml (changes)" wrap
+    listen overleaf
+      bind :8080
+      bind :8443 ssl crt /etc/haproxy-certs/tls.pem
+      http-request redirect scheme https unless { ssl_fc }
+      http-request set-header X-Forwarded-Proto https if { ssl_fc }
+      option forwardfor
+      # ... rest unchanged
+---
+# DaemonSet: mount the Secret and open the port
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy}
+            - {name: tls, mountPath: /etc/haproxy-certs, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
+        - name: tls
+          secret:
+            secretName: haproxy-tls
+---
+# Service
+  ports:
+    - {name: http, port: 80, targetPort: 8080, nodePort: 30081}
+    - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+```
+
+Forøg `config-hash`, så HAProxy genstarter, sæt derefter ConfigMap'et som ovenfor, og genstart replikaerne.
+
+Omdirigeringen bevarer forespørgslens port: den passer til en load balancer på port 80 og 443, men på NodePorts sender den `http://host:30081` til `https://host:30081`. Uden en load balancer foran skal du udelade omdirigeringslinjen og give brugerne adressen `https://...:30443`.
+
+### Testet på Kubernetes
+
+På Kubernetes 1.37 med tre replikaer og HAProxy, der terminerede HTTPS som ovenfor, med `OVERLEAF_SITE_URL` på `https://` og `OVERLEAF_SECURE_COOKIE`: brugere aktiverede via `https://`-links, loggede ind med en sessionscookie markeret `Secure`, uploadede og kompilerede projekter med PDF'en hentet, blev på deres replika, åbnede editorens WebSocket (`wss`) og klonede og pushede med Git over HTTPS. `http://`-forespørgsler på NodePort blev omdirigeret til `https://` med samme port, som beskrevet ovenfor.

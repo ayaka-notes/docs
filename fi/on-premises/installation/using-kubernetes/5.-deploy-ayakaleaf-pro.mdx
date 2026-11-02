@@ -1,0 +1,123 @@
+---
+title: 5. Ayakaleaf Pron käyttöönotto
+description: Ota käyttöön Ayakaleaf Pro -podi, sen datataltio ja NodePort-Service.
+icon: rocket-launch
+---
+
+```yaml title="40-overleaf.yaml" wrap
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overleaf-data
+  namespace: overleaf
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one pod owns the data volume; never run two at once
+  selector:
+    matchLabels:
+      app: overleaf
+  template:
+    metadata:
+      labels:
+        app: overleaf
+    spec:
+      terminationGracePeriodSeconds: 60   # time to flush pending edits, like the Toolkit
+      # Keep the environment to what the ConfigMap and Secret set: no REDIS_PORT=tcp://... and the like
+      enableServiceLinks: false
+      containers:
+        - name: sharelatex
+          image: ghcr.io/ayaka-notes/overleaf-pro:6.3.2
+          envFrom:
+            - configMapRef:
+                name: overleaf-env
+            - secretRef:
+                name: overleaf-secrets
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 80
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/overleaf
+            - name: compiles
+              mountPath: /var/lib/overleaf/data/compiles
+            - name: output
+              mountPath: /var/lib/overleaf/data/output
+            - name: cache
+              mountPath: /var/lib/overleaf/data/cache
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overleaf-data
+        # Compile scratch space on the node; same paths as SANDBOXED_COMPILES_HOST_DIR_*
+        - name: compiles
+          hostPath:
+            path: /srv/overleaf/compiles
+            type: DirectoryOrCreate
+        - name: output
+          hostPath:
+            path: /srv/overleaf/output
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /srv/overleaf/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overleaf
+  namespace: overleaf
+spec:
+  type: NodePort
+  selector:
+    app: overleaf
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f 40-overleaf.yaml
+kubectl -n overleaf rollout status deployment/overleaf --timeout=10m
+kubectl -n overleaf logs deployment/overleaf | grep -E 'Finished migrations|Missing required'
+```
+
+Ensimmäinen käynnistys ajaa tietokantamigraatiot ja kestää minuutin tai kaksi. Podi on valmis, kun `/status` vastaa; avaa sitten `OVERLEAF_SITE_URL`.
+
+### Miksi manifesti näyttää tältä
+
+* <strong>Datataltio.</strong> Kaikki polun `/var/lib/overleaf` alla (projektitiedostot, historia, lataukset) sijaitsee PVC:llä. Solmun paikallisella tallennustilalla, kuten local-pathilla, tiedot pysyvät yhdellä solmulla; verkon lohkotallennuksella podi voi siirtyä solmujen välillä.
+* <strong>Käännöstaltiot ja Docker-socket.</strong> Ayakaleaf Pro pyytää solmun Dockeria käynnistämään TeX Live -kontin ja antaa sille projektin käännöshakemiston **sen solmulla olevan polun perusteella**. Siksi nämä hakemistot ovat `hostPath`-taltioita, ja niiden polut toistetaan asetuksissa `SANDBOXED_COMPILES_HOST_DIR_*`. Niiden sisältö on väliaikaista dataa eikä vaadi varmuuskopiointia.
+* <strong>`enableServiceLinks: false`.</strong> Kubernetes lisää jokaiseen podiin Docker-tyyliset muuttujat nimiavaruuden jokaisesta Servicestä: Service `redis` muuttuu muotoon `REDIS_PORT=tcp://10.x.x.x:6379`, Service `git-bridge` muotoon `GIT_BRIDGE_PORT=tcp://...`. Jotkin Overleaf-palvelut lukevat näillä nimillä olevia muuttujia. Tässä podissa `OVERLEAF_REDIS_*`-asetukset ja ConfigMap voittavat, mutta git-bridge ottaa `GIT_BRIDGE_PORT`-muuttujan porttinaan ja pysähtyy (katso [Git-integraatio](/fi/on-premises/configuration/kubernetes/integrations/git-integration)). Linkkien poistaminen käytöstä rajaa ympäristön siihen, minkä itse asetat.
+* <strong>`Recreate`.</strong> Kaksi podia ei saa koskaan käyttää samaa datataltiota tai ajaa migraatioita samanaikaisesti.
+* <strong>Julkaiseminen.</strong> NodePort-Service vastaa jokaisen solmun portissa `30080`. Tuotannossa sijoita eteen ingress-ohjaimesi tai kuormantasaajasi ja päätä TLS siellä; sen on sallittava WebSocketit, 10 minuutin pyyntöaikakatkaisut (pitkät käännökset) ja 50 Mt:n lataukset sekä välitettävä `X-Forwarded-For` ja `X-Forwarded-Proto`.

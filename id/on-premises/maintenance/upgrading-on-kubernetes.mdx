@@ -1,0 +1,136 @@
+---
+title: Upgrade di Kubernetes
+description: Upgrade deployment Kubernetes Ayakaleaf Pro, dengan satu replika atau beberapa.
+icon: arrow-up-from-square
+---
+
+Upgrade mengganti tag image. Versi baru memigrasikan database saat dimulai, dan migrasi ini harus berjalan **sekali, dari satu pod, saat tidak ada pod versi lama yang berjalan**. Di Kubernetes hal ini tidak memungkinkan rolling update biasa pada StatefulSet yang diskalakan.
+
+<Danger>
+
+Buat [cadangan yang konsisten](/id/on-premises/maintenance/data-and-backups#performing-a-consistent-backup) sebelum setiap upgrade, dengan Ayakaleaf Pro dihentikan. Baca [catatan rilis](/id/on-premises/release-notes) untuk langkah-langkah versi tujuan upgrade Anda.
+
+</Danger>
+
+Sebelum memulai, di setiap node yang menjalankan Ayakaleaf Pro, pull image TeX Live apa pun yang dicantumkan oleh versi baru atau konfigurasi baru Anda, dengan `sudo docker pull`.
+
+<Tabs>
+<Tab title="Satu replika">
+
+<Steps>
+<Step title="Hentikan Ayakaleaf Pro">
+```bash
+kubectl -n overleaf scale deployment/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf --timeout=5m
+```
+</Step>
+
+<Step title="Cadangkan">
+MongoDB, dari anggota mana pun:
+
+```bash wrap
+kubectl -n overleaf exec mongo-0 -- mongodump --quiet --archive --gzip \
+  --uri 'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/sharelatex?replicaSet=overleaf' \
+  > sharelatex-$(date +%F).archive.gz
+```
+
+Volume data, melalui pod berumur pendek yang me-mount-nya (pod ini akan berjalan di node tempat volume berada):
+
+```bash wrap
+kubectl -n overleaf run backup --image=busybox --restart=Never --overrides='
+{"spec":{"containers":[{"name":"backup","image":"busybox","command":["sleep","3600"],
+ "volumeMounts":[{"name":"d","mountPath":"/data"}]}],
+ "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"overleaf-data"}}]}}'
+kubectl -n overleaf wait --for=condition=Ready pod/backup
+kubectl -n overleaf exec backup -- tar czf - -C /data . > overleaf-data-$(date +%F).tar.gz
+kubectl -n overleaf delete pod backup
+```
+
+Lakukan hal yang sama untuk volume git-bridge (`data-git-bridge-0`), dan simpan salinan Secret `overleaf-secrets`. Jika penyimpanan Anda mendukung [VolumeSnapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), snapshot dari volume-volume tersebut memberikan hasil yang sama.
+</Step>
+
+<Step title="Ubah versi dan mulai">
+Atur tag baru di `40-overleaf.yaml` (dan di `45-git-bridge.yaml`, yang harus menggunakan tag yang sama), lalu:
+
+```bash
+kubectl apply -f 40-overleaf.yaml -f 45-git-bridge.yaml
+kubectl -n overleaf scale deployment/overleaf --replicas=1
+kubectl -n overleaf rollout status deployment/overleaf --timeout=20m
+kubectl -n overleaf logs deployment/overleaf | grep 'Finished migrations'
+```
+
+Deployment menggunakan `strategy: Recreate`, sehingga bahkan tag yang diubah tidak pernah menjalankan dua versi sekaligus.
+</Step>
+</Steps>
+
+</Tab>
+
+<Tab title="Beberapa replika">
+
+Untuk penyiapan di [Penskalaan horizontal](/id/on-premises/configuration/kubernetes/horizontal-scaling).
+
+<Steps>
+<Step title="Hentikan semua replika">
+```bash
+kubectl -n overleaf scale statefulset/overleaf --replicas=0
+kubectl -n overleaf wait --for=delete pod -l app=overleaf-ha --timeout=10m
+```
+</Step>
+
+<Step title="Cadangkan">
+MongoDB seperti di tab satu replika, bucket S3 Anda dengan alat dari penyedia Anda, volume git-bridge (`data-git-bridge-0`), dan Secret-Secret. `/srv/overleaf-ha` milik replika hanya menyimpan output kompilasi dan tidak perlu dicadangkan.
+</Step>
+
+<Step title="Mulai satu replika dengan versi baru">
+Atur tag baru di `70-overleaf.yaml` dan `75-git-bridge.yaml`, serta `replicas: 1`:
+
+```bash
+kubectl apply -f 70-overleaf.yaml -f 75-git-bridge.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+kubectl -n overleaf logs overleaf-0 | grep 'Finished migrations'
+```
+
+Periksa bahwa Anda dapat masuk, membuka proyek, dan melakukan kompilasi.
+</Step>
+
+<Step title="Mulai replika lainnya">
+Atur kembali `replicas: 3` dan terapkan. `OrderedReady` memulainya satu per satu.
+
+```bash
+kubectl apply -f 70-overleaf.yaml
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+</Step>
+</Steps>
+
+<Warning>
+
+Jangan mengubah image dari StatefulSet terskala yang sedang berjalan dengan `kubectl set image` atau `kubectl apply`: rolling update akan memulai versi baru, beserta migrasinya, sementara replika lama masih melayani pengguna. Perubahan konfigurasi tanpa versi baru aman dilakukan sebagai rolling restart: `kubectl -n overleaf rollout restart statefulset/overleaf`.
+
+</Warning>
+
+</Tab>
+</Tabs>
+
+### MongoDB dan Redis
+
+Upgrade keduanya secara terpisah dari Ayakaleaf Pro. Untuk MongoDB, ikuti [Memperbarui MongoDB](/id/on-premises/maintenance/updating-mongodb) (satu versi mayor setiap kali, `featureCompatibilityVersion` setelah setiap langkah); replica set menerima image baru satu anggota setiap kali saat Anda mengubah image di `10-mongo.yaml`, karena StatefulSet mengganti `mongo-2`, `mongo-1`, dan `mongo-0` secara bergiliran.
+
+### Rollback
+
+Hentikan Ayakaleaf Pro seperti di atas, pulihkan MongoDB dari arsip (`mongorestore --drop --archive --gzip`) serta volume atau bucket dari cadangan, atur tag lama, dan mulai lagi. Migrasi versi baru tidak dapat dibatalkan dengan cara lain.
+
+### Tanya Jawab
+
+<Accordion title="Sebuah replika tetap tidak siap, dan replika lainnya tidak pernah dimulai">
+
+<strong>Jawaban:</strong> Dengan `podManagementPolicy: OrderedReady`, `overleaf-1` hanya dimulai setelah `overleaf-0` siap, dan rolling update tidak mengganti pod yang tidak pernah siap. Setelah Anda memperbaiki penyebabnya, misalnya pengaturan yang salah di ConfigMap, hapus pod yang macet agar StatefulSet membuatnya kembali dari template saat ini:
+
+```bash
+kubectl -n overleaf delete pod overleaf-0
+kubectl -n overleaf rollout status statefulset/overleaf --timeout=20m
+```
+
+Kami mengalami hal ini di klaster uji kami setelah sebuah pengaturan membuat `overleaf-0` tidak pernah siap; menghapus pod tersebut memungkinkan ketiga replika dimulai.
+
+</Accordion>

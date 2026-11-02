@@ -1,0 +1,64 @@
+---
+title: Biên dịch trong sandbox
+description: Biên dịch LaTeX trong các container TeX Live trên các node của một cluster Kubernetes.
+icon: gear-code
+---
+
+Các lần biên dịch được thực hiện bởi dịch vụ **clsi** bên trong mọi pod Ayakaleaf Pro. Khi bật biên dịch trong sandbox, clsi yêu cầu **Docker Engine của node** mà pod đang chạy khởi động một container TeX Live cho mỗi lần biên dịch, và trao cho nó thư mục của dự án theo đường dẫn trên node đó. Cách hoạt động của sandbox và các image hiện có được mô tả trong [Biên dịch trong sandbox](/vi/on-premises/configuration/overleaf-toolkit/sandboxed-compiles).
+
+| | |
+| --- | --- |
+| Dịch vụ | clsi (biên dịch), web (danh sách image trong cài đặt trình biên dịch), trong mọi pod Ayakaleaf Pro |
+| Node | Docker Engine và mọi image của `ALL_TEX_LIVE_DOCKER_IMAGES`, trên mọi node có thể chạy Ayakaleaf Pro |
+| Mount của pod | `/var/run/docker.sock`, và các thư mục compile, output và cache dưới dạng volume `hostPath` |
+| Tác vụ định kỳ | clsi xóa các thư mục biên dịch không được dùng trong một ngày, và mỗi giờ gỡ bỏ các container TeX Live cũ khỏi Docker của node |
+
+### Cấu hình
+
+Quá trình cài đặt đã thiết lập mọi thứ: Docker và các image trên các node trong [0. Chuẩn bị các node](/vi/on-premises/installation/using-kubernetes/0.-prepare-the-nodes), các cài đặt trong [4. Cá nhân hóa phiên bản của bạn](/vi/on-premises/installation/using-kubernetes/4.-personalizing-your-instance) và các volume trong [5. Triển khai Ayakaleaf Pro](/vi/on-premises/installation/using-kubernetes/5.-deploy-ayakaleaf-pro). Các cài đặt, tất cả đều nằm trong ConfigMap:
+
+| Biến | Giá trị |
+| --- | --- |
+| `SANDBOXED_COMPILES`, `SANDBOXED_COMPILES_SIBLING_CONTAINERS`, `DOCKER_RUNNER` | `"true"` |
+| `SANDBOXED_COMPILES_HOST_DIR_COMPILES` | đường dẫn trên node của volume được mount tại `/var/lib/overleaf/data/compiles` |
+| `SANDBOXED_COMPILES_HOST_DIR_OUTPUT` | đường dẫn trên node của volume được mount tại `/var/lib/overleaf/data/output` |
+| `SANDBOXED_COMPILES_HOST_DIR_CACHE` | đường dẫn trên node của volume được mount tại `/var/lib/overleaf/data/cache` |
+| `ALL_TEX_LIVE_DOCKER_IMAGES`, `ALL_TEX_LIVE_DOCKER_IMAGE_NAMES`, `TEX_LIVE_DOCKER_IMAGE` | các image, giống như trên Toolkit |
+
+### Thêm một phiên bản TeX Live
+
+<Steps>
+<Step title="Pull image trên mọi node">
+```bash
+# on each node that can run Ayakaleaf Pro
+sudo docker pull ghcr.io/ayaka-notes/texlive-full:2025.1
+```
+
+Toolkit tự pull các image; trên Kubernetes thì không ai làm việc đó. Hãy pull vào **Docker**, không dùng `crictl`: clsi yêu cầu image từ Docker. Một lần biên dịch với image không có trên node sẽ thất bại.
+</Step>
+
+<Step title="Liệt kê image trong ConfigMap và khởi động lại">
+```yaml
+  ALL_TEX_LIVE_DOCKER_IMAGES: ghcr.io/ayaka-notes/texlive-full:2026.1,ghcr.io/ayaka-notes/texlive-full:2025.1
+  ALL_TEX_LIVE_DOCKER_IMAGE_NAMES: TeX Live 2026,TeX Live 2025
+  TEX_LIVE_DOCKER_IMAGE: ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+```
+</Step>
+</Steps>
+
+Một node được thêm vào cluster sau này cần có Docker và tất cả các image trước khi Ayakaleaf Pro chạy trên đó. Hãy gắn nhãn cho các node như vậy và giữ Ayakaleaf Pro trên chúng bằng `nodeSelector` nếu không phải node nào cũng đủ điều kiện.
+
+### Nhiều replica
+
+Mỗi replica biên dịch trên node của chính nó và lưu kết quả biên dịch ở đó, vì vậy người dùng phải ở lại replica đã biên dịch, điều mà cookie sticky của load balancer đảm bảo. Không bao giờ chạy hai replica trên cùng một node: chúng sẽ dùng chung các thư mục biên dịch của node. Thiết lập [Mở rộng theo chiều ngang](/vi/on-premises/configuration/kubernetes/horizontal-scaling) ngăn chặn điều này bằng `podAntiAffinity`.
+
+Các container TeX Live chạy bên cạnh pod, nằm ngoài giới hạn bộ nhớ của pod và ngoài tầm quan sát của scheduler. Hãy để trống bộ nhớ trên các node cho chúng, xem [0. Chuẩn bị các node](/vi/on-premises/installation/using-kubernetes/0.-prepare-the-nodes).
+
+### Đã kiểm thử trên Kubernetes
+
+Trên Kubernetes 1.37 với ba replica phía sau HAProxy, mỗi node một replica, và TeX Live 2026 và 2025 được pull vào Docker trên mọi node, các bài kiểm thử end-to-end của chúng tôi cho biên dịch trong sandbox đều đạt (7 trường hợp): một dự án mới biên dịch ra PDF, cài đặt trình biên dịch cung cấp cả hai image và chuyển đổi giữa chúng, XeLaTeX với fontspec, lỗi LaTeX và biên dịch lại sau khi sửa, dừng một lần biên dịch đang chạy, và SyncTeX theo cả hai chiều. Một bài kiểm thử tải với 12 người dùng cùng lúc biên dịch một tài liệu 600 trang đã chạy 4 lần biên dịch trên mỗi node, xem [Những gì có thể mong đợi](/vi/on-premises/configuration/kubernetes/horizontal-scaling#what-to-expect).

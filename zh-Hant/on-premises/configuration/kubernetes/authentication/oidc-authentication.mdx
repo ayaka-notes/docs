@@ -1,0 +1,129 @@
+---
+title: OIDC 驗證
+description: 在 Kubernetes 部署中，讓使用者透過 OpenID Connect 提供者登入。
+icon: id-card-clip
+---
+
+OIDC 登入由每個 Ayakaleaf Pro pod 中的 **web** 服務（`authentication` 模組）處理。它沒有背景工作，也沒有獨立的 pod。提供者端（用戶端、重新導向 URI、管理員 claim）與 Toolkit 相同，因此請先依照 [OIDC 驗證](/zh-Hant/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication)設定您的 OpenID Provider（OP），然後依下列方式將設定值放入 Kubernetes。
+
+### 各元件的執行位置
+
+| | |
+| --- | --- |
+| 服務 | web，位於每個 Ayakaleaf Pro pod 中；設定會在 web 啟動時讀取 |
+| Pod → OP | `OVERLEAF_OIDC_TOKEN_URL` 與 `OVERLEAF_OIDC_USER_INFO_URL`，每次登入時 |
+| 瀏覽器 → OP | `OVERLEAF_OIDC_AUTHORIZATION_URL`，以及登出時的 `OVERLEAF_OIDC_LOGOUT_URL` |
+| OP → Overleaf | 無：OP 只會將瀏覽器重新導向回來 |
+| 登入狀態 | Redis 中的工作階段，由所有副本共用 |
+| 定期工作 | 無 |
+
+### 設定
+
+<Steps>
+<Step title="在 OP 中註冊 Overleaf">
+請在您的 OP 中允許下列由 `OVERLEAF_SITE_URL` 組成的位址：
+
+| 用途 | URI |
+| --- | --- |
+| 重新導向 URI（登入） | `${OVERLEAF_SITE_URL}/oidc/login/callback` |
+| 登出後重新導向 URI | `${OVERLEAF_SITE_URL}` |
+| 連結既有帳號後的登出後重新導向 URI | `${OVERLEAF_SITE_URL}/user/settings` |
+
+請依照[使用 discovery 文件查找設定值](/zh-Hant/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#finding-the-values-with-the-discovery-document)中的說明，在 OP 的 discovery 文件中找到這五個 URL。
+</Step>
+
+<Step title="將設定加入 ConfigMap">
+加入到 `overleaf-env`（`30-config.yaml`，若為[多個副本](/zh-Hant/on-premises/configuration/kubernetes/horizontal-scaling)則為 `60-config.yaml`）：
+
+```yaml title="30-config.yaml (additions)" wrap
+  EXTERNAL_AUTH: oidc
+  OVERLEAF_OIDC_PROVIDER_ID: authentik
+  OVERLEAF_OIDC_PROVIDER_NAME: Authentik
+  OVERLEAF_OIDC_IDENTITY_SERVICE_NAME: Log in with Authentik
+  OVERLEAF_OIDC_ISSUER: https://authentik.example.com/application/o/overleaf/
+  OVERLEAF_OIDC_AUTHORIZATION_URL: https://authentik.example.com/application/o/authorize/
+  OVERLEAF_OIDC_TOKEN_URL: https://authentik.example.com/application/o/token/
+  OVERLEAF_OIDC_USER_INFO_URL: https://authentik.example.com/application/o/userinfo/
+  OVERLEAF_OIDC_LOGOUT_URL: https://authentik.example.com/application/o/overleaf/end-session/
+  OVERLEAF_OIDC_CLIENT_ID: <Client ID>
+  OVERLEAF_OIDC_USER_ID_FIELD: username
+  OVERLEAF_OIDC_IS_ADMIN_FIELD: groups
+  OVERLEAF_OIDC_IS_ADMIN_FIELD_VALUE: Admins
+  OVERLEAF_OIDC_UPDATE_USER_DETAILS_ON_LOGIN: "true"
+```
+
+`EXTERNAL_AUTH` 接受以空格分隔的清單，例如 `ldap oidc`。所有 `OVERLEAF_OIDC_*` 設定請參閱[環境變數](/zh-Hant/on-premises/configuration/overleaf-toolkit/authentication/oidc-authentication#environment-variables)；除了用戶端密鑰以外，全部都放入 ConfigMap。
+
+<Warning>
+
+請為 `"true"` 與 `"false"` 加上引號：ConfigMap 只能保存字串。設為 `""` 的鍵與缺少的鍵並不相同：`OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS: ""` 會關閉首次登入時的帳號建立，而省略此鍵則允許所有網域。
+
+</Warning>
+</Step>
+
+<Step title="將用戶端密鑰放入 Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge \
+  -p '{"stringData":{"OVERLEAF_OIDC_CLIENT_SECRET":"<Client Secret>"}}'
+```
+</Step>
+
+<Step title="信任私有 CA（選用）">
+如果 OP 的憑證來自您自己的 CA，請將該 CA 加入掛載於 `/var/lib/overleaf/certs` 的 Secret `overleaf-certs` 中（請參閱[憑證與其他檔案](/zh-Hant/on-premises/configuration/kubernetes#憑證與其他檔案)），並讓 Node.js 指向它：
+
+```yaml
+  NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem
+```
+</Step>
+
+<Step title="套用並重新啟動">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+kubectl -n overleaf rollout status deployment/overleaf
+```
+
+接著確認每個 pod 都能連線到 token 端點。呼叫此端點的是 pod 而非瀏覽器，因此防火牆或 DNS 問題只會在這裡顯現：
+
+```bash
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" \
+    https://authentik.example.com/application/o/token/
+done
+```
+
+任何 HTTP 狀態碼（GET 會得到 `405`）都表示端點可連線；`000` 則表示無法連線。
+</Step>
+</Steps>
+
+### 多個副本
+
+不需要額外設定。登入的 `state` 值以及登出時使用的 ID token 都保存在工作階段中，而工作階段位於 Redis，因此無論由哪個副本接收回呼都能正常運作。
+
+### 在 Kubernetes 上的測試
+
+以 goauthentik 作為 OP，在 Kubernetes 1.37 上以三個副本置於 HAProxy 之後，我們針對 OIDC 的端對端測試全部通過（35 個案例）：登入，以及透過 OP 登出；依群組、依電子郵件、依單一值對應管理員以及不做對應的情況；每次登入時更新名稱與管理員旗標；連結與取消連結帳號；OIDC 帳號的密碼重設與密碼變更；已停權的帳號；`OVERLEAF_OIDC_ALLOWED_EMAIL_DOMAINS`；`OVERLEAF_DISABLE_LOCAL_LOGIN`；以及 OIDC 搭配公開存取。
+
+### 問與答
+
+<Accordion title="登入失敗並顯示「Unable to verify authorization request state」">
+
+<strong>回答：</strong>瀏覽器在回呼時沒有送回工作階段 cookie。在 Kubernetes 上常見的原因如下：
+
+* 已設定 `OVERLEAF_SECURE_COOKIE`，但使用者透過純 HTTP 開啟網站，因此瀏覽器永遠不會儲存該 cookie。`OVERLEAF_SECURE_COOKIE` 的任何值（即使是 `"false"`）都會啟用安全 cookie；請改為移除此鍵。
+* 網站是以 `OVERLEAF_SITE_URL` 以外的位址開啟。
+* 在 HTTPS 後方，您的 ingress 或負載平衡器沒有傳送 `X-Forwarded-Proto: https`，或其位址未列於 `OVERLEAF_TRUSTED_PROXY_IPS` 中。
+
+</Accordion>
+
+<Accordion title="在哪裡可以看到登入失敗的原因？">
+
+<strong>回答：</strong>在處理該請求之 pod 的 web 日誌中，而不是在 `kubectl logs` 中：
+
+```bash
+kubectl -n overleaf exec deploy/overleaf -- grep -i oidc /var/log/overleaf/web.log | tail
+```
+
+若有多個副本，請逐一檢查每個 `overleaf-N`。
+
+</Accordion>

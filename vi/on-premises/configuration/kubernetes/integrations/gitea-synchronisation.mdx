@@ -1,0 +1,67 @@
+---
+title: Đồng bộ hóa Gitea
+description: Cho phép người dùng đồng bộ dự án với các repository trên Gitea.com hoặc Gitea của riêng bạn trên triển khai Kubernetes.
+icon: mug-hot
+---
+
+Đồng bộ hóa Gitea chạy trong dịch vụ **web** (module `gitea-sync`) của mọi pod Ayakaleaf Pro. Tính năng này cần [Tích hợp Git](/vi/on-premises/configuration/kubernetes/integrations/git-integration). Hãy tạo ứng dụng OAuth và tìm hiểu chức năng của từng thiết lập trong [Đồng bộ hóa Gitea](/vi/on-premises/configuration/overleaf-toolkit/integrations/gitea-synchronisation); trang này đưa nó vào Kubernetes.
+
+| | |
+| --- | --- |
+| Dịch vụ | web (module `gitea-sync`), trong mọi pod Ayakaleaf Pro; được đọc khi web khởi động |
+| Pod → Gitea | REST API của `GITEA_SYNC_URL` (mặc định `https://gitea.com/api/v1`), mỗi khi người dùng liên kết, nhập, xuất hoặc đồng bộ |
+| Trình duyệt → Gitea | `${GITEA_SYNC_URL}/login/oauth/authorize` để liên kết tài khoản, sau đó quay lại `${OVERLEAF_SITE_URL}/user/gitea-sync/oauth2/callback` |
+| Gitea → Overleaf | không có: không có webhook, phiên bản không cần truy cập được từ Gitea |
+| Dữ liệu lưu trữ | access token và refresh token Gitea của người dùng, được mã hóa, trong MongoDB |
+| Tác vụ định kỳ | không có: việc đồng bộ diễn ra khi người dùng nhấp |
+
+### Cấu hình
+
+<Steps>
+<Step title="ConfigMap">
+```yaml title="30-config.yaml (additions)"
+  GITEA_SYNC_ENABLED: "true"
+  GITEA_SYNC_CLIENT_ID: <client ID>
+  # your own Gitea: its ROOT_URL
+  # GITEA_SYNC_URL: https://gitea.example.com
+  # optional: send the module's requests to Gitea through an HTTP proxy
+  # GITEA_SYNC_PROXY_URL: http://proxy.example.com:3128
+```
+
+`GIT_BRIDGE_ENABLED: "true"` và StatefulSet git-bridge từ [Tích hợp Git](/vi/on-premises/configuration/kubernetes/integrations/git-integration) phải được thiết lập sẵn: nếu không, cài đặt tài khoản và trình soạn thảo sẽ ẩn Đồng bộ hóa Gitea.
+</Step>
+
+<Step title="Secret">
+```bash
+kubectl -n overleaf patch secret overleaf-secrets --type merge -p '{"stringData":{
+  "GITEA_SYNC_CLIENT_SECRET":"<client secret>",
+  "GITEA_TOKEN_CIPHER_PASSWORD":"'"$(openssl rand -hex 32)"'"}}'
+```
+
+`GITEA_TOKEN_CIPHER_PASSWORD` mã hóa access token và refresh token Gitea của người dùng trong MongoDB. Mọi replica phải dùng cùng một giá trị, và việc thay đổi nó sau này sẽ khiến mọi người dùng phải liên kết lại Gitea.
+</Step>
+
+<Step title="CA riêng (tùy chọn)">
+Nếu Gitea của bạn có chứng chỉ do CA riêng của bạn cấp, hãy thêm CA vào Secret `overleaf-certs` được mount tại `/var/lib/overleaf/certs` (xem [Chứng chỉ và các tệp khác](/vi/on-premises/configuration/kubernetes#chứng-chỉ-và-các-tệp-khác)) và đặt `NODE_EXTRA_CA_CERTS: /var/lib/overleaf/certs/ca.pem` trong ConfigMap.
+</Step>
+
+<Step title="Áp dụng, khởi động lại và kiểm tra">
+```bash
+kubectl apply -f 30-config.yaml
+kubectl -n overleaf rollout restart deployment/overleaf     # or statefulset/overleaf
+for p in $(kubectl -n overleaf get pod -l app=overleaf -o name); do   # app=overleaf-ha for several replicas
+  kubectl -n overleaf exec "$p" -- curl -sS -o /dev/null -w "$p %{http_code}\n" https://gitea.com/api/v1/version
+done
+```
+
+Bất kỳ mã trạng thái HTTP nào đều có nghĩa là Gitea truy cập được từ pod đó; `000` nghĩa là không.
+</Step>
+</Steps>
+
+### Nhiều replica
+
+Không cần gì thêm ngoài `GITEA_TOKEN_CIPHER_PASSWORD` dùng chung. Mỗi lần đồng bộ nhận một khóa trong Redis, dùng chung với các tính năng đồng bộ Git khác, nên hai replica không bao giờ đồng bộ cùng một dự án cùng lúc.
+
+### Đã kiểm thử trên Kubernetes
+
+Với một Gitea 1.23 thật tại `GITEA_SYNC_URL`, trên Kubernetes 1.37 với một replica và Tích hợp Git được bật, các bài kiểm thử end-to-end của chúng tôi cho Đồng bộ hóa Gitea đều đạt (39 trường hợp): liên kết và hủy liên kết tài khoản qua OAuth2 của Gitea, làm mới access token sắp hết hạn và các quyền đã bị thu hồi, xuất vào một repository riêng tư mới hoặc repository của tổ chức, nhập một repository, pull và push, merge, xung đột, nhánh bị xóa và bị force push, tệp nhị phân, đổi tên và xóa, cùng những gì chủ sở hữu, biên tập viên và người xem có thể làm.
