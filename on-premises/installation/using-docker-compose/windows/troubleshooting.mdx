@@ -1,0 +1,132 @@
+---
+title: Troubleshooting
+description: Diagnose Docker Desktop integration, MongoDB startup, Windows localhost access and sandboxed compiles on WSL 2.
+icon: wrench
+---
+
+Run Toolkit and Docker commands in **Ubuntu** unless marked **PowerShell**. Keep the configuration and data while diagnosing failures.
+
+### WSL or Docker reports that virtualization is unavailable
+
+The WSL 2 backend needs hardware virtualization and **Virtual Machine Platform**, not the full Hyper-V feature used by Docker's alternative Hyper-V backend. Start with these checks:
+
+1. In Windows **Task Manager → Performance → CPU**, check **Virtualization: Enabled**. If disabled, enable Intel VT-x/VMX or AMD-V/SVM in BIOS/UEFI following your PC manufacturer's instructions.
+2. In **PowerShell as administrator**, check the Windows features:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+If required features are disabled, enable them and restart Windows before retrying WSL:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. If the features and BIOS setting are enabled but error `0x80370102` remains, check in **PowerShell as administrator**:
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+If it explicitly reports `Off`, restore hypervisor startup and restart Windows:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. If Windows itself runs in a VM, the outer hypervisor must expose **nested virtualization**. Enabling a Windows checkbox alone cannot supply missing virtual CPU features.
+
+Follow [Microsoft's WSL error 0x80370102 repair guide](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed) and [Docker's virtualization troubleshooting](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working) for the matching error. These repairs change Windows features or boot configuration; run only the ones relevant to your diagnosis.
+
+### Docker Desktop needs an update or cannot pull images
+
+For **WSL update required**, run `wsl --update` in PowerShell, restart Windows if requested, then reopen Docker Desktop and Ubuntu. If the Ubuntu row still says WSL 1, convert the distribution as described in step 0.
+
+For registry timeouts, DNS, proxy or certificate errors, check the exact failing registry in the pull output. Configure the Windows/Docker Desktop proxy and certificate trust if your network needs them; do not disable TLS verification. A successful GitHub clone does not prove Docker can reach `ghcr.io` or Docker Hub. See [Docker Desktop proxy settings](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies). Once connectivity works, rerun `bin/up -d`; the configured image names must stay consistent.
+
+### Docker is unavailable in Ubuntu
+
+If `docker` is not found, open Docker Desktop in Windows, enable Ubuntu under **Settings → Resources → WSL Integration**, apply the change and reopen Ubuntu. Check the distribution's name and WSL mode with `wsl --list --verbose` in **PowerShell**. It must use WSL 2.
+
+If the client exists but cannot reach the daemon, check that the engine has finished starting. Inspect `docker context ls` and any custom `DOCKER_HOST`/`DOCKER_CONTEXT` settings; a remote engine or an old Ubuntu Engine socket is not this guide's local Desktop setup. Do not fix this by installing another daemon or making the socket world-writable.
+
+### MongoDB fails to start
+
+`bin/up` initializes the MongoDB replica set before starting the application. If it stops at `Waiting for Mongo...`, inspect the database in a second **Ubuntu** terminal:
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+If `mongo` is absent and the output shows an image-pull error, resolve registry access or disk space first; it has not reached database startup. Once the cause is fixed, rerun `bin/up -d`.
+
+| Evidence | What to check |
+| --- | --- |
+| `OOMKilled=true` | Increase memory available to WSL/Docker or reduce other workloads, then retry |
+| `No space left on device` | Check Windows host storage, Ubuntu's `df -h` and Docker's disk usage; free space without deleting live database data |
+| Permission or storage errors under `/data/db` | Keep `MONGO_DATA_PATH` on Ubuntu's Linux filesystem. Check the actual bind mount and ownership; do not apply `chmod -R 777` |
+| Illegal instruction / CPU feature errors | Check that the CPU and virtualization expose the features required by your MongoDB version; changing the port will not fix this |
+| Database format / upgrade errors with existing data | Follow the supported [upgrade procedure](/on-premises/maintenance/upgrading-your-deployment); do not point an arbitrary older MongoDB image at newer data |
+
+When MongoDB is running, check the replica set:
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+The result should be `1`. `bin/up -d` performs the initial replica-set setup; starting Compose services directly on a new deployment skips that Toolkit step.
+
+Only apply a MongoDB kernel workaround if your Docker engine uses an affected kernel. If MongoDB logs indicate a kernel issue, compare the engine's actual kernel with [MongoDB's production notes](https://www.mongodb.com/docs/manual/administration/production-notes/) and update WSL/Docker as appropriate. Never erase `data/mongo` as a general startup fix.
+
+### Windows cannot open localhost
+
+First test in Ubuntu:
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+Then test in **PowerShell**:
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+If both fail, check the application logs and port configuration. If only Windows fails, check for another Windows process using port 8080, custom WSL networking settings, VPN/proxy rules or security software. Do not disable the firewall globally. A changed port needs matching `OVERLEAF_PORT`, `OVERLEAF_SITE_URL` and browser URL, followed by `bin/up -d`.
+
+### Sandboxed compiles fail
+
+Verify all three parts: the image exists in this Docker engine, the application can use the engine socket, and the sibling container can mount the compile directory:
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+Use the image configured in `config/variables.env`. `SERVER_PRO=true`, `SIBLING_CONTAINERS_ENABLED=true` and `DOCKER_SOCKET_PATH=/var/run/docker.sock` belong in `config/overleaf.rc`. After edits, run `bin/up -d`; `bin/start` alone does not update the container environment.
+
+A `No such image` error means Docker cannot find the exact image requested by that project. Keep `TEX_LIVE_DOCKER_IMAGE` and `ALL_TEX_LIVE_DOCKER_IMAGES` consistent, pull the image in the same engine, and check the project's TeX Live selection. Existing projects may retain an older image choice.
+
+For a mount error or an empty `/compile` directory, confirm that the Toolkit is under Ubuntu's home directory and Docker Desktop's integration is enabled for that same distribution. Do not replace the WSL host path with a Windows `C:\...` path. The Toolkit computes the sibling-container path from `OVERLEAF_DATA_PATH`.
+
+A missing `ctexart.cls` or font with **basic** is a package/image limitation. First verify the plain article from [step 6](/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks); use a fuller image for projects needing additional packages. Do not disable sandboxing to fix a missing TeX package.
+
+### Shell scripts report CRLF errors
+
+Run the scripts in Ubuntu Bash. Edit configuration with LF line endings. Errors mentioning `bash\r` or `$'\r'` usually mean files were converted to Windows CRLF. Restore the affected script from the repository or convert its line endings, preserving local configuration changes.
+
+### Containers disappear after a restart
+
+Check Docker Desktop is running and Ubuntu integration is enabled. `docker ps` shows only running containers; inspect `docker ps -a` too. If the engine is different from the one used during setup, switch back to the correct context rather than initializing another empty installation.
+
+For containers present but stopped, run `bin/start` and inspect logs. Follow [Keep the instance available](/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available) for login startup, restart policies and Windows sleep settings.
