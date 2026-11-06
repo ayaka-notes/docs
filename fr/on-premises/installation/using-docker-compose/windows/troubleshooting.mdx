@@ -1,0 +1,132 @@
+---
+title: Dépannage
+description: Diagnostiquez l'intégration de Docker Desktop, le démarrage de MongoDB, l'accès à localhost depuis Windows et les compilations en sandbox sous WSL 2.
+icon: wrench
+---
+
+Exécutez les commandes du Toolkit et de Docker dans **Ubuntu**, sauf mention **PowerShell**. Conservez la configuration et les données pendant le diagnostic des pannes.
+
+### WSL ou Docker indique que la virtualisation n'est pas disponible {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+Le backend WSL 2 nécessite la virtualisation matérielle et **Virtual Machine Platform** (Plateforme de machine virtuelle), et non la fonctionnalité Hyper-V complète utilisée par le backend Hyper-V alternatif de Docker. Commencez par ces vérifications :
+
+1. Dans le **Gestionnaire des tâches → Performance → Processeur** de Windows, vérifiez **Virtualisation : Activé**. Si elle est désactivée, activez Intel VT-x/VMX ou AMD-V/SVM dans le BIOS/UEFI en suivant les instructions du fabricant de votre PC.
+2. Dans **PowerShell en tant qu'administrateur**, vérifiez les fonctionnalités Windows :
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+Si des fonctionnalités requises sont désactivées, activez-les et redémarrez Windows avant de réessayer WSL :
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. Si les fonctionnalités et le paramètre du BIOS sont activés mais que l'erreur `0x80370102` persiste, vérifiez dans **PowerShell en tant qu'administrateur** :
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+S'il indique explicitement `Off`, rétablissez le démarrage de l'hyperviseur et redémarrez Windows :
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. Si Windows s'exécute lui-même dans une VM, l'hyperviseur externe doit exposer la **virtualisation imbriquée**. Cocher une case dans Windows ne peut pas, à lui seul, fournir des fonctionnalités de processeur virtuel manquantes.
+
+Suivez le [guide de réparation de l'erreur WSL 0x80370102 de Microsoft](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed) et le [dépannage de la virtualisation de Docker](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working) pour l'erreur correspondante. Ces réparations modifient les fonctionnalités Windows ou la configuration de démarrage ; n'exécutez que celles qui correspondent à votre diagnostic.
+
+### Docker Desktop doit être mis à jour ou ne parvient pas à récupérer les images {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+Pour **WSL update required**, exécutez `wsl --update` dans PowerShell, redémarrez Windows si demandé, puis rouvrez Docker Desktop et Ubuntu. Si la ligne Ubuntu indique toujours WSL 1, convertissez la distribution comme décrit à l'étape 0.
+
+Pour les dépassements de délai du registre ou les erreurs de DNS, de proxy ou de certificat, identifiez dans la sortie de récupération le registre exact qui échoue. Configurez le proxy de Windows/Docker Desktop et la confiance des certificats si votre réseau l'exige ; ne désactivez pas la vérification TLS. Un clonage GitHub réussi ne prouve pas que Docker peut joindre `ghcr.io` ou Docker Hub. Consultez les [paramètres de proxy de Docker Desktop](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies). Une fois la connectivité rétablie, relancez `bin/up -d` ; les noms d'images configurés doivent rester cohérents.
+
+### Docker n'est pas disponible dans Ubuntu {#docker-is-unavailable-in-ubuntu}
+
+Si `docker` est introuvable, ouvrez Docker Desktop dans Windows, activez Ubuntu sous **Settings → Resources → WSL Integration**, appliquez la modification et rouvrez Ubuntu. Vérifiez le nom de la distribution et son mode WSL avec `wsl --list --verbose` dans **PowerShell**. Elle doit utiliser WSL 2.
+
+Si le client existe mais ne parvient pas à joindre le démon, vérifiez que le moteur a fini de démarrer. Examinez `docker context ls` et tout paramètre personnalisé `DOCKER_HOST`/`DOCKER_CONTEXT` ; un moteur distant ou l'ancien socket d'un Engine installé dans Ubuntu ne correspond pas à la configuration Desktop locale de ce guide. Ne corrigez pas cela en installant un autre démon ou en rendant le socket accessible en écriture à tous.
+
+### MongoDB ne démarre pas {#mongodb-fails-to-start}
+
+`bin/up` initialise le replica set de MongoDB avant de démarrer l'application. S'il s'arrête à `Waiting for Mongo...`, examinez la base de données dans un second terminal **Ubuntu** :
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+Si `mongo` est absent et que la sortie affiche une erreur de récupération d'image, résolvez d'abord le problème d'accès au registre ou d'espace disque ; le démarrage de la base de données n'a pas encore été atteint. Une fois la cause corrigée, relancez `bin/up -d`.
+
+| Indice | Ce qu'il faut vérifier |
+| --- | --- |
+| `OOMKilled=true` | Augmentez la mémoire disponible pour WSL/Docker ou réduisez les autres charges de travail, puis réessayez |
+| `No space left on device` | Vérifiez le stockage de l'hôte Windows, le `df -h` d'Ubuntu et l'utilisation du disque par Docker ; libérez de l'espace sans supprimer les données actives de la base de données |
+| Erreurs de permission ou de stockage sous `/data/db` | Conservez `MONGO_DATA_PATH` sur le système de fichiers Linux d'Ubuntu. Vérifiez le bind mount effectif et la propriété des fichiers ; n'appliquez pas `chmod -R 777` |
+| Erreurs Illegal instruction / de fonctionnalité du processeur | Vérifiez que le processeur et la virtualisation exposent les fonctionnalités requises par votre version de MongoDB ; changer de port ne résoudra pas ce problème |
+| Erreurs de format de base de données / de mise à niveau avec des données existantes | Suivez la [procédure de mise à niveau](/fr/on-premises/maintenance/upgrading-your-deployment) prise en charge ; ne faites pas pointer une image MongoDB plus ancienne quelconque vers des données plus récentes |
+
+Lorsque MongoDB fonctionne, vérifiez le replica set :
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+Le résultat doit être `1`. `bin/up -d` effectue la configuration initiale du replica set ; démarrer directement les services Compose sur un nouveau déploiement saute cette étape du Toolkit.
+
+N'appliquez un contournement de noyau pour MongoDB que si votre moteur Docker utilise un noyau concerné. Si les journaux de MongoDB indiquent un problème de noyau, comparez le noyau effectif du moteur avec les [notes de production de MongoDB](https://www.mongodb.com/docs/manual/administration/production-notes/) et mettez à jour WSL/Docker en conséquence. N'effacez jamais `data/mongo` comme solution générale à un problème de démarrage.
+
+### Windows ne peut pas ouvrir localhost {#windows-cannot-open-localhost}
+
+Testez d'abord dans Ubuntu :
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+Testez ensuite dans **PowerShell** :
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+Si les deux échouent, vérifiez les journaux de l'application et la configuration du port. Si seul Windows échoue, recherchez un autre processus Windows utilisant le port 8080, des paramètres réseau WSL personnalisés, des règles de VPN/proxy ou un logiciel de sécurité. Ne désactivez pas le pare-feu globalement. Un port modifié nécessite des valeurs correspondantes pour `OVERLEAF_PORT`, `OVERLEAF_SITE_URL` et l'URL du navigateur, suivies de `bin/up -d`.
+
+### Les compilations en sandbox échouent {#sandboxed-compiles-fail}
+
+Vérifiez les trois éléments : l'image existe dans ce moteur Docker, l'application peut utiliser le socket du moteur, et le conteneur frère peut monter le répertoire de compilation :
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+Utilisez l'image configurée dans `config/variables.env`. `SERVER_PRO=true`, `SIBLING_CONTAINERS_ENABLED=true` et `DOCKER_SOCKET_PATH=/var/run/docker.sock` doivent figurer dans `config/overleaf.rc`. Après des modifications, exécutez `bin/up -d` ; `bin/start` seul ne met pas à jour l'environnement du conteneur.
+
+Une erreur `No such image` signifie que Docker ne trouve pas l'image exacte demandée par ce projet. Gardez `TEX_LIVE_DOCKER_IMAGE` et `ALL_TEX_LIVE_DOCKER_IMAGES` cohérents, récupérez l'image dans le même moteur et vérifiez la version de TeX Live sélectionnée pour le projet. Les projets existants peuvent conserver un ancien choix d'image.
+
+En cas d'erreur de montage ou de répertoire `/compile` vide, vérifiez que le Toolkit se trouve dans le répertoire personnel d'Ubuntu et que l'intégration de Docker Desktop est activée pour cette même distribution. Ne remplacez pas le chemin d'hôte WSL par un chemin Windows `C:\...`. Le Toolkit calcule le chemin du conteneur frère à partir de `OVERLEAF_DATA_PATH`.
+
+Un `ctexart.cls` ou une police manquants avec **basic** relèvent d'une limitation du paquet ou de l'image. Vérifiez d'abord l'article simple de l'[étape 6](/fr/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks) ; utilisez une image plus complète pour les projets qui nécessitent des paquets supplémentaires. Ne désactivez pas la sandbox pour corriger un paquet TeX manquant.
+
+### Les scripts shell signalent des erreurs CRLF {#shell-scripts-report-crlf-errors}
+
+Exécutez les scripts dans Ubuntu Bash. Modifiez la configuration avec des fins de ligne LF. Les erreurs mentionnant `bash\r` ou `$'\r'` signifient généralement que des fichiers ont été convertis au format CRLF de Windows. Restaurez le script concerné depuis le dépôt ou convertissez ses fins de ligne, en préservant les modifications de configuration locales.
+
+### Les conteneurs disparaissent après un redémarrage {#containers-disappear-after-a-restart}
+
+Vérifiez que Docker Desktop fonctionne et que l'intégration d'Ubuntu est activée. `docker ps` n'affiche que les conteneurs en cours d'exécution ; examinez aussi `docker ps -a`. Si le moteur est différent de celui utilisé lors de l'installation, revenez au bon contexte au lieu d'initialiser une autre installation vide.
+
+Pour des conteneurs présents mais arrêtés, exécutez `bin/start` et examinez les journaux. Suivez [Garder l'instance disponible](/fr/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available) pour le démarrage à l'ouverture de session, les politiques de redémarrage et les paramètres de mise en veille de Windows.

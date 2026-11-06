@@ -1,0 +1,132 @@
+---
+title: 故障排除
+description: 诊断 WSL 2 上的 Docker Desktop 集成、MongoDB 启动、Windows localhost 访问以及沙盒编译问题。
+icon: wrench
+---
+
+除非标记为 **PowerShell**，否则请在 **Ubuntu** 中运行 Toolkit 和 Docker 命令。诊断故障时请保留配置和数据。
+
+### WSL 或 Docker 报告虚拟化不可用 {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+WSL 2 后端需要硬件虚拟化和 **Virtual Machine Platform**（虚拟机平台），而不是 Docker 另一种 Hyper-V 后端所使用的完整 Hyper-V 功能。请从以下检查开始：
+
+1. 在 Windows **任务管理器 → 性能 → CPU** 中，检查 **虚拟化：已启用**。如果显示已禁用，请按照电脑制造商的说明在 BIOS/UEFI 中启用 Intel VT-x/VMX 或 AMD-V/SVM。
+2. 在**以管理员身份运行的 PowerShell** 中，检查 Windows 功能：
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+如果所需功能已禁用，请启用它们并重启 Windows，然后再重试 WSL：
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. 如果这些功能和 BIOS 设置都已启用，但仍出现错误 `0x80370102`，请在**以管理员身份运行的 PowerShell** 中检查：
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+如果它明确报告 `Off`，请恢复虚拟机监控程序的启动并重启 Windows：
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. 如果 Windows 本身运行在虚拟机中，外层虚拟机监控程序必须开放**嵌套虚拟化**。仅在 Windows 中勾选某个选项无法提供缺失的虚拟 CPU 功能。
+
+请根据对应的错误，参阅 [Microsoft 的 WSL 错误 0x80370102 修复指南](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed)和 [Docker 的虚拟化故障排除](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working)。这些修复会更改 Windows 功能或启动配置；请只运行与你的诊断相关的修复。
+
+### Docker Desktop 需要更新或无法拉取镜像 {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+对于 **WSL update required**，请在 PowerShell 中运行 `wsl --update`，如有要求请重启 Windows，然后重新打开 Docker Desktop 和 Ubuntu。如果 Ubuntu 这一行仍显示 WSL 1，请按照第 0 步中的说明转换该发行版。
+
+对于镜像仓库超时、DNS、代理或证书错误，请在拉取输出中检查具体失败的镜像仓库。如果你的网络需要，请配置 Windows/Docker Desktop 的代理和证书信任；不要禁用 TLS 验证。能够成功从 GitHub 克隆并不能证明 Docker 可以访问 `ghcr.io` 或 Docker Hub。参见 [Docker Desktop 代理设置](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies)。连接正常后，请重新运行 `bin/up -d`；配置的镜像名称必须保持一致。
+
+### Ubuntu 中无法使用 Docker {#docker-is-unavailable-in-ubuntu}
+
+如果找不到 `docker`，请在 Windows 中打开 Docker Desktop，在 **Settings → Resources → WSL Integration** 下启用 Ubuntu，应用更改并重新打开 Ubuntu。在 **PowerShell** 中使用 `wsl --list --verbose` 检查发行版的名称和 WSL 模式。它必须使用 WSL 2。
+
+如果客户端存在但无法连接到守护进程，请检查引擎是否已完成启动。检查 `docker context ls` 以及任何自定义的 `DOCKER_HOST`/`DOCKER_CONTEXT` 设置；远程引擎或旧的 Ubuntu Engine socket 不属于本指南的本地 Desktop 设置。不要通过安装另一个守护进程或将 socket 设为所有人可写来解决此问题。
+
+### MongoDB 无法启动 {#mongodb-fails-to-start}
+
+`bin/up` 会在启动应用程序之前初始化 MongoDB 副本集。如果它停在 `Waiting for Mongo...`，请在第二个 **Ubuntu** 终端中检查数据库：
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+如果没有 `mongo`，且输出显示镜像拉取错误，请先解决镜像仓库访问或磁盘空间问题；此时尚未进入数据库启动阶段。解决原因后，请重新运行 `bin/up -d`。
+
+| 现象 | 检查内容 |
+| --- | --- |
+| `OOMKilled=true` | 增加 WSL/Docker 可用的内存或减少其他工作负载，然后重试 |
+| `No space left on device` | 检查 Windows 主机存储、Ubuntu 的 `df -h` 以及 Docker 的磁盘使用情况；在不删除实时数据库数据的前提下释放空间 |
+| `/data/db` 下的权限或存储错误 | 让 `MONGO_DATA_PATH` 保持在 Ubuntu 的 Linux 文件系统中。检查实际的绑定挂载和所有权；不要使用 `chmod -R 777` |
+| Illegal instruction / CPU 功能错误 | 检查 CPU 和虚拟化是否提供了你的 MongoDB 版本所需的功能；更改端口无法解决此问题 |
+| 现有数据的数据库格式 / 升级错误 | 按照受支持的[升级流程](/zh-Hans/on-premises/maintenance/upgrading-your-deployment)操作；不要让任意较旧的 MongoDB 镜像使用较新的数据 |
+
+MongoDB 运行后，检查副本集：
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+结果应为 `1`。`bin/up -d` 会执行初始的副本集设置；在新部署上直接启动 Compose 服务会跳过这一 Toolkit 步骤。
+
+只有当你的 Docker 引擎使用的是受影响的内核时，才需要应用 MongoDB 内核变通方法。如果 MongoDB 日志表明存在内核问题，请将引擎的实际内核与 [MongoDB 的生产环境说明](https://www.mongodb.com/docs/manual/administration/production-notes/)进行比较，并相应地更新 WSL/Docker。切勿将清除 `data/mongo` 作为通用的启动修复方法。
+
+### Windows 无法打开 localhost {#windows-cannot-open-localhost}
+
+首先在 Ubuntu 中测试：
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+然后在 **PowerShell** 中测试：
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+如果两者都失败，请检查应用程序日志和端口配置。如果只有 Windows 失败，请检查是否有其他 Windows 进程占用了端口 8080、自定义的 WSL 网络设置、VPN/代理规则或安全软件。不要全局禁用防火墙。更改端口后，需要相应地修改 `OVERLEAF_PORT`、`OVERLEAF_SITE_URL` 和浏览器 URL，然后运行 `bin/up -d`。
+
+### 沙盒编译失败 {#sandboxed-compiles-fail}
+
+请验证全部三个部分：该镜像存在于此 Docker 引擎中、应用程序可以使用引擎 socket，以及兄弟容器可以挂载编译目录：
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+请使用 `config/variables.env` 中配置的镜像。`SERVER_PRO=true`、`SIBLING_CONTAINERS_ENABLED=true` 和 `DOCKER_SOCKET_PATH=/var/run/docker.sock` 应写在 `config/overleaf.rc` 中。编辑后请运行 `bin/up -d`；仅运行 `bin/start` 不会更新容器环境。
+
+`No such image` 错误表示 Docker 找不到该项目所请求的确切镜像。请保持 `TEX_LIVE_DOCKER_IMAGE` 和 `ALL_TEX_LIVE_DOCKER_IMAGES` 一致，在同一个引擎中拉取该镜像，并检查项目的 TeX Live 选择。现有项目可能保留了较旧的镜像选择。
+
+对于挂载错误或空的 `/compile` 目录，请确认 Toolkit 位于 Ubuntu 的主目录下，并且 Docker Desktop 已为同一个发行版启用集成。不要将 WSL 主机路径替换为 Windows 的 `C:\...` 路径。Toolkit 会根据 `OVERLEAF_DATA_PATH` 计算兄弟容器的路径。
+
+在 **basic** 镜像中缺少 `ctexart.cls` 或字体属于宏包/镜像本身的限制。请先验证[第 6 步](/zh-Hans/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks)中的简单 article；对于需要额外宏包的项目，请使用更完整的镜像。不要通过禁用沙盒来解决缺少 TeX 宏包的问题。
+
+### Shell 脚本报告 CRLF 错误 {#shell-scripts-report-crlf-errors}
+
+请在 Ubuntu Bash 中运行脚本。使用 LF 换行符编辑配置。提及 `bash\r` 或 `$'\r'` 的错误通常表示文件已被转换为 Windows 的 CRLF 格式。请从仓库恢复受影响的脚本或转换其换行符，同时保留本地的配置更改。
+
+### 重启后容器消失 {#containers-disappear-after-a-restart}
+
+检查 Docker Desktop 是否正在运行，以及是否已启用 Ubuntu 集成。`docker ps` 只显示正在运行的容器；也请检查 `docker ps -a`。如果引擎与设置时使用的不同，请切换回正确的上下文，而不是初始化另一个空的安装。
+
+对于存在但已停止的容器，请运行 `bin/start` 并检查日志。关于登录时启动、重启策略和 Windows 睡眠设置，请参阅[保持实例可用](/zh-Hans/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available)。

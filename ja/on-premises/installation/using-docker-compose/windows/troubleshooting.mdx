@@ -1,0 +1,132 @@
+---
+title: トラブルシューティング
+description: WSL 2 上での Docker Desktop の連携、MongoDB の起動、Windows からの localhost へのアクセス、サンドボックスコンパイルの問題を診断します。
+icon: wrench
+---
+
+**PowerShell** と記載されている場合を除き、Toolkit と Docker のコマンドは **Ubuntu** で実行してください。障害を診断している間も、設定とデータは保持してください。
+
+### WSL または Docker が仮想化を利用できないと報告する {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+WSL 2 バックエンドには、ハードウェア仮想化と **Virtual Machine Platform** が必要です。Docker の代替となる Hyper-V バックエンドで使用される Hyper-V の完全な機能は必要ありません。まず次の項目を確認してください:
+
+1. Windows の **タスク マネージャー → パフォーマンス → CPU** で、**仮想化: 有効** になっていることを確認します。無効になっている場合は、PC メーカーの手順に従って BIOS/UEFI で Intel VT-x/VMX または AMD-V/SVM を有効にしてください。
+2. **PowerShell を管理者として**開き、Windows の機能を確認します:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+必要な機能が無効になっている場合は、有効にして Windows を再起動してから、WSL を再試行してください:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. 機能と BIOS の設定が有効になっているのにエラー `0x80370102` が解消しない場合は、**PowerShell を管理者として**開いて次を確認します:
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+明示的に `Off` と表示される場合は、ハイパーバイザーの起動を元に戻して Windows を再起動します:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. Windows 自体が VM 内で実行されている場合は、外側のハイパーバイザーが**入れ子になった仮想化**を公開している必要があります。Windows のチェックボックスを有効にするだけでは、不足している仮想 CPU の機能を補うことはできません。
+
+該当するエラーについては、[Microsoft の WSL エラー 0x80370102 の修復ガイド](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed)と [Docker の仮想化に関するトラブルシューティング](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working)に従ってください。これらの修復は Windows の機能やブート構成を変更するため、診断結果に関係するものだけを実行してください。
+
+### Docker Desktop の更新が必要、またはイメージをプルできない {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+**WSL update required** と表示された場合は、PowerShell で `wsl --update` を実行し、求められたら Windows を再起動してから、Docker Desktop と Ubuntu を開き直してください。Ubuntu の行がまだ WSL 1 と表示されている場合は、ステップ 0 の説明に従ってディストリビューションを変換してください。
+
+レジストリのタイムアウト、DNS、プロキシ、証明書のエラーの場合は、プルの出力で失敗している正確なレジストリを確認してください。ネットワークで必要な場合は、Windows/Docker Desktop のプロキシと証明書の信頼を設定してください。TLS の検証は無効にしないでください。GitHub からのクローンが成功しても、Docker が `ghcr.io` や Docker Hub にアクセスできることの証明にはなりません。[Docker Desktop のプロキシ設定](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies)を参照してください。接続できるようになったら `bin/up -d` を再実行してください。設定したイメージ名は一貫させておく必要があります。
+
+### Ubuntu で Docker を利用できない {#docker-is-unavailable-in-ubuntu}
+
+`docker` が見つからない場合は、Windows で Docker Desktop を開き、**Settings → Resources → WSL Integration** で Ubuntu を有効にして変更を適用し、Ubuntu を開き直してください。**PowerShell** で `wsl --list --verbose` を実行し、ディストリビューションの名前と WSL のモードを確認してください。WSL 2 を使用している必要があります。
+
+クライアントは存在するのにデーモンにアクセスできない場合は、エンジンの起動が完了していることを確認してください。`docker context ls` と、カスタムの `DOCKER_HOST`/`DOCKER_CONTEXT` の設定を確認してください。リモートのエンジンや古い Ubuntu の Engine のソケットは、このガイドのローカルの Desktop 構成ではありません。別のデーモンをインストールしたり、ソケットを誰でも書き込み可能にしたりして解決しようとしないでください。
+
+### MongoDB が起動しない {#mongodb-fails-to-start}
+
+`bin/up` は、アプリケーションを起動する前に MongoDB のレプリカセットを初期化します。`Waiting for Mongo...` で止まる場合は、2 つ目の **Ubuntu** ターミナルでデータベースを調べてください:
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+`mongo` が存在せず、出力にイメージのプルのエラーが表示される場合は、まずレジストリへのアクセスまたはディスク容量の問題を解決してください。データベースの起動まで到達していません。原因を解決したら、`bin/up -d` を再実行してください。
+
+| 兆候 | 確認すること |
+| --- | --- |
+| `OOMKilled=true` | WSL/Docker で利用可能なメモリを増やすか、他のワークロードを減らしてから再試行します |
+| `No space left on device` | Windows ホストのストレージ、Ubuntu の `df -h`、Docker のディスク使用量を確認します。稼働中のデータベースのデータを削除せずに空き容量を確保してください |
+| `/data/db` 以下の権限またはストレージのエラー | `MONGO_DATA_PATH` は Ubuntu の Linux ファイルシステム上に置いてください。実際のバインドマウントと所有者を確認し、`chmod -R 777` は適用しないでください |
+| Illegal instruction / CPU 機能のエラー | CPU と仮想化が、使用している MongoDB のバージョンに必要な機能を公開していることを確認します。ポートを変更しても解決しません |
+| 既存のデータでのデータベース形式 / アップグレードのエラー | サポートされている[アップグレード手順](/ja/on-premises/maintenance/upgrading-your-deployment)に従ってください。より新しいデータに対して、任意の古い MongoDB イメージを使用しないでください |
+
+MongoDB が実行されている場合は、レプリカセットを確認します:
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+結果は `1` になるはずです。`bin/up -d` はレプリカセットの初期設定を行います。新しいデプロイで Compose のサービスを直接起動すると、この Toolkit のステップが省略されます。
+
+MongoDB のカーネルの回避策は、Docker エンジンが影響を受けるカーネルを使用している場合にのみ適用してください。MongoDB のログにカーネルの問題が示されている場合は、エンジンの実際のカーネルを [MongoDB のプロダクションノート](https://www.mongodb.com/docs/manual/administration/production-notes/)と比較し、必要に応じて WSL/Docker を更新してください。一般的な起動の修正として `data/mongo` を消去しないでください。
+
+### Windows から localhost を開けない {#windows-cannot-open-localhost}
+
+まず Ubuntu でテストします:
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+次に **PowerShell** でテストします:
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+両方とも失敗する場合は、アプリケーションのログとポートの設定を確認してください。Windows のみで失敗する場合は、ポート 8080 を使用している他の Windows プロセス、カスタムの WSL ネットワーク設定、VPN/プロキシのルール、セキュリティソフトウェアを確認してください。ファイアウォールを全体的に無効にしないでください。ポートを変更した場合は、`OVERLEAF_PORT`、`OVERLEAF_SITE_URL`、ブラウザーの URL を一致させてから、`bin/up -d` を実行する必要があります。
+
+### サンドボックスコンパイルが失敗する {#sandboxed-compiles-fail}
+
+3 つの要素をすべて確認してください。イメージがこの Docker エンジンに存在すること、アプリケーションがエンジンのソケットを使用できること、兄弟コンテナがコンパイルディレクトリをマウントできることです:
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+`config/variables.env` で設定したイメージを使用してください。`SERVER_PRO=true`、`SIBLING_CONTAINERS_ENABLED=true`、`DOCKER_SOCKET_PATH=/var/run/docker.sock` は `config/overleaf.rc` に記述します。編集後は `bin/up -d` を実行してください。`bin/start` だけではコンテナの環境は更新されません。
+
+`No such image` エラーは、そのプロジェクトが要求する正確なイメージを Docker が見つけられないことを意味します。`TEX_LIVE_DOCKER_IMAGE` と `ALL_TEX_LIVE_DOCKER_IMAGES` を一貫させ、同じエンジンでイメージをプルし、プロジェクトの TeX Live の選択を確認してください。既存のプロジェクトでは、古いイメージの選択が残っている場合があります。
+
+マウントのエラーや `/compile` ディレクトリが空の場合は、Toolkit が Ubuntu のホームディレクトリ以下にあり、Docker Desktop の連携が同じディストリビューションで有効になっていることを確認してください。WSL のホストパスを Windows の `C:\...` パスに置き換えないでください。Toolkit は `OVERLEAF_DATA_PATH` から兄弟コンテナのパスを算出します。
+
+**basic** で `ctexart.cls` やフォントが見つからないのは、パッケージ/イメージの制限です。まず [ステップ 6](/ja/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks) のシンプルな article を確認し、追加のパッケージが必要なプロジェクトにはより充実したイメージを使用してください。TeX パッケージが見つからない問題を解決するためにサンドボックスを無効にしないでください。
+
+### シェルスクリプトが CRLF のエラーを報告する {#shell-scripts-report-crlf-errors}
+
+スクリプトは Ubuntu の Bash で実行してください。設定は LF の改行コードで編集してください。`bash\r` や `$'\r'` に言及するエラーは、通常ファイルが Windows の CRLF に変換されたことを意味します。ローカルの設定変更を保持したまま、影響を受けたスクリプトをリポジトリから復元するか、改行コードを変換してください。
+
+### 再起動後にコンテナが消える {#containers-disappear-after-a-restart}
+
+Docker Desktop が実行中で、Ubuntu の連携が有効になっていることを確認してください。`docker ps` は実行中のコンテナのみを表示するため、`docker ps -a` も確認してください。エンジンがセットアップ時に使用したものと異なる場合は、空のインストールを新たに初期化するのではなく、正しいコンテキストに切り替えてください。
+
+コンテナが存在するが停止している場合は、`bin/start` を実行してログを確認してください。ログイン時の起動、再起動ポリシー、Windows のスリープの設定については、[インスタンスを利用可能な状態に保つ](/ja/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available)に従ってください。

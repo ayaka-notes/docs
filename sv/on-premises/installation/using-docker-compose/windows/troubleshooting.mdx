@@ -1,0 +1,132 @@
+---
+title: Felsökning
+description: Diagnostisera Docker Desktop-integration, start av MongoDB, åtkomst till localhost från Windows och sandlådekompilering på WSL 2.
+icon: wrench
+---
+
+Kör Toolkit- och Docker-kommandon i **Ubuntu** om de inte är markerade med **PowerShell**. Behåll konfigurationen och data medan du diagnostiserar fel.
+
+### WSL eller Docker rapporterar att virtualisering inte är tillgänglig {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+WSL 2-backend behöver hårdvaruvirtualisering och **Virtual Machine Platform**, inte den fullständiga Hyper-V-funktionen som används av Dockers alternativa Hyper-V-backend. Börja med dessa kontroller:
+
+1. I Windows **Aktivitetshanteraren → Prestanda → CPU** kontrollerar du **Virtualisering: Aktiverad**. Om den är inaktiverad aktiverar du Intel VT-x/VMX eller AMD-V/SVM i BIOS/UEFI enligt datortillverkarens instruktioner.
+2. I **PowerShell som administratör** kontrollerar du Windows-funktionerna:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+Om nödvändiga funktioner är inaktiverade aktiverar du dem och startar om Windows innan du försöker med WSL igen:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. Om funktionerna och BIOS-inställningen är aktiverade men felet `0x80370102` kvarstår kontrollerar du i **PowerShell som administratör**:
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+Om den uttryckligen rapporterar `Off` återställer du start av hypervisorn och startar om Windows:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. Om Windows självt körs i en VM måste den yttre hypervisorn exponera **nästlad virtualisering**. Att bara markera en kryssruta i Windows kan inte tillhandahålla saknade virtuella CPU-funktioner.
+
+Följ [Microsofts reparationsguide för WSL-felet 0x80370102](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed) och [Dockers felsökning av virtualisering](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working) för det aktuella felet. Dessa reparationer ändrar Windows-funktioner eller startkonfigurationen; kör bara de som är relevanta för din diagnos.
+
+### Docker Desktop behöver en uppdatering eller kan inte hämta avbildningar {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+Vid **WSL update required** kör du `wsl --update` i PowerShell, startar om Windows om du uppmanas till det och öppnar sedan Docker Desktop och Ubuntu igen. Om Ubuntu-raden fortfarande visar WSL 1 konverterar du distributionen enligt beskrivningen i steg 0.
+
+Vid tidsgränser, DNS-, proxy- eller certifikatfel mot registret kontrollerar du exakt vilket register som misslyckas i utdata från hämtningen. Konfigurera proxy och certifikatförtroende i Windows/Docker Desktop om ditt nätverk kräver det; inaktivera inte TLS-verifiering. En lyckad kloning från GitHub bevisar inte att Docker kan nå `ghcr.io` eller Docker Hub. Se [proxyinställningar i Docker Desktop](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies). När anslutningen fungerar kör du `bin/up -d` igen; de konfigurerade avbildningsnamnen måste förbli konsekventa.
+
+### Docker är inte tillgängligt i Ubuntu {#docker-is-unavailable-in-ubuntu}
+
+Om `docker` inte hittas öppnar du Docker Desktop i Windows, aktiverar Ubuntu under **Settings → Resources → WSL Integration**, tillämpar ändringen och öppnar Ubuntu igen. Kontrollera distributionens namn och WSL-läge med `wsl --list --verbose` i **PowerShell**. Den måste använda WSL 2.
+
+Om klienten finns men inte kan nå daemonen kontrollerar du att motorn har startat klart. Granska `docker context ls` och eventuella anpassade inställningar för `DOCKER_HOST`/`DOCKER_CONTEXT`; en fjärrmotor eller en gammal socket för en Engine i Ubuntu är inte den lokala Desktop-konfiguration som den här guiden använder. Åtgärda inte detta genom att installera en annan daemon eller göra socketen skrivbar för alla.
+
+### MongoDB startar inte {#mongodb-fails-to-start}
+
+`bin/up` initierar MongoDB:s replikuppsättning innan applikationen startas. Om den stannar vid `Waiting for Mongo...` granskar du databasen i en andra **Ubuntu**-terminal:
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+Om `mongo` saknas och utdata visar ett fel vid hämtning av avbildningen löser du först registeråtkomsten eller diskutrymmet; databasstarten har då inte nåtts. När orsaken är åtgärdad kör du `bin/up -d` igen.
+
+| Tecken | Vad du ska kontrollera |
+| --- | --- |
+| `OOMKilled=true` | Öka minnet som är tillgängligt för WSL/Docker eller minska andra arbetsbelastningar och försök sedan igen |
+| `No space left on device` | Kontrollera lagringsutrymmet på Windows-värden, Ubuntus `df -h` och Dockers diskanvändning; frigör utrymme utan att ta bort aktiva databasdata |
+| Behörighets- eller lagringsfel under `/data/db` | Behåll `MONGO_DATA_PATH` i Ubuntus Linux-filsystem. Kontrollera den faktiska bind-monteringen och ägarskapet; använd inte `chmod -R 777` |
+| Illegal instruction / fel om CPU-funktioner | Kontrollera att CPU:n och virtualiseringen exponerar de funktioner som din MongoDB-version kräver; att byta port löser inte detta |
+| Fel om databasformat/uppgradering med befintliga data | Följ den [uppgraderingsprocedur](/sv/on-premises/maintenance/upgrading-your-deployment) som stöds; peka inte en godtycklig äldre MongoDB-avbildning mot nyare data |
+
+När MongoDB körs kontrollerar du replikuppsättningen:
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+Resultatet ska vara `1`. `bin/up -d` utför den första konfigurationen av replikuppsättningen; om du startar Compose-tjänster direkt i en ny driftsättning hoppas det Toolkit-steget över.
+
+Tillämpa bara en kärnlösning för MongoDB om din Docker-motor använder en påverkad kärna. Om MongoDB-loggarna tyder på ett kärnproblem jämför du motorns faktiska kärna med [MongoDB:s produktionsanteckningar](https://www.mongodb.com/docs/manual/administration/production-notes/) och uppdaterar WSL/Docker vid behov. Radera aldrig `data/mongo` som en allmän lösning på startproblem.
+
+### Windows kan inte öppna localhost {#windows-cannot-open-localhost}
+
+Testa först i Ubuntu:
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+Testa sedan i **PowerShell**:
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+Om båda misslyckas kontrollerar du applikationsloggarna och portkonfigurationen. Om bara Windows misslyckas kontrollerar du om en annan Windows-process använder port 8080, anpassade nätverksinställningar för WSL, VPN-/proxyregler eller säkerhetsprogramvara. Inaktivera inte brandväggen globalt. En ändrad port kräver matchande `OVERLEAF_PORT`, `OVERLEAF_SITE_URL` och webbläsar-URL, följt av `bin/up -d`.
+
+### Sandlådekompilering misslyckas {#sandboxed-compiles-fail}
+
+Verifiera alla tre delarna: avbildningen finns i den här Docker-motorn, applikationen kan använda motorns socket och syskoncontainern kan montera kompileringskatalogen:
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+Använd den avbildning som är konfigurerad i `config/variables.env`. `SERVER_PRO=true`, `SIBLING_CONTAINERS_ENABLED=true` och `DOCKER_SOCKET_PATH=/var/run/docker.sock` hör hemma i `config/overleaf.rc`. Efter ändringar kör du `bin/up -d`; `bin/start` ensamt uppdaterar inte containerns miljö.
+
+Ett `No such image`-fel betyder att Docker inte hittar exakt den avbildning som projektet begär. Håll `TEX_LIVE_DOCKER_IMAGE` och `ALL_TEX_LIVE_DOCKER_IMAGES` konsekventa, hämta avbildningen i samma motor och kontrollera projektets val av TeX Live. Befintliga projekt kan behålla ett äldre val av avbildning.
+
+Vid ett monteringsfel eller en tom `/compile`-katalog bekräftar du att Toolkit ligger under Ubuntus hemkatalog och att Docker Desktops integration är aktiverad för samma distribution. Ersätt inte WSL-värdsökvägen med en Windows-sökväg som `C:\...`. Toolkit beräknar syskoncontainerns sökväg från `OVERLEAF_DATA_PATH`.
+
+En saknad `ctexart.cls` eller ett saknat typsnitt med **basic** är en begränsning i paket/avbildning. Verifiera först den enkla artikeln från [steg 6](/sv/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks); använd en mer fullständig avbildning för projekt som behöver ytterligare paket. Inaktivera inte sandlådan för att åtgärda ett saknat TeX-paket.
+
+### Skalskript rapporterar CRLF-fel {#shell-scripts-report-crlf-errors}
+
+Kör skripten i Ubuntu Bash. Redigera konfigurationen med LF-radslut. Fel som nämner `bash\r` eller `$'\r'` betyder oftast att filer har konverterats till Windows CRLF. Återställ det berörda skriptet från repositoriet eller konvertera dess radslut, och bevara lokala konfigurationsändringar.
+
+### Containrar försvinner efter en omstart {#containers-disappear-after-a-restart}
+
+Kontrollera att Docker Desktop körs och att Ubuntu-integrationen är aktiverad. `docker ps` visar bara containrar som körs; granska även `docker ps -a`. Om motorn är en annan än den som användes vid konfigurationen byter du tillbaka till rätt kontext i stället för att initiera ännu en tom installation.
+
+Om containrarna finns men är stoppade kör du `bin/start` och granskar loggarna. Följ [Håll instansen tillgänglig](/sv/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available) för start vid inloggning, omstartspolicyer och Windows vilolägesinställningar.
