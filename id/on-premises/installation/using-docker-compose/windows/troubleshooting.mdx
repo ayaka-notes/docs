@@ -1,0 +1,132 @@
+---
+title: Pemecahan masalah
+description: Diagnosis integrasi Docker Desktop, startup MongoDB, akses localhost Windows, dan sandboxed compiles di WSL 2.
+icon: wrench
+---
+
+Jalankan perintah Toolkit dan Docker di **Ubuntu** kecuali ditandai **PowerShell**. Pertahankan konfigurasi dan data selama mendiagnosis kegagalan.
+
+### WSL atau Docker melaporkan bahwa virtualisasi tidak tersedia {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+Backend WSL 2 memerlukan virtualisasi hardware dan **Virtual Machine Platform**, bukan fitur Hyper-V lengkap yang digunakan oleh backend Hyper-V alternatif Docker. Mulailah dengan pemeriksaan berikut:
+
+1. Di **Task Manager → Performance → CPU** Windows, periksa **Virtualization: Enabled**. Jika dinonaktifkan, aktifkan Intel VT-x/VMX atau AMD-V/SVM di BIOS/UEFI sesuai petunjuk produsen PC Anda.
+2. Di **PowerShell sebagai administrator**, periksa fitur Windows:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+Jika fitur yang diperlukan dinonaktifkan, aktifkan fitur tersebut dan restart Windows sebelum mencoba WSL lagi:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. Jika fitur dan pengaturan BIOS sudah diaktifkan tetapi error `0x80370102` masih muncul, periksa di **PowerShell sebagai administrator**:
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+Jika secara eksplisit melaporkan `Off`, pulihkan startup hypervisor dan restart Windows:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. Jika Windows sendiri berjalan di VM, hypervisor luar harus menyediakan **nested virtualization**. Mengaktifkan checkbox Windows saja tidak dapat menyediakan fitur CPU virtual yang tidak ada.
+
+Ikuti [panduan perbaikan error WSL 0x80370102 dari Microsoft](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed) dan [pemecahan masalah virtualisasi Docker](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working) untuk error yang sesuai. Perbaikan ini mengubah fitur Windows atau konfigurasi boot; jalankan hanya yang relevan dengan diagnosis Anda.
+
+### Docker Desktop memerlukan pembaruan atau tidak dapat melakukan pull image {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+Untuk **WSL update required**, jalankan `wsl --update` di PowerShell, restart Windows jika diminta, lalu buka kembali Docker Desktop dan Ubuntu. Jika baris Ubuntu masih menunjukkan WSL 1, konversikan distribusi seperti yang dijelaskan di langkah 0.
+
+Untuk timeout registry, DNS, proxy, atau error sertifikat, periksa registry yang gagal secara persis di output pull. Konfigurasikan proxy Windows/Docker Desktop dan kepercayaan sertifikat jika jaringan Anda memerlukannya; jangan menonaktifkan verifikasi TLS. Clone GitHub yang berhasil tidak membuktikan bahwa Docker dapat menjangkau `ghcr.io` atau Docker Hub. Lihat [pengaturan proxy Docker Desktop](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies). Setelah konektivitas berfungsi, jalankan kembali `bin/up -d`; nama image yang dikonfigurasi harus tetap konsisten.
+
+### Docker tidak tersedia di Ubuntu {#docker-is-unavailable-in-ubuntu}
+
+Jika `docker` tidak ditemukan, buka Docker Desktop di Windows, aktifkan Ubuntu di **Settings → Resources → WSL Integration**, terapkan perubahan, lalu buka kembali Ubuntu. Periksa nama distribusi dan mode WSL dengan `wsl --list --verbose` di **PowerShell**. Distribusi harus menggunakan WSL 2.
+
+Jika client ada tetapi tidak dapat menjangkau daemon, periksa bahwa engine sudah selesai dijalankan. Periksa `docker context ls` dan pengaturan `DOCKER_HOST`/`DOCKER_CONTEXT` kustom apa pun; engine remote atau socket Engine Ubuntu lama bukanlah penyiapan Desktop lokal dalam panduan ini. Jangan memperbaikinya dengan menginstal daemon lain atau membuat socket dapat ditulis oleh semua pengguna.
+
+### MongoDB gagal dijalankan {#mongodb-fails-to-start}
+
+`bin/up` menginisialisasi replica set MongoDB sebelum menjalankan aplikasi. Jika berhenti di `Waiting for Mongo...`, periksa database di terminal **Ubuntu** kedua:
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+Jika `mongo` tidak ada dan output menunjukkan error pull image, selesaikan akses registry atau ruang disk terlebih dahulu; prosesnya belum mencapai startup database. Setelah penyebabnya diperbaiki, jalankan kembali `bin/up -d`.
+
+| Bukti | Yang perlu diperiksa |
+| --- | --- |
+| `OOMKilled=true` | Tingkatkan memori yang tersedia untuk WSL/Docker atau kurangi workload lain, lalu coba lagi |
+| `No space left on device` | Periksa penyimpanan host Windows, `df -h` di Ubuntu, dan penggunaan disk Docker; kosongkan ruang tanpa menghapus data database yang aktif |
+| Error izin atau penyimpanan di bawah `/data/db` | Simpan `MONGO_DATA_PATH` di filesystem Linux Ubuntu. Periksa bind mount dan kepemilikan yang sebenarnya; jangan menerapkan `chmod -R 777` |
+| Error illegal instruction / fitur CPU | Periksa bahwa CPU dan virtualisasi menyediakan fitur yang diperlukan oleh versi MongoDB Anda; mengubah port tidak akan memperbaikinya |
+| Error format database / upgrade dengan data yang sudah ada | Ikuti [prosedur upgrade](/id/on-premises/maintenance/upgrading-your-deployment) yang didukung; jangan mengarahkan image MongoDB lama sembarang ke data yang lebih baru |
+
+Saat MongoDB berjalan, periksa replica set:
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+Hasilnya seharusnya `1`. `bin/up -d` melakukan penyiapan awal replica set; menjalankan layanan Compose secara langsung pada deployment baru akan melewati langkah Toolkit tersebut.
+
+Terapkan solusi sementara kernel MongoDB hanya jika engine Docker Anda menggunakan kernel yang terdampak. Jika log MongoDB menunjukkan masalah kernel, bandingkan kernel engine yang sebenarnya dengan [catatan produksi MongoDB](https://www.mongodb.com/docs/manual/administration/production-notes/) dan perbarui WSL/Docker sesuai kebutuhan. Jangan pernah menghapus `data/mongo` sebagai perbaikan startup umum.
+
+### Windows tidak dapat membuka localhost {#windows-cannot-open-localhost}
+
+Uji terlebih dahulu di Ubuntu:
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+Kemudian uji di **PowerShell**:
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+Jika keduanya gagal, periksa log aplikasi dan konfigurasi port. Jika hanya Windows yang gagal, periksa apakah ada proses Windows lain yang menggunakan port 8080, pengaturan jaringan WSL kustom, aturan VPN/proxy, atau perangkat lunak keamanan. Jangan menonaktifkan firewall secara global. Port yang diubah memerlukan `OVERLEAF_PORT`, `OVERLEAF_SITE_URL`, dan URL browser yang sesuai, diikuti dengan `bin/up -d`.
+
+### Sandboxed compiles gagal {#sandboxed-compiles-fail}
+
+Verifikasi ketiga bagian: image ada di engine Docker ini, aplikasi dapat menggunakan socket engine, dan kontainer sibling dapat me-mount direktori kompilasi:
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+Gunakan image yang dikonfigurasi di `config/variables.env`. `SERVER_PRO=true`, `SIBLING_CONTAINERS_ENABLED=true`, dan `DOCKER_SOCKET_PATH=/var/run/docker.sock` ditempatkan di `config/overleaf.rc`. Setelah mengedit, jalankan `bin/up -d`; `bin/start` saja tidak memperbarui lingkungan kontainer.
+
+Error `No such image` berarti Docker tidak dapat menemukan image persis yang diminta oleh proyek tersebut. Jaga agar `TEX_LIVE_DOCKER_IMAGE` dan `ALL_TEX_LIVE_DOCKER_IMAGES` tetap konsisten, lakukan pull image di engine yang sama, dan periksa pilihan TeX Live proyek. Proyek yang sudah ada mungkin masih menyimpan pilihan image yang lebih lama.
+
+Untuk error mount atau direktori `/compile` yang kosong, pastikan Toolkit berada di bawah direktori home Ubuntu dan integrasi Docker Desktop diaktifkan untuk distribusi yang sama. Jangan mengganti path host WSL dengan path Windows `C:\...`. Toolkit menghitung path kontainer sibling dari `OVERLEAF_DATA_PATH`.
+
+`ctexart.cls` atau font yang tidak ada pada image **basic** adalah keterbatasan paket/image. Verifikasi terlebih dahulu artikel sederhana dari [langkah 6](/id/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks); gunakan image yang lebih lengkap untuk proyek yang memerlukan paket tambahan. Jangan menonaktifkan sandboxing untuk memperbaiki paket TeX yang tidak ada.
+
+### Skrip shell melaporkan error CRLF {#shell-scripts-report-crlf-errors}
+
+Jalankan skrip di Ubuntu Bash. Edit konfigurasi dengan akhir baris LF. Error yang menyebutkan `bash\r` atau `$'\r'` biasanya berarti file telah dikonversi ke CRLF Windows. Pulihkan skrip yang terdampak dari repositori atau konversikan akhir barisnya, dengan tetap mempertahankan perubahan konfigurasi lokal.
+
+### Kontainer hilang setelah restart {#containers-disappear-after-a-restart}
+
+Periksa bahwa Docker Desktop sedang berjalan dan integrasi Ubuntu diaktifkan. `docker ps` hanya menampilkan kontainer yang sedang berjalan; periksa juga `docker ps -a`. Jika engine berbeda dari yang digunakan saat penyiapan, beralihlah kembali ke context yang benar alih-alih menginisialisasi instalasi kosong lainnya.
+
+Untuk kontainer yang ada tetapi berhenti, jalankan `bin/start` dan periksa log. Ikuti [Menjaga instance tetap tersedia](/id/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available) untuk startup saat login, restart policy, dan pengaturan mode tidur Windows.

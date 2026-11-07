@@ -1,0 +1,132 @@
+---
+title: Řešení problémů
+description: Diagnostika integrace Docker Desktop, spouštění MongoDB, přístupu k localhost z Windows a Sandboxed Compiles na WSL 2.
+icon: wrench
+---
+
+Příkazy Toolkitu a Dockeru spouštějte v **Ubuntu**, pokud nejsou označeny jako **PowerShell**. Při diagnostice selhání zachovejte konfiguraci i data.
+
+### WSL nebo Docker hlásí, že virtualizace není dostupná {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+Backend WSL 2 potřebuje hardwarovou virtualizaci a **Virtual Machine Platform**, nikoli plnou funkci Hyper-V, kterou používá alternativní backend Hyper-V Dockeru. Začněte těmito kontrolami:
+
+1. Ve Windows ve **Správci úloh → Výkon → CPU** zkontrolujte **Virtualizace: Povoleno**. Pokud je vypnutá, zapněte Intel VT-x/VMX nebo AMD-V/SVM v BIOS/UEFI podle pokynů výrobce vašeho počítače.
+2. V **PowerShellu jako správce** zkontrolujte funkce Windows:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+Pokud jsou požadované funkce vypnuté, zapněte je a před dalším pokusem o WSL restartujte Windows:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. Pokud jsou funkce i nastavení BIOS zapnuté, ale chyba `0x80370102` přetrvává, zkontrolujte v **PowerShellu jako správce**:
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+Pokud výslovně hlásí `Off`, obnovte spouštění hypervisoru a restartujte Windows:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. Pokud samotné Windows běží ve virtuálním počítači, vnější hypervisor musí zpřístupnit **vnořenou virtualizaci**. Samotné zaškrtnutí políčka ve Windows nemůže dodat chybějící funkce virtuálního CPU.
+
+Pro odpovídající chybu postupujte podle [návodu Microsoftu k opravě chyby WSL 0x80370102](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed) a [řešení problémů s virtualizací od Dockeru](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working). Tyto opravy mění funkce Windows nebo konfiguraci spouštění; spouštějte jen ty, které odpovídají vaší diagnóze.
+
+### Docker Desktop vyžaduje aktualizaci nebo nemůže stahovat image {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+Při hlášení **WSL update required** spusťte v PowerShellu `wsl --update`, pokud k tomu budete vyzváni, restartujte Windows a poté znovu otevřete Docker Desktop a Ubuntu. Pokud řádek Ubuntu stále uvádí WSL 1, převeďte distribuci podle kroku 0.
+
+Při vypršení časového limitu registru nebo chybách DNS, proxy či certifikátů zjistěte ve výstupu stahování, který registr přesně selhává. Pokud to vaše síť vyžaduje, nakonfigurujte proxy a důvěryhodnost certifikátů ve Windows/Docker Desktop; neověřování TLS nevypínejte. Úspěšné naklonování z GitHubu nedokazuje, že Docker dosáhne na `ghcr.io` nebo Docker Hub. Viz [nastavení proxy v Docker Desktop](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies). Jakmile připojení funguje, znovu spusťte `bin/up -d`; nakonfigurované názvy image musí zůstat konzistentní.
+
+### Docker není v Ubuntu dostupný {#docker-is-unavailable-in-ubuntu}
+
+Pokud `docker` nebyl nalezen, otevřete ve Windows Docker Desktop, zapněte Ubuntu v **Settings → Resources → WSL Integration**, použijte změnu a znovu otevřete Ubuntu. Název distribuce a režim WSL zkontrolujte pomocí `wsl --list --verbose` v **PowerShellu**. Distribuce musí používat WSL 2.
+
+Pokud klient existuje, ale nemůže se připojit k démonu, zkontrolujte, že se engine dokončil spouštění. Prohlédněte si `docker context ls` a případná vlastní nastavení `DOCKER_HOST`/`DOCKER_CONTEXT`; vzdálený engine nebo socket starého Engine v Ubuntu není lokální nastavení Desktop z tohoto návodu. Neřešte to instalací dalšího démona ani tím, že socket zpřístupníte pro zápis všem.
+
+### MongoDB se nespustí {#mongodb-fails-to-start}
+
+`bin/up` inicializuje replica set MongoDB před spuštěním aplikace. Pokud se zastaví u `Waiting for Mongo...`, prohlédněte si databázi v druhém terminálu **Ubuntu**:
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+Pokud `mongo` chybí a výstup ukazuje chybu stahování image, vyřešte nejprve přístup k registru nebo místo na disku; ke spuštění databáze vůbec nedošlo. Po odstranění příčiny znovu spusťte `bin/up -d`.
+
+| Příznak | Co zkontrolovat |
+| --- | --- |
+| `OOMKilled=true` | Zvyšte paměť dostupnou pro WSL/Docker nebo omezte jiné úlohy a zkuste to znovu |
+| `No space left on device` | Zkontrolujte úložiště hostitele Windows, `df -h` v Ubuntu a využití disku Dockerem; uvolněte místo, aniž byste mazali živá data databáze |
+| Chyby oprávnění nebo úložiště pod `/data/db` | Ponechte `MONGO_DATA_PATH` v linuxovém souborovém systému Ubuntu. Zkontrolujte skutečný bind mount a vlastnictví; nepoužívejte `chmod -R 777` |
+| Chyby Illegal instruction / funkcí CPU | Zkontrolujte, že CPU a virtualizace zpřístupňují funkce vyžadované vaší verzí MongoDB; změna portu to nevyřeší |
+| Chyby formátu databáze / upgradu se stávajícími daty | Postupujte podle podporovaného [postupu upgradu](/cs/on-premises/maintenance/upgrading-your-deployment); nenasměrujte libovolný starší image MongoDB na novější data |
+
+Když MongoDB běží, zkontrolujte replica set:
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+Výsledek by měl být `1`. `bin/up -d` provádí počáteční nastavení replica setu; přímé spuštění služeb Compose u nového nasazení tento krok Toolkitu přeskočí.
+
+Obejití problému s jádrem pro MongoDB použijte pouze tehdy, pokud váš engine Dockeru používá dotčené jádro. Pokud logy MongoDB naznačují problém s jádrem, porovnejte skutečné jádro enginu s [produkčními poznámkami MongoDB](https://www.mongodb.com/docs/manual/administration/production-notes/) a podle potřeby aktualizujte WSL/Docker. Nikdy nemažte `data/mongo` jako obecnou opravu spouštění.
+
+### Windows nemohou otevřít localhost {#windows-cannot-open-localhost}
+
+Nejprve otestujte v Ubuntu:
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+Poté otestujte v **PowerShellu**:
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+Pokud selžou oba testy, zkontrolujte logy aplikace a konfiguraci portu. Pokud selhávají pouze Windows, zkontrolujte, zda port 8080 nepoužívá jiný proces Windows, a dále vlastní nastavení sítě WSL, pravidla VPN/proxy nebo bezpečnostní software. Bránu firewall globálně nevypínejte. Změněný port vyžaduje odpovídající `OVERLEAF_PORT`, `OVERLEAF_SITE_URL` a URL v prohlížeči a poté `bin/up -d`.
+
+### Sandboxed Compiles selhávají {#sandboxed-compiles-fail}
+
+Ověřte všechny tři části: image existuje v tomto enginu Dockeru, aplikace může používat socket enginu a sourozenecký kontejner může připojit kompilační adresář:
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+Použijte image nakonfigurovaný v `config/variables.env`. `SERVER_PRO=true`, `SIBLING_CONTAINERS_ENABLED=true` a `DOCKER_SOCKET_PATH=/var/run/docker.sock` patří do `config/overleaf.rc`. Po úpravách spusťte `bin/up -d`; samotný `bin/start` prostředí kontejneru neaktualizuje.
+
+Chyba `No such image` znamená, že Docker nemůže najít přesný image, který daný projekt požaduje. Udržujte `TEX_LIVE_DOCKER_IMAGE` a `ALL_TEX_LIVE_DOCKER_IMAGES` konzistentní, stáhněte image ve stejném enginu a zkontrolujte výběr TeX Live v projektu. Existující projekty si mohou ponechat starší volbu image.
+
+Při chybě připojení nebo prázdném adresáři `/compile` ověřte, že je Toolkit v domovském adresáři Ubuntu a že je integrace Docker Desktop zapnutá pro tutéž distribuci. Nenahrazujte cestu na hostiteli WSL cestou Windows `C:\...`. Toolkit vypočítá cestu pro sourozenecký kontejner z `OVERLEAF_DATA_PATH`.
+
+Chybějící `ctexart.cls` nebo písmo s image **basic** je omezení balíčků/image. Nejprve ověřte jednoduchý článek z [kroku 6](/cs/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks); pro projekty vyžadující další balíčky použijte plnější image. Nevypínejte sandbox kvůli chybějícímu balíčku TeXu.
+
+### Shellové skripty hlásí chyby CRLF {#shell-scripts-report-crlf-errors}
+
+Spouštějte skripty v Ubuntu Bash. Konfiguraci upravujte s konci řádků LF. Chyby zmiňující `bash\r` nebo `$'\r'` obvykle znamenají, že soubory byly převedeny na windowsové CRLF. Obnovte dotčený skript z repozitáře nebo převeďte jeho konce řádků a zachovejte přitom lokální změny konfigurace.
+
+### Kontejnery po restartu zmizí {#containers-disappear-after-a-restart}
+
+Zkontrolujte, že Docker Desktop běží a integrace s Ubuntu je zapnutá. `docker ps` zobrazuje pouze běžící kontejnery; prohlédněte si také `docker ps -a`. Pokud se engine liší od toho, který byl použit při instalaci, přepněte zpět na správný kontext, místo abyste inicializovali další prázdnou instalaci.
+
+Pokud kontejnery existují, ale jsou zastavené, spusťte `bin/start` a prohlédněte si logy. Pro spouštění při přihlášení, zásady restartu a nastavení spánku Windows postupujte podle části [Zajištění dostupnosti instance](/cs/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available).
