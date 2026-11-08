@@ -1,0 +1,132 @@
+---
+title: Fejlfinding
+description: Diagnosticer Docker Desktop-integration, opstart af MongoDB, adgang til localhost fra Windows og sandboxed compiles på WSL 2.
+icon: wrench
+---
+
+Kør Toolkit- og Docker-kommandoer i **Ubuntu**, medmindre de er markeret med **PowerShell**. Behold konfigurationen og dataene, mens du diagnosticerer fejl.
+
+### WSL eller Docker rapporterer, at virtualisering ikke er tilgængelig {#wsl-or-docker-reports-that-virtualization-is-unavailable}
+
+WSL 2-backenden kræver hardwarevirtualisering og **Virtual Machine Platform**, ikke den fulde Hyper-V-funktion, som Dockers alternative Hyper-V-backend bruger. Start med disse kontroller:
+
+1. Kontrollér **Virtualization: Enabled** under **Task Manager → Performance → CPU** i Windows. Hvis den er deaktiveret, skal du aktivere Intel VT-x/VMX eller AMD-V/SVM i BIOS/UEFI efter din pc-producents vejledning.
+2. Kontrollér Windows-funktionerne i **PowerShell som administrator**:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
+```
+
+Hvis nødvendige funktioner er deaktiveret, skal du aktivere dem og genstarte Windows, før du prøver WSL igen:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+3. Hvis funktionerne og BIOS-indstillingen er aktiveret, men fejlen `0x80370102` fortsætter, skal du kontrollere følgende i **PowerShell som administrator**:
+
+```powershell
+bcdedit /enum | findstr -i hypervisorlaunchtype
+```
+
+Hvis den eksplicit rapporterer `Off`, skal du gendanne hypervisor-opstarten og genstarte Windows:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+```
+
+4. Hvis Windows selv kører i en VM, skal den ydre hypervisor stille **nested virtualization** til rådighed. Et afkrydsningsfelt i Windows kan ikke alene levere manglende virtuelle CPU-funktioner.
+
+Følg [Microsofts reparationsvejledning til WSL-fejl 0x80370102](https://learn.microsoft.com/en-us/windows/wsl/troubleshooting#error-0x80370102-the-virtual-machine-could-not-be-started-because-a-required-feature-is-not-installed) og [Dockers fejlfinding af virtualisering](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/#docker-desktop-fails-due-to-virtualization-not-working) for den tilsvarende fejl. Disse reparationer ændrer Windows-funktioner eller opstartskonfiguration; kør kun dem, der er relevante for din diagnose.
+
+### Docker Desktop skal opdateres eller kan ikke hente images {#docker-desktop-needs-an-update-or-cannot-pull-images}
+
+Ved **WSL update required** skal du køre `wsl --update` i PowerShell, genstarte Windows, hvis du bliver bedt om det, og derefter åbne Docker Desktop og Ubuntu igen. Hvis Ubuntu-rækken stadig viser WSL 1, skal du konvertere distributionen som beskrevet i trin 0.
+
+Ved registry-timeouts, DNS-, proxy- eller certifikatfejl skal du kontrollere, præcis hvilken registry der fejler, i outputtet fra hentningen. Konfigurer proxy og certifikattillid i Windows/Docker Desktop, hvis dit netværk kræver det; deaktiver ikke TLS-verifikation. En vellykket kloning fra GitHub beviser ikke, at Docker kan nå `ghcr.io` eller Docker Hub. Se [Docker Desktops proxyindstillinger](https://docs.docker.com/desktop/settings-and-maintenance/settings/#proxies). Når forbindelsen virker, skal du køre `bin/up -d` igen; de konfigurerede image-navne skal forblive konsistente.
+
+### Docker er ikke tilgængelig i Ubuntu {#docker-is-unavailable-in-ubuntu}
+
+Hvis `docker` ikke findes, skal du åbne Docker Desktop i Windows, aktivere Ubuntu under **Settings → Resources → WSL Integration**, anvende ændringen og åbne Ubuntu igen. Kontrollér distributionens navn og WSL-tilstand med `wsl --list --verbose` i **PowerShell**. Den skal bruge WSL 2.
+
+Hvis klienten findes, men ikke kan nå daemonen, skal du kontrollere, at enginen er færdig med at starte. Undersøg `docker context ls` og eventuelle brugerdefinerede `DOCKER_HOST`/`DOCKER_CONTEXT`-indstillinger; en ekstern engine eller en gammel Engine-socket i Ubuntu er ikke denne vejlednings lokale Desktop-opsætning. Løs ikke dette ved at installere en anden daemon eller gøre socket'en skrivbar for alle.
+
+### MongoDB starter ikke {#mongodb-fails-to-start}
+
+`bin/up` initialiserer MongoDBs replica set, før applikationen startes. Hvis den stopper ved `Waiting for Mongo...`, skal du undersøge databasen i en anden **Ubuntu**-terminal:
+
+```bash
+cd "$HOME/ayakaleaf-toolkit"
+bin/docker-compose ps -a
+bin/docker-compose logs --tail=150 mongo
+docker inspect mongo --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker info --format '{{.KernelVersion}}'
+```
+
+Hvis `mongo` mangler, og outputtet viser en fejl ved hentning af image, skal du først løse adgangen til registry eller diskpladsen; databasen er ikke nået til opstart. Når årsagen er rettet, skal du køre `bin/up -d` igen.
+
+| Tegn | Hvad du skal kontrollere |
+| --- | --- |
+| `OOMKilled=true` | Øg den hukommelse, der er tilgængelig for WSL/Docker, eller reducer andre arbejdsbelastninger, og prøv igen |
+| `No space left on device` | Kontrollér lagerpladsen på Windows-værten, Ubuntus `df -h` og Dockers diskforbrug; frigør plads uden at slette aktive databasedata |
+| Tilladelses- eller lagerfejl under `/data/db` | Behold `MONGO_DATA_PATH` på Ubuntus Linux-filsystem. Kontrollér det faktiske bind-mount og ejerskab; anvend ikke `chmod -R 777` |
+| Illegal instruction / fejl om CPU-funktioner | Kontrollér, at CPU'en og virtualiseringen stiller de funktioner til rådighed, som din MongoDB-version kræver; det hjælper ikke at ændre porten |
+| Fejl om databaseformat / opgradering med eksisterende data | Følg den understøttede [opgraderingsprocedure](/da/on-premises/maintenance/upgrading-your-deployment); peg ikke et vilkårligt ældre MongoDB-image mod nyere data |
+
+Når MongoDB kører, skal du kontrollere replica set'et:
+
+```bash
+bin/docker-compose exec -T mongo mongosh --quiet --eval 'rs.status().ok'
+```
+
+Resultatet skal være `1`. `bin/up -d` udfører den indledende opsætning af replica set'et; hvis du starter Compose-tjenester direkte på en ny udrulning, springes dette Toolkit-trin over.
+
+Anvend kun en MongoDB-kerneløsning, hvis din Docker-engine bruger en berørt kerne. Hvis MongoDB-loggene tyder på et kerneproblem, skal du sammenligne enginens faktiske kerne med [MongoDBs produktionsnoter](https://www.mongodb.com/docs/manual/administration/production-notes/) og opdatere WSL/Docker efter behov. Slet aldrig `data/mongo` som en generel løsning på opstartsproblemer.
+
+### Windows kan ikke åbne localhost {#windows-cannot-open-localhost}
+
+Test først i Ubuntu:
+
+```bash
+bin/docker-compose ps
+bin/docker-compose port sharelatex 80
+curl -I http://localhost:8080/launchpad
+```
+
+Test derefter i **PowerShell**:
+
+```powershell
+curl.exe -I http://localhost:8080/launchpad
+```
+
+Hvis begge mislykkes, skal du kontrollere applikationsloggene og portkonfigurationen. Hvis kun Windows mislykkes, skal du kontrollere, om en anden Windows-proces bruger port 8080, samt brugerdefinerede WSL-netværksindstillinger, VPN-/proxyregler eller sikkerhedssoftware. Deaktiver ikke firewallen globalt. En ændret port kræver tilsvarende `OVERLEAF_PORT`, `OVERLEAF_SITE_URL` og browser-URL efterfulgt af `bin/up -d`.
+
+### Sandboxed compiles mislykkes {#sandboxed-compiles-fail}
+
+Kontrollér alle tre dele: imaget findes i denne Docker-engine, applikationen kan bruge engine-socket'en, og søskendecontaineren kan montere kompileringsmappen:
+
+```bash
+docker image inspect ghcr.io/ayaka-notes/texlive-basic:2026.1 --format '{{.Architecture}} {{.Id}}'
+docker inspect sharelatex --format '{{json .Mounts}}'
+bin/logs -f clsi
+```
+
+Brug det image, der er konfigureret i `config/variables.env`. `SERVER_PRO=true`, `SIBLING_CONTAINERS_ENABLED=true` og `DOCKER_SOCKET_PATH=/var/run/docker.sock` hører hjemme i `config/overleaf.rc`. Kør `bin/up -d` efter ændringer; `bin/start` alene opdaterer ikke containerens miljø.
+
+En `No such image`-fejl betyder, at Docker ikke kan finde præcis det image, som projektet anmoder om. Hold `TEX_LIVE_DOCKER_IMAGE` og `ALL_TEX_LIVE_DOCKER_IMAGES` konsistente, hent imaget i den samme engine, og kontrollér projektets valg af TeX Live. Eksisterende projekter kan beholde et ældre valg af image.
+
+Ved en mount-fejl eller en tom `/compile`-mappe skal du bekræfte, at Toolkit ligger under Ubuntus hjemmemappe, og at Docker Desktops integration er aktiveret for den samme distribution. Erstat ikke WSL-værtsstien med en Windows-sti som `C:\...`. Toolkit beregner søskendecontainerens sti ud fra `OVERLEAF_DATA_PATH`.
+
+En manglende `ctexart.cls` eller skrifttype med **basic** er en begrænsning i pakker/image. Kontrollér først den simple artikel fra [trin 6](/da/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks); brug et mere komplet image til projekter, der kræver yderligere pakker. Deaktiver ikke sandboxing for at løse en manglende TeX-pakke.
+
+### Shell-scripts rapporterer CRLF-fejl {#shell-scripts-report-crlf-errors}
+
+Kør scriptene i Ubuntu Bash. Rediger konfigurationen med LF-linjeskift. Fejl, der nævner `bash\r` eller `$'\r'`, betyder normalt, at filerne er blevet konverteret til Windows-CRLF. Gendan det berørte script fra repositoriet, eller konverter dets linjeskift, og bevar lokale konfigurationsændringer.
+
+### Containere forsvinder efter en genstart {#containers-disappear-after-a-restart}
+
+Kontrollér, at Docker Desktop kører, og at Ubuntu-integrationen er aktiveret. `docker ps` viser kun kørende containere; undersøg også `docker ps -a`. Hvis enginen er en anden end den, der blev brugt under opsætningen, skal du skifte tilbage til den korrekte kontekst i stedet for at initialisere endnu en tom installation.
+
+Hvis containerne findes, men er stoppet, skal du køre `bin/start` og undersøge loggene. Følg [Hold instansen tilgængelig](/da/on-premises/installation/using-docker-compose/windows/6.-post-installation-tasks#keep-the-instance-available) for opstart ved login, genstartspolitikker og Windows' dvaleindstillinger.
