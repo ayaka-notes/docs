@@ -1,0 +1,62 @@
+---
+title: Notifications Collection
+icon: bell
+---
+
+`notifications` holds the notices shown at the top of a user's project dashboard. One document is one notice for one user, identified by its `key`. Only the `notifications` service touches the collection (`services/notifications/app/js/Notifications.js`); `web` and `third-party-datastore` call its HTTP API. There is no Mongoose schema.
+
+#### Fields
+
+| Field         | Type     | Meaning                                                                                                                                                     | Source                  |
+| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `_id`         | ObjectId | Notice id. `web` marks a notice as read by this id.                                                                                                         | `Notifications.js:58-65` |
+| `user_id`     | ObjectId | The user who sees the notice.                                                                                                                               | `Notifications.js:26`   |
+| `key`         | String   | Identifies the notice, for example `project-invite-<inviteId>`. The upsert keeps one document per `user_id` and `key`; there is no unique index. | `Notifications.js:27`, `:51-55` |
+| `templateKey` | String   | Which notice the frontend renders. Removed when the notice is read or dismissed; the document stays.                                                        | `Notifications.js:29`, `:63`, `:72`, `:78` |
+| `messageOpts` | Object   | Values for the notice text, depending on `templateKey` (for a project invite: `userName`, `projectName`, `projectId`, `token`). Removed when the user dismisses the notice by id. | `Notifications.js:28`, `:63` |
+| `expires`     | Date     | Optional. The TTL index deletes the document after this time.                                                                                               | `Notifications.js:35-50` |
+
+#### Who Writes It
+
+| Code                                                    | What it does                                                                                                     |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `Notifications.js:20-56` (`addNotification`)            | `POST /user/:user_id` (`services/notifications/app.ts:29`). Upserts by `user_id` + `key`. If a document with that key already exists, it is only written again when the caller sends `forceCreate`. |
+| `Notifications.js:58-65` (`removeNotificationId`)       | `DELETE /user/:user_id/notification/:notification_id` (`app.ts:31-34`): unsets `templateKey` and `messageOpts`.   |
+| `Notifications.js:67-80`                                | `DELETE /user/:user_id` and `DELETE /key/:key` (`app.ts:35-36`): unset `templateKey` by key.                      |
+| `Notifications.js:87-100`                               | `DELETE /key/:key/bulk` (`app.ts:38-41`) deletes unread notices with a key; `deleteNotificationByKeyOnly` deletes one document by key. |
+| `services/web/app/src/Features/Notifications/NotificationsHandler.mjs:33-66` | `web` side of `addNotification`. Sends `forceCreate: true` unless the caller passes `false`.           |
+| `services/third-party-datastore/app/js/QueueWorker.mjs:46-58` | Our Dropbox sync: when it unlinks a Dropbox account, it posts the `dropbox-unlinked` notice directly.      |
+
+Notices that CE and our modules create:
+
+| `key`                                  | `templateKey`                                                                                                                  | Created at                                                                                             |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `project-invite-<inviteId>`            | `notification_project_invite`, expires with the invite                                                                         | `services/web/app/src/Features/Collaborators/CollaboratorsInviteHandler.mjs:40-42`, built at `services/web/app/src/Features/Notifications/NotificationsBuilder.mjs:100-122`. Only when the invited email belongs to an existing user. |
+| `tpdsFileLimit-<userId>`               | `notification_tpds_file_limit`                                                                                                 | `services/web/app/src/Features/ThirdPartyDataStore/TpdsController.mjs:118-124` (a Dropbox update would push a project over the file limit), `NotificationsBuilder.mjs:175-195` |
+| `dropboxDuplicateProjectNames-<userId>` | `notification_dropbox_duplicate_project_names`                                                                                | `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateHandler.mjs:160-169`, `NotificationsBuilder.mjs:10-30` |
+| `dropbox-unlinked`                     | `dropbox_unlinked_because_access_denied`, `dropbox_unlinked_because_full` or `dropbox_unlinked_because_suspended`             | `services/third-party-datastore/app/js/QueueWorker.mjs:20-25`, `:46-58` (our Dropbox sync)               |
+
+`NotificationsBuilder.mjs` also builds keys for group invitations, institution affiliations, subscriptions and old debug projects. Their callers are in the subscription and institution code, and the old-debug-projects check only runs when `isSaas` (`services/web/app/src/Features/Project/ProjectListController.mjs:234-236`).
+
+#### Who Reads It
+
+| Code                                                                      | What it does                                                                                  |
+| ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `Notifications.js:4-10` (`getUserNotifications`)                          | `GET /user/:user_id` (`app.ts:30`). Returns only the user's documents that still have a `templateKey`. |
+| `services/web/app/src/Features/Project/ProjectListController.mjs:367`     | Loads the notices for the project dashboard.                                                  |
+| `services/web/app/src/Features/Notifications/NotificationsController.mjs` | `GET /notifications`, `DELETE /notifications/:notificationId` and `GET /user/notification/:notificationId` (`services/web/app/src/router.mjs:922-937`). |
+| `services/web/modules/dropbox/app/src/DropboxHandler.mjs:128-131`         | Our Dropbox module: when a user links Dropbox again, marks `dropbox-unlinked` and `dropboxDuplicateProjectNames-<userId>` as read. |
+
+#### Indexes
+
+| Name        | Keys             | Options                  | Migration                                                       |
+| ----------- | ---------------- | ------------------------ | --------------------------------------------------------------- |
+| `expires_1` | `{ expires: 1 }` | TTL, `expireAfterSeconds: 10` | `tools/migrations/20190912145014_create_notifications_indexes.mjs` |
+| `key_1`     | `{ key: 1 }`     |                          | same                                                            |
+| `user_id_1` | `{ user_id: 1 }` |                          | same                                                            |
+
+#### Notes
+
+* A read notice is not deleted: only `templateKey` goes. Because the document still holds the key, a later `addNotification` without `forceCreate` for the same key does nothing (`Notifications.js:21-24`).
+* The `/key/:key` routes act on the key alone, across users (`Notifications.js:76-100`).
+* If `web` has no `apis.notifications.url`, it neither creates nor reads notices (`NotificationsHandler.mjs:17`, `:41`).

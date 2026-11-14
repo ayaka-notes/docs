@@ -1,0 +1,61 @@
+---
+title: Dropbox Entities Collection
+icon: file-arrow-up
+---
+
+`dropboxEntities` holds one document per file that Dropbox sync has copied between a project and one user's Dropbox, plus short-lived tombstones. It belongs to Dropbox sync: third-party-datastore (`services/third-party-datastore/app/js/StateManager.mjs`) writes and reads it, and the `dropbox` web module (`services/web/modules/dropbox/app/src/DropboxHandler.mjs`) clears it. There is no Mongoose schema.
+
+#### Fields
+
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Set by the driver on insert. | `StateManager.mjs:46,97` |
+| `overleaf.userId` | ObjectId | The user whose Dropbox has the file. Set on every document. | `StateManager.mjs:48,98` |
+| `overleaf.projectId` | ObjectId | The project of the doc or file. Set when known; tombstones have none. | `StateManager.mjs:49-51` |
+| `overleaf.id` | ObjectId | The `_id` of the doc or file in the project's `rootFolder`. Set when known. | `StateManager.mjs:52` |
+| `overleaf.type` | String | `doc` or `file`. Current code writes it but does not read it. | `StateManager.mjs:53`; values from `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateSender.mjs:35,96` and `UpdateMerger.mjs:104,119` |
+| `dropbox.id` | String | The `id` of the file in the Dropbox file metadata. Not set on tombstones. | `StateManager.mjs:56` |
+| `dropbox.pathLower` | String | The path of the file in Dropbox, lower-cased and without a trailing slash. Updated when the file or its project folder moves. | `StateManager.mjs:14-16,57,91,99` |
+| `dropbox.rev` | String | The Dropbox revision at the last sync. The next upload sends it, so a file that changed in Dropbox is not overwritten. | `StateManager.mjs:58`, `JobProcessor.mjs:114-122` |
+| `dropbox.contentHash` | String | The Dropbox content hash at the last sync. A listed file with the same hash is skipped, as it is our own upload or already applied. | `StateManager.mjs:59`, `PullManager.mjs:147-149` |
+| `tombstone` | Boolean | `true` marks a path that third-party-datastore itself deleted or moved away in Dropbox. When Dropbox reports that deletion back, it is not applied to the project. | `StateManager.mjs:100`, `PullManager.mjs:189-192` |
+| `createdAt` | Date | Tombstones only: when it was made. A finished pull removes the tombstones made before it started. | `StateManager.mjs:101,115-121` |
+
+A tombstone has only `overleaf.userId`, `dropbox.pathLower`, `tombstone` and `createdAt` (`StateManager.mjs:96-103`).
+
+#### Who Writes It
+
+| Code | What it does |
+| ---- | ------------ |
+| `services/third-party-datastore/app/js/StateManager.mjs:35-62` (`recordEntity`) | Deletes the user's documents with the same `dropbox.id`, `dropbox.pathLower` or `overleaf.id`, then inserts the new state. |
+| `services/third-party-datastore/app/js/JobProcessor.mjs:102-134` (`addEntity`) | Records a doc or file after uploading it from Overleaf to Dropbox (`:125-133`). |
+| `services/third-party-datastore/app/js/PullManager.mjs:142-177` (`applyFile`) | Records a Dropbox file after web applied it to the project (`:168-176`). |
+| `StateManager.mjs:80-94` (`moveEntities`) | Rewrites `dropbox.pathLower` under a moved path: project rename (`JobProcessor.mjs:195`) and file or folder move (`JobProcessor.mjs:239`). |
+| `StateManager.mjs:96-103` (`addTombstone`) | After a delete (`JobProcessor.mjs:153`), a project rename (`:202`) or a move (`:240`) in Dropbox. |
+| `StateManager.mjs:72-78` (`removeEntities`) | Deletes the entries at and under a path, except tombstones: after a delete from Overleaf (`JobProcessor.mjs:152`) or in Dropbox (`PullManager.mjs:206`). |
+| `StateManager.mjs:115-121` (`clearTombstones`) | At the end of a pull (`PullManager.mjs:31,69`). |
+| `StateManager.mjs:186-190` (`removeUserState`), called from `services/third-party-datastore/app/js/QueueWorker.mjs:43` | Deletes all of the user's documents when third-party-datastore unlinks an account it can no longer use. |
+| `DropboxHandler.mjs:142-146` (`removeUserState`) | Deletes all of the user's documents on link (`:125`), on unlink (`:183`), and when a deleted user expires (`services/web/modules/dropbox/index.mjs:62-64`). |
+| `DropboxHandler.mjs:150-154` (`removeProjectState`) | Deletes the project's documents when a deleted project expires (`index.mjs:54-56`). |
+
+#### Who Reads It
+
+| Code | What it does |
+| ---- | ------------ |
+| `StateManager.mjs:64-70` (`findEntityByPath`) | Gets `dropbox.rev` before an upload (`JobProcessor.mjs:114`) and `dropbox.contentHash` before applying a Dropbox file (`PullManager.mjs:147`). |
+| `StateManager.mjs:106-112` (`findTombstone`) | Checks a reported deletion at the path or one of its parents (`PullManager.mjs:189`). |
+| `StateManager.mjs:160-175` (`getSyncedPaths`) | Lists the synced file paths after a cursor reset, so that a file missing from the listing counts as deleted (`PullManager.mjs:74-85`). |
+
+#### Indexes
+
+| Name | Keys | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+| `overleaf_userId_1_overleaf_projectId_1` | `overleaf.userId: 1, overleaf.projectId: 1` | | `tools/migrations/20250130104049_create_dropboxEntities_userId_projectId_index.mjs` |
+
+`20220811111800_create_dropboxEntities_index.mjs` and `20220825160708_recreate_dropboxEntities.mjs` are tagged `saas` only, so CE does not have their unique indexes on `(overleaf.userId, dropbox.id)` and `(overleaf.userId, overleaf.id)`, or their hashed index on `dropbox.pathLower`.
+
+#### Notes
+
+* Uniqueness comes only from the delete before each insert in `recordEntity` (`StateManager.mjs:38-45`). The comment at `StateManager.mjs:3-11` mentions unique indexes; CE does not have them.
+* Queries by user and path (`findEntityByPath`, `findTombstone`, `removeEntities`) use the index only for `overleaf.userId`.

@@ -3,49 +3,84 @@ title: Docs Collection
 icon: file-lines
 ---
 
-`Docs`: Docs is overleaf's internal term of an editable file, for example, a pure `tex` file, or a `.bib` file.  It stores the file content, revision information, and deletion state.
+`docs` holds the content of the editable text files of a project (Overleaf calls them docs), for example `main.tex` or `sample.bib`. One document per doc: its lines, its comments and tracked changes, two counters and the deletion state. The file name and place in the tree are not here but in `projects.rootFolder` (see [Projects Collection](/dev/data-model/projects-collection)). Binary files are not here either.
 
-#### Core Identification
+Apart from migrations and maintenance scripts, only docstore writes this collection, in `services/docstore/app/js/MongoManager.js`. There is no Mongoose model; web and document-updater reach it through the docstore HTTP API (`services/docstore/app.js:31-70`). In the Source column, bare file names are under `services/docstore/app/js/`.
 
-* `_id`: Unique MongoDB ObjectId identifying this document record.
-* `project_id`: Reference to the project (`Project._id`) this file belongs to.
-* `name`: Filename as shown in the project file tree (e.g., `main.tex`, `sample.bib`).
+#### Fields
 
-#### Revision & Versioning
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Doc id, the same as the `_id` of the doc entry in `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Project of the doc. | `MongoManager.js:144` |
+| `lines` | Array of String | The text, one element per line. Missing while the doc is archived (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Comments and tracked changes, see below. Missing while the doc is archived. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstore's own counter. Starts at 1 and goes up by 1 each time `lines` or `ranges` change. Every update matches on the old `rev`, so two writers cannot overwrite each other. Not a history version. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | The OT version of the doc from document-updater, saved when it flushes. docstore rejects a flush with a lower version. Older docs kept it in the `docOps` collection; the migration `20231105000000_move_doc_versions_from_docops_to_docs` moved it here. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true` when the doc was deleted from the project. Missing for docs that were never deleted. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | When the doc was deleted. | `HttpController.js:87` |
+| `name` | String | File name at the time of deletion. Only set when the doc is deleted; live docs have no `name` here. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true` when `lines`, `ranges` and `rev` were moved to the docstore persistor (`Settings.docstore.bucket`, key `<project_id>/<doc_id>`) and `lines` and `ranges` were removed from Mongo. Unset again when the doc is read back. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Lock held while the doc is being archived. | `MongoManager.js:177-193` |
 
-* `rev`: Revision number of this document within the project history.
-* `version`: Internal schema or format version used by the editor backend.
+#### Ranges
 
-These fields are used by Overleaf’s custom versioning system to track incremental edits and support history and rollback.
+`ranges` has two arrays. document-updater builds them with `libraries/ranges-tracker/index.cjs`; docstore turns ids into ObjectIds and `ts` into Dates before saving (`RangeManager.js:41-63`). A doc without comments or tracked changes has `ranges: {}` or no `ranges`.
 
-#### File Content
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Commented text spans. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Comment id. It equals `op.t`, the thread id of the comment in the `rooms` collection; docstore forces them to match. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | The commented text in the doc (not the comment message). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Character offset of the start of `op.c` in the doc. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Thread id, see `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | `user_id` and `ts` of the comment. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Tracked changes, sorted by position. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Id of the change. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Inserted text, or deleted text. One of the two. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Character offset of the change. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Author. Changes made by anonymous editors keep the string `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | When the change was made. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Array of strings representing the file content line by line.\
-    Each element corresponds to one logical line in the source file.
+The text of a comment and its replies is not in `docs`: it is in the `messages` collection, in the room whose `thread_id` is the comment id. Whether a comment is resolved is stored on that room, not here; docstore drops a `resolved` flag if one is sent (`RangeManager.js:59-61`). See [Rooms Collection](/dev/data-model/rooms-collection) and [Messages Collection](/dev/data-model/messages-collection).
 
-    In this example, it stores a BibTeX entry:
+#### Who Writes It
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Data structure reserved for editor annotations or tracked ranges\
-  (e.g., selections, comments, or change tracking). Empty when no active ranges are present. `op` Operation object that binds the comment to a specific position in the document.
-  * `op.c` — Comment Selected Text (Character Contents)
-  * `op.p` — Anchor Position (Character Offset)
-  * `id` Unique ObjectId of this comment entry.
-  * `metadata` Author and timestamp information.
+| Code | What it does |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Creates or updates a doc: `lines`, `ranges` and `version`. web calls it when a doc is created and when document-updater flushes an open doc (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Marks a doc as deleted with `deleted`, `deletedAt` and `name`. |
+| `DocArchiveManager.js:29-88` | Archives a doc: copies `lines`, `ranges` and `rev` to the persistor and sets `inS3`. Runs for a whole project when it is deactivated, and for a single doc on delete when `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Brings an archived doc back into Mongo when it is read (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Deletes all docs of a project when the project is destroyed. |
 
-#### Deletion State
+#### Who Reads It
 
-* `deleted`:\
-  Indicates whether this document has been deleted from the project.
-* `deletedAt`:\
-  Timestamp recording when the document was deleted.
+| Code | What it does |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Loads a doc (through web) when someone opens it. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | All web reads: one doc, all docs of a project, all ranges, deleted docs. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Copies a project; flushes document-updater first. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Lists the deleted docs of a project in the admin panel. |
 
-Deleted documents are usually kept for history recovery and version browsing rather than being immediately removed from the database.
+#### Indexes
 
-Here is an real example for an Overleaf `docs`.
+All come from migrations tagged `server-ce` in `tools/migrations/`.
 
-<Accordion title="A Simple Example">
+| Name | Keys | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Notes
+
+* While a doc is open, its newest text is in document-updater (Redis), not here. Mongo is only updated when document-updater flushes (`services/document-updater/app/js/PersistenceManager.js:128-160`). Code that reads the docs of a whole project should call `flushProjectToMongo` first, as `ProjectDuplicator` does.
+* Deleted docs stay in this collection, with `deleted: true`, until the project is destroyed. docstore returns at most `MAX_DELETED_DOCS` (default 2000) of them, newest first (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). The history panel does not use them; it reads history-v1.
+* The `rev` and `version` counters are unrelated to project history versions in history-v1.
+
+Here are real examples of Overleaf `docs`.
+
+<Accordion title="A Deleted Doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Here is an real example for an Overleaf `docs`.
 
 </Accordion>
 
-<Accordion title="A Complicated Example">
+<Accordion title="A Doc With Comments">
 
 ```json5
 {

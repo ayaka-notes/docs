@@ -1,0 +1,53 @@
+---
+title: Project History Failures Collection
+icon: triangle-exclamation
+---
+
+`projectHistoryFailures` holds one document per project whose history updates project-history could not process, or for which it started a resync. The document is deleted again as soon as processing works. project-history writes it in `services/project-history/app/js/ErrorRecorder.js`; its type is in `services/project-history/app/js/mongo-types.ts:3-24`. Web also has a Mongoose schema for it (`services/web/app/src/models/ProjectHistoryFailure.mjs:5-19`), but no web code uses that model.
+
+#### Fields
+
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Created by the upsert. | `ErrorRecorder.js:45-60` |
+| `project_id` | String | The project id, stored as a string, not an ObjectId. | `ErrorRecorder.js:46`, `mongo-types.ts:5` |
+| `error` | String | The last error, as `error.toString()`. | `ErrorRecorder.js:37` |
+| `stack` | String | Stack of the last error. | `ErrorRecorder.js:38` |
+| `queueSize` | Number | Updates waiting in the project's Redis queue at the last error (`services/project-history/app/js/UpdatesProcessor.js:375`); `-1` when the error came from starting a resync (`services/project-history/app/js/SyncManager.js:75`, `96`). | `ErrorRecorder.js:36` |
+| `ts` | Date | Time of the last error. | `ErrorRecorder.js:39` |
+| `attempts` | Number | Number of errors recorded since the document was created. | `ErrorRecorder.js:49` |
+| `history` | Array of Object | The last 10 events, newest first: error records `{ queueSize, error, stack, ts }` and resync starts `{ resyncStartedAt }`. | `ErrorRecorder.js:50-56`, `92-98` |
+| `resyncStartedAt` | Date | When the last resync started. | `ErrorRecorder.js:90` |
+| `resyncAttempts` | Number | Number of resyncs started since the document was created. | `ErrorRecorder.js:91` |
+| `forceDebug` | Boolean | Set by project-history `POST /project/:project_id/force` (`?clear=true` sets it to `false`). While `true`, an ops-out-of-order error in the stored chunk is logged and ignored (`UpdatesProcessor.js:574-592`). | `ErrorRecorder.js:72-82` |
+| `requestCount` | Number | In the web schema (`ProjectHistoryFailure.mjs:16`). Only `ErrorRecorder.getLastFailure` increments it, and nothing calls that function. | `ErrorRecorder.js:131-138` |
+
+#### Who Writes It
+
+| Code | What it does |
+| ---- | ------------ |
+| `services/project-history/app/js/ErrorRecorder.js:34-66` | `record`: upsert of the error, `attempts` +1, entry added to `history`. Called when processing a project's updates fails (`UpdatesProcessor.js:91`, `169`, `242`, `293`, `345`) and when a resync cannot start (`SyncManager.js:75`, `96`). |
+| `ErrorRecorder.js:86-102` | `recordSyncStart`: upsert, `resyncStartedAt`, `resyncAttempts` +1, entry added to `history`, each time a resync starts (`SyncManager.js:104`). |
+| `ErrorRecorder.js:68-70` | `clearError`: deletes the document after a successful flush (`UpdatesProcessor.js:101`, `194`, `259`, `355`), on project-history `DELETE /project/:project_id` (`services/project-history/app/js/HttpController.js:1386`), and for a bad project id during a retry (`services/project-history/app/js/RetryManager.js:161`). |
+| `ErrorRecorder.js:72-82` | `setForceDebug`: upsert of `forceDebug` (`HttpController.js:1016-1035`, route at `services/project-history/app/js/Router.js:82`). |
+| `ErrorRecorder.js:109-119` | `cloneFailure`: copies the document to another project, for project-history `POST /project/:project_id/clone` (`HttpController.js:135`), which nothing in web calls. |
+
+#### Who Reads It
+
+| Code | What it does |
+| ---- | ------------ |
+| `RetryManager.js:113-126` | Loads all failures for the retry cron jobs (`server-ce/config/crontab-history`, project-history `POST /retry/failures`). The soft job processes the queue again; the hard job resyncs the project, as a hard resync when `resyncAttempts` is at least 1 and the error is not a running resync (`RetryManager.js:30-31`, `35-56`, `106-111`). |
+| `services/project-history/app/js/FlushManager.js:73-82` | The flush of all projects skips projects that have a failure. |
+| `UpdatesProcessor.js:578-592` | Reads `forceDebug`. |
+| `ErrorRecorder.js:124-129`, `140-145` | `getFailureRecord` and `getFailedProjects`: used by `GET /project/:project_id/debug-info` (`HttpController.js:571`) and `GET /status/failures`, `GET /status/failures-full` (`Router.js:88-90`). |
+
+#### Indexes
+
+| Name | Keys | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `project_id_1` | `{ project_id: 1 }` | | `tools/migrations/20190912145018_create_projectHistoryFailures_indexes.mjs` |
+
+#### Notes
+
+* A document stays until a flush of the project succeeds or the project is deleted (`clearError` above), so each document marks a project whose last flush or resync has not succeeded yet.
+* Error strings starting with `OError:` are returned as `Error:` (`ErrorRecorder.js:18-26`); the stored value is unchanged.

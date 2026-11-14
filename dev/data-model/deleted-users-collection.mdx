@@ -1,0 +1,65 @@
+---
+title: Deleted Users Collection
+icon: user-xmark
+---
+
+`deletedUsers` keeps a user account after it is deleted: one document per deleted account, with a copy of the whole user document and who deleted it. Web writes it in `services/web/app/src/Features/User/UserDeleter.mjs`; the schema is `services/web/app/src/models/DeletedUser.mjs`. When the hard deletion delay has passed, the expiry removes the copy of the user, but the record with `deleterData` stays.
+
+Deleting a user also deletes the projects the user owns; they go to [Deleted Projects](/dev/data-model/deleted-projects-collection) with the reason `account-deletion`.
+
+#### Fields
+
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Record id, not the user id. | `DeletedUser.mjs:21` |
+| `user` | Object | Copy of the `users` document at deletion, with the user schema, see [Users Collection](/dev/data-model/users-collection). Removed on expiry. | `DeletedUser.mjs:24`, `UserDeleter.mjs:192-196,104,106` |
+| `deleterData` | Object | Who deleted the account, and a summary that stays after expiry. | `DeletedUser.mjs:7-19,23` |
+| `deleterData.deletedAt` | Date | Time of deletion. The expiry runs `userHardDeletionDelay` after it: 90 days, or `OVERLEAF_USER_HARD_DELETION_DELAY` milliseconds (`services/web/config/settings.defaults.js:739-741`). | `DeletedUser.mjs:10`, `UserDeleter.mjs:198` |
+| `deleterData.deleterId` | ObjectId | User who deleted the account: the user on the account settings page, or the admin in the admin panel. Missing when the `delete-user` script deleted it. | `DeletedUser.mjs:8`, `UserDeleter.mjs:199` |
+| `deleterData.deleterIpAddress` | String | IP address of that request; `0.0.0.0` from the `delete-user` script (`services/web/modules/server-ce-scripts/scripts/delete-user.mjs:40-44`). Removed on expiry. | `DeletedUser.mjs:9`, `UserDeleter.mjs:200,105` |
+| `deleterData.deletedUserId` | ObjectId | `_id` of the deleted user. Core looks records up by it. | `DeletedUser.mjs:11`, `UserDeleter.mjs:201` |
+| `deleterData.deletedUserLastLoggedIn` | Date | `lastLoggedIn` of the user. | `DeletedUser.mjs:12`, `UserDeleter.mjs:202` |
+| `deleterData.deletedUserSignUpDate` | Date | `signUpDate` of the user. | `DeletedUser.mjs:13`, `UserDeleter.mjs:203` |
+| `deleterData.deletedUserLoginCount` | Number | `loginCount` of the user. | `DeletedUser.mjs:14`, `UserDeleter.mjs:204` |
+| `deleterData.deletedUserReferralId` | String | `referal_id` of the user. | `DeletedUser.mjs:15`, `UserDeleter.mjs:205` |
+| `deleterData.deletedUserReferredUsers` | Array of ObjectId | `refered_users` of the user. | `DeletedUser.mjs:16`, `UserDeleter.mjs:206` |
+| `deleterData.deletedUserReferredUserCount` | Number | `refered_user_count` of the user. | `DeletedUser.mjs:17`, `UserDeleter.mjs:207` |
+| `deleterData.deletedUserOverleafId` | Number | `overleaf.id` of the user, when set. | `DeletedUser.mjs:18`, `UserDeleter.mjs:208` |
+
+#### Who Writes It
+
+| Code | What it does |
+| ---- | ------------ |
+| `UserDeleter.mjs:37-80` (`deleteUser`) | Adds a `delete-account` audit log entry, cleans up the user and fires the `deleteUser` hook, upserts the record (`_createDeletedUser`, `UserDeleter.mjs:192-213`), deletes the user's projects, sends the security alert email unless skipped, and deletes the `users` document. Callers: the account settings page (`services/web/app/src/Features/User/UserController.mjs:280-284`), the admin panel (`services/web/modules/admin-tools/app/src/AdminUserManager.mjs:604-612`) and the `delete-user` script (`delete-user.mjs:40-45`). |
+| `UserDeleter.mjs:93-115` (`expireDeletedUser`) | Fires the `expireDeletedUser` hook, deletes the user's onboarding data, then removes `user` and `deleterData.deleterIpAddress`. |
+| `UserDeleter.mjs:117-161` (`expireDeletedUsersAfterDuration`) | Expires every record older than the delay and deletes the user's `userAuditLogEntries`. Route `POST /internal/expire-deleted-users-after-duration` (`services/web/app/src/router.mjs:847-851`), which the Community Edition cron calls every hour at minute 15 when `ENABLE_CRON_RESOURCE_DELETION` is `true` (`server-ce/cron/delete-users.sh:10-23`, `server-ce/config/crontab-deletion:2`). One user: `POST /internal/users/:userId/expire` (`router.mjs:857-861`). |
+| `AdminUserManager.mjs:630-649` (`purgeDeletedUser`, module `admin-tools`) | Purge in the admin panel: runs `expireDeletedUser` and deletes the user's audit log entries. |
+| `AdminUserManager.mjs:651-696` (`restoreDeletedUser`, module `admin-tools`) | Restore in the admin panel: creates the `users` document again from `user` (refused if the email is taken), deletes the record, and restores the projects deleted with the account. |
+
+#### Who Reads It
+
+| Code | What it does |
+| ---- | ------------ |
+| `services/web/modules/admin-tools/app/src/AdminUserListManager.mjs:195-213,263-275` | Lists and counts deleted users for the admin panel, filtering on `user.*`. |
+| `AdminUserListManager.mjs:428-452` | Shows one deleted user that has not expired, with the deleter. |
+| `AdminUserListManager.mjs:456-480` | Names the owner of a row in other admin lists, also when the owner is deleted. |
+| `AdminUserListManager.mjs:175-183` | Collects the login provider ids, from deleted users too. |
+| `AdminUserManager.mjs:623-627,631-634,652` | Reads the record when an admin deletes, purges or restores a user; these look it up by `user._id`. |
+
+#### Indexes
+
+| Name | Keys | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `deleterData.deleteUserId_1` | `{ "deleterData.deletedUserId": 1 }` | unique | `20200210121103_uniqueify-deletedthings-indexes.mjs` |
+| `deleterData_deletedAt_user_1` | `{ "deleterData.deletedAt": 1 }` | partial: `user` is an object | `20250116090001_deletedUsers_non_expired_index.mjs` |
+| `user.email_1` | `{ "user.email": 1 }` | | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+| `user.emails.email_1` | `{ "user.emails.email": 1 }` | partial: `user.emails.email` exists | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+
+Migrations are in `tools/migrations/`. The index name says `deleteUserId`, but the key is `deletedUserId`.
+
+#### Notes
+
+* Modules that listen to `expireDeletedUser` delete their own data of the user: `dropbox` (`services/web/modules/dropbox/index.mjs:62`), `github-sync` (`services/web/modules/github-sync/index.mjs:66`), `gitlab-sync` (`services/web/modules/gitlab-sync/index.mjs:56`) and `gitea-sync` (`services/web/modules/gitea-sync/index.mjs:56`).
+* An expired record is never deleted: `deleterData` stays for good, only `user` and the IP address are removed.
+* The user's personal access tokens are not deleted with the account, see [OAuth Access Tokens](/dev/data-model/oauth-access-tokens-collection).
+* Mongoose also gives `deleterData` its own `_id`, which nothing reads.

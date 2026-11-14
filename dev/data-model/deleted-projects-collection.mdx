@@ -1,0 +1,77 @@
+---
+title: Deleted Projects Collection
+icon: trash-can
+---
+
+`deletedProjects` keeps a project after it is deleted: one document per deleted project, with a copy of the whole project document and who deleted it. Web writes it in `services/web/app/src/Features/Project/ProjectDeleter.mjs`; the schema is `services/web/app/src/models/DeletedProject.mjs`. When the hard deletion delay has passed, the expiry destroys the project's data and empties `project`, but the record with `deleterData` stays.
+
+A project in the trash is not here: trashing only adds the user to `trashed` of the project, see [Projects Collection](/dev/data-model/projects-collection).
+
+#### Fields
+
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Record id, not the project id. | `DeletedProject.mjs:26` |
+| `project` | Object | Copy of the `projects` document at deletion, with the project schema. `null` once the record has expired. | `DeletedProject.mjs:29`, `ProjectDeleter.mjs:277-281,400-410` |
+| `deleterData` | Object | Who deleted the project, and a summary that stays after expiry. Keys whose value is `undefined` are left out. | `DeletedProject.mjs:7-24,28`, `ProjectDeleter.mjs:247-275` |
+| `deleterData.deletedAt` | Date | Time of deletion. The expiry runs `projectHardDeletionDelay` after it: 90 days, or `OVERLEAF_PROJECT_HARD_DELETION_DELAY` milliseconds (`services/web/config/settings.defaults.js:742-744`). | `DeletedProject.mjs:10`, `ProjectDeleter.mjs:248` |
+| `deleterData.deleterId` | ObjectId | User who deleted the project. Missing when no user did it directly, see `deletedReason`. | `DeletedProject.mjs:8`, `ProjectDeleter.mjs:249-250` |
+| `deleterData.deleterIpAddress` | String | IP address of that request. Set to `null` on expiry. | `DeletedProject.mjs:9`, `ProjectDeleter.mjs:251,406` |
+| `deleterData.deletedReason` | String | Why the project was deleted, see the table below. Older records have none. | `DeletedProject.mjs:23`, `ProjectDeleter.mjs:252` |
+| `deleterData.deletedProjectId` | ObjectId | `_id` of the deleted project. Lookups of one record use it. | `DeletedProject.mjs:11`, `ProjectDeleter.mjs:253` |
+| `deleterData.deletedProjectOwnerId` | ObjectId | `owner_ref` of the project. | `DeletedProject.mjs:12`, `ProjectDeleter.mjs:254` |
+| `deleterData.deletedProjectCollaboratorIds` | Array of ObjectId | `collaberator_refs` of the project. | `DeletedProject.mjs:13`, `ProjectDeleter.mjs:255` |
+| `deleterData.deletedProjectReadOnlyIds` | Array of ObjectId | `readOnly_refs` of the project. | `DeletedProject.mjs:14`, `ProjectDeleter.mjs:256` |
+| `deleterData.deletedProjectReviewerIds` | Array of ObjectId | `reviewer_refs` of the project. | `DeletedProject.mjs:15`, `ProjectDeleter.mjs:257` |
+| `deleterData.deletedProjectReadWriteTokenAccessIds` | Array of ObjectId | `tokenAccessReadAndWrite_refs` of the project. | `DeletedProject.mjs:16`, `ProjectDeleter.mjs:258-259` |
+| `deleterData.deletedProjectReadOnlyTokenAccessIds` | Array of ObjectId | `tokenAccessReadOnly_refs` of the project. | `DeletedProject.mjs:17`, `ProjectDeleter.mjs:267` |
+| `deleterData.deletedProjectReadWriteToken` | String | `tokens.readAndWrite` of the project, when it had one. | `DeletedProject.mjs:18`, `ProjectDeleter.mjs:268` |
+| `deleterData.deletedProjectReadOnlyToken` | String | `tokens.readOnly` of the project, when it had one. | `DeletedProject.mjs:19`, `ProjectDeleter.mjs:269` |
+| `deleterData.deletedProjectLastUpdatedAt` | Date | `lastUpdated` of the project. | `DeletedProject.mjs:20`, `ProjectDeleter.mjs:270` |
+| `deleterData.deletedProjectOverleafId` | Number | `overleaf.id` of the project, when set. | `DeletedProject.mjs:21`, `ProjectDeleter.mjs:260-262` |
+| `deleterData.deletedProjectOverleafHistoryId` | Mixed | `overleaf.history.id` of the project, when set. | `DeletedProject.mjs:22`, `ProjectDeleter.mjs:263-266` |
+
+`deletedReason` values (`services/web/app/src/Features/Project/DeletedProjectReasons.mjs:1-8`):
+
+| Value | Set when | `deleterId` |
+| ----- | -------- | ----------- |
+| `user` | A user deletes the project from the project list (`services/web/app/src/Features/Project/ProjectController.mjs:281-291`), or an admin deletes it in the admin panel (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:486-491`) | set |
+| `account-deletion` | The owner's account is deleted (`ProjectDeleter.mjs:82-95`, called from `services/web/app/src/Features/User/UserDeleter.mjs:66`) | missing |
+| `zip-import-failure` | Creating a project from an uploaded zip fails (`services/web/app/src/Features/Uploads/ProjectUploadManager.mjs:58-61,103-104`) | missing |
+| `clone-failure` | Copying a project fails; the broken copy is deleted (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:202-207`) | missing |
+| `script` | `services/web/scripts/soft_delete_project.mjs:15-17` | missing |
+| `github-import-failure` | Defined, but nothing in this repo uses it | |
+
+#### Who Writes It
+
+| Code | What it does |
+| ---- | ------------ |
+| `ProjectDeleter.mjs:189-293` (`deleteProject`) | Flushes the project, archives its docs out of Mongo, removes it from tags, upserts the record and deletes the `projects` document. |
+| `ProjectDeleter.mjs:295-342` (`undeleteProject`) | Inserts the project again under the name `<name> (Restored)` (made unique for the owner) and no longer archived, then deletes the record. Fails with `project_too_old_to_restore` once `project` is `null`. Called from the admin panel: restore one project (`AdminProjectManager.mjs:497-515`) or restore a deleted user with the projects deleted with the account (`services/web/modules/admin-tools/app/src/AdminUserManager.mjs:678-689`). |
+| `ProjectDeleter.mjs:344-416` (`expireDeletedProject`) | Destroys the docs, history, chat and project audit log of the project and fires the `projectExpired` hook, then sets `project` and `deleterData.deleterIpAddress` to `null`. If the project exists again, it only deletes the stale record. |
+| `ProjectDeleter.mjs:97-146` (`expireDeletedProjectsAfterDuration`) | Expires a batch of records older than the delay. Route `POST /internal/expire-deleted-projects-after-duration` (`services/web/app/src/router.mjs:842-846`), which the Community Edition cron calls every hour at minute 20 when `ENABLE_CRON_RESOURCE_DELETION` is `true` (`server-ce/cron/delete-projects.sh:10-23`, `server-ce/config/crontab-deletion:3`). One project: `POST /internal/project/:projectId/expire-deleted-project` (`router.mjs:852-856`), or Purge in the admin panel (`AdminProjectManager.mjs:517-529`). |
+
+#### Who Reads It
+
+| Code | What it does |
+| ---- | ------------ |
+| `AdminProjectManager.mjs:129-140,204-272` (module `admin-tools`) | Lists the deleted projects that have not expired. |
+| `AdminProjectManager.mjs:418-454` | Shows one deleted project with its owner and deleter. |
+| `AdminProjectManager.mjs:178-191` | Finds projects by a link-sharing token, deleted ones included (`project.tokens.*`). |
+| `AdminUserManager.mjs:678-684` | Finds the projects to bring back with a restored user: owned by the user and deleted with reason `account-deletion` or none. |
+
+#### Indexes
+
+| Name | Keys | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `deleterData.deletedProjectId_1` | `{ "deleterData.deletedProjectId": 1 }` | unique | `20190912145002_create_deletedProjects_indexes.mjs`, made unique by `20200210121103_uniqueify-deletedthings-indexes.mjs` |
+| `deleterdata_deletedProjectOwnerId_1` | `{ "deleterData.deletedProjectOwnerId": 1 }` | | `20200120163346_atlas_recommended_indexes.mjs` |
+| `deleterData.deletedAt_1` | `{ "deleterData.deletedAt": 1 }` | partial: `project` is an object | `20250126195914_update_deleterData.deletedAt_index.mjs` (replaces the plain index from `20190912145002_create_deletedProjects_indexes.mjs`) |
+
+Migrations are in `tools/migrations/`.
+
+#### Notes
+
+* Modules that listen to `projectExpired` delete their own data of the project: `git-bridge` (`services/web/modules/git-bridge/index.mjs:37`), `github-sync` (`services/web/modules/github-sync/index.mjs:56`), `gitlab-sync` (`services/web/modules/gitlab-sync/index.mjs:46`), `gitea-sync` (`services/web/modules/gitea-sync/index.mjs:46`) and `dropbox` (`services/web/modules/dropbox/index.mjs:54`).
+* An expired record is never deleted: `deleterData` stays for good, only `project` and the IP address are emptied.
+* Mongoose also gives `deleterData` its own `_id`, which nothing reads.

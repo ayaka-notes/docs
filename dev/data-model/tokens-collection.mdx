@@ -1,0 +1,62 @@
+---
+title: Tokens Collection
+icon: key
+---
+
+`tokens` holds one-time tokens: the secret in a link that lets someone set a password. One document is one token. There is no Mongoose model; web writes the collection through `services/web/app/src/Features/Security/OneTimeTokenHandler.mjs` with the native driver.
+
+#### Fields
+
+| Field | Type | Meaning | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Document id. | `OneTimeTokenHandler.mjs:40` |
+| `use` | String | What the token is for, see [Uses](#uses) below. Every lookup filters on it. | `OneTimeTokenHandler.mjs:41` |
+| `token` | String | The secret in the link: 32 random bytes as 64 hex characters, stored as is. | `OneTimeTokenHandler.mjs:38,42` |
+| `data` | Object | What the token stands for, returned when it is used. | `OneTimeTokenHandler.mjs:43` |
+| `data.user_id` | String | Id of the user, written as a string by every caller. | `services/web/app/src/Features/PasswordReset/PasswordResetHandler.mjs:27`, `services/web/app/src/Features/User/UserRegistrationHandler.mjs:117`, `services/web/modules/admin-tools/app/src/AdminUserManager.mjs:79` |
+| `data.email` | String | Email of the user when the token was made. A password reset looks the user up by this main email (`PasswordResetHandler.mjs:66-70`). | same as `data.user_id` |
+| `createdAt` | Date | Creation time. The TTL index deletes the token 90 days later. | `OneTimeTokenHandler.mjs:36,44` |
+| `expiresAt` | Date | `createdAt` plus `expiresIn` seconds: 1 hour by default, 1 week for an activation link. Lookups ignore a token after this time. | `OneTimeTokenHandler.mjs:35-37,45` |
+| `peekCount` | Number | How often the token was looked at without being used. Each `peekValueFromToken` adds 1; at 4 (`MAX_PEEKS`) the token stops working. | `OneTimeTokenHandler.mjs:8-31,107` |
+| `usedAt` | Date | Time the token was used or cancelled. Lookups ignore a token that has it. | `OneTimeTokenHandler.mjs:51-104` |
+
+#### Uses
+
+| `use` | Feature | Expiry | Code |
+| ----- | ------- | ------ | ---- |
+| `password` | Password reset email, from the "forgot password" page | 1 hour | `PasswordResetHandler.mjs:14-42` |
+| `password` | Activation link: an account made with a random password, then a link to set one. Used by public registration (`services/web/modules/login-register/app/src/RegisterController.mjs:65`), the admin registration page of `user-activate` (`services/web/modules/user-activate/app/src/UserActivateController.mjs:27-30`) and the `create-user` script (`services/web/modules/server-ce-scripts/scripts/create-user.mjs:21`) | 1 week | `UserRegistrationHandler.mjs:97-130` |
+| `password` | Activation or password reset link sent from the admin panel (module `admin-tools`) | 1 week (activation), 1 hour (reset) | `AdminUserManager.mjs:76-103,196-206` |
+| `email_confirmation` | Email confirmation link. Only read: nothing in this repo creates such tokens any more, as confirmation now sends a 6-digit code (`services/web/app/src/Features/User/UserEmailsConfirmationHandler.mjs:15-35`) | | `UserEmailsConfirmationHandler.mjs:12,37-66` |
+
+#### Who Writes It
+
+| Code | What it does |
+| ---- | ------------ |
+| `OneTimeTokenHandler.mjs:34-49` (`getNewToken`) | Inserts a token. Callers: `PasswordResetHandler.mjs:28`, `UserRegistrationHandler.mjs:115-119`, `AdminUserManager.mjs:77-81`. |
+| `OneTimeTokenHandler.mjs:8-32` (`peekValueFromToken`) | Returns `data` of a valid token and adds 1 to `peekCount`. Used when the password reset page opens (`services/web/app/src/Features/PasswordReset/PasswordResetController.mjs:195-208`) and again when the new password is set (`PasswordResetHandler.mjs:94-96`), and by email confirmation (`UserEmailsConfirmationHandler.mjs:38-41`). |
+| `OneTimeTokenHandler.mjs:75-88` (`expireToken`) | Sets `usedAt` on one token: after a new password is set (`PasswordResetHandler.mjs:44-48,119`) or an email is confirmed (`UserEmailsConfirmationHandler.mjs:65`). |
+| `OneTimeTokenHandler.mjs:90-104` (`expireAllTokensForUser`) | Sets `usedAt` on every open `password` token of a user, when the user changes the password in the settings (`services/web/app/src/Features/User/UserController.mjs:146-149`) or an admin sets it in the admin panel (`AdminUserManager.mjs:479-488`). |
+
+#### Who Reads It
+
+| Code | What it does |
+| ---- | ------------ |
+| `PasswordResetHandler.mjs:50-70,94-119` | Turns a reset or activation token into the user, then sets the password. The activation page of `user-activate` only passes the token on to this form. |
+| `UserEmailsConfirmationHandler.mjs:37-66` | Confirms an email from an `email_confirmation` token of the logged-in user. |
+| `AdminUserManager.mjs:213-223` (module `admin-tools`) | Finds the open activation token of a user, to show the activation link in the admin panel again. Reads `db.tokens` directly. |
+
+#### Indexes
+
+| Name | Keys | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `token_1_use_1` | `{ token: 1, use: 1 }` | unique | `20190912145031_create_tokens_indexes.mjs` |
+| `createdAt_1` | `{ createdAt: 1 }` | TTL, `expireAfterSeconds: 7776000` (90 days) | `20210407085118_token-expiry-with-ttl-index.mjs` |
+| `data.user_id_1` | `{ "data.user_id": 1 }` | | `20231113173237_tokens_user_id_index.mjs` |
+
+Migrations are in `tools/migrations/`.
+
+#### Notes
+
+* A used or expired token is not deleted at once: it stays, with `usedAt` or a past `expiresAt`, until the TTL index removes it 90 days after `createdAt`.
+* `OneTimeTokenHandler` also has `getValueFromTokenAndExpire` (`OneTimeTokenHandler.mjs:51-73`), but nothing calls it.
