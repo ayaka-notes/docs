@@ -3,79 +3,145 @@ title: Kolekce Projects
 icon: rectangle-vertical-history
 ---
 
-`Project` představuje jeden LaTeXový projekt v Overleafu. Ukládá metadata projektu, vlastnictví a řízení přístupu, strukturu souborů, nastavení kompilace a stav spolupráce.
+`projects` obsahuje jeden dokument na projekt: název, vlastníka a členy, sdílení, strom souborů a nastavení projektu. Text dokumentů tu není (viz [Kolekce Docs](/cs/dev/data-model/docs-collection)) a binární soubory jsou uloženy v úložišti blobů history-v1 pod svým `hash`. Schéma je `services/web/app/src/models/Project.mjs`, strom souborů je vedle v `Folder.mjs`, `File.mjs` a `Doc.mjs`.
 
-#### Základní identifikace a metadata
+Ve sloupci Zdroj je `Project.mjs:N` řádek tohoto schématu, ostatní názvy souborů bez cesty jsou v `services/web/app/src/Features/` a `modules/...` je v `services/web/`. Čísla řádků pocházejí ze `server-pro` v době psaní.
 
-* `_id`: Jedinečný MongoDB ObjectId identifikující projekt.
-* `name`: Zobrazovaný název projektu.
-* `description`: Volitelný textový popis projektu.
-* `active`: Určuje, zda je projekt aktuálně aktivní.
-* `version`: Interní verze schématu nebo formátu projektu.
-* `trashed`: Seznam položek přesunutých do koše (měkké smazání).
-* `deletedDocs`: Záznamy o trvale smazaných dokumentech.
+#### Základní identifikace a metadata {#core-identification-&-metadata}
 
-#### Vlastnictví a řízení přístupu
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id projektu. | MongoDB |
+| `name` | String | Název projektu. | `Project.mjs:18` |
+| `description` | String | Popis projektu. Ve výchozím stavu prázdný. | `Project.mjs:50` |
+| `version` | Number | Zvyšuje se o 1 při každé změně stromu souborů (přidání, přejmenování, přesunutí, smazání, nahrazení). | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | `false` po deaktivaci projektu: jeho dokumenty byly archivovány mimo Mongo (`docs.inS3`). Otevření projektu je obnoví z archivu a hodnotu znovu nastaví na `true`. V CE běží cron, který deaktivuje staré projekty, jen s `ENABLE_CRON_RESOURCE_DELETION=true`. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Uživatelé, kteří projekt archivovali. Archivace platí pro každého uživatele zvlášť. Staré logické hodnoty převedla migrace `20221111111111_ce_sp_convert_archived_state`. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Uživatelé, kteří projekt přesunuli do svého koše. Také pro každého uživatele zvlášť. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Zastaralé, `{ _id, name, deletedAt }`. Smazané dokumenty nyní zůstávají v `docs` s `deleted: true`. Toto pole se čte jen při obnově starého smazaného projektu: záznamy se zkopírují do docstore a pole se vyprázdní. Nic do něj nezapisuje. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Pouze ve schématu: jádro CE a naše moduly ho nepoužívají. | `Project.mjs:28` |
 
-* `owner_ref`: Odkaz na uživatele, který projekt vlastní.
-* `collaberator_refs`: Uživatelé s oprávněním k úpravám.
-* `reviewer_refs`: Uživatelé s přístupem na úrovni recenzenta.
-* `readOnly_refs`: Uživatelé s přístupem pouze pro čtení.
-* `pendingEditor_refs` / `pendingReviewer_refs`: Čekající pozvánky.
+#### Vlastnictví a řízení přístupu {#ownership-&-access-control}
 
-#### Přístup na základě tokenů
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Vlastník. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Uživatelé, kteří mohou upravovat (tento pravopis je skutečný název pole). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | Uživatelé, kteří mohou revidovat: komentovat a navrhovat se sledováním změn. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Uživatelé, kteří mohou pouze prohlížet. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | Nejde o pozvánky (ty jsou v `projectInvites`). Uživatelé přidaní jako editoři nebo revizoři v době, kdy vlastník neměl volné místo pro spolupracovníka. Přidají se do `readOnly_refs` a jsou zde uvedeni, dokud je nelze povýšit. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Čtenáři, kteří požádali o větší přístup: `userId`, `privilegeLevel`, `requestedAt`. Jeden záznam na uživatele. Odstraní se, když je žádost schválena nebo zamítnuta, nebo když uživatel projekt opustí. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Stav sledování změn. `true` znamená zapnuto pro všechny (starý formát); jinak objekt s id uživatelů jako klíči a `true` pro každého uživatele, který ho má zapnuté. Zapisuje ho modul `track-changes` a jádro ho zapne uživateli, který se stane revizorem. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | Propojení IEEE Collabratec: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. V CE se nepoužívá. | `Project.mjs:104-116` |
 
-* `tokens`: Registr tokenů pro sdílené odkazy.
-* `tokenAccessReadOnly_refs`: Tokeny udělující přístup pouze pro čtení.
-* `tokenAccessReadAndWrite_refs`: Tokeny udělující přístup pro čtení i zápis.
+#### Sdílení odkazem {#link-sharing}
 
-#### Sledování aktivity
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` nebo `tokenBased` (sdílení odkazem zapnuto). Staré projekty mohou mít ještě zastaralé hodnoty `readOnly` nebo `readAndWrite`. Hodnota `public` neexistuje. Tento pravopis je skutečný název pole. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Token odkazu pouze pro čtení. Jedinečný. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Token odkazu pro úpravy. Jedinečný. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Číselná předpona tokenu pro úpravy, podle které se token vyhledává. Jedinečná. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Uživatelé, kteří se připojili přes odkaz pouze pro čtení (id uživatelů, ne tokeny). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Uživatelé, kteří se připojili přes odkaz pro úpravy. | `Project.mjs:84` |
 
-* `lastUpdated`: Časové razítko poslední změny.
-* `lastUpdatedBy`: Uživatel, který provedl poslední aktualizaci.
-* `lastOpened`: Časové razítko posledního otevření projektu.
-* `deletedByExternalDataSource`: Zda bylo smazání vyvoláno externí integrací.
+Vypnutí sdílení odkazem odstraní `tokens` a vrátí `publicAccesLevel` na `private` (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Struktura projektu
+#### Sledování aktivity {#activity-tracking}
 
-Kořenový dokument a složka
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | Čas poslední změny obsahu nebo stromu souborů. Pouze roste. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Uživatel, který provedl tuto poslední změnu. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Kdy naposledy někdo projekt otevřel. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | `true`, když byla složka projektu smazána na straně Dropboxu. Samotný projekt se nesmaže; editor zobrazí upozornění a příznak se vymaže při příštím otevření projektu. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | Pozůstatek importu z overleaf.com v1. Když je hodnota větší než 0, projekt se při načtení jednou odešle do Dropboxu a počítadlo se vynuluje. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: ObjectId hlavního vstupního dokumentu LaTeXu (obvykle `main.tex`).
-* `rootFolder`: Vložená reprezentace stromu souborů projektu.
+#### Struktura projektu {#project-structure}
 
-Každý záznam složky obsahuje:
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Hlavní dokument, který se kompiluje. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Hlavní soubor `.bib` zvolený v nastavení projektu. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Strom souborů. Vždy jeden prvek: kořenová složka. | `Project.mjs:43` |
 
-* `name` / `_id`: Název a identifikátor složky.
-* `docs`: Seznam zdrojových dokumentů LaTeXu s názvem a `_id`.
-* `fileRefs`: Odkazy na binární soubory (obrázky, datové soubory), včetně:
-  * `name`: Název souboru
-  * `created`: Časové razítko nahrání
-  * `rev`: Počítadlo revizí
-  * `hash`: Hash obsahu pro deduplikaci
-  * `linkedFileData`: Propojení s externím úložištěm (pokud existuje)
-* `folders`: Vnořené podsložky.
+Každá složka (`Folder.mjs`):
 
-#### Nastavení kompilace a editoru
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id složky. | MongoDB |
+| `name` | String | Název složky (kořenová složka se jmenuje `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Upravitelné textové soubory: pouze `_id` a `name`. `_id` je `_id` v kolekci `docs`, která obsahuje text. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | Binární soubory, viz níže. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Podsložky. | `Folder.mjs:17` |
 
-* `compiler`: Zvolený LaTeXový engine (`pdflatex`, `xelatex`, `lualatex` atd.).
-* `spellCheckLanguage`: Jazyk kontroly pravopisu pro tento projekt.
+Každý soubor v `fileRefs` (`File.mjs`):
 
-#### Nastavení veřejného přístupu a sdílení
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id souboru. Změní se při nahrazení souboru. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Název souboru. | `File.mjs:7` |
+| `created` | Date | Kdy byl soubor nahrán nebo naposledy nahrazen. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Zvyšuje se o 1 při každém nahrazení souboru. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | SHA-1 obsahu. Soubor je uložen v úložišti blobů history-v1 pod tímto hashem a stahování ho čte odtamtud. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Nastaveno pro propojené soubory (z URL, jiného projektu, výstupního souboru, Zotera nebo Mendeley): `provider`, jeho zdrojová data a `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: Viditelnost projektu (`private`, `readOnly`, `public` atd.).
-* `collabratecUsers`: Propojení uživatelé z externích platforem pro spolupráci.
+#### Nastavení kompilace a editoru {#compilation-&-editor-settings}
 
-#### Rozšíření specifická pro Overleaf
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | Engine LaTeX: jeden ze `Settings.safeCompilers` (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | Obraz TeX Live použitý pro tento projekt při kompilaci v sandboxu. Nový projekt dostane `Settings.currentImageName`; galerie šablon a MCP server ho mohou změnit. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Jazyk kontroly pravopisu. Nový projekt převezme `ace.spellCheckLanguage` vlastníka. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Nastavení projektu uložené z požadavku na nastavení (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Nastavení formátu citací. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Branding vydavatele. Může ho nastavit galerie šablon. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | Šablona overleaf.com v1, ze které projekt pochází. V CE se nenastavuje. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: Identifikátor používaný službou historie.
-  * `display`: Zda je historie povolena a viditelná.
+#### Historie (`overleaf`) {#history-overleaf}
 
-#### Interní verzování
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Id projektu v project-history a history-v1. Nové projekty používají id projektu jako řetězec. Jedinečné. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | U nových projektů vždy `true`; ponecháno jen kvůli kompatibilitě. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Historie ukládá i komentáře a sledované změny. Obnovení verze je obnoví, jen když je tato hodnota `true`. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Fáze přechodu na formát aktualizací OT historie. Pouze roste. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Kdy naposledy skončila opětovná synchronizace historie. Zapisuje ho project-history, ne web. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Pozůstatek přechodu na úplnou historii projektu. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Nastaveno na ladicí kopii jiného projektu. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | Data importu z overleaf.com v1. V CE se nenastavují. `overleaf.id` má jedinečný index. | `Project.mjs:88-91` |
+| `__v` | Number | Klíč verze Mongoose. | Mongoose |
 
-* `__v`: Interní klíč verze Mongoose pro řízení souběžnosti.
+history-v1 může také zapisovat `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt` a `overleaf.backup.*`, ale jen když je nakonfigurován jeho `backupStore` (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE ho nekonfiguruje, takže se tato pole neobjevují.
 
-Zde je skutečný příklad pro uživatele Overleafu.
+#### Indexy {#indexes}
+
+Všechny pocházejí z migrací označených `server-ce` v `tools/migrations/`.
+
+| Název | Klíče | Volby | Migrace |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Poznámky {#notes}
+
+* `autoIndex` v Mongoose je vypnutý (`services/web/app/src/infrastructure/Mongoose.mjs:7`): volby `index` ve schématu existují jen proto, že je vytvářejí výše uvedené migrace.
+* Migrace `20250620152657_ensure_collaborator_arrays` nastaví chybějící `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs` a `reviewer_refs` na `[]`.
+* Smazání projektu přesune dokument do `deletedProjects` (viz [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
+
+Zde je skutečný příklad projektu Overleaf.
 
 <Accordion title="Příklad projektu">
 
