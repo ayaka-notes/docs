@@ -1,0 +1,62 @@
+---
+title: Notifications コレクション
+icon: bell
+---
+
+`notifications` は、ユーザーのプロジェクトダッシュボード上部に表示されるお知らせを保持します。1 つのドキュメントは 1 人のユーザーへの 1 件のお知らせで、`key` で識別されます。コレクションを直接扱うのは `notifications` サービスだけです（`services/notifications/app/js/Notifications.js`）。`web` と `third-party-datastore` はその HTTP API を呼び出します。Mongoose スキーマはありません。
+
+#### フィールド {#fields}
+
+| フィールド | 型 | 意味 | 出典 |
+| --- | --- | --- | --- |
+| `_id` | ObjectId | お知らせ id。`web` はこの id でお知らせを既読にします。 | `Notifications.js:58-65` |
+| `user_id` | ObjectId | お知らせを見るユーザー。 | `Notifications.js:26` |
+| `key` | String | お知らせを識別します。例: `project-invite-<inviteId>`。upsert により `user_id` と `key` ごとに 1 つのドキュメントが保たれます。一意インデックスはありません。 | `Notifications.js:27`, `:51-55` |
+| `templateKey` | String | フロントエンドがどのお知らせを描画するか。お知らせが既読または閉じられると削除されますが、ドキュメントは残ります。 | `Notifications.js:29`, `:63`, `:72`, `:78` |
+| `messageOpts` | Object | お知らせの文面に使う値で、`templateKey` によって異なります（プロジェクト招待では `userName`、`projectName`、`projectId`、`token`）。ユーザーが id でお知らせを閉じると削除されます。 | `Notifications.js:28`, `:63` |
+| `expires` | Date | 任意。この日時を過ぎると TTL インデックスがドキュメントを削除します。 | `Notifications.js:35-50` |
+
+#### 書き込むコード {#who-writes-it}
+
+| コード | 動作 |
+| --- | --- |
+| `Notifications.js:20-56` (`addNotification`) | `POST /user/:user_id` (`services/notifications/app.ts:29`). `user_id` + `key` で upsert します。そのキーのドキュメントが既にある場合、呼び出し側が `forceCreate` を送ったときだけ再度書き込まれます。 |
+| `Notifications.js:58-65` (`removeNotificationId`) | `DELETE /user/:user_id/notification/:notification_id` (`app.ts:31-34`): `templateKey` と `messageOpts` を削除します。 |
+| `Notifications.js:67-80` | `DELETE /user/:user_id` と `DELETE /key/:key` (`app.ts:35-36`): キーで `templateKey` を削除します。 |
+| `Notifications.js:87-100` | `DELETE /key/:key/bulk` (`app.ts:38-41`) はキーを持つ未読のお知らせを削除します。`deleteNotificationByKeyOnly` はキーで 1 つのドキュメントを削除します。 |
+| `services/web/app/src/Features/Notifications/NotificationsHandler.mjs:33-66` | `addNotification` の `web` 側。呼び出し側が `false` を渡さない限り `forceCreate: true` を送ります。 |
+| `services/third-party-datastore/app/js/QueueWorker.mjs:46-58` | 私たちの Dropbox 同期: Dropbox アカウントのリンクを解除するとき、`dropbox-unlinked` のお知らせを直接投稿します。 |
+
+CE と私たちのモジュールが作成するお知らせ:
+
+| `key` | `templateKey` | 作成箇所 |
+| --- | --- | --- |
+| `project-invite-<inviteId>` | `notification_project_invite`, 招待とともに期限切れ | `services/web/app/src/Features/Collaborators/CollaboratorsInviteHandler.mjs:40-42`, 構築箇所 `services/web/app/src/Features/Notifications/NotificationsBuilder.mjs:100-122`. 招待されたメールアドレスが既存ユーザーのものである場合のみ。 |
+| `tpdsFileLimit-<userId>` | `notification_tpds_file_limit` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsController.mjs:118-124` (Dropbox の更新によりプロジェクトがファイル数の上限を超える場合), `NotificationsBuilder.mjs:175-195` |
+| `dropboxDuplicateProjectNames-<userId>` | `notification_dropbox_duplicate_project_names` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateHandler.mjs:160-169`, `NotificationsBuilder.mjs:10-30` |
+| `dropbox-unlinked` | `dropbox_unlinked_because_access_denied`, `dropbox_unlinked_because_full` または `dropbox_unlinked_because_suspended` | `services/third-party-datastore/app/js/QueueWorker.mjs:20-25`, `:46-58` (私たちの Dropbox 同期) |
+
+`NotificationsBuilder.mjs` は、グループ招待、所属機関、サブスクリプション、古いデバッグプロジェクト用のキーも構築します。それらの呼び出し元はサブスクリプションと機関のコードにあり、古いデバッグプロジェクトのチェックは `isSaas` の場合にのみ実行されます（`services/web/app/src/Features/Project/ProjectListController.mjs:234-236`）。
+
+#### 読み取るコード {#who-reads-it}
+
+| コード | 動作 |
+| --- | --- |
+| `Notifications.js:4-10` (`getUserNotifications`) | `GET /user/:user_id` (`app.ts:30`). まだ `templateKey` を持つユーザーのドキュメントだけを返します。 |
+| `services/web/app/src/Features/Project/ProjectListController.mjs:367` | プロジェクトダッシュボード用のお知らせを読み込みます。 |
+| `services/web/app/src/Features/Notifications/NotificationsController.mjs` | `GET /notifications`, `DELETE /notifications/:notificationId` と `GET /user/notification/:notificationId` (`services/web/app/src/router.mjs:922-937`). |
+| `services/web/modules/dropbox/app/src/DropboxHandler.mjs:128-131` | 私たちの Dropbox モジュール: ユーザーが Dropbox を再リンクすると、`dropbox-unlinked` と `dropboxDuplicateProjectNames-<userId>` を既読にします。 |
+
+#### インデックス {#indexes}
+
+| 名前 | キー | オプション | マイグレーション |
+| --- | --- | --- | --- |
+| `expires_1` | `{ expires: 1 }` | TTL, `expireAfterSeconds: 10` | `tools/migrations/20190912145014_create_notifications_indexes.mjs` |
+| `key_1` | `{ key: 1 }` | | 同上 |
+| `user_id_1` | `{ user_id: 1 }` | | 同上 |
+
+#### 補足 {#notes}
+
+* 既読のお知らせは削除されず、`templateKey` だけが消えます。ドキュメントにはキーが残るため、後で同じキーに対して `forceCreate` なしで `addNotification` を呼んでも何も起きません（`Notifications.js:21-24`）。
+* `/key/:key` ルートはユーザーを問わず、キーだけを対象に動作します（`Notifications.js:76-100`）。
+* `web` に `apis.notifications.url` がない場合、お知らせの作成も読み取りも行いません（`NotificationsHandler.mjs:17`、`:41`）。
