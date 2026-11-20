@@ -3,79 +3,145 @@ title: Колекція Projects
 icon: rectangle-vertical-history
 ---
 
-`Project` представляє окремий LaTeX-проєкт в Overleaf. Він зберігає метадані проєкту, інформацію про власника та керування доступом, файлову структуру, налаштування компіляції та стан спільної роботи.
+`projects` зберігає по одному документу на проєкт: назву, власника й учасників, спільний доступ, дерево файлів і налаштування проєкту. Тексту документів тут немає (див. [Колекція Docs](/uk/dev/data-model/docs-collection)), а двійкові файли зберігаються у сховищі blob-об'єктів history-v1 під своїм `hash`. Схема: `services/web/app/src/models/Project.mjs`, дерево файлів описано поруч у `Folder.mjs`, `File.mjs` і `Doc.mjs`.
 
-#### Основна ідентифікація та метадані
+У стовпці «Джерело» `Project.mjs:N` означає рядок цієї схеми, інші назви файлів без шляху містяться в `services/web/app/src/Features/`, а `modules/...` міститься в `services/web/`. Номери рядків узято з `server-pro` на момент написання.
 
-* `_id`: унікальний MongoDB ObjectId, що ідентифікує проєкт.
-* `name`: відображувана назва проєкту.
-* `description`: необов'язковий текстовий опис проєкту.
-* `active`: показує, чи проєкт наразі активний.
-* `version`: внутрішня версія схеми або формату проєкту.
-* `trashed`: список елементів, переміщених до кошика (м'яке видалення).
-* `deletedDocs`: записи про остаточно видалені документи.
+#### Основна ідентифікація та метадані {#core-identification-&-metadata}
 
-#### Власність і керування доступом
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id проєкту. | MongoDB |
+| `name` | String | Назва проєкту. | `Project.mjs:18` |
+| `description` | String | Опис проєкту. За замовчуванням порожній. | `Project.mjs:50` |
+| `version` | Number | Збільшується на 1 після кожної зміни дерева файлів (додавання, перейменування, переміщення, видалення, заміна). | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | `false` після деактивації проєкту: його документи заархівовано з Mongo (`docs.inS3`). Відкриття проєкту розархівовує їх і знову встановлює `true`. У CE cron-завдання, що деактивує старі проєкти, запускається лише з `ENABLE_CRON_RESOURCE_DELETION=true`. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Користувачі, які заархівували проєкт. Архівування діє для кожного користувача окремо. Старі булеві значення перетворила міграція `20221111111111_ce_sp_convert_archived_state`. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Користувачі, які перемістили проєкт до свого кошика. Теж для кожного користувача окремо. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Застаріле поле, `{ _id, name, deletedAt }`. Видалені документи тепер залишаються в `docs` з `deleted: true`. Цей масив читається лише під час відновлення старого видаленого проєкту: записи копіюються в docstore, а масив очищується. Ніщо в нього не пише. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Лише в схемі: ядро CE і наші модулі його не використовують. | `Project.mjs:28` |
 
-* `owner_ref`: посилання на користувача, якому належить проєкт.
-* `collaberator_refs`: користувачі з правами редагування.
-* `reviewer_refs`: користувачі з доступом рівня рецензента.
-* `readOnly_refs`: користувачі з доступом лише для читання.
-* `pendingEditor_refs` / `pendingReviewer_refs`: очікувані запрошення.
+#### Власність і керування доступом {#ownership-&-access-control}
 
-#### Доступ на основі токенів
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Власник. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Користувачі, які можуть редагувати (таке написання і є справжньою назвою поля). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | Користувачі, які можуть рецензувати: коментувати й пропонувати зміни з відстеженням змін. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Користувачі, які можуть лише переглядати. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | Це не запрошення (вони зберігаються в `projectInvites`). Користувачі, яких додали як редакторів або рецензентів, коли власник не мав вільного місця для співавтора. Їх додають до `readOnly_refs` і перелічують тут, доки їх не можна буде підвищити. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Читачі, які попросили більше доступу: `userId`, `privilegeLevel`, `requestedAt`. Один запис на користувача. Видаляється, коли запит схвалено чи відхилено або користувач залишив проєкт. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Стан відстеження змін. `true` означає ввімкнено для всіх (старий формат); інакше це об'єкт з id користувачів як ключами і `true` для кожного користувача, у якого його ввімкнено. Його записує модуль `track-changes`, а ядро вмикає його для користувача, якого призначено рецензентом. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | Зв'язки з IEEE Collabratec: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. У CE не використовується. | `Project.mjs:104-116` |
 
-* `tokens`: реєстр токенів для спільних посилань.
-* `tokenAccessReadOnly_refs`: токени, що надають доступ лише для читання.
-* `tokenAccessReadAndWrite_refs`: токени, що надають доступ для читання й запису.
+#### Доступ за посиланням {#link-sharing}
 
-#### Відстеження активності
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` або `tokenBased` (доступ за посиланням увімкнено). У старих проєктах ще можуть траплятися застарілі значення `readOnly` або `readAndWrite`. Значення `public` немає. Таке написання і є справжньою назвою поля. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Токен посилання лише для перегляду. Унікальний. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Токен посилання для редагування. Унікальний. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Числовий префікс токена редагування, за яким шукають токен. Унікальний. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Користувачі, які приєдналися за посиланням для перегляду (id користувачів, а не токени). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Користувачі, які приєдналися за посиланням для редагування. | `Project.mjs:84` |
 
-* `lastUpdated`: позначка часу останньої зміни.
-* `lastUpdatedBy`: користувач, який виконав останнє оновлення.
-* `lastOpened`: позначка часу, коли проєкт востаннє відкривали.
-* `deletedByExternalDataSource`: чи було видалення ініційоване зовнішньою інтеграцією.
+Вимкнення доступу за посиланням видаляє `tokens` і повертає `publicAccesLevel` до `private` (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Структура проєкту
+#### Відстеження активності {#activity-tracking}
 
-Кореневий документ і папка
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | Час останньої зміни вмісту або дерева файлів. Лише збільшується. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Користувач, який зробив цю останню зміну. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Час, коли хтось востаннє відкривав проєкт. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | `true`, коли папку проєкту видалили на боці Dropbox. Сам проєкт не видаляється; редактор показує сповіщення, а прапорець скидається під час наступного відкриття проєкту. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | Спадок імпорту з overleaf.com v1. Якщо значення більше за 0, під час завантаження проєкт один раз надсилається в Dropbox, а лічильник скидається. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: ObjectId головного вхідного LaTeX-документа (зазвичай `main.tex`).
-* `rootFolder`: вбудоване представлення файлового дерева проєкту.
+#### Структура проєкту {#project-structure}
 
-Кожен запис папки містить:
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Основний документ, який компілюється. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Основний файл `.bib`, вибраний у налаштуваннях проєкту. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Дерево файлів. Завжди один елемент: коренева папка. | `Project.mjs:43` |
 
-* `name` / `_id`: назву та ідентифікатор папки.
-* `docs`: список вихідних LaTeX-документів з назвою та `_id`.
-* `fileRefs`: посилання на бінарні файли (зображення, файли даних), зокрема:
-  * `name`: ім'я файлу
-  * `created`: позначка часу завантаження
-  * `rev`: лічильник ревізій
-  * `hash`: хеш вмісту для дедуплікації
-  * `linkedFileData`: зв'язок із зовнішнім сховищем (якщо є)
-* `folders`: вкладені підпапки.
+Кожна папка (`Folder.mjs`):
 
-#### Налаштування компіляції та редактора
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id папки. | MongoDB |
+| `name` | String | Назва папки (коренева папка називається `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Редаговані текстові файли: лише `_id` і `name`. `_id` збігається з `_id` у колекції `docs`, де зберігається текст. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | Двійкові файли, див. нижче. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Вкладені папки. | `Folder.mjs:17` |
 
-* `compiler`: вибраний рушій LaTeX (`pdflatex`, `xelatex`, `lualatex` тощо).
-* `spellCheckLanguage`: мова перевірки орфографії для цього проєкту.
+Кожен файл у `fileRefs` (`File.mjs`):
 
-#### Налаштування публічності та спільного доступу
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id файлу. Змінюється, коли файл замінюють. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Назва файлу. | `File.mjs:7` |
+| `created` | Date | Коли файл було завантажено або востаннє замінено. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Збільшується на 1 після кожної заміни файлу. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | SHA-1 вмісту. Файл зберігається у сховищі blob-об'єктів history-v1 під цим хешем, і завантаження читають його звідти. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Задається для пов'язаних файлів (з URL, іншого проєкту, вихідного файлу, Zotero або Mendeley): `provider`, його вихідні дані та `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: видимість проєкту (`private`, `readOnly`, `public` тощо).
-* `collabratecUsers`: пов'язані користувачі із зовнішніх платформ для спільної роботи.
+#### Налаштування компіляції та редактора {#compilation-&-editor-settings}
 
-#### Специфічні розширення Overleaf
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | Рушій LaTeX: один із `Settings.safeCompilers` (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | Образ TeX Live, що використовується для цього проєкту під час компіляції в пісочниці. Новий проєкт отримує `Settings.currentImageName`; галерея шаблонів і MCP-сервер можуть його змінити. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Мова перевірки правопису. Новий проєкт копіює `ace.spellCheckLanguage` власника. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Налаштування проєкту, збережене із запиту налаштувань (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Налаштування формату посилань. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Брендинг видавця. Його може задати галерея шаблонів. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | Шаблон overleaf.com v1, з якого створено проєкт. У CE не задається. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: ідентифікатор, який використовує служба історії.
-  * `display`: чи увімкнена та видима історія.
+#### Історія (`overleaf`) {#history-overleaf}
 
-#### Внутрішнє версіонування
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Id проєкту в project-history та history-v1. Нові проєкти використовують id проєкту як рядок. Унікальний. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | Для нових проєктів завжди `true`; зберігається лише для сумісності. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Історія також зберігає коментарі та відстежені зміни. Відновлення версії відновлює їх, лише якщо це значення `true`. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Етап переходу на формат OT-оновлень історії. Лише збільшується. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Час, коли востаннє завершилася повторна синхронізація історії. Записує project-history, а не web. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Залишилися від переходу на повну історію проєкту. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Задається для налагоджувальної копії іншого проєкту. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | Дані імпорту overleaf.com v1. У CE не задаються. `overleaf.id` має унікальний індекс. | `Project.mjs:88-91` |
+| `__v` | Number | Ключ версії Mongoose. | Mongoose |
 
-* `__v`: внутрішній ключ версії Mongoose для керування паралельним доступом.
+history-v1 також може записувати `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt` і `overleaf.backup.*`, але лише якщо налаштовано його `backupStore` (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE його не налаштовує, тому ці поля не з'являються.
 
-Ось реальний приклад для Overleaf.
+#### Індекси {#indexes}
+
+Усі вони створюються міграціями з тегом `server-ce` у `tools/migrations/`.
+
+| Назва | Ключі | Параметри | Міграція |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Примітки {#notes}
+
+* `autoIndex` у Mongoose вимкнено (`services/web/app/src/infrastructure/Mongoose.mjs:7`): параметри `index` у схемі існують лише тому, що їх створюють наведені вище міграції.
+* Міграція `20250620152657_ensure_collaborator_arrays` встановлює відсутні `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs` і `reviewer_refs` у `[]`.
+* Під час видалення проєкту документ переміщується до `deletedProjects` (див. [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
+
+Ось реальний приклад проєкту Overleaf.
 
 <Accordion title="Приклад проєкту">
 

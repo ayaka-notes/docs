@@ -3,84 +3,165 @@ title: Users コレクション
 icon: user
 ---
 
-`User` は Overleaf システム内の 1 つのユーザーアカウントを表します。認証データ、機能フラグ、エディターの設定、アクセス権限、アクティビティのメタデータを保存します。
+`users` はアカウントごとに 1 つのドキュメントを保持します。ログインデータ、プロフィール、エディターの設定、機能、アクティビティを保存します。スキーマは `services/web/app/src/models/User.mjs` で、ほとんどの書き込みは `services/web/app/src/Features/User/UserUpdater.mjs` を経由します。ソース列では、`User.mjs:N` はこのスキーマの行を表し、パスのないその他のファイル名は `services/web/app/src/Features/` 配下、`modules/...` は `services/web/` 配下にあります。行番号は執筆時点の `server-pro` のものです。
 
-#### コアアイデンティティと認証
+#### コアアイデンティティと認証 {#core-identity-&-authentication}
 
-* `_id`: ユーザーの一意な MongoDB ObjectId。
-* `email` / `emails`: プライマリメールアドレスとメールアドレスの履歴。
-* `hashedPassword`: ローカル認証に使用される BCrypt でハッシュ化されたパスワード。
-* `first_name` / `last_name`: ユーザープロフィールの名前フィールド。
-* `role` / `isAdmin` / `adminRoles`: ロールと管理者権限のフラグ。
-* `twoFactorAuthentication`: 二要素認証の設定(有効な場合)。
-* `samlIdentifiers` / `thirdPartyIdentifiers`: 外部アイデンティティプロバイダーとの紐付け。
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | ユーザーの Id。他のコレクションは `user_id`、`owner_ref` などのフィールドでここを参照します。 | MongoDB |
+| `email` | String | メインのメールアドレス。大文字と小文字を区別しない場合も一意です(インデックスを参照)。 | `User.mjs:26` |
+| `emails` | Object の配列 | アカウントのすべてのアドレス。メインのアドレスは `email` と等しいエントリです。 | `User.mjs:27` |
+| `emails.email` | String | アドレス。 | `User.mjs:29` |
+| `emails.reversedHostname` | String | アドレスのドメインを逆順にしたもの(`moc.elpmaxe`)。アドレスの追加時に設定されます。 | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | アドレスが追加された日時。 | `User.mjs:31` |
+| `emails.confirmedAt` | Date | アドレスが最初に確認された日時(後の確認でも以前の日付が保持されます)。LDAP、SAML、OIDC モジュールはアカウント作成時に `emails.0.confirmedAt` を設定します。 | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | アドレスが最後に確認された日時。 | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | アドレスの機関 SSO リンク。機関 SSO は CE に含まれません。 | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | 機関への所属状態。CE に含まれません。 | `User.mjs:39` |
+| `first_name` / `last_name` | String | プロフィール名(最大 255 文字)。LDAP、SAML、OIDC はログインのたびにこれらを更新できます。 | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | ユーザーがアカウント設定で職種と所属機関として入力する自由記述テキスト。`role` は権限ではありません。 | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | ローカルパスワードの bcrypt ハッシュ。パスワードのないアカウントには存在しません。LDAP と SAML のログインはこれを削除し、マイグレーション `20260511150000_reset_hardcoded_admin_password` は既知のデフォルトパスワードを削除します。 | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | サイト管理者。LDAP、SAML、OIDC はログインのたびに IdP の属性からこれを設定できます。 | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | より細かな管理者ロール。`Settings.adminRolesEnabled` が設定されている場合にのみ読み取られます。 | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Object の配列 | SAML ログインのリンク。`saml` モジュールは `samlIdentifiers.0.providerId`(常に `'1'`)、`externalUserId`、`userIdAttribute` を書き込みます。 | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Object の配列 | OIDC ログインのリンク。コアの `ThirdPartyIdentityManager` が `oidc` モジュールのために書き込みます。 | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`、`enrolledAt`、`secretEncrypted`。スキーマにのみ存在し、CE のコアと当社のモジュールは使用しません。 | `User.mjs:239-243` |
 
-#### アカウントの状態とライフサイクル
+#### アカウントの状態とライフサイクル {#account-status-&-lifecycle}
 
-* `signUpDate`: アカウント作成のタイムスタンプ。
-* `holdingAccount`: アカウントが確認待ちまたは制限されているかどうか。
-* `must_reconfirm`: ユーザーがメールアドレスを再確認する必要があるかどうか。
-* `lastPrimaryEmailCheck`: プライマリメールアドレスが最後に検証された日時。
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | アカウントが作成された日時。 | `User.mjs:75` |
+| `suspended` | Boolean | 管理者がアカウントを無効にした場合は `true`。`UserUpdater.suspendUser` がこれを設定してセッションを終了します。`admin-tools` モジュールがこれを呼び出し、元に戻すこともできます。セッションの背後にないすべてのエントリポイント(トークン、署名付きリンク、WebSocket、Webhook)はこれを確認する必要があります。 | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | 登録を完了していない仮アカウントの場合は `true`。登録すると `false` に設定され、連絡先は仮アカウントをスキップします。 | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | `true` の場合、ログイン時にエディターではなく再確認ページに移動します。パスワードをリセットすると `false` に戻ります。CE ではこれを `true` に設定するものはありません。 | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | ユーザーがメインのメールアドレスがまだ自分のものであると最後に確認した日時、またはメインのメールアドレスを変更した日時。overleaf.com(`saas`)のみがこれを確認し、古すぎる場合はプロジェクト一覧がメインのメールアドレスの確認ページにリダイレクトします。 | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | 必須。アナリティクスイベントに使われる Id。`UserCreator` はこれがないとユーザーを作成しません。登録経路と LDAP、SAML、OIDC モジュールはランダムな UUID を渡します(`UserRegistrationHandler.mjs:103`、`modules/login-register/app/src/RegisterController.mjs:127`)。マイグレーション `20260424120000` と `20260616070000_back_fill_users_analyticsId` は古いアカウントについて `_id` からこれを埋めました。 | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | オンボーディングメールが送信された日時。メールは `saas` 機能が有効な場合にのみスケジュールされるため、CE では設定されません。 | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | スキーマにのみ存在し、CE のコアと当社のモジュールは使用しません。 | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | リンクされた overleaf.com v1 アカウントの `id`、`accessToken`、`refreshToken`。`overleaf.id` には一意のインデックスがあります。CE ではこれらのフィールドを書き込むものはありません。 | `User.mjs:230-234` |
 
-#### ログインとアクティビティの追跡
+#### ログインとアクティビティの追跡 {#login-&-activity-tracking}
 
-* `lastLoginIp`: 最後に成功したログインの IP アドレス。
-* `loginCount`: ログイン成功の合計回数。
-* `loginEpoch`: ログインセッションの内部カウンター。
-* `lastLoggedIn`: 最後のログインのタイムスタンプ。
-* `lastActive`: 最後に記録されたアクティビティのタイムスタンプ。
-* `lastFailedLogin`: 最後に失敗したログイン試行のタイムスタンプ。
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | 最後のログインの IP。 | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | ログインに成功した回数。 | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | 最後にログインに成功した日時。 | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | ログイン用のロック。ログインを試みるたびに値を増やし、読み取った値がまだ残っている場合にのみドキュメントを更新するため、並行する 2 つのログインが両方とも通ることはありません。LDAP、SAML、OIDC モジュールも同様です。 | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | 最後にパスワードを間違えた日時。 | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | ユーザーが最後にプロジェクトを開いた日時。 | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### エディターの設定(`ace`)
+#### エディターの設定(`ace`) {#editor-preferences-ace}
 
-オンラインエディターに関するユーザーの設定を定義します。
+アカウント設定ページは `UserController.updateUserSettings`(`UserController.mjs:460-530`)を通じてこれらを保存します。
 
-* `theme` / `overallTheme`: エディターと UI のテーマ。
-* `fontSize`: エディターのフォントサイズ。
-* `autoComplete`、`autoPairDelimiters`: 編集支援機能。
-* `spellCheckLanguage`: スペルチェックに使用する言語。
-* `pdfViewer`: 選択された PDF ビューアーのバックエンド。
-* `syntaxValidation`、`mathPreview`、`breadcrumbs`: エディターの UX 機能。
-* `enableNewEditor`: 新しいエディター UI が有効かどうか。
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | キーバインド。設定ページは `default`、`vim`、`emacs` のいずれかを保存します。スキーマのデフォルトは `none` です。 | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | エディターのテーマ。デフォルトは `textmate`。 | `User.mjs:92` |
+| `ace.overallTheme` | String | UI のテーマ。`system` は `lightTheme` と `darkTheme` を切り替えます。`light-` または空の場合は `theme` を使用します。 | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | `overallTheme: system` で使われるエディターのテーマ。デフォルトは `textmate` と `overleaf_dark`。 | `User.mjs:96-97` |
+| `ace.fontSize` | Number | エディターのフォントサイズ。デフォルトは 12。 | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | エディターのフォントと行の高さ。 | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | オートコンプリートと閉じ括弧の自動入力。デフォルトは `true`。 | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | スペルチェックの言語。デフォルトは `en`。新しいプロジェクトはこれをコピーします。 | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | PDF ビューアー。デフォルトは `pdfjs`。 | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | コードチェック。 | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | 数式プレビュー。デフォルトは `true`。 | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | エディター上部のパンくずリスト。デフォルトは `false`。 | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | エディターの表示オプション。デフォルトは `false`、`true`、`false`、`false`、`true`。 | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` または `simple`。 | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | 文献管理ツールの設定:`enabled`(デフォルトは `true`)、`groups`(`{ id }` の配列)、`disablePersonalLibrary`。 | `User.mjs:10-22`, `:114-116` |
 
-#### 機能フラグと制限(`features`)
+#### 機能フラグと制限(`features`) {#feature-flags-&-limits-features}
 
-ユーザーが利用できる機能を制御します。
+`features` は計算結果であり、手動で編集するものではありません。`FeaturesUpdater` は `Settings.defaultFeatures` から始めて、期限切れでない `featuresOverrides` のエントリをすべてマージし、結果を `featuresUpdatedAt` とともに書き込みます(`FeaturesUpdater.mjs:220-300`、`UserFeaturesUpdater.mjs:10-24`)。本番イメージは `collaborators`、`dropbox`、`versioning`、`compileTimeout`、`compileGroup`、`trackChanges`、`references` をデフォルトとして設定します(`server-ce/config/settings.js:301-309`)。その他のキーは未設定のままです。
 
-* `collaborators`: 共同編集者の最大数(`-1` = 無制限)。
-* `versioning`、`trackChanges`: 履歴と変更追跡の機能。
-* `dropbox`、`github`、`gitBridge`: 外部連携の利用可否。
-* `compileTimeout`: 最大コンパイル時間(秒)。
-* `compileGroup`: 割り当てられたコンパイルリソースグループ。
-* `aiErrorAssistant`: AI ベースのコンパイルエラーアシスタントのフラグ。古いアカウントにはこのフィールドやトップレベルの `aiErrorAssistant.enabled` が残っている場合がありますが、これらはすでにスキーマに含まれておらず、Ayakaleaf Pro はどちらも読み取りません。エラーアシスタントは、AI アシスタントと同様に、インスタンスの AI 設定とユーザーの `aiFeatures.enabled`（未設定の場合は AI が有効）によって有効になります。
+Ayakaleaf Pro では、管理パネルがユーザーごとに機能をオフにします。`admin-tools` モジュールはこれを `note: 'admin-panel'` を持つ `featuresOverrides` のエントリとして保存し(`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`)、`instance-features` モジュールは未設定のキーをオンとして扱います(`modules/instance-features/app/src/UserFeatures.mjs:12-14`)。
 
-#### アクセス制御とスタッフ権限(`staffAccess`)
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | プロジェクトあたりの共同編集者の最大数。`-1` は無制限。 | `User.mjs:119` |
+| `features.versioning` | Boolean | 履歴。 | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Dropbox 同期、GitHub・GitLab・Gitea 同期、Git アクセス。これらのモジュールが確認します。`requireUserFeature` を参照してください。`gitlab` と `gitea`(v6.3.4 以降)にはデフォルトがありません。管理者が Features タブでオフにするまで未設定のままで、これはオンとみなされます。マイグレーション `20230817081910_back_fill_gitBridge_feature_server_pro` はすべてのユーザーに `gitBridge: true` を設定しました。 | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | コンパイルのタイムアウト(秒)。`COMPILE_TIMEOUT` がデフォルトを設定します。 | `User.mjs:132` |
+| `features.compileGroup` | String | コンパイルグループ。例:`standard`。 | `User.mjs:136` |
+| `features.references` | Boolean | 非推奨。古いアカウントでは引き続き `referencesSearch` と `mendeley` をオンにします。 | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | 変更履歴の記録。`track-changes` モジュールがプロジェクトのオーナーについてこれを確認します。 | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | 文献管理ツールとのリンク。 | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | 文献検索、記号パレット、オフラインモードのスイッチ。 | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | AI の利用ティア。デフォルトは `basic`。 | `User.mjs:159` |
+| `featuresOverrides` | Object の配列 | デフォルトに対するユーザーごとの変更。各エントリには `createdAt`、`expiresAt`(この日付以降は無視)、`note`、`features`(上記と同じキーに加えて `templates`)があります。 | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | `features` が最後に計算された日時。 | `User.mjs:197` |
+| `featuresEpoch` | String | 最後の計算時点の `Settings.featuresEpoch` のコピー。古いアカウントの更新に使われます。 | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-スタッフやパブリッシャーのきめ細かなアクセス権を定義します。
+AI アシスタントとエラーアシスタントは `features` のキーではありません。インスタンスの AI 設定と `aiFeatures.enabled` に従います。下記を参照してください。
 
-* パブリッシャー、機関、グループ、管理者、実験に関するメトリクスと管理の権限。
+#### 連携 {#integrations}
 
-#### 登録と連携
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` にすると、このユーザーの AI アシスタントとエラーアシスタントがオフになります。デフォルトは `true`。 | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | リンクされた文献管理ツールの暗号化された認証情報。`tpr-webmodule` モジュールが書き込みます(Mendeley は `{ encrypted }`、Zotero は `{ apiKeyEncrypted }`)。リンクを解除すると削除されます。 | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Dropbox アカウントの Id。スキーマにはなく、`dropbox` モジュールが直接書き込みます。一意であるため、1 つの Dropbox アカウントは 1 人のユーザーにのみリンクされます。コアはこれを使って同期対象のユーザーを見つけます。 | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | 暗号化された Dropbox のリフレッシュトークン。スキーマにはなく、`dropbox` モジュールが書き込みます。リンクを解除すると `dropbox` オブジェクト全体が削除されます。 | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | ユーザーのアプリフォルダーの Dropbox `list_folder` カーソル。次回の取得で新しい変更だけを読み取るために使われます。スキーマにはなく、ユーザーが同じ Dropbox アカウントにリンクされている間だけ third-party-datastore が書き込みます。 | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | グループ SSO(`groupId`、`linkedAt`、`primary` からなる `sso` 配列)と管理対象ユーザーのフィールド(`managedBy`、`enrolledAt`)。グループサブスクリプションは CE に含まれません。 | `User.mjs:56-72` |
+| `writefull` | Object | Writefull の状態:`initialized`、`autoCreatedAccount`、`isPremium`、`premiumSource`。コアは `saas` 機能が有効な場合にのみこれを書き込むため、CE にはありません。 | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | スキーマにのみ存在し、CE のコアと当社のモジュールは使用しません。 | `User.mjs:249-255` |
 
-* `enrollment.sso`: 連携済みの SSO 登録。
-* `refProviders`: 文献プロバイダーとの連携。
-* `writefull`: Writefull 執筆アシスタントのアカウント状態。
-* `dsMobileApp`: モバイルアプリの設定(存在する場合)。
+#### プログラムと実験 {#programs-&-experiments}
 
-#### プログラムと実験
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | ユーザーがベータプログラムに参加しています。 | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | アルファプログラム。マイグレーション `20220826104236_disable_alpha_beta_program` は、すべてのユーザーについてこれと `betaProgram` を `false` に設定しました。 | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Labs プログラム。CE ではこれらを設定するものはありません。マイグレーション `20260615090000_back_fill_labsProgram` は値がない場合に `labsProgram: false` を設定しました。 | `User.mjs:228-229` |
+| `splitTests` | Mixed | テスト名ごとの A/B テストの割り当て。 | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: アーリーアクセスプログラムへの参加状況。
-* `labsExperiments`: 有効化された実験的機能。
-* `awareOfV2`: ユーザーが V2 エディターを認識済みかどうか。
+#### 紹介とチュートリアル {#referrals-&-tutorials}
 
-#### 紹介とチュートリアル
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | 作成時に生成されるランダムな紹介 Id。 | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | ObjectId の配列 / Number | この紹介 Id で登録したユーザー。 | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | チュートリアルのキーごと:`{ state, updatedAt, postponedUntil }`。 | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`、`refered_users`、`refered_user_count`: 紹介の追跡。
-* `completedTutorials`: オンボーディングおよび機能チュートリアルの進捗。
+#### インデックス {#indexes}
+
+すべて `tools/migrations/` 内の `server-ce` タグ付きマイグレーションによるものです。
+
+| 名前 | キー | オプション | マイグレーション |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### 注意事項 {#notes}
+
+* Mongoose の `autoIndex` はオフになっているため(`services/web/app/src/infrastructure/Mongoose.mjs:7`)、インデックスを作成するのは上記のマイグレーションだけです。
+* ユーザーを削除すると、ドキュメント全体が `deletedUsers` に移動します([Deleted Users Collection](/dev/data-model/deleted-users-collection) を参照)。
 
 ***
 
 以下は Overleaf ユーザーの実際の例です。
+
+<Info>
+
+このアカウントは古いバージョンで作成されました。スキーマにはもう存在せず、何も読み取らないフィールドがまだ残っています:`staffAccess`、`ace.enableNewEditor`、`features.aiErrorAssistant`、`aiErrorAssistant`、`writefull.enabled`(現在は `writefull.initialized`)。`ace.breadcrumbs` のデフォルトは現在 `false` です。
+
+</Info>
 
 <Accordion title="ユーザーの例">
 
@@ -171,7 +252,7 @@ icon: user
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),

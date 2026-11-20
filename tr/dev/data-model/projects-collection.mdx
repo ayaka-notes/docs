@@ -3,79 +3,145 @@ title: Projects Koleksiyonu
 icon: rectangle-vertical-history
 ---
 
-`Project`, Overleaf'teki tek bir LaTeX projesini temsil eder. Proje meta verilerini, sahiplik ve erişim denetimini, dosya yapısını, derleme ayarlarını ve iş birliği durumunu saklar.
+`projects`, proje başına bir belge tutar: ad, sahip ve üyeler, paylaşım, dosya ağacı ve proje ayarları. Belgelerin metni burada değildir (bkz. [Docs Koleksiyonu](/tr/dev/data-model/docs-collection)) ve ikili dosyalar history-v1 blob deposunda kendi `hash` değerleri altında durur. Şema `services/web/app/src/models/Project.mjs` dosyasıdır; dosya ağacı yanındaki `Folder.mjs`, `File.mjs` ve `Doc.mjs` dosyalarındadır.
 
-#### Temel Tanımlama ve Meta Veriler
+Kaynak sütununda `Project.mjs:N` bu şemanın bir satırıdır, yolu olmayan diğer dosya adları `services/web/app/src/Features/` altında, `modules/...` ise `services/web/` altındadır. Satır numaraları yazım anındaki `server-pro` sürümünden alınmıştır.
 
-* `_id`: Projeyi tanımlayan benzersiz MongoDB ObjectId.
-* `name`: Projenin görünen adı.
-* `description`: Projenin isteğe bağlı metin açıklaması.
-* `active`: Projenin şu anda etkin olup olmadığını belirtir.
-* `version`: Dahili şema veya proje biçimi sürümü.
-* `trashed`: Çöp kutusuna taşınan (geçici olarak silinen) öğelerin listesi.
-* `deletedDocs`: Kalıcı olarak silinen belgelerin kayıtları.
+#### Temel Tanımlama ve Meta Veriler {#core-identification-&-metadata}
 
-#### Sahiplik ve Erişim Denetimi
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Projenin id'si. | MongoDB |
+| `name` | String | Proje adı. | `Project.mjs:18` |
+| `description` | String | Proje açıklaması. Varsayılan olarak boş. | `Project.mjs:50` |
+| `version` | Number | Dosya ağacındaki her değişiklikte (ekleme, yeniden adlandırma, taşıma, silme, değiştirme) 1 artar. | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | Proje devre dışı bırakıldıktan sonra `false` olur: belgeleri Mongo dışına arşivlenmiştir (`docs.inS3`). Projeyi açmak arşivden çıkarır ve değeri yeniden `true` yapar. CE'de eski projeleri devre dışı bırakan cron yalnızca `ENABLE_CRON_RESOURCE_DELETION=true` ile çalışır. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Projeyi arşivleyen kullanıcılar. Arşivleme kullanıcı başınadır. Eski boolean değerler `20221111111111_ce_sp_convert_archived_state` taşıması ile dönüştürüldü. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Projeyi çöp kutusuna taşıyan kullanıcılar. Bu da kullanıcı başınadır. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Eski alan, `{ _id, name, deletedAt }`. Silinen belgeler artık `deleted: true` ile `docs` içinde kalır. Bu dizi yalnızca eski bir silinmiş proje geri yüklenirken okunur: girdiler docstore'a kopyalanır ve dizi boşaltılır. Hiçbir şey ona yazmaz. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Yalnızca şemada: CE çekirdeği ve modüllerimiz bunu kullanmaz. | `Project.mjs:28` |
 
-* `owner_ref`: Projenin sahibi olan kullanıcıya başvuru.
-* `collaberator_refs`: Düzenleme izinlerine sahip kullanıcılar.
-* `reviewer_refs`: İnceleyici düzeyinde erişime sahip kullanıcılar.
-* `readOnly_refs`: Salt okunur erişime sahip kullanıcılar.
-* `pendingEditor_refs` / `pendingReviewer_refs`: Bekleyen davetler.
+#### Sahiplik ve Erişim Denetimi {#ownership-&-access-control}
 
-#### Token Tabanlı Erişim
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Sahip. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Düzenleyebilen kullanıcılar (bu yazım alanın gerçek adıdır). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | İnceleyebilen kullanıcılar: yorum yapabilir ve değişiklik izleme ile öneride bulunabilir. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Yalnızca görüntüleyebilen kullanıcılar. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | Davetler değildir (onlar `projectInvites` içindedir). Sahibin boş ortak çalışan yeri yokken düzenleyici veya gözden geçiren olarak eklenen kullanıcılar. `readOnly_refs` alanına eklenir ve yükseltilebilene kadar burada listelenirler. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Daha fazla erişim isteyen görüntüleyenler: `userId`, `privilegeLevel`, `requestedAt`. Kullanıcı başına bir girdi. İstek kabul edildiğinde, reddedildiğinde veya kullanıcı projeden ayrıldığında kaldırılır. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Değişiklik izleme durumu. `true` herkes için açık anlamına gelir (eski biçim); aksi halde, kullanıcı id'lerini anahtar olarak kullanan ve açık olan her kullanıcı için `true` içeren bir nesnedir. `track-changes` modülü bunu yazar; çekirdek ise gözden geçiren yapılan bir kullanıcı için açar. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | IEEE Collabratec bağlantıları: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. CE'de kullanılmaz. | `Project.mjs:104-116` |
 
-* `tokens`: Paylaşılan bağlantılar için token kaydı.
-* `tokenAccessReadOnly_refs`: Salt okunur erişim sağlayan token'lar.
-* `tokenAccessReadAndWrite_refs`: Okuma-yazma erişimi sağlayan token'lar.
+#### Bağlantıyla Paylaşım {#link-sharing}
 
-#### Etkinlik Takibi
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` veya `tokenBased` (bağlantıyla paylaşım açık). Eski projelerde hâlâ eski `readOnly` veya `readAndWrite` değerleri olabilir. `public` diye bir değer yoktur. Bu yazım alanın gerçek adıdır. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Salt görüntüleme bağlantısının belirteci. Benzersiz. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Düzenleme bağlantısının belirteci. Benzersiz. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Düzenleme belirtecinin sayısal öneki; belirteci aramak için kullanılır. Benzersiz. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Salt görüntüleme bağlantısıyla katılan kullanıcılar (belirteçler değil, kullanıcı id'leri). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Düzenleme bağlantısıyla katılan kullanıcılar. | `Project.mjs:84` |
 
-* `lastUpdated`: En son değişikliğin zaman damgası.
-* `lastUpdatedBy`: Son güncellemeyi yapan kullanıcı.
-* `lastOpened`: Projenin en son açıldığı zamanın zaman damgası.
-* `deletedByExternalDataSource`: Silme işleminin harici bir entegrasyon tarafından tetiklenip tetiklenmediği.
+Bağlantıyla paylaşımı kapatmak `tokens` alanını kaldırır ve `publicAccesLevel` değerini yeniden `private` yapar (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Proje Yapısı
+#### Etkinlik Takibi {#activity-tracking}
 
-Kök Belge ve Klasör
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | İçerikte veya dosya ağacında yapılan son değişikliğin zamanı. Yalnızca ileri gider. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Bu son değişikliği yapan kullanıcı. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Birinin projeyi en son açtığı zaman. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | Proje klasörü Dropbox tarafında silindiğinde `true` olur. Projenin kendisi silinmez; düzenleyici bir uyarı gösterir ve proje bir sonraki açılışında bayrak temizlenir. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | overleaf.com v1 içe aktarımından kalma. 0'dan büyük olduğunda proje yüklenirken bir kez Dropbox'a gönderilir ve sayaç sıfırlanır. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: Ana LaTeX giriş belgesinin ObjectId'si (genellikle `main.tex`).
-* `rootFolder`: Projenin dosya ağacının satır içi gösterimi.
+#### Proje Yapısı {#project-structure}
 
-Her klasör girdisi şunları içerir:
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Derlenen ana belge. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Proje ayarlarında seçilen ana `.bib` dosyası. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Dosya ağacı. Her zaman tek öğe: kök klasör. | `Project.mjs:43` |
 
-* `name` / `_id`: Klasör adı ve tanımlayıcısı.
-* `docs`: Adı ve `_id` değeriyle birlikte LaTeX kaynak belgelerinin listesi.
-* `fileRefs`: İkili dosya başvuruları (görseller, veri dosyaları); şunları içerir:
-  * `name`: Dosya adı
-  * `created`: Yükleme zaman damgası
-  * `rev`: Revizyon sayacı
-  * `hash`: Yinelenenleri önlemek için içerik özeti (hash)
-  * `linkedFileData`: Harici depolama bağlantısı (varsa)
-* `folders`: İç içe alt klasörler.
+Her klasör (`Folder.mjs`):
 
-#### Derleme ve Düzenleyici Ayarları
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Klasör id'si. | MongoDB |
+| `name` | String | Klasör adı (kök klasörün adı `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Düzenlenebilir metin dosyaları: yalnızca `_id` ve `name`. `_id`, metni tutan `docs` koleksiyonundaki `_id` ile aynıdır. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | İkili dosyalar, aşağıya bakın. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Alt klasörler. | `Folder.mjs:17` |
 
-* `compiler`: Seçilen LaTeX motoru (`pdflatex`, `xelatex`, `lualatex` vb.).
-* `spellCheckLanguage`: Bu proje için yazım denetimi dili.
+`fileRefs` içindeki her dosya (`File.mjs`):
 
-#### Herkese Açık Erişim ve Paylaşım Ayarları
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Dosya id'si. Dosya değiştirildiğinde değişir. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Dosya adı. | `File.mjs:7` |
+| `created` | Date | Dosyanın yüklendiği veya en son değiştirildiği zaman. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Dosya her değiştirildiğinde 1 artar. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | İçeriğin SHA-1 değeri. Dosya bu karma altında history-v1 blob deposunda saklanır ve indirmeler onu oradan okur. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Bağlantılı dosyalar için ayarlanır (bir URL'den, başka bir projeden, bir çıktı dosyasından, Zotero veya Mendeley'den): `provider`, kaynak verileri ve `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: Proje görünürlüğü (`private`, `readOnly`, `public` vb.).
-* `collabratecUsers`: Harici iş birliği platformlarından bağlanan kullanıcılar.
+#### Derleme ve Düzenleyici Ayarları {#compilation-&-editor-settings}
 
-#### Overleaf'e Özgü Uzantılar
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | LaTeX motoru: `Settings.safeCompilers` değerlerinden biri (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | Bu projenin korumalı alan derlemelerinde kullanılan TeX Live imajı. Yeni bir proje `Settings.currentImageName` değerini alır; şablon galerisi ve MCP sunucusu bunu değiştirebilir. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Yazım denetimi dili. Yeni bir proje sahibin `ace.spellCheckLanguage` değerini kopyalar. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Ayarlar isteğinden kaydedilen proje ayarı (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Kaynakça biçimi ayarı. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Yayıncı markalaması. Şablon galerisi bunu ayarlayabilir. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | Projenin geldiği overleaf.com v1 şablonu. CE'de ayarlanmaz. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: Geçmiş hizmeti tarafından kullanılan tanımlayıcı.
-  * `display`: Geçmişin etkin ve görünür olup olmadığı.
+#### Geçmiş (`overleaf`) {#history-overleaf}
 
-#### Dahili Sürümleme
+| Alan | Tür | Anlamı | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Projenin project-history ve history-v1 içindeki id'si. Yeni projeler proje id'sini dize olarak kullanır. Benzersiz. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | Yeni projelerde her zaman `true`; yalnızca uyumluluk için tutulur. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Geçmiş, yorumları ve izlenen değişiklikleri de saklar. Bir sürümü geri yüklemek, bunları yalnızca bu değer `true` olduğunda geri yükler. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Geçmişin OT güncelleme biçimine geçiş aşaması. Yalnızca artar. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Geçmişin yeniden eşitlemesinin en son tamamlandığı zaman. web değil, project-history tarafından yazılır. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Tam proje geçmişine geçişten kalma. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Başka bir projenin hata ayıklama kopyasında ayarlanır. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | overleaf.com v1 içe aktarım verileri. CE'de ayarlanmaz. `overleaf.id` benzersiz bir dizine sahiptir. | `Project.mjs:88-91` |
+| `__v` | Number | Mongoose sürüm anahtarı. | Mongoose |
 
-* `__v`: Eşzamanlılık denetimi için Mongoose dahili sürüm anahtarı.
+history-v1 ayrıca `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt` ve `overleaf.backup.*` alanlarını da yazabilir, ancak yalnızca `backupStore` yapılandırıldığında (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE bunu yapılandırmaz, bu yüzden bu alanlar görünmez.
 
-Aşağıda bir Overleaf kullanıcısı için gerçek bir örnek verilmiştir.
+#### Dizinler {#indexes}
+
+Hepsi `tools/migrations/` içindeki `server-ce` etiketli taşımalardan gelir.
+
+| Ad | Anahtarlar | Seçenekler | Taşıma |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Notlar {#notes}
+
+* Mongoose `autoIndex` kapalıdır (`services/web/app/src/infrastructure/Mongoose.mjs:7`): şemadaki `index` seçenekleri yalnızca yukarıdaki taşımalar onları oluşturduğu için vardır.
+* `20250620152657_ensure_collaborator_arrays` taşıması eksik `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs` ve `reviewer_refs` alanlarını `[]` olarak ayarlar.
+* Bir projeyi silmek belgeyi `deletedProjects` koleksiyonuna taşır (bkz. [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
+
+İşte gerçek bir Overleaf projesi örneği.
 
 <Accordion title="Proje Örneği">
 

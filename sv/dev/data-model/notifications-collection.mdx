@@ -1,0 +1,62 @@
+---
+title: Samlingen Notifications
+icon: bell
+---
+
+`notifications` innehåller de meddelanden som visas överst på en användares projektpanel. Ett dokument är ett meddelande för en användare, identifierat av sin `key`. Bara tjänsten `notifications` rör samlingen (`services/notifications/app/js/Notifications.js`); `web` och `third-party-datastore` anropar dess HTTP-API. Det finns inget Mongoose-schema.
+
+#### Fält {#fields}
+
+| Fält | Typ | Betydelse | Källa |
+| --- | --- | --- | --- |
+| `_id` | ObjectId | Meddelandets id. `web` markerar ett meddelande som läst med detta id. | `Notifications.js:58-65` |
+| `user_id` | ObjectId | Användaren som ser meddelandet. | `Notifications.js:26` |
+| `key` | String | Identifierar meddelandet, till exempel `project-invite-<inviteId>`. Upserten behåller ett dokument per `user_id` och `key`; det finns inget unikt index. | `Notifications.js:27`, `:51-55` |
+| `templateKey` | String | Vilket meddelande frontend återger. Tas bort när meddelandet läses eller stängs; dokumentet finns kvar. | `Notifications.js:29`, `:63`, `:72`, `:78` |
+| `messageOpts` | Object | Värden för meddelandetexten beroende på `templateKey` (för en projektinbjudan: `userName`, `projectName`, `projectId`, `token`). Tas bort när användaren stänger meddelandet via id. | `Notifications.js:28`, `:63` |
+| `expires` | Date | Valfritt. TTL-indexet raderar dokumentet efter denna tid. | `Notifications.js:35-50` |
+
+#### Vem skriver {#who-writes-it}
+
+| Kod | Vad den gör |
+| --- | --- |
+| `Notifications.js:20-56` (`addNotification`) | `POST /user/:user_id` (`services/notifications/app.ts:29`). Upsert på `user_id` + `key`. Om ett dokument med den nyckeln redan finns skrivs det bara igen när anroparen skickar `forceCreate`. |
+| `Notifications.js:58-65` (`removeNotificationId`) | `DELETE /user/:user_id/notification/:notification_id` (`app.ts:31-34`): tar bort `templateKey` och `messageOpts`. |
+| `Notifications.js:67-80` | `DELETE /user/:user_id` och `DELETE /key/:key` (`app.ts:35-36`): tar bort `templateKey` via nyckel. |
+| `Notifications.js:87-100` | `DELETE /key/:key/bulk` (`app.ts:38-41`) raderar olästa meddelanden med en nyckel; `deleteNotificationByKeyOnly` raderar ett dokument via nyckel. |
+| `services/web/app/src/Features/Notifications/NotificationsHandler.mjs:33-66` | `web`-sidan av `addNotification`. Skickar `forceCreate: true` om inte anroparen anger `false`. |
+| `services/third-party-datastore/app/js/QueueWorker.mjs:46-58` | Vår Dropbox-synkronisering: när den kopplar bort ett Dropbox-konto publicerar den meddelandet `dropbox-unlinked` direkt. |
+
+Meddelanden som CE och våra moduler skapar:
+
+| `key` | `templateKey` | Skapas i |
+| --- | --- | --- |
+| `project-invite-<inviteId>` | `notification_project_invite`, upphör med inbjudan | `services/web/app/src/Features/Collaborators/CollaboratorsInviteHandler.mjs:40-42`, byggs i `services/web/app/src/Features/Notifications/NotificationsBuilder.mjs:100-122`. Bara när den inbjudna e-postadressen tillhör en befintlig användare. |
+| `tpdsFileLimit-<userId>` | `notification_tpds_file_limit` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsController.mjs:118-124` (en Dropbox-uppdatering skulle få ett projekt att överskrida filgränsen), `NotificationsBuilder.mjs:175-195` |
+| `dropboxDuplicateProjectNames-<userId>` | `notification_dropbox_duplicate_project_names` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateHandler.mjs:160-169`, `NotificationsBuilder.mjs:10-30` |
+| `dropbox-unlinked` | `dropbox_unlinked_because_access_denied`, `dropbox_unlinked_because_full` eller `dropbox_unlinked_because_suspended` | `services/third-party-datastore/app/js/QueueWorker.mjs:20-25`, `:46-58` (vår Dropbox-synkronisering) |
+
+`NotificationsBuilder.mjs` bygger även nycklar för gruppinbjudningar, institutionstillhörighet, prenumerationer och gamla felsökningsprojekt. Deras anropare finns i prenumerations- och institutionskoden, och kontrollen av gamla felsökningsprojekt körs bara med `isSaas` (`services/web/app/src/Features/Project/ProjectListController.mjs:234-236`).
+
+#### Vem läser {#who-reads-it}
+
+| Kod | Vad den gör |
+| --- | --- |
+| `Notifications.js:4-10` (`getUserNotifications`) | `GET /user/:user_id` (`app.ts:30`). Returnerar bara de dokument för användaren som fortfarande har en `templateKey`. |
+| `services/web/app/src/Features/Project/ProjectListController.mjs:367` | Läser in meddelandena för projektpanelen. |
+| `services/web/app/src/Features/Notifications/NotificationsController.mjs` | `GET /notifications`, `DELETE /notifications/:notificationId` och `GET /user/notification/:notificationId` (`services/web/app/src/router.mjs:922-937`). |
+| `services/web/modules/dropbox/app/src/DropboxHandler.mjs:128-131` | Vår Dropbox-modul: när en användare kopplar Dropbox igen markeras `dropbox-unlinked` och `dropboxDuplicateProjectNames-<userId>` som lästa. |
+
+#### Index {#indexes}
+
+| Namn | Nycklar | Alternativ | Migrering |
+| --- | --- | --- | --- |
+| `expires_1` | `{ expires: 1 }` | TTL, `expireAfterSeconds: 10` | `tools/migrations/20190912145014_create_notifications_indexes.mjs` |
+| `key_1` | `{ key: 1 }` | | samma |
+| `user_id_1` | `{ user_id: 1 }` | | samma |
+
+#### Anmärkningar {#notes}
+
+* Ett läst meddelande raderas inte: bara `templateKey` försvinner. Eftersom dokumentet fortfarande har nyckeln gör ett senare `addNotification` utan `forceCreate` för samma nyckel ingenting (`Notifications.js:21-24`).
+* Routerna `/key/:key` verkar bara på nyckeln, för alla användare (`Notifications.js:76-100`).
+* Om `web` saknar `apis.notifications.url` varken skapar eller läser den meddelanden (`NotificationsHandler.mjs:17`, `:41`).

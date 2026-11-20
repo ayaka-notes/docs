@@ -3,17 +3,32 @@ title: 設定沙箱編譯
 icon: box-archive
 ---
 
-若要在開發環境中設定沙箱編譯，開發環境與正式環境之間有些許差異。你需要注意以下 3 件事：
+沙箱編譯在開發環境中的運作方式與正式環境映像檔略有不同。開發環境已經設定好沙箱編譯；本頁說明相關設定以及需要注意的三件事：
 
 * 檔案權限問題
 * history-v1 與 filestore 之間的磁碟區共用
 * 子目錄問題
 
-### 啟用沙箱編譯
+### 啟用沙箱編譯 {#enable-sandbox-compiles}
 
-這裡只需要像在 Overleaf CE 中一樣啟用沙箱編譯即可，唯一需要注意的是使用者設定。這裡我們將其設為 root。
+沙箱編譯預設為開啟。`develop/docker-compose.yml` 為 `clsi` 設定了 `SANDBOXED_COMPILES=true`，其餘設定位於 `develop/dev.env`：
 
-在正式環境中，我們使用 www-data 作為 Overleaf 容器與 TeX 編譯容器之間的共用使用者。然而在開發環境中，容器內的預設使用者是 node，且沒有 www-data 使用者可供對應，因此我們改用 root 作為替代做法。
+```dotenv title="develop/dev.env" wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+SANDBOXED_COMPILES_HOST_DIR_COMPILES=${PWD}/compiles
+SANDBOXED_COMPILES_HOST_DIR_OUTPUT=${PWD}/output
+TEXLIVE_IMAGE_USER=tex
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2026.1, ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2026, Texlive 2025
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+clsi 不會自行拉取映像檔，因此請用 `docker pull ghcr.io/ayaka-notes/texlive-full:2026.1`（以及 `:2025.1`）拉取一次映像檔。
+
+LaTeX 在兄弟容器中以 `TEXLIVE_IMAGE_USER` 身分執行。在開發環境中該使用者是 `tex`，這也是 clsi 的預設值（`services/clsi/config/settings.defaults.cjs:154`）。正式環境映像檔在 `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` 時改用 `www-data`（`server-ce/config/env.sh:15-21`），因為在那裡檔案由 Overleaf 容器的 `www-data` 使用者建立。
 
 <Warning>
 
@@ -21,22 +36,11 @@ icon: box-archive
 
 </Warning>
 
-```dotenv wrap
-#################
-#   Sandbox     #
-#################
-SANDBOXED_COMPILES=true
-TEXLIVE_IMAGE_USER=root
-ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
-ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
-TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
-```
+### 修正檔案權限 {#fix-file-permissions}
 
-### 修正檔案權限
+clsi 容器以 root 身分啟動，將 `compiles`、`output` 和 `cache` 資料夾交給 `node` 使用者（uid `1000`），然後以 `node` 身分執行 clsi（`services/clsi/entrypoint.sh`）。因此主機上的 `develop/compiles` 屬於 uid `1000`，與開發環境中 `tex` 的 uid 相同（請參閱 `develop/pandoc/Dockerfile` 中的註解）。使用上述設定，開發環境不需修改任何權限即可編譯。
 
-LaTeX 會以 `TEXLIVE_IMAGE_USER` 環境變數所指定的使用者身分在同層容器中執行。在上述範例中，此值設為 `root`，其 uid 為 `0`。這會與上述權限產生衝突，因為 root 使用者沒有寫入 `compiles` 子資料夾的權限。
-
-一個快速的修正方式是將 `compiles` 的群組擁有權交給 `root` 群組並授予讀寫權限，同時設定 `setgid`，讓新的子資料夾也繼承此擁有權：
+如果改為設定 `TEXLIVE_IMAGE_USER=root`，root（uid `0`）沒有寫入 `compiles` 子資料夾的權限。這種情況下，請將 `compiles` 的所屬群組設為 `root` 並授予寫入權限，同時設定 `setgid`，讓新建立的子資料夾繼承該所屬關係：
 
 ```bash title="bash"
 sudo chown -R 1000:root compiles
@@ -46,7 +50,13 @@ sudo chmod g+s compiles
 
 詳細說明請參閱 `services/clsi/README.md`。
 
-### history-v1 與 filestore 之間的磁碟區共用
+### history-v1 與 filestore 之間的磁碟區共用 {#volume-share-between-history-v1-and-filestore}
+
+<Info>
+
+本節和下一節的設定已包含在 `develop/docker-compose.yml` 和 `develop/dev.env` 中。只有在 `develop/dev.rc` 中設定 `S3_ENABLED=false` 時才有作用。使用預設的 `S3_ENABLED=true` 時，filestore 和 history-v1 會改為將這些檔案儲存在 RustFS 儲存桶中（`develop/s3/docker-compose.yml`）。
+
+</Info>
 
 預設情況下，filestore 在 Overleaf 中扮演 S3 與其他服務之間的橋樑。然而在 Overleaf CE 或 Server Pro 中，所有檔案預設都儲存在本機。因此，Overleaf 採用了一個相當巧妙的方法。
 
@@ -73,7 +83,7 @@ switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
 }
 ```
 
-同時，`data/history` 也會被 history 服務使用。如此一來，不同的微服務便能共用相同的資料。你需要在開發環境中將 `history-v1-buckets` 這個磁碟區加入 filestore 服務，否則 **clsi 將無法從 filestore 服務拉取 blob 檔案**。
+同時，`data/history` 也被歷史服務使用。如此一來，不同的微服務就可以共用同一份資料。這就是 develop 中的 filestore 服務掛載 history-v1 的 `history-v1-buckets` 磁碟區的原因。沒有它，**clsi 將無法從 filestore 服務拉取 blob 檔案**。
 
 ```yml title="develop/docker-compose.yml" wrap
   filestore:
@@ -91,16 +101,16 @@ switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
       - history-v1-buckets:/buckets
 ```
 
-此外，你還需要在 `dev.env` 設定中加入 BUCKET 名稱：
+filestore 透過 `dev.env` 中的以下設定找到儲存桶：
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
 OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 ```
 
-### 使用子目錄
+### 使用子目錄 {#use-subdirectories}
 
-Filestore 預設將 useSubdirectories 設為 true，但在開發環境中，history v1 會<strong>將所有資料扁平化</strong>，進而造成衝突。若要修正此問題，你需要加入以下設定：
+filestore 總是以子目錄方式讀取歷史 blob（`services/filestore/app/js/KeyBuilder.js:58`、`:70`）。正式環境映像檔為 history-v1 開啟了 `useSubdirectories`（`server-ce/config/production.json`），但 history-v1 的預設設定沒有開啟，所以在開發環境中 history-v1 會<strong>把所有資料扁平化儲存。</strong>因此 `dev.env` 為 history-v1 設定了 `NODE_CONFIG`：&#x20;
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
@@ -108,7 +118,7 @@ OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
 ```
 
-在 history v1 中，所有 `project_blobs` 檔案原本是這樣儲存的：
+如果沒有它，history-v1 會這樣儲存 `project_blobs` 檔案：
 
 ```bash wrap
 node@43eb5dac5b1b:/buckets/project_blobs$ ls
@@ -120,4 +130,4 @@ node@43eb5dac5b1b:/buckets/project_blobs$ ls
 
 ```
 
-你需要將 useSubdirectories 設為 `true`，改用子目錄模式。此時，blob 中原本的 `_` 會被替換為 `/`。
+將 `useSubdirectories` 設為 `true` 後，這些名稱中的 `_` 會變成 `/`，因此每個 blob 都會儲存在子資料夾中。

@@ -1,0 +1,62 @@
+---
+title: Notifications-collectie
+icon: bell
+---
+
+`notifications` bevat de meldingen die bovenaan het projectdashboard van een gebruiker worden getoond. Eén document is één melding voor één gebruiker, herkenbaar aan zijn `key`. Alleen de dienst `notifications` benadert de collectie (`services/notifications/app/js/Notifications.js`); `web` en `third-party-datastore` roepen de HTTP-API ervan aan. Er is geen Mongoose-schema.
+
+#### Velden {#fields}
+
+| Veld | Type | Betekenis | Bron |
+| --- | --- | --- | --- |
+| `_id` | ObjectId | Melding-id. `web` markeert een melding via deze id als gelezen. | `Notifications.js:58-65` |
+| `user_id` | ObjectId | De gebruiker die de melding ziet. | `Notifications.js:26` |
+| `key` | String | Identificeert de melding, bijvoorbeeld `project-invite-<inviteId>`. De upsert houdt één document per `user_id` en `key`; er is geen unieke index. | `Notifications.js:27`, `:51-55` |
+| `templateKey` | String | Welke melding de frontend weergeeft. Wordt verwijderd wanneer de melding gelezen of gesloten is; het document blijft bestaan. | `Notifications.js:29`, `:63`, `:72`, `:78` |
+| `messageOpts` | Object | Waarden voor de meldingstekst, afhankelijk van `templateKey` (bij een projectuitnodiging: `userName`, `projectName`, `projectId`, `token`). Wordt verwijderd wanneer de gebruiker de melding via haar id sluit. | `Notifications.js:28`, `:63` |
+| `expires` | Date | Optioneel. De TTL-index verwijdert het document na dit tijdstip. | `Notifications.js:35-50` |
+
+#### Wie schrijft {#who-writes-it}
+
+| Code | Wat het doet |
+| --- | --- |
+| `Notifications.js:20-56` (`addNotification`) | `POST /user/:user_id` (`services/notifications/app.ts:29`). Upsert op `user_id` + `key`. Als er al een document met die sleutel bestaat, wordt het alleen opnieuw geschreven wanneer de aanroeper `forceCreate` meestuurt. |
+| `Notifications.js:58-65` (`removeNotificationId`) | `DELETE /user/:user_id/notification/:notification_id` (`app.ts:31-34`): verwijdert `templateKey` en `messageOpts`. |
+| `Notifications.js:67-80` | `DELETE /user/:user_id` en `DELETE /key/:key` (`app.ts:35-36`): verwijderen `templateKey` op sleutel. |
+| `Notifications.js:87-100` | `DELETE /key/:key/bulk` (`app.ts:38-41`) verwijdert ongelezen meldingen met een sleutel; `deleteNotificationByKeyOnly` verwijdert één document op sleutel. |
+| `services/web/app/src/Features/Notifications/NotificationsHandler.mjs:33-66` | `web`-kant van `addNotification`. Stuurt `forceCreate: true`, tenzij de aanroeper `false` meegeeft. |
+| `services/third-party-datastore/app/js/QueueWorker.mjs:46-58` | Onze Dropbox-synchronisatie: wanneer die een Dropbox-account ontkoppelt, plaatst ze de melding `dropbox-unlinked` rechtstreeks. |
+
+Meldingen die CE en onze modules aanmaken:
+
+| `key` | `templateKey` | Aangemaakt in |
+| --- | --- | --- |
+| `project-invite-<inviteId>` | `notification_project_invite`, verloopt met de uitnodiging | `services/web/app/src/Features/Collaborators/CollaboratorsInviteHandler.mjs:40-42`, opgebouwd in `services/web/app/src/Features/Notifications/NotificationsBuilder.mjs:100-122`. Alleen wanneer het uitgenodigde e-mailadres bij een bestaande gebruiker hoort. |
+| `tpdsFileLimit-<userId>` | `notification_tpds_file_limit` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsController.mjs:118-124` (een Dropbox-update zou een project boven de bestandslimiet brengen), `NotificationsBuilder.mjs:175-195` |
+| `dropboxDuplicateProjectNames-<userId>` | `notification_dropbox_duplicate_project_names` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateHandler.mjs:160-169`, `NotificationsBuilder.mjs:10-30` |
+| `dropbox-unlinked` | `dropbox_unlinked_because_access_denied`, `dropbox_unlinked_because_full` of `dropbox_unlinked_because_suspended` | `services/third-party-datastore/app/js/QueueWorker.mjs:20-25`, `:46-58` (onze Dropbox-synchronisatie) |
+
+`NotificationsBuilder.mjs` bouwt ook sleutels voor groepsuitnodigingen, instellingsaffiliaties, abonnementen en oude debugprojecten. De aanroepers daarvan zitten in de code voor abonnementen en instellingen, en de controle op oude debugprojecten draait alleen bij `isSaas` (`services/web/app/src/Features/Project/ProjectListController.mjs:234-236`).
+
+#### Wie leest {#who-reads-it}
+
+| Code | Wat het doet |
+| --- | --- |
+| `Notifications.js:4-10` (`getUserNotifications`) | `GET /user/:user_id` (`app.ts:30`). Geeft alleen de documenten van de gebruiker terug die nog een `templateKey` hebben. |
+| `services/web/app/src/Features/Project/ProjectListController.mjs:367` | Laadt de meldingen voor het projectdashboard. |
+| `services/web/app/src/Features/Notifications/NotificationsController.mjs` | `GET /notifications`, `DELETE /notifications/:notificationId` en `GET /user/notification/:notificationId` (`services/web/app/src/router.mjs:922-937`). |
+| `services/web/modules/dropbox/app/src/DropboxHandler.mjs:128-131` | Onze Dropbox-module: wanneer een gebruiker Dropbox opnieuw koppelt, markeert die `dropbox-unlinked` en `dropboxDuplicateProjectNames-<userId>` als gelezen. |
+
+#### Indexen {#indexes}
+
+| Naam | Sleutels | Opties | Migratie |
+| --- | --- | --- | --- |
+| `expires_1` | `{ expires: 1 }` | TTL, `expireAfterSeconds: 10` | `tools/migrations/20190912145014_create_notifications_indexes.mjs` |
+| `key_1` | `{ key: 1 }` | | dezelfde |
+| `user_id_1` | `{ user_id: 1 }` | | dezelfde |
+
+#### Opmerkingen {#notes}
+
+* Een gelezen melding wordt niet verwijderd: alleen `templateKey` verdwijnt. Omdat het document de sleutel nog bevat, doet een latere `addNotification` zonder `forceCreate` voor dezelfde sleutel niets (`Notifications.js:21-24`).
+* De routes `/key/:key` werken alleen op de sleutel, over alle gebruikers heen (`Notifications.js:76-100`).
+* Als `web` geen `apis.notifications.url` heeft, maakt het geen meldingen aan en leest het ze niet (`NotificationsHandler.mjs:17`, `:41`).

@@ -3,84 +3,165 @@ title: Collezione Users
 icon: user
 ---
 
-`User` rappresenta un singolo account utente nel sistema Overleaf. Memorizza i dati di autenticazione, i flag delle funzionalità, le preferenze dell'editor, i permessi di accesso e i metadati sull'attività.
+`users` contiene un documento per account. Memorizza i dati di accesso, il profilo, le impostazioni dell'editor, le funzionalità e l'attività. Lo schema è `services/web/app/src/models/User.mjs`; la maggior parte delle scritture passa da `services/web/app/src/Features/User/UserUpdater.mjs`. Nella colonna Fonte, `User.mjs:N` è una riga di quello schema, gli altri nomi di file senza percorso si trovano in `services/web/app/src/Features/` e `modules/...` si trova in `services/web/`. I numeri di riga si riferiscono a `server-pro` al momento della stesura.
 
-#### Identità principale e autenticazione
+#### Identità principale e autenticazione {#core-identity-&-authentication}
 
-* `_id`: ObjectId MongoDB univoco dell'utente.
-* `email` / `emails`: email principale e storico degli indirizzi email.
-* `hashedPassword`: password con hash BCrypt usata per l'autenticazione locale.
-* `first_name` / `last_name`: campi del nome nel profilo utente.
-* `role` / `isAdmin` / `adminRoles`: flag del ruolo e dei privilegi amministrativi.
-* `twoFactorAuthentication`: configurazione dell'autenticazione a due fattori (se abilitata).
-* `samlIdentifiers` / `thirdPartyIdentifiers`: collegamenti a provider di identità esterni.
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id dell'utente. Le altre collezioni puntano qui con `user_id`, `owner_ref` e campi simili. | MongoDB |
+| `email` | String | Email principale. Univoca, anche senza distinzione tra maiuscole e minuscole (vedi Indici). | `User.mjs:26` |
+| `emails` | Array di Object | Tutti gli indirizzi dell'account. Quello principale è la voce uguale a `email`. | `User.mjs:27` |
+| `emails.email` | String | L'indirizzo. | `User.mjs:29` |
+| `emails.reversedHostname` | String | Dominio dell'indirizzo, invertito (`moc.elpmaxe`). Impostato quando l'indirizzo viene aggiunto. | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | Quando l'indirizzo è stato aggiunto. | `User.mjs:31` |
+| `emails.confirmedAt` | Date | Quando l'indirizzo è stato confermato per la prima volta (una conferma successiva mantiene la data precedente). I moduli LDAP, SAML e OIDC impostano `emails.0.confirmedAt` quando creano un account. | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | Ora dell'ultima conferma dell'indirizzo. | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | Collegamento SSO istituzionale dell'indirizzo. L'SSO istituzionale non fa parte di CE. | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | Stato di affiliazione istituzionale. Non fa parte di CE. | `User.mjs:39` |
+| `first_name` / `last_name` | String | Nome del profilo, al massimo 255 caratteri. LDAP, SAML e OIDC possono aggiornarli a ogni accesso. | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | Testo libero che l'utente inserisce come ruolo lavorativo e istituzione nelle impostazioni dell'account. `role` non è un permesso. | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | Hash bcrypt della password locale. Manca negli account senza password: gli accessi LDAP e SAML lo rimuovono, e la migrazione `20260511150000_reset_hardcoded_admin_password` rimuove una password predefinita nota. | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | Amministratore del sito. LDAP, SAML e OIDC possono impostarlo da un attributo dell'IdP a ogni accesso. | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | Ruoli di amministrazione più granulari. Letti solo quando `Settings.adminRolesEnabled` è impostato. | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Array di Object | Collegamento di accesso SAML. Il modulo `saml` scrive `samlIdentifiers.0.providerId` (sempre `'1'`), `externalUserId` e `userIdAttribute`. | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Array di Object | Collegamenti di accesso OIDC, scritti da `ThirdPartyIdentityManager` del core per il modulo `oidc`. | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`, `enrolledAt`, `secretEncrypted`. Solo nello schema: il core di CE e i nostri moduli non lo usano. | `User.mjs:239-243` |
 
-#### Stato e ciclo di vita dell'account
+#### Stato e ciclo di vita dell'account {#account-status-&-lifecycle}
 
-* `signUpDate`: timestamp di creazione dell'account.
-* `holdingAccount`: indica se l'account è in attesa di conferma o soggetto a restrizioni.
-* `must_reconfirm`: indica se l'utente deve riconfermare la propria email.
-* `lastPrimaryEmailCheck`: ultima volta in cui l'email principale è stata convalidata.
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | Quando l'account è stato creato. | `User.mjs:75` |
+| `suspended` | Boolean | `true` quando un amministratore ha disattivato l'account. `UserUpdater.suspendUser` lo imposta e termina le sessioni; il modulo `admin-tools` lo chiama e può ripristinarlo. Ogni punto di ingresso che non è dietro una sessione (token, link firmati, websocket, webhook) deve controllarlo. | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | `true` per un account segnaposto che non ha completato la registrazione. La registrazione lo imposta a `false`; i contatti ignorano gli account segnaposto. | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | Se è `true`, l'accesso porta l'utente alla pagina di riconferma invece che all'editor. Una reimpostazione della password lo riporta a `false`. Niente in CE lo imposta a `true`. | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | Ultima volta in cui l'utente ha confermato che l'email principale è ancora sua, o ha cambiato l'email principale. Solo overleaf.com (`saas`) lo controlla: quando è troppo vecchio, l'elenco dei progetti reindirizza alla pagina di verifica dell'email principale. | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | Obbligatorio. Id usato per gli eventi di analisi. `UserCreator` rifiuta di creare un utente senza di esso; i percorsi di registrazione e i moduli LDAP, SAML e OIDC passano un UUID casuale (`UserRegistrationHandler.mjs:103`, `modules/login-register/app/src/RegisterController.mjs:127`). Le migrazioni `20260424120000` e `20260616070000_back_fill_users_analyticsId` lo hanno compilato a partire da `_id` per gli account vecchi. | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | Quando è stata inviata l'email di benvenuto. L'email viene pianificata solo quando la funzionalità `saas` è attiva, quindi CE non lo imposta. | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | Solo nello schema: il core di CE e i nostri moduli non li usano. | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | `id`, `accessToken`, `refreshToken` di un account overleaf.com v1 collegato. `overleaf.id` ha un indice univoco; niente in CE scrive questi campi. | `User.mjs:230-234` |
 
-#### Tracciamento di accessi e attività
+#### Tracciamento di accessi e attività {#login-&-activity-tracking}
 
-* `lastLoginIp`: indirizzo IP dell'ultimo login riuscito.
-* `loginCount`: numero totale di login riusciti.
-* `loginEpoch`: contatore interno delle sessioni di login.
-* `lastLoggedIn`: timestamp dell'ultimo login.
-* `lastActive`: timestamp dell'ultima attività registrata.
-* `lastFailedLogin`: timestamp dell'ultimo tentativo di login non riuscito.
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | IP dell'ultimo accesso. | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | Numero di accessi riusciti. | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | Ora dell'ultimo accesso riuscito. | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | Blocco per gli accessi: ogni tentativo di accesso lo incrementa e aggiorna il documento solo se ha ancora il valore letto, così due accessi paralleli non possono riuscire entrambi. I moduli LDAP, SAML e OIDC fanno lo stesso. | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | Ora dell'ultima password errata. | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | Ultima volta in cui l'utente ha aperto un progetto. | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### Preferenze dell'editor (`ace`)
+#### Preferenze dell'editor (`ace`) {#editor-preferences-ace}
 
-Definisce le preferenze dell'utente per l'editor online:
+La pagina delle impostazioni dell'account li salva tramite `UserController.updateUserSettings` (`UserController.mjs:460-530`).
 
-* `theme` / `overallTheme`: tema dell'editor e dell'interfaccia.
-* `fontSize`: dimensione del carattere dell'editor.
-* `autoComplete`, `autoPairDelimiters`: funzionalità di assistenza alla scrittura.
-* `spellCheckLanguage`: lingua usata per il controllo ortografico.
-* `pdfViewer`: backend del visualizzatore PDF selezionato.
-* `syntaxValidation`, `mathPreview`, `breadcrumbs`: funzionalità di usabilità dell'editor.
-* `enableNewEditor`: indica se la nuova interfaccia dell'editor è abilitata.
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | Scorciatoie da tastiera. La pagina delle impostazioni salva `default`, `vim` o `emacs`; il valore predefinito dello schema è `none`. | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | Tema dell'editor. Predefinito `textmate`. | `User.mjs:92` |
+| `ace.overallTheme` | String | Tema dell'interfaccia. `system` alterna tra `lightTheme` e `darkTheme`; `light-` o vuoto usa `theme`. | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | Temi dell'editor usati con `overallTheme: system`. Predefiniti `textmate` e `overleaf_dark`. | `User.mjs:96-97` |
+| `ace.fontSize` | Number | Dimensione del carattere dell'editor. Predefinita 12. | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | Carattere e interlinea dell'editor. | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | Completamento automatico e chiusura delle parentesi. Predefinito `true`. | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | Lingua del controllo ortografico. Predefinita `en`. Un nuovo progetto la copia. | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | Visualizzatore PDF. Predefinito `pdfjs`. | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | Controllo del codice. | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | Anteprima matematica. Predefinita `true`. | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | Breadcrumb sopra l'editor. Predefinito `false`. | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | Opzioni di visualizzazione dell'editor. Predefiniti `false`, `true`, `false`, `false`, `true`. | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` o `simple`. | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | Impostazioni del gestore di riferimenti: `enabled` (predefinito `true`), `groups` (array di `{ id }`), `disablePersonalLibrary`. | `User.mjs:10-22`, `:114-116` |
 
-#### Flag delle funzionalità e limiti (`features`)
+#### Flag delle funzionalità e limiti (`features`) {#feature-flags-&-limits-features}
 
-Controlla la disponibilità delle funzionalità per l'utente:
+`features` è il risultato di un calcolo, non qualcosa da modificare a mano. `FeaturesUpdater` parte da `Settings.defaultFeatures`, unisce ogni voce di `featuresOverrides` non scaduta e scrive il risultato con `featuresUpdatedAt` (`FeaturesUpdater.mjs:220-300`, `UserFeaturesUpdater.mjs:10-24`). L'immagine di produzione imposta `collaborators`, `dropbox`, `versioning`, `compileTimeout`, `compileGroup`, `trackChanges` e `references` come valori predefiniti (`server-ce/config/settings.js:301-309`); le altre chiavi restano non impostate.
 
-* `collaborators`: numero massimo di collaboratori (`-1` = illimitati).
-* `versioning`, `trackChanges`: funzionalità di cronologia e revisioni tracciate.
-* `dropbox`, `github`, `gitBridge`: disponibilità delle integrazioni esterne.
-* `compileTimeout`: tempo massimo di compilazione (in secondi).
-* `compileGroup`: gruppo di risorse di compilazione assegnato.
-* `aiErrorAssistant`: flag dell'assistente AI per gli errori di compilazione. Gli account meno recenti potrebbero ancora averlo, insieme al campo di primo livello `aiErrorAssistant.enabled`, ma non fanno più parte dello schema e Ayakaleaf Pro non legge né l'uno né l'altro. L'assistente per gli errori viene abilitato dalle impostazioni AI dell'istanza e dal campo `aiFeatures.enabled` dell'utente (se non impostato, l'AI è attiva), esattamente come l'assistente AI.
+In Ayakaleaf Pro il pannello di amministrazione disattiva le funzionalità per singolo utente. Il modulo `admin-tools` le salva come voce di `featuresOverrides` con `note: 'admin-panel'` (`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`), e il modulo `instance-features` considera attiva una chiave non impostata (`modules/instance-features/app/src/UserFeatures.mjs:12-14`).
 
-#### Controllo degli accessi e permessi dello staff (`staffAccess`)
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | Numero massimo di collaboratori per progetto, `-1` = illimitato. | `User.mjs:119` |
+| `features.versioning` | Boolean | Cronologia. | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Sincronizzazione Dropbox, sincronizzazione GitHub, GitLab e Gitea, e accesso Git. Controllati da quei moduli, vedi `requireUserFeature`. `gitlab` e `gitea` (da v6.3.4) non hanno un valore predefinito: restano non impostati, il che conta come attivo, finché un amministratore non li disattiva nella scheda Features. La migrazione `20230817081910_back_fill_gitBridge_feature_server_pro` ha impostato `gitBridge: true` per tutti gli utenti. | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | Timeout di compilazione in secondi. `COMPILE_TIMEOUT` imposta il valore predefinito. | `User.mjs:132` |
+| `features.compileGroup` | String | Gruppo di compilazione, per esempio `standard`. | `User.mjs:136` |
+| `features.references` | Boolean | Deprecato. Per gli account più vecchi attiva ancora `referencesSearch` e `mendeley`. | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | Revisioni. Il modulo `track-changes` lo controlla sul proprietario del progetto. | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | Collegamenti ai gestori di riferimenti. | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | Interruttori per la ricerca dei riferimenti, la tavolozza dei simboli e la modalità offline. | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | Livello di utilizzo dell'IA. Predefinito `basic`. | `User.mjs:159` |
+| `featuresOverrides` | Array di Object | Modifiche per utente ai valori predefiniti. Ogni voce ha `createdAt`, `expiresAt` (ignorata dopo questa data), `note` e `features` (stesse chiavi di sopra, più `templates`). | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | Quando `features` è stato calcolato l'ultima volta. | `User.mjs:197` |
+| `featuresEpoch` | String | Copia di `Settings.featuresEpoch` all'ultimo calcolo, usata per aggiornare gli account vecchi. | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-Definisce diritti di accesso granulari per lo staff o gli editori:
+L'assistente IA e l'assistente errori non sono una chiave di `features`. Seguono le impostazioni IA dell'istanza e `aiFeatures.enabled`, vedi sotto.
 
-* Permessi di metriche e gestione per editori, istituzioni, gruppi, amministratori ed esperimenti.
+#### Integrazioni {#integrations}
 
-#### Iscrizioni e integrazioni
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` disattiva l'assistente IA e l'assistente errori per questo utente. Predefinito `true`. | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | Credenziali cifrate del gestore di riferimenti collegato, scritte dal modulo `tpr-webmodule` (`{ encrypted }` per Mendeley, `{ apiKeyEncrypted }` per Zotero). Rimosse quando si scollega. | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Id dell'account Dropbox. Non è nello schema: il modulo `dropbox` lo scrive direttamente. Univoco, quindi un account Dropbox è collegato a un solo utente. Il core lo usa per trovare gli utenti da sincronizzare. | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | Token di aggiornamento Dropbox cifrato. Non è nello schema, scritto dal modulo `dropbox`. L'intero oggetto `dropbox` viene rimosso quando si scollega. | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | Cursore Dropbox `list_folder` della cartella dell'app dell'utente, così il prossimo pull legge solo le modifiche più recenti. Non è nello schema: scritto da third-party-datastore, solo finché l'utente è ancora collegato allo stesso account Dropbox. | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | SSO di gruppo (array `sso` di `groupId`, `linkedAt`, `primary`) e campi degli utenti gestiti (`managedBy`, `enrolledAt`). Gli abbonamenti di gruppo non fanno parte di CE. | `User.mjs:56-72` |
+| `writefull` | Object | Stato di Writefull: `initialized`, `autoCreatedAccount`, `isPremium`, `premiumSource`. Il core lo scrive solo quando la funzionalità `saas` è attiva, quindi non in CE. | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | Solo nello schema: il core di CE e i nostri moduli non li usano. | `User.mjs:249-255` |
 
-* `enrollment.sso`: iscrizioni SSO collegate.
-* `refProviders`: integrazioni con provider di riferimenti bibliografici.
-* `writefull`: stato dell'account dell'assistente di scrittura Writefull.
-* `dsMobileApp`: configurazione dell'app mobile (se presente).
+#### Programmi ed esperimenti {#programs-&-experiments}
 
-#### Programmi ed esperimenti
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | L'utente si è iscritto al programma beta. | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Programma alpha. La migrazione `20220826104236_disable_alpha_beta_program` lo ha impostato, insieme a `betaProgram`, a `false` per tutti gli utenti. | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Programma Labs. Niente in CE li imposta; la migrazione `20260615090000_back_fill_labsProgram` ha impostato `labsProgram: false` dove mancava. | `User.mjs:228-229` |
+| `splitTests` | Mixed | Assegnazioni dei test A/B per nome del test. | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: partecipazione ai programmi di accesso anticipato.
-* `labsExperiments`: funzionalità sperimentali abilitate.
-* `awareOfV2`: indica se l'utente ha preso visione dell'editor V2.
+#### Referral e tutorial {#referrals-&-tutorials}
 
-#### Referral e tutorial
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | Id referral casuale, generato alla creazione. | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | Array di ObjectId / Number | Utenti che si sono registrati con questo id referral. | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | Per chiave di tutorial: `{ state, updatedAt, postponedUntil }`. | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`, `refered_users`, `refered_user_count`: tracciamento dei referral.
-* `completedTutorials`: avanzamento dei tutorial di onboarding e delle funzionalità.
+#### Indici {#indexes}
+
+Provengono tutti da migrazioni con tag `server-ce` in `tools/migrations/`.
+
+| Nome | Chiavi | Opzioni | Migrazione |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### Note {#notes}
+
+* `autoIndex` di Mongoose è disattivato (`services/web/app/src/infrastructure/Mongoose.mjs:7`), quindi solo le migrazioni sopra creano indici.
+* Eliminare un utente sposta l'intero documento in `deletedUsers` (vedi [Deleted Users Collection](/dev/data-model/deleted-users-collection)).
 
 ***
 
 Ecco un esempio reale di utente Overleaf.
+
+<Info>
+
+Questo account è stato creato con una versione precedente. Ha ancora campi che non sono più nello schema e che niente legge: `staffAccess`, `ace.enableNewEditor`, `features.aiErrorAssistant`, `aiErrorAssistant` e `writefull.enabled` (ora `writefull.initialized`). `ace.breadcrumbs` ora è `false` per impostazione predefinita.
+
+</Info>
 
 <Accordion title="Esempio di utente">
 
@@ -171,7 +252,7 @@ Ecco un esempio reale di utente Overleaf.
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),

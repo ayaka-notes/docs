@@ -3,84 +3,165 @@ title: Koleksi Users
 icon: user
 ---
 
-`User` mewakili satu akun pengguna dalam sistem Overleaf. Koleksi ini menyimpan data autentikasi, feature flag, preferensi editor, izin akses, dan metadata aktivitas.
+`users` menyimpan satu dokumen per akun. Isinya data login, profil, pengaturan editor, fitur, dan aktivitas. Skemanya adalah `services/web/app/src/models/User.mjs`; sebagian besar penulisan melalui `services/web/app/src/Features/User/UserUpdater.mjs`. Di kolom Sumber, `User.mjs:N` adalah baris dari skema tersebut, nama file lain tanpa path berada di `services/web/app/src/Features/`, dan `modules/...` berada di `services/web/`. Nomor baris berasal dari `server-pro` saat tulisan ini dibuat.
 
-#### Identitas Inti & Autentikasi
+#### Identitas Inti & Autentikasi {#core-identity-&-authentication}
 
-* `_id`: ObjectId MongoDB unik milik pengguna.
-* `email` / `emails`: Email utama dan catatan riwayat email.
-* `hashedPassword`: Kata sandi yang di-hash dengan BCrypt dan digunakan untuk autentikasi lokal.
-* `first_name` / `last_name`: Kolom nama profil pengguna.
-* `role` / `isAdmin` / `adminRoles`: Flag peran dan hak istimewa administratif.
-* `twoFactorAuthentication`: Konfigurasi autentikasi dua faktor (jika diaktifkan).
-* `samlIdentifiers` / `thirdPartyIdentifiers`: Keterikatan dengan penyedia identitas eksternal.
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id pengguna. Koleksi lain merujuk ke sini dengan `user_id`, `owner_ref`, dan field serupa. | MongoDB |
+| `email` | String | Email utama. Unik, juga tanpa membedakan huruf besar/kecil (lihat Indeks). | `User.mjs:26` |
+| `emails` | Array Object | Semua alamat akun. Alamat utama adalah entri yang sama dengan `email`. | `User.mjs:27` |
+| `emails.email` | String | Alamatnya. | `User.mjs:29` |
+| `emails.reversedHostname` | String | Domain alamat, dibalik (`moc.elpmaxe`). Diatur saat alamat ditambahkan. | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | Kapan alamat ditambahkan. | `User.mjs:31` |
+| `emails.confirmedAt` | Date | Kapan alamat pertama kali dikonfirmasi (konfirmasi berikutnya mempertahankan tanggal yang lebih awal). Modul LDAP, SAML, dan OIDC mengatur `emails.0.confirmedAt` saat membuat akun. | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | Waktu konfirmasi terakhir alamat. | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | Tautan SSO institusi dari alamat. SSO institusi bukan bagian dari CE. | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | Status afiliasi institusi. Bukan bagian dari CE. | `User.mjs:39` |
+| `first_name` / `last_name` | String | Nama profil, paling banyak 255 karakter. LDAP, SAML, dan OIDC dapat memperbaruinya pada setiap login. | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | Teks bebas yang diisi pengguna sebagai peran pekerjaan dan institusi di pengaturan akun. `role` bukan izin. | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | Hash bcrypt dari kata sandi lokal. Tidak ada pada akun tanpa kata sandi: login LDAP dan SAML menghapusnya, dan migrasi `20260511150000_reset_hardcoded_admin_password` menghapus kata sandi default yang sudah diketahui. | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | Admin situs. LDAP, SAML, dan OIDC dapat mengaturnya dari atribut IdP pada setiap login. | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | Peran admin yang lebih rinci. Hanya dibaca jika `Settings.adminRolesEnabled` diatur. | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Array Object | Tautan login SAML. Modul `saml` menulis `samlIdentifiers.0.providerId` (selalu `'1'`), `externalUserId`, dan `userIdAttribute`. | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Array Object | Tautan login OIDC, ditulis oleh `ThirdPartyIdentityManager` inti untuk modul `oidc`. | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`, `enrolledAt`, `secretEncrypted`. Hanya ada di skema: inti CE dan modul kami tidak menggunakannya. | `User.mjs:239-243` |
 
-#### Status & Siklus Hidup Akun
+#### Status & Siklus Hidup Akun {#account-status-&-lifecycle}
 
-* `signUpDate`: Stempel waktu pembuatan akun.
-* `holdingAccount`: Apakah akun sedang menunggu konfirmasi atau dibatasi.
-* `must_reconfirm`: Menunjukkan apakah pengguna harus mengonfirmasi ulang email-nya.
-* `lastPrimaryEmailCheck`: Waktu terakhir email utama divalidasi.
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | Kapan akun dibuat. | `User.mjs:75` |
+| `suspended` | Boolean | `true` jika admin menonaktifkan akun. `UserUpdater.suspendUser` mengaturnya dan mengakhiri sesi; modul `admin-tools` memanggilnya dan dapat mengembalikannya. Setiap titik masuk yang tidak berada di balik sesi (token, tautan bertanda tangan, websocket, webhook) harus memeriksanya. | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | `true` untuk akun placeholder yang belum menyelesaikan pendaftaran. Pendaftaran mengaturnya menjadi `false`; kontak melewati akun placeholder. | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | Jika `true`, login mengarahkan pengguna ke halaman konfirmasi ulang alih-alih editor. Reset kata sandi mengembalikannya ke `false`. Tidak ada yang di CE mengaturnya menjadi `true`. | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | Terakhir kali pengguna mengonfirmasi bahwa email utama masih miliknya, atau mengganti email utama. Hanya overleaf.com (`saas`) yang memeriksanya: jika terlalu lama, daftar proyek mengarahkan ke halaman pemeriksaan email utama. | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | Wajib. Id yang digunakan untuk event analitik. `UserCreator` menolak membuat pengguna tanpanya; alur pendaftaran serta modul LDAP, SAML, dan OIDC meneruskan UUID acak (`UserRegistrationHandler.mjs:103`, `modules/login-register/app/src/RegisterController.mjs:127`). Migrasi `20260424120000` dan `20260616070000_back_fill_users_analyticsId` mengisinya dari `_id` untuk akun lama. | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | Kapan email orientasi dikirim. Email hanya dijadwalkan saat fitur `saas` aktif, jadi CE tidak mengaturnya. | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | Hanya ada di skema: inti CE dan modul kami tidak menggunakannya. | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | `id`, `accessToken`, `refreshToken` dari akun overleaf.com v1 yang tertaut. `overleaf.id` memiliki indeks unik; tidak ada yang di CE menulis field ini. | `User.mjs:230-234` |
 
-#### Pelacakan Login & Aktivitas
+#### Pelacakan Login & Aktivitas {#login-&-activity-tracking}
 
-* `lastLoginIp`: Alamat IP dari login terakhir yang berhasil.
-* `loginCount`: Jumlah total login yang berhasil.
-* `loginEpoch`: Penghitung internal untuk sesi login.
-* `lastLoggedIn`: Stempel waktu login terakhir.
-* `lastActive`: Stempel waktu aktivitas terakhir yang tercatat.
-* `lastFailedLogin`: Stempel waktu percobaan login gagal terakhir.
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | IP login terakhir. | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | Jumlah login yang berhasil. | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | Waktu login terakhir yang berhasil. | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | Kunci untuk login: setiap percobaan login menaikkan nilainya dan hanya memperbarui dokumen jika masih memiliki nilai yang dibacanya, sehingga dua login paralel tidak bisa sama-sama lolos. Modul LDAP, SAML, dan OIDC melakukan hal yang sama. | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | Waktu kata sandi salah terakhir. | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | Terakhir kali pengguna membuka proyek. | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### Preferensi Editor (`ace`)
+#### Preferensi Editor (`ace`) {#editor-preferences-ace}
 
-Mendefinisikan preferensi pengguna untuk editor online:
+Halaman pengaturan akun menyimpannya melalui `UserController.updateUserSettings` (`UserController.mjs:460-530`).
 
-* `theme` / `overallTheme`: Tema editor dan UI.
-* `fontSize`: Ukuran font editor.
-* `autoComplete`, `autoPairDelimiters`: Fitur bantuan penyuntingan.
-* `spellCheckLanguage`: Bahasa yang digunakan untuk pemeriksaan ejaan.
-* `pdfViewer`: Backend penampil PDF yang dipilih.
-* `syntaxValidation`, `mathPreview`, `breadcrumbs`: Fitur UX editor.
-* `enableNewEditor`: Apakah UI editor baru diaktifkan.
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | Pintasan keyboard. Halaman pengaturan menyimpan `default`, `vim`, atau `emacs`; default skema adalah `none`. | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | Tema editor. Default `textmate`. | `User.mjs:92` |
+| `ace.overallTheme` | String | Tema UI. `system` beralih antara `lightTheme` dan `darkTheme`; `light-` atau kosong menggunakan `theme`. | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | Tema editor yang digunakan dengan `overallTheme: system`. Default `textmate` dan `overleaf_dark`. | `User.mjs:96-97` |
+| `ace.fontSize` | Number | Ukuran font editor. Default 12. | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | Font dan tinggi baris editor. | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | Pelengkapan otomatis dan penutup kurung. Default `true`. | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | Bahasa pemeriksa ejaan. Default `en`. Proyek baru menyalinnya. | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | Penampil PDF. Default `pdfjs`. | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | Pemeriksaan kode. | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | Pratinjau matematika. Default `true`. | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | Breadcrumb di atas editor. Default `false`. | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | Opsi tampilan editor. Default `false`, `true`, `false`, `false`, `true`. | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` atau `simple`. | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | Pengaturan pengelola referensi: `enabled` (default `true`), `groups` (array `{ id }`), `disablePersonalLibrary`. | `User.mjs:10-22`, `:114-116` |
 
-#### Feature Flag & Batasan (`features`)
+#### Feature Flag & Batasan (`features`) {#feature-flags-&-limits-features}
 
-Mengendalikan ketersediaan fungsi untuk pengguna:
+`features` adalah hasil perhitungan, bukan sesuatu untuk diedit secara manual. `FeaturesUpdater` dimulai dari `Settings.defaultFeatures`, menggabungkan setiap entri `featuresOverrides` yang belum kedaluwarsa, lalu menulis hasilnya bersama `featuresUpdatedAt` (`FeaturesUpdater.mjs:220-300`, `UserFeaturesUpdater.mjs:10-24`). Image produksi mengatur `collaborators`, `dropbox`, `versioning`, `compileTimeout`, `compileGroup`, `trackChanges`, dan `references` sebagai default (`server-ce/config/settings.js:301-309`); kunci lainnya tetap tidak diatur.
 
-* `collaborators`: Jumlah maksimum kolaborator (`-1` = tidak terbatas).
-* `versioning`, `trackChanges`: Fitur riwayat dan pelacakan perubahan.
-* `dropbox`, `github`, `gitBridge`: Ketersediaan integrasi eksternal.
-* `compileTimeout`: Waktu kompilasi maksimum (detik).
-* `compileGroup`: Grup sumber daya kompilasi yang ditetapkan.
-* `aiErrorAssistant`: Flag asisten error kompilasi berbasis AI. Akun lama mungkin masih memilikinya, serta `aiErrorAssistant.enabled` di tingkat atas, tetapi keduanya tidak lagi ada dalam skema dan Ayakaleaf Pro tidak membaca keduanya. Asisten error diaktifkan melalui pengaturan AI instans dan `aiFeatures.enabled` milik pengguna (jika tidak diatur, AI aktif), sama seperti asisten AI.
+Di Ayakaleaf Pro, panel admin menonaktifkan fitur per pengguna. Modul `admin-tools` menyimpannya sebagai entri `featuresOverrides` dengan `note: 'admin-panel'` (`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`), dan modul `instance-features` menganggap kunci yang tidak diatur sebagai aktif (`modules/instance-features/app/src/UserFeatures.mjs:12-14`).
 
-#### Kontrol Akses & Izin Staf (`staffAccess`)
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | Jumlah kolaborator maksimum per proyek, `-1` = tidak terbatas. | `User.mjs:119` |
+| `features.versioning` | Boolean | Riwayat. | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Sinkronisasi Dropbox, sinkronisasi GitHub, GitLab, dan Gitea, serta akses Git. Diperiksa oleh modul-modul tersebut, lihat `requireUserFeature`. `gitlab` dan `gitea` (sejak v6.3.4) tidak memiliki default: keduanya tetap tidak diatur, yang dihitung sebagai aktif, sampai administrator menonaktifkannya di tab Features. Migrasi `20230817081910_back_fill_gitBridge_feature_server_pro` mengatur `gitBridge: true` untuk semua pengguna. | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | Batas waktu kompilasi dalam detik. `COMPILE_TIMEOUT` mengatur default-nya. | `User.mjs:132` |
+| `features.compileGroup` | String | Grup kompilasi, misalnya `standard`. | `User.mjs:136` |
+| `features.references` | Boolean | Usang. Untuk akun lama, field ini masih mengaktifkan `referencesSearch` dan `mendeley`. | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | Lacak perubahan. Modul `track-changes` memeriksanya pada pemilik proyek. | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | Tautan pengelola referensi. | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | Sakelar untuk pencarian referensi, palet simbol, dan mode offline. | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | Tingkat penggunaan AI. Default `basic`. | `User.mjs:159` |
+| `featuresOverrides` | Array Object | Perubahan default per pengguna. Setiap entri memiliki `createdAt`, `expiresAt` (diabaikan setelah tanggal ini), `note`, dan `features` (kunci yang sama seperti di atas, ditambah `templates`). | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | Kapan `features` terakhir dihitung. | `User.mjs:197` |
+| `featuresEpoch` | String | Salinan `Settings.featuresEpoch` pada perhitungan terakhir, digunakan untuk menyegarkan akun lama. | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-Mendefinisikan hak akses staf atau penerbit secara terperinci:
+Asisten AI dan asisten error bukan kunci `features`. Keduanya mengikuti pengaturan AI instance dan `aiFeatures.enabled`, lihat di bawah.
 
-* Izin metrik dan manajemen untuk penerbit, institusi, grup, admin, dan eksperimen.
+#### Integrasi {#integrations}
 
-#### Pendaftaran & Integrasi
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` menonaktifkan asisten AI dan asisten error untuk pengguna ini. Default `true`. | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | Kredensial terenkripsi dari pengelola referensi yang tertaut, ditulis oleh modul `tpr-webmodule` (`{ encrypted }` untuk Mendeley, `{ apiKeyEncrypted }` untuk Zotero). Dihapus saat tautan diputus. | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Id akun Dropbox. Tidak ada di skema: modul `dropbox` menulisnya secara langsung. Unik, sehingga satu akun Dropbox tertaut ke satu pengguna. Inti menggunakannya untuk menemukan pengguna yang akan disinkronkan. | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | Refresh token Dropbox terenkripsi. Tidak ada di skema, ditulis oleh modul `dropbox`. Seluruh objek `dropbox` dihapus saat tautan diputus. | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | Kursor Dropbox `list_folder` dari folder aplikasi pengguna, sehingga pengambilan berikutnya hanya membaca perubahan yang lebih baru. Tidak ada di skema: ditulis oleh third-party-datastore, hanya selama pengguna masih tertaut ke akun Dropbox yang sama. | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | SSO grup (array `sso` berisi `groupId`, `linkedAt`, `primary`) dan field pengguna terkelola (`managedBy`, `enrolledAt`). Langganan grup bukan bagian dari CE. | `User.mjs:56-72` |
+| `writefull` | Object | Status Writefull: `initialized`, `autoCreatedAccount`, `isPremium`, `premiumSource`. Inti hanya menulisnya saat fitur `saas` aktif, jadi tidak di CE. | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | Hanya ada di skema: inti CE dan modul kami tidak menggunakannya. | `User.mjs:249-255` |
 
-* `enrollment.sso`: Pendaftaran SSO yang terhubung.
-* `refProviders`: Integrasi penyedia referensi.
-* `writefull`: Status akun asisten penulisan Writefull.
-* `dsMobileApp`: Konfigurasi aplikasi seluler (jika ada).
+#### Program & Eksperimen {#programs-&-experiments}
 
-#### Program & Eksperimen
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | Pengguna bergabung dengan program beta. | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Program alfa. Migrasi `20220826104236_disable_alpha_beta_program` mengaturnya beserta `betaProgram` menjadi `false` untuk semua pengguna. | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Program Labs. Tidak ada yang di CE mengaturnya; migrasi `20260615090000_back_fill_labsProgram` mengatur `labsProgram: false` jika belum ada. | `User.mjs:228-229` |
+| `splitTests` | Mixed | Penugasan uji A/B berdasarkan nama uji. | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: Partisipasi dalam program akses awal.
-* `labsExperiments`: Fitur eksperimental yang diaktifkan.
-* `awareOfV2`: Apakah pengguna telah mengetahui editor V2.
+#### Referral & Tutorial {#referrals-&-tutorials}
 
-#### Referral & Tutorial
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | Id referral acak, dibuat saat pembuatan akun. | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | Array ObjectId / Number | Pengguna yang mendaftar dengan id referral ini. | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | Per kunci tutorial: `{ state, updatedAt, postponedUntil }`. | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`, `refered_users`, `refered_user_count`: Pelacakan referral.
-* `completedTutorials`: Kemajuan tutorial orientasi dan fitur.
+#### Indeks {#indexes}
+
+Semuanya berasal dari migrasi bertag `server-ce` di `tools/migrations/`.
+
+| Nama | Kunci | Opsi | Migrasi |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### Catatan {#notes}
+
+* `autoIndex` Mongoose dinonaktifkan (`services/web/app/src/infrastructure/Mongoose.mjs:7`), jadi hanya migrasi di atas yang membuat indeks.
+* Menghapus pengguna memindahkan seluruh dokumen ke `deletedUsers` (lihat [Deleted Users Collection](/dev/data-model/deleted-users-collection)).
 
 ***
 
-Berikut adalah contoh nyata User Overleaf.
+Berikut contoh nyata pengguna Overleaf.
+
+<Info>
+
+Akun ini dibuat di versi lama. Akun ini masih memiliki field yang tidak lagi ada di skema dan tidak dibaca oleh apa pun: `staffAccess`, `ace.enableNewEditor`, `features.aiErrorAssistant`, `aiErrorAssistant`, dan `writefull.enabled` (sekarang `writefull.initialized`). `ace.breadcrumbs` kini default-nya `false`.
+
+</Info>
 
 <Accordion title="Contoh User">
 
@@ -171,7 +252,7 @@ Berikut adalah contoh nyata User Overleaf.
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),

@@ -1,0 +1,62 @@
+---
+title: Coleção Notifications
+icon: bell
+---
+
+`notifications` guarda os avisos exibidos no topo do painel de projetos de um usuário. Um documento é um aviso para um usuário, identificado pela sua `key`. Somente o serviço `notifications` acessa a coleção (`services/notifications/app/js/Notifications.js`); `web` e `third-party-datastore` chamam sua API HTTP. Não há schema do Mongoose.
+
+#### Campos {#fields}
+
+| Campo | Tipo | Significado | Fonte |
+| --- | --- | --- | --- |
+| `_id` | ObjectId | Id do aviso. `web` marca um aviso como lido por este id. | `Notifications.js:58-65` |
+| `user_id` | ObjectId | O usuário que vê o aviso. | `Notifications.js:26` |
+| `key` | String | Identifica o aviso, por exemplo `project-invite-<inviteId>`. O upsert mantém um documento por `user_id` e `key`; não há índice único. | `Notifications.js:27`, `:51-55` |
+| `templateKey` | String | Qual aviso o frontend renderiza. Removido quando o aviso é lido ou dispensado; o documento permanece. | `Notifications.js:29`, `:63`, `:72`, `:78` |
+| `messageOpts` | Object | Valores para o texto do aviso, conforme o `templateKey` (para um convite de projeto: `userName`, `projectName`, `projectId`, `token`). Removido quando o usuário dispensa o aviso pelo id. | `Notifications.js:28`, `:63` |
+| `expires` | Date | Opcional. O índice TTL exclui o documento após esse momento. | `Notifications.js:35-50` |
+
+#### Quem escreve {#who-writes-it}
+
+| Código | O que faz |
+| --- | --- |
+| `Notifications.js:20-56` (`addNotification`) | `POST /user/:user_id` (`services/notifications/app.ts:29`). Faz upsert por `user_id` + `key`. Se já existir um documento com essa chave, ele só é escrito novamente quando o chamador envia `forceCreate`. |
+| `Notifications.js:58-65` (`removeNotificationId`) | `DELETE /user/:user_id/notification/:notification_id` (`app.ts:31-34`): remove `templateKey` e `messageOpts`. |
+| `Notifications.js:67-80` | `DELETE /user/:user_id` e `DELETE /key/:key` (`app.ts:35-36`): removem `templateKey` pela chave. |
+| `Notifications.js:87-100` | `DELETE /key/:key/bulk` (`app.ts:38-41`) exclui avisos não lidos com uma chave; `deleteNotificationByKeyOnly` exclui um documento pela chave. |
+| `services/web/app/src/Features/Notifications/NotificationsHandler.mjs:33-66` | Lado `web` de `addNotification`. Envia `forceCreate: true`, a menos que o chamador passe `false`. |
+| `services/third-party-datastore/app/js/QueueWorker.mjs:46-58` | Nossa sincronização com o Dropbox: ao desvincular uma conta do Dropbox, publica diretamente o aviso `dropbox-unlinked`. |
+
+Avisos que o CE e nossos módulos criam:
+
+| `key` | `templateKey` | Criado em |
+| --- | --- | --- |
+| `project-invite-<inviteId>` | `notification_project_invite`, expira com o convite | `services/web/app/src/Features/Collaborators/CollaboratorsInviteHandler.mjs:40-42`, montado em `services/web/app/src/Features/Notifications/NotificationsBuilder.mjs:100-122`. Somente quando o e-mail convidado pertence a um usuário existente. |
+| `tpdsFileLimit-<userId>` | `notification_tpds_file_limit` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsController.mjs:118-124` (uma atualização do Dropbox faria um projeto ultrapassar o limite de arquivos), `NotificationsBuilder.mjs:175-195` |
+| `dropboxDuplicateProjectNames-<userId>` | `notification_dropbox_duplicate_project_names` | `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateHandler.mjs:160-169`, `NotificationsBuilder.mjs:10-30` |
+| `dropbox-unlinked` | `dropbox_unlinked_because_access_denied`, `dropbox_unlinked_because_full` ou `dropbox_unlinked_because_suspended` | `services/third-party-datastore/app/js/QueueWorker.mjs:20-25`, `:46-58` (nossa sincronização com o Dropbox) |
+
+`NotificationsBuilder.mjs` também monta chaves para convites de grupo, afiliações institucionais, assinaturas e projetos antigos de depuração. Quem as chama está no código de assinaturas e instituições, e a verificação de projetos antigos de depuração só é executada com `isSaas` (`services/web/app/src/Features/Project/ProjectListController.mjs:234-236`).
+
+#### Quem lê {#who-reads-it}
+
+| Código | O que faz |
+| --- | --- |
+| `Notifications.js:4-10` (`getUserNotifications`) | `GET /user/:user_id` (`app.ts:30`). Retorna apenas os documentos do usuário que ainda têm um `templateKey`. |
+| `services/web/app/src/Features/Project/ProjectListController.mjs:367` | Carrega os avisos para o painel de projetos. |
+| `services/web/app/src/Features/Notifications/NotificationsController.mjs` | `GET /notifications`, `DELETE /notifications/:notificationId` e `GET /user/notification/:notificationId` (`services/web/app/src/router.mjs:922-937`). |
+| `services/web/modules/dropbox/app/src/DropboxHandler.mjs:128-131` | Nosso módulo do Dropbox: quando um usuário vincula o Dropbox novamente, marca `dropbox-unlinked` e `dropboxDuplicateProjectNames-<userId>` como lidos. |
+
+#### Índices {#indexes}
+
+| Nome | Chaves | Opções | Migração |
+| --- | --- | --- | --- |
+| `expires_1` | `{ expires: 1 }` | TTL, `expireAfterSeconds: 10` | `tools/migrations/20190912145014_create_notifications_indexes.mjs` |
+| `key_1` | `{ key: 1 }` | | a mesma |
+| `user_id_1` | `{ user_id: 1 }` | | a mesma |
+
+#### Observações {#notes}
+
+* Um aviso lido não é excluído: apenas o `templateKey` some. Como o documento ainda contém a chave, um `addNotification` posterior sem `forceCreate` para a mesma chave não faz nada (`Notifications.js:21-24`).
+* As rotas `/key/:key` atuam apenas sobre a chave, para todos os usuários (`Notifications.js:76-100`).
+* Se `web` não tiver `apis.notifications.url`, ele não cria nem lê avisos (`NotificationsHandler.mjs:17`, `:41`).

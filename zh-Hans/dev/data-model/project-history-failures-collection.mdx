@@ -1,0 +1,53 @@
+---
+title: Project History Failures 集合
+icon: triangle-exclamation
+---
+
+`projectHistoryFailures` 中每个项目一个文档：project-history 无法处理其历史更新的项目，或已为其启动重新同步的项目。一旦处理成功，该文档就会再次被删除。project-history 在 `services/project-history/app/js/ErrorRecorder.js` 中写入它；类型定义在 `services/project-history/app/js/mongo-types.ts:3-24` 中。Web 也有它的 Mongoose schema（`services/web/app/src/models/ProjectHistoryFailure.mjs:5-19`），但没有 Web 代码使用该模型。
+
+#### 字段 {#fields}
+
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 由 upsert 创建。 | `ErrorRecorder.js:45-60` |
+| `project_id` | String | 项目 ID，以字符串而非 ObjectId 存储。 | `ErrorRecorder.js:46`, `mongo-types.ts:5` |
+| `error` | String | 最近一次错误，形式为 `error.toString()`。 | `ErrorRecorder.js:37` |
+| `stack` | String | 最近一次错误的堆栈。 | `ErrorRecorder.js:38` |
+| `queueSize` | Number | 最近一次出错时项目 Redis 队列中等待的更新数（`services/project-history/app/js/UpdatesProcessor.js:375`）；错误来自启动重新同步时为 `-1`（`services/project-history/app/js/SyncManager.js:75`、`96`）。 | `ErrorRecorder.js:36` |
+| `ts` | Date | 最近一次错误的时间。 | `ErrorRecorder.js:39` |
+| `attempts` | Number | 文档创建以来记录的错误次数。 | `ErrorRecorder.js:49` |
+| `history` | Array of Object | 最近 10 个事件，最新的在前：错误记录 `{ queueSize, error, stack, ts }` 和重新同步启动 `{ resyncStartedAt }`。 | `ErrorRecorder.js:50-56`, `92-98` |
+| `resyncStartedAt` | Date | 最近一次重新同步启动的时间。 | `ErrorRecorder.js:90` |
+| `resyncAttempts` | Number | 文档创建以来启动的重新同步次数。 | `ErrorRecorder.js:91` |
+| `forceDebug` | Boolean | 由 project-history `POST /project/:project_id/force` 设置（`?clear=true` 将其设为 `false`）。当 `true` 时，已存储 chunk 中的 ops-out-of-order 错误会被记录日志并忽略（`UpdatesProcessor.js:574-592`）。 | `ErrorRecorder.js:72-82` |
+| `requestCount` | Number | 存在于 Web schema 中（`ProjectHistoryFailure.mjs:16`）。只有 `ErrorRecorder.getLastFailure` 会递增它，而没有任何代码调用该函数。 | `ErrorRecorder.js:131-138` |
+
+#### 写入方 {#who-writes-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `services/project-history/app/js/ErrorRecorder.js:34-66` | `record`：upsert 错误，`attempts` 加 1，并向 `history` 添加一条记录。在处理项目更新失败时调用（`UpdatesProcessor.js:91`、`169`、`242`、`293`、`345`），以及无法启动重新同步时调用（`SyncManager.js:75`、`96`）。 |
+| `ErrorRecorder.js:86-102` | `recordSyncStart`：每次启动重新同步时 upsert、设置 `resyncStartedAt`、`resyncAttempts` 加 1，并向 `history` 添加一条记录（`SyncManager.js:104`）。 |
+| `ErrorRecorder.js:68-70` | `clearError`：在成功 flush 之后删除该文档（`UpdatesProcessor.js:101`、`194`、`259`、`355`），在 project-history `DELETE /project/:project_id` 时删除（`services/project-history/app/js/HttpController.js:1386`），以及在重试期间遇到无效项目 ID 时删除（`services/project-history/app/js/RetryManager.js:161`）。 |
+| `ErrorRecorder.js:72-82` | `setForceDebug`：upsert `forceDebug`（`HttpController.js:1016-1035`，路由位于 `services/project-history/app/js/Router.js:82`）。 |
+| `ErrorRecorder.js:109-119` | `cloneFailure`：把该文档复制到另一个项目，用于 project-history `POST /project/:project_id/clone`（`HttpController.js:135`），Web 中没有任何代码调用它。 |
+
+#### 读取方 {#who-reads-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `RetryManager.js:113-126` | 为重试定时任务加载所有失败记录（`server-ce/config/crontab-history`，project-history `POST /retry/failures`）。soft 任务重新处理队列；hard 任务重新同步项目，当 `resyncAttempts` 至少为 1 且错误不是正在运行的重新同步时执行 hard 重新同步（`RetryManager.js:30-31`、`35-56`、`106-111`）。 |
+| `services/project-history/app/js/FlushManager.js:73-82` | flush 所有项目时会跳过存在失败记录的项目。 |
+| `UpdatesProcessor.js:578-592` | 读取 `forceDebug`。 |
+| `ErrorRecorder.js:124-129`, `140-145` | `getFailureRecord` 和 `getFailedProjects`：由 `GET /project/:project_id/debug-info`（`HttpController.js:571`）以及 `GET /status/failures`、`GET /status/failures-full`（`Router.js:88-90`）使用。 |
+
+#### 索引 {#indexes}
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `project_id_1` | `{ project_id: 1 }` |  | `tools/migrations/20190912145018_create_projectHistoryFailures_indexes.mjs` |
+
+#### 说明 {#notes}
+
+* 文档会一直保留，直到该项目的某次 flush 成功或项目被删除（见上文 `clearError`），因此每个文档都标记着一个最近一次 flush 或重新同步尚未成功的项目。
+* 以 `OError:` 开头的错误字符串会以 `Error:` 的形式返回（`ErrorRecorder.js:18-26`）；存储的值不变。

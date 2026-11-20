@@ -3,84 +3,165 @@ title: Users 集合
 icon: user
 ---
 
-`User` 代表 Overleaf 系統中的單一使用者帳號。它儲存驗證資料、功能旗標、編輯器偏好設定、存取權限以及活動中繼資料。
+`users` 為每個帳號保存一份文件，儲存登入資料、個人資料、編輯器設定、功能與活動。結構描述為 `services/web/app/src/models/User.mjs`；大多數寫入都經由 `services/web/app/src/Features/User/UserUpdater.mjs`。在「來源」欄中，`User.mjs:N` 代表該結構描述的某一行，其他沒有路徑的檔名位於 `services/web/app/src/Features/` 底下，`modules/...` 則位於 `services/web/` 底下。行號取自撰寫當時的 `server-pro`。
 
-#### 核心身分與驗證
+#### 核心身分與驗證 {#core-identity-&-authentication}
 
-* `_id`：使用者的唯一 MongoDB ObjectId。
-* `email` / `emails`：主要電子郵件與歷史電子郵件記錄。
-* `hashedPassword`：用於本機驗證、以 BCrypt 雜湊處理的密碼。
-* `first_name` / `last_name`：使用者個人資料的姓名欄位。
-* `role` / `isAdmin` / `adminRoles`：角色與管理權限旗標。
-* `twoFactorAuthentication`：雙重驗證設定（若已啟用）。
-* `samlIdentifiers` / `thirdPartyIdentifiers`：外部身分提供者的綁定。
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 使用者的 Id。其他集合透過 `user_id`、`owner_ref` 等類似欄位指向這裡。 | MongoDB |
+| `email` | String | 主要電子郵件。唯一，且不區分大小寫時也唯一（請參閱「索引」）。 | `User.mjs:26` |
+| `emails` | Object 陣列 | 帳號的所有地址。主要地址是與 `email` 相同的那一筆。 | `User.mjs:27` |
+| `emails.email` | String | 地址。 | `User.mjs:29` |
+| `emails.reversedHostname` | String | 地址的網域，以反向順序儲存（`moc.elpmaxe`）。在新增地址時設定。 | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | 新增地址的時間。 | `User.mjs:31` |
+| `emails.confirmedAt` | Date | 地址首次確認的時間（之後的確認會保留較早的日期）。LDAP、SAML 與 OIDC 模組在建立帳號時會設定 `emails.0.confirmedAt`。 | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | 地址最近一次確認的時間。 | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | 地址的機構 SSO 連結。機構 SSO 不屬於 CE。 | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | 機構隸屬狀態。不屬於 CE。 | `User.mjs:39` |
+| `first_name` / `last_name` | String | 個人資料中的姓名，最多 255 個字元。LDAP、SAML 與 OIDC 可在每次登入時更新。 | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | 使用者在帳號設定中填寫的職務與機構，為自由文字。`role` 不是權限。 | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | 本機密碼的 bcrypt 雜湊。沒有密碼的帳號不含此欄位：LDAP 與 SAML 登入會移除它，遷移 `20260511150000_reset_hardcoded_admin_password` 會移除一組已知的預設密碼。 | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | 網站管理員。LDAP、SAML 與 OIDC 可在每次登入時依 IdP 屬性設定它。 | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | 更細緻的管理員角色。僅在設定了 `Settings.adminRolesEnabled` 時讀取。 | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Object 陣列 | SAML 登入連結。`saml` 模組會寫入 `samlIdentifiers.0.providerId`（一律為 `'1'`）、`externalUserId` 與 `userIdAttribute`。 | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Object 陣列 | OIDC 登入連結，由核心的 `ThirdPartyIdentityManager` 為 `oidc` 模組寫入。 | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`、`enrolledAt`、`secretEncrypted`。僅存在於結構描述中：CE 核心與我們的模組都不使用它。 | `User.mjs:239-243` |
 
-#### 帳號狀態與生命週期
+#### 帳號狀態與生命週期 {#account-status-&-lifecycle}
 
-* `signUpDate`：帳號建立的時間戳記。
-* `holdingAccount`：帳號是否正在等待確認或受到限制。
-* `must_reconfirm`：表示使用者是否必須重新確認其電子郵件。
-* `lastPrimaryEmailCheck`：上次驗證主要電子郵件的時間。
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | 帳號建立的時間。 | `User.mjs:75` |
+| `suspended` | Boolean | 管理員停用帳號時為 `true`。`UserUpdater.suspendUser` 會設定它並結束工作階段；`admin-tools` 模組會呼叫它，也可以將其還原。所有不在工作階段之後的進入點（權杖、簽署連結、websocket、webhook）都必須檢查它。 | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | 尚未完成註冊的預留帳號為 `true`。註冊會將其設為 `false`；聯絡人會略過預留帳號。 | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | 為 `true` 時，登入會將使用者導向重新確認頁面，而不是編輯器。重設密碼會將其改回 `false`。CE 中沒有任何地方會將其設為 `true`。 | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | 使用者最近一次確認主要電子郵件仍屬於自己，或變更主要電子郵件的時間。只有 overleaf.com（`saas`）會檢查它：時間過久時，專案清單會重新導向至主要電子郵件檢查頁面。 | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | 必填。用於分析事件的 Id。缺少它時 `UserCreator` 會拒絕建立使用者；註冊流程以及 LDAP、SAML 與 OIDC 模組會傳入隨機 UUID（`UserRegistrationHandler.mjs:103`、`modules/login-register/app/src/RegisterController.mjs:127`）。遷移 `20260424120000` 與 `20260616070000_back_fill_users_analyticsId` 已為舊帳號依 `_id` 補上此值。 | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | 歡迎信的寄送時間。只有啟用 `saas` 功能時才會排程該信件，因此 CE 不會設定它。 | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | 僅存在於結構描述中：CE 核心與我們的模組都不使用它們。 | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | 已連結的 overleaf.com v1 帳號的 `id`、`accessToken`、`refreshToken`。`overleaf.id` 有唯一索引；CE 中沒有任何地方寫入這些欄位。 | `User.mjs:230-234` |
 
-#### 登入與活動追蹤
+#### 登入與活動追蹤 {#login-&-activity-tracking}
 
-* `lastLoginIp`：上次成功登入的 IP 位址。
-* `loginCount`：成功登入的總次數。
-* `loginEpoch`：登入工作階段的內部計數器。
-* `lastLoggedIn`：上次登入的時間戳記。
-* `lastActive`：上次記錄到活動的時間戳記。
-* `lastFailedLogin`：上次登入失敗的時間戳記。
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | 最近一次登入的 IP。 | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | 成功登入的次數。 | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | 最近一次成功登入的時間。 | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | 登入鎖：每次登入嘗試都會讓它遞增，且只有在文件仍保有讀到的值時才更新文件，因此兩個並行登入無法同時通過。LDAP、SAML 與 OIDC 模組也採用相同做法。 | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | 最近一次輸入錯誤密碼的時間。 | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | 使用者最近一次開啟專案的時間。 | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### 編輯器偏好設定（`ace`）
+#### 編輯器偏好設定（`ace`） {#editor-preferences-ace}
 
-定義使用者對線上編輯器的偏好設定：
+帳號設定頁面透過 `UserController.updateUserSettings`（`UserController.mjs:460-530`）儲存這些值。
 
-* `theme` / `overallTheme`：編輯器與 UI 主題。
-* `fontSize`：編輯器字型大小。
-* `autoComplete`、`autoPairDelimiters`：編輯輔助功能。
-* `spellCheckLanguage`：拼字檢查使用的語言。
-* `pdfViewer`：選取的 PDF 檢視器後端。
-* `syntaxValidation`、`mathPreview`、`breadcrumbs`：編輯器使用體驗功能。
-* `enableNewEditor`：是否啟用新版編輯器 UI。
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | 按鍵綁定。設定頁面會儲存 `default`、`vim` 或 `emacs`；結構描述的預設值為 `none`。 | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | 編輯器佈景主題。預設 `textmate`。 | `User.mjs:92` |
+| `ace.overallTheme` | String | 介面佈景主題。`system` 會在 `lightTheme` 與 `darkTheme` 之間切換；`light-` 或空值則使用 `theme`。 | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | 搭配 `overallTheme: system` 使用的編輯器佈景主題。預設 `textmate` 與 `overleaf_dark`。 | `User.mjs:96-97` |
+| `ace.fontSize` | Number | 編輯器字型大小。預設 12。 | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | 編輯器字型與行高。 | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | 自動完成與自動補上右括號。預設 `true`。 | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | 拼字檢查語言。預設 `en`。新專案會複製此值。 | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | PDF 檢視器。預設 `pdfjs`。 | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | 程式碼檢查。 | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | 數學預覽。預設 `true`。 | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | 編輯器上方的導覽路徑。預設 `false`。 | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | 編輯器顯示選項。預設值依序為 `false`、`true`、`false`、`false`、`true`。 | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` 或 `simple`。 | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | 文獻管理工具設定：`enabled`（預設 `true`）、`groups`（`{ id }` 陣列）、`disablePersonalLibrary`。 | `User.mjs:10-22`, `:114-116` |
 
-#### 功能旗標與限制（`features`）
+#### 功能旗標與限制（`features`） {#feature-flags-&-limits-features}
 
-控制使用者可使用的功能：
+`features` 是計算的結果，不應手動編輯。`FeaturesUpdater` 從 `Settings.defaultFeatures` 開始，合併每一筆未過期的 `featuresOverrides` 項目，並將結果連同 `featuresUpdatedAt` 一起寫入（`FeaturesUpdater.mjs:220-300`、`UserFeaturesUpdater.mjs:10-24`）。正式環境映像檔將 `collaborators`、`dropbox`、`versioning`、`compileTimeout`、`compileGroup`、`trackChanges` 與 `references` 設為預設值（`server-ce/config/settings.js:301-309`）；其他鍵則維持未設定。
 
-* `collaborators`：協作者人數上限（`-1` = 無限制）。
-* `versioning`、`trackChanges`：歷史記錄與變更追蹤功能。
-* `dropbox`、`github`、`gitBridge`：外部整合的可用性。
-* `compileTimeout`：最長編譯時間（秒）。
-* `compileGroup`：指派的編譯資源群組。
-* `aiErrorAssistant`：以 AI 為基礎的編譯錯誤助理旗標。較舊的帳號可能仍保有此欄位以及頂層的 `aiErrorAssistant.enabled`，但它們已不在結構描述中，Ayakaleaf Pro 也不會讀取其中任何一個。錯誤助理與 AI 助理相同，是由執行個體的 AI 設定以及使用者的 `aiFeatures.enabled`（未設定時 AI 為開啟）來啟用。
+在 Ayakaleaf Pro 中，管理面板會依使用者關閉功能。`admin-tools` 模組將其儲存為帶有 `note: 'admin-panel'` 的 `featuresOverrides` 項目（`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`），而 `instance-features` 模組會將未設定的鍵視為開啟（`modules/instance-features/app/src/UserFeatures.mjs:12-14`）。
 
-#### 存取控制與員工權限（`staffAccess`）
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | 每個專案的協作者上限，`-1` 表示無限制。 | `User.mjs:119` |
+| `features.versioning` | Boolean | 歷程記錄。 | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Dropbox 同步、GitHub、GitLab 與 Gitea 同步，以及 Git 存取。由相應模組檢查，請參閱 `requireUserFeature`。`gitlab` 與 `gitea`（自 v6.3.4 起）沒有預設值：在管理員於 Features 分頁將其關閉之前，它們會維持未設定，並視為開啟。遷移 `20230817081910_back_fill_gitBridge_feature_server_pro` 已為所有使用者設定 `gitBridge: true`。 | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | 編譯逾時（秒）。`COMPILE_TIMEOUT` 設定預設值。 | `User.mjs:132` |
+| `features.compileGroup` | String | 編譯群組，例如 `standard`。 | `User.mjs:136` |
+| `features.references` | Boolean | 已淘汰。對於較舊的帳號，它仍會開啟 `referencesSearch` 與 `mendeley`。 | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | 追蹤修訂。`track-changes` 模組會在專案擁有者身上檢查它。 | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | 文獻管理工具連結。 | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | 文獻搜尋、符號面板與離線模式的開關。 | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | AI 使用等級。預設 `basic`。 | `User.mjs:159` |
+| `featuresOverrides` | Object 陣列 | 針對個別使用者對預設值的變更。每個項目包含 `createdAt`、`expiresAt`（此日期之後忽略）、`note` 與 `features`（與上方相同的鍵，另加 `templates`）。 | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | 最近一次計算 `features` 的時間。 | `User.mjs:197` |
+| `featuresEpoch` | String | 上次計算時 `Settings.featuresEpoch` 的副本，用來更新舊帳號。 | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-定義細緻的員工或出版商存取權限：
+AI 助理與錯誤助理不是 `features` 中的鍵。它們依循執行個體的 AI 設定與 `aiFeatures.enabled`，請參閱下方。
 
-* 針對出版商、機構、群組、管理員與實驗的指標與管理權限。
+#### 整合 {#integrations}
 
-#### 註冊與整合
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | 為 `false` 時會為此使用者關閉 AI 助理與錯誤助理。預設 `true`。 | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | 已連結文獻管理工具的加密憑證，由 `tpr-webmodule` 模組寫入（Mendeley 為 `{ encrypted }`，Zotero 為 `{ apiKeyEncrypted }`）。取消連結時移除。 | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Dropbox 帳號 Id。不在結構描述中：由 `dropbox` 模組直接寫入。具唯一性，因此一個 Dropbox 帳號只會連結一位使用者。核心用它來找出需要同步的使用者。 | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | 加密的 Dropbox 重新整理權杖。不在結構描述中，由 `dropbox` 模組寫入。取消連結時會移除整個 `dropbox` 物件。 | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | 使用者應用程式資料夾的 Dropbox `list_folder` 游標，讓下一次拉取只讀取較新的變更。不在結構描述中：由 third-party-datastore 寫入，且僅在使用者仍連結同一個 Dropbox 帳號時寫入。 | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | 群組 SSO（由 `groupId`、`linkedAt`、`primary` 組成的 `sso` 陣列）與受管理使用者欄位（`managedBy`、`enrolledAt`）。群組訂閱不屬於 CE。 | `User.mjs:56-72` |
+| `writefull` | Object | Writefull 狀態：`initialized`、`autoCreatedAccount`、`isPremium`、`premiumSource`。核心只有在啟用 `saas` 功能時才會寫入，因此 CE 中沒有。 | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | 僅存在於結構描述中：CE 核心與我們的模組都不使用它們。 | `User.mjs:249-255` |
 
-* `enrollment.sso`：已連結的 SSO 註冊。
-* `refProviders`：參考文獻提供者整合。
-* `writefull`：Writefull 寫作助理的帳號狀態。
-* `dsMobileApp`：行動應用程式設定（若存在）。
+#### 計畫與實驗 {#programs-&-experiments}
 
-#### 計畫與實驗
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | 使用者已加入 beta 計畫。 | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Alpha 計畫。遷移 `20220826104236_disable_alpha_beta_program` 已將它與 `betaProgram` 對所有使用者設為 `false`。 | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Labs 計畫。CE 中沒有任何地方設定它們；遷移 `20260615090000_back_fill_labsProgram` 已在缺少處設定 `labsProgram: false`。 | `User.mjs:228-229` |
+| `splitTests` | Mixed | 依測試名稱記錄的 A/B 測試分配。 | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`：參與搶先體驗計畫的情況。
-* `labsExperiments`：已啟用的實驗性功能。
-* `awareOfV2`：使用者是否已知悉 V2 編輯器。
+#### 推薦與教學 {#referrals-&-tutorials}
 
-#### 推薦與教學
+| 欄位 | 型別 | 意義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | 隨機推薦 Id，於建立時產生。 | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | ObjectId 陣列 / Number | 使用此推薦 Id 註冊的使用者。 | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | 依教學鍵：`{ state, updatedAt, postponedUntil }`。 | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`、`refered_users`、`refered_user_count`：推薦追蹤。
-* `completedTutorials`：新手引導與功能教學的進度。
+#### 索引 {#indexes}
+
+全部來自 `tools/migrations/` 中帶有 `server-ce` 標籤的遷移。
+
+| 名稱 | 鍵 | 選項 | 遷移 |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### 附註 {#notes}
+
+* Mongoose 的 `autoIndex` 已關閉（`services/web/app/src/infrastructure/Mongoose.mjs:7`），因此只有上述遷移會建立索引。
+* 刪除使用者會將整份文件移至 `deletedUsers`（請參閱 [Deleted Users Collection](/dev/data-model/deleted-users-collection)）。
 
 ***
 
-以下是一個 Overleaf User 的真實範例。
+以下是一個真實的 Overleaf 使用者範例。
+
+<Info>
+
+此帳號是在舊版本中建立的。它仍保有已不在結構描述中、也沒有任何地方讀取的欄位：`staffAccess`、`ace.enableNewEditor`、`features.aiErrorAssistant`、`aiErrorAssistant` 與 `writefull.enabled`（現為 `writefull.initialized`）。`ace.breadcrumbs` 現在預設為 `false`。
+
+</Info>
 
 <Accordion title="User 範例">
 
@@ -171,7 +252,7 @@ icon: user
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),

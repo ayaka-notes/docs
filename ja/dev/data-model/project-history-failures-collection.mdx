@@ -1,0 +1,53 @@
+---
+title: Project History Failures コレクション
+icon: triangle-exclamation
+---
+
+`projectHistoryFailures` には、project-history が履歴の更新を処理できなかったプロジェクト、または再同期を開始したプロジェクトごとに 1 つのドキュメントが保存されます。処理が成功するとすぐにドキュメントは削除されます。project-history が `services/project-history/app/js/ErrorRecorder.js` で書き込み、型は `services/project-history/app/js/mongo-types.ts:3-24` にあります。Web にもこの Mongoose スキーマがあります（`services/web/app/src/models/ProjectHistoryFailure.mjs:5-19`）が、そのモデルを使う Web のコードはありません。
+
+#### フィールド {#fields}
+
+| フィールド | 型 | 意味 | 出典 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | upsert で作成されます。 | `ErrorRecorder.js:45-60` |
+| `project_id` | String | プロジェクト ID。ObjectId ではなく文字列で保存されます。 | `ErrorRecorder.js:46`, `mongo-types.ts:5` |
+| `error` | String | 最後のエラー。`error.toString()` の形式です。 | `ErrorRecorder.js:37` |
+| `stack` | String | 最後のエラーのスタック。 | `ErrorRecorder.js:38` |
+| `queueSize` | Number | 最後のエラー時にプロジェクトの Redis キューで待機していた更新数（`services/project-history/app/js/UpdatesProcessor.js:375`）。エラーが再同期の開始から生じた場合は `-1` です（`services/project-history/app/js/SyncManager.js:75`、`96`）。 | `ErrorRecorder.js:36` |
+| `ts` | Date | 最後のエラーの日時。 | `ErrorRecorder.js:39` |
+| `attempts` | Number | ドキュメント作成以降に記録されたエラー数。 | `ErrorRecorder.js:49` |
+| `history` | Array of Object | 直近 10 件のイベント（新しい順）: エラー記録 `{ queueSize, error, stack, ts }` と再同期の開始 `{ resyncStartedAt }`。 | `ErrorRecorder.js:50-56`, `92-98` |
+| `resyncStartedAt` | Date | 最後に再同期を開始した日時。 | `ErrorRecorder.js:90` |
+| `resyncAttempts` | Number | ドキュメント作成以降に開始した再同期の回数。 | `ErrorRecorder.js:91` |
+| `forceDebug` | Boolean | project-history `POST /project/:project_id/force` が設定します（`?clear=true` は `false` に設定）。`true` の間は、保存済み chunk の ops-out-of-order エラーはログに記録されて無視されます（`UpdatesProcessor.js:574-592`）。 | `ErrorRecorder.js:72-82` |
+| `requestCount` | Number | Web スキーマにあります（`ProjectHistoryFailure.mjs:16`）。これを増やすのは `ErrorRecorder.getLastFailure` だけで、その関数を呼び出すものはありません。 | `ErrorRecorder.js:131-138` |
+
+#### 書き込み元 {#who-writes-it}
+
+| コード | 処理内容 |
+| ---- | ------------ |
+| `services/project-history/app/js/ErrorRecorder.js:34-66` | `record`: エラーを upsert し、`attempts` を 1 増やし、`history` にエントリを追加します。プロジェクトの更新処理が失敗したとき（`UpdatesProcessor.js:91`、`169`、`242`、`293`、`345`）と、再同期を開始できないとき（`SyncManager.js:75`、`96`）に呼び出されます。 |
+| `ErrorRecorder.js:86-102` | `recordSyncStart`: 再同期を開始するたびに upsert し、`resyncStartedAt` を設定し、`resyncAttempts` を 1 増やし、`history` にエントリを追加します（`SyncManager.js:104`）。 |
+| `ErrorRecorder.js:68-70` | `clearError`: flush が成功した後（`UpdatesProcessor.js:101`、`194`、`259`、`355`）、project-history `DELETE /project/:project_id` のとき（`services/project-history/app/js/HttpController.js:1386`）、再試行中に不正なプロジェクト ID があったとき（`services/project-history/app/js/RetryManager.js:161`）にドキュメントを削除します。 |
+| `ErrorRecorder.js:72-82` | `setForceDebug`: `forceDebug` を upsert します（`HttpController.js:1016-1035`、ルートは `services/project-history/app/js/Router.js:82`）。 |
+| `ErrorRecorder.js:109-119` | `cloneFailure`: ドキュメントを別のプロジェクトにコピーします。project-history `POST /project/:project_id/clone` 用です（`HttpController.js:135`）が、Web から呼び出すコードはありません。 |
+
+#### 読み取り元 {#who-reads-it}
+
+| コード | 処理内容 |
+| ---- | ------------ |
+| `RetryManager.js:113-126` | 再試行用の cron ジョブのためにすべての失敗を読み込みます（`server-ce/config/crontab-history`、project-history `POST /retry/failures`）。soft ジョブはキューを再処理し、hard ジョブはプロジェクトを再同期します。`resyncAttempts` が 1 以上でエラーが実行中の再同期でない場合は hard 再同期になります（`RetryManager.js:30-31`、`35-56`、`106-111`）。 |
+| `services/project-history/app/js/FlushManager.js:73-82` | 全プロジェクトの flush では、失敗があるプロジェクトをスキップします。 |
+| `UpdatesProcessor.js:578-592` | `forceDebug` を読み取ります。 |
+| `ErrorRecorder.js:124-129`, `140-145` | `getFailureRecord` と `getFailedProjects`: `GET /project/:project_id/debug-info`（`HttpController.js:571`）と `GET /status/failures`、`GET /status/failures-full`（`Router.js:88-90`）で使われます。 |
+
+#### インデックス {#indexes}
+
+| 名前 | キー | オプション | マイグレーション |
+| ---- | ---- | ------- | --------- |
+| `project_id_1` | `{ project_id: 1 }` |  | `tools/migrations/20190912145018_create_projectHistoryFailures_indexes.mjs` |
+
+#### 注意事項 {#notes}
+
+* ドキュメントは、プロジェクトの flush が成功するかプロジェクトが削除されるまで残ります（上記の `clearError`）。そのため、各ドキュメントは最後の flush または再同期がまだ成功していないプロジェクトを示します。
+* `OError:` で始まるエラー文字列は `Error:` として返されます（`ErrorRecorder.js:18-26`）。保存されている値は変わりません。

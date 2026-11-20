@@ -1,0 +1,62 @@
+---
+title: Colección Tokens
+icon: key
+---
+
+`tokens` contiene tokens de un solo uso: el secreto de un enlace que permite a alguien establecer una contraseña. Un documento es un token. No hay modelo de Mongoose; web escribe la colección mediante `services/web/app/src/Features/Security/OneTimeTokenHandler.mjs` con el driver nativo.
+
+#### Campos {#fields}
+
+| Campo | Tipo | Significado | Origen |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id del documento. | `OneTimeTokenHandler.mjs:40` |
+| `use` | String | Para qué sirve el token, ver [Usos](#uses) más abajo. Todas las búsquedas filtran por él. | `OneTimeTokenHandler.mjs:41` |
+| `token` | String | El secreto del enlace: 32 bytes aleatorios como 64 caracteres hexadecimales, guardado tal cual. | `OneTimeTokenHandler.mjs:38,42` |
+| `data` | Object | Lo que representa el token; se devuelve al usarlo. | `OneTimeTokenHandler.mjs:43` |
+| `data.user_id` | String | Id del usuario, escrito como cadena por todos los llamadores. | `services/web/app/src/Features/PasswordReset/PasswordResetHandler.mjs:27`, `services/web/app/src/Features/User/UserRegistrationHandler.mjs:117`, `services/web/modules/admin-tools/app/src/AdminUserManager.mjs:79` |
+| `data.email` | String | Correo del usuario cuando se creó el token. Un restablecimiento de contraseña busca al usuario por este correo principal (`PasswordResetHandler.mjs:66-70`). | igual que `data.user_id` |
+| `createdAt` | Date | Momento de creación. El índice TTL borra el token 90 días después. | `OneTimeTokenHandler.mjs:36,44` |
+| `expiresAt` | Date | `createdAt` más `expiresIn` segundos: 1 hora por defecto, 1 semana para un enlace de activación. Las búsquedas ignoran el token después de esta fecha. | `OneTimeTokenHandler.mjs:35-37,45` |
+| `peekCount` | Number | Cuántas veces se consultó el token sin usarlo. Cada `peekValueFromToken` suma 1; al llegar a 4 (`MAX_PEEKS`) el token deja de funcionar. | `OneTimeTokenHandler.mjs:8-31,107` |
+| `usedAt` | Date | Momento en que se usó o canceló el token. Las búsquedas ignoran un token que lo tenga. | `OneTimeTokenHandler.mjs:51-104` |
+
+#### Usos {#uses}
+
+| `use` | Función | Caducidad | Código |
+| ----- | ------- | ------ | ---- |
+| `password` | Correo de restablecimiento de contraseña, desde la página "olvidé mi contraseña" | 1 hora | `PasswordResetHandler.mjs:14-42` |
+| `password` | Enlace de activación: una cuenta creada con una contraseña aleatoria y luego un enlace para establecer una. Lo usan el registro público (`services/web/modules/login-register/app/src/RegisterController.mjs:65`), la página de registro de administración de `user-activate` (`services/web/modules/user-activate/app/src/UserActivateController.mjs:27-30`) y el script `create-user` (`services/web/modules/server-ce-scripts/scripts/create-user.mjs:21`) | 1 semana | `UserRegistrationHandler.mjs:97-130` |
+| `password` | Enlace de activación o de restablecimiento de contraseña enviado desde el panel de administración (módulo `admin-tools`) | 1 semana (activación), 1 hora (restablecimiento) | `AdminUserManager.mjs:76-103,196-206` |
+| `email_confirmation` | Enlace de confirmación de correo. Solo se lee: ya nada en este repositorio crea estos tokens, porque la confirmación ahora envía un código de 6 dígitos (`services/web/app/src/Features/User/UserEmailsConfirmationHandler.mjs:15-35`) | | `UserEmailsConfirmationHandler.mjs:12,37-66` |
+
+#### Quién escribe {#who-writes-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `OneTimeTokenHandler.mjs:34-49` (`getNewToken`) | Inserta un token. Llamadores: `PasswordResetHandler.mjs:28`, `UserRegistrationHandler.mjs:115-119`, `AdminUserManager.mjs:77-81`. |
+| `OneTimeTokenHandler.mjs:8-32` (`peekValueFromToken`) | Devuelve `data` de un token válido y suma 1 a `peekCount`. Se usa al abrir la página de restablecimiento de contraseña (`services/web/app/src/Features/PasswordReset/PasswordResetController.mjs:195-208`), de nuevo al establecer la nueva contraseña (`PasswordResetHandler.mjs:94-96`), y en la confirmación de correo (`UserEmailsConfirmationHandler.mjs:38-41`). |
+| `OneTimeTokenHandler.mjs:75-88` (`expireToken`) | Establece `usedAt` en un token: tras establecer una contraseña nueva (`PasswordResetHandler.mjs:44-48,119`) o confirmar un correo (`UserEmailsConfirmationHandler.mjs:65`). |
+| `OneTimeTokenHandler.mjs:90-104` (`expireAllTokensForUser`) | Establece `usedAt` en todos los tokens `password` abiertos de un usuario, cuando el usuario cambia la contraseña en la configuración (`services/web/app/src/Features/User/UserController.mjs:146-149`) o un administrador la establece en el panel de administración (`AdminUserManager.mjs:479-488`). |
+
+#### Quién lee {#who-reads-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `PasswordResetHandler.mjs:50-70,94-119` | Convierte un token de restablecimiento o activación en el usuario y luego establece la contraseña. La página de activación de `user-activate` solo pasa el token a este formulario. |
+| `UserEmailsConfirmationHandler.mjs:37-66` | Confirma un correo a partir de un token `email_confirmation` del usuario con sesión iniciada. |
+| `AdminUserManager.mjs:213-223` (module `admin-tools`) | Busca el token de activación abierto de un usuario para volver a mostrar el enlace de activación en el panel de administración. Lee `db.tokens` directamente. |
+
+#### Índices {#indexes}
+
+| Nombre | Claves | Opciones | Migración |
+| ---- | ---- | ------- | --------- |
+| `token_1_use_1` | `{ token: 1, use: 1 }` | único | `20190912145031_create_tokens_indexes.mjs` |
+| `createdAt_1` | `{ createdAt: 1 }` | TTL, `expireAfterSeconds: 7776000` (90 días) | `20210407085118_token-expiry-with-ttl-index.mjs` |
+| `data.user_id_1` | `{ "data.user_id": 1 }` | | `20231113173237_tokens_user_id_index.mjs` |
+
+Las migraciones están en `tools/migrations/`.
+
+#### Notas {#notes}
+
+* Un token usado o caducado no se borra enseguida: permanece, con `usedAt` o un `expiresAt` pasado, hasta que el índice TTL lo elimina 90 días después de `createdAt`.
+* `OneTimeTokenHandler` también tiene `getValueFromTokenAndExpire` (`OneTimeTokenHandler.mjs:51-73`), pero nada lo llama.

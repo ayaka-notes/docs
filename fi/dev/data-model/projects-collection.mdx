@@ -3,77 +3,143 @@ title: Projects-kokoelma
 icon: rectangle-vertical-history
 ---
 
-`Project` edustaa yksittäistä LaTeX-projektia Overleafissa. Se tallentaa projektin metatiedot, omistajuuden ja käyttöoikeuksien hallinnan, tiedostorakenteen, käännösasetukset ja yhteistyön tilan.
+`projects` sisältää yhden dokumentin projektia kohden: nimen, omistajan ja jäsenet, jakamisen, tiedostopuun ja projektin asetukset. Dokumenttien teksti ei ole täällä (katso [Docs-kokoelma](/fi/dev/data-model/docs-collection)), ja binääritiedostot ovat history-v1:n blob-tallennustilassa `hash`-arvonsa alla. Skeema on `services/web/app/src/models/Project.mjs`, ja tiedostopuu on sen vieressä tiedostoissa `Folder.mjs`, `File.mjs` ja `Doc.mjs`.
 
-#### Perustunnisteet ja metatiedot
+Lähde-sarakkeessa `Project.mjs:N` on kyseisen skeeman rivi, muut polkua vailla olevat tiedostonimet ovat hakemistossa `services/web/app/src/Features/`, ja `modules/...` on hakemistossa `services/web/`. Rivinumerot ovat `server-pro`:sta kirjoitushetkellä.
 
-* `_id`: Projektin yksilöivä MongoDB ObjectId.
-* `name`: Projektin näyttönimi.
-* `description`: Valinnainen tekstikuvaus projektista.
-* `active`: Kertoo, onko projekti tällä hetkellä aktiivinen.
-* `version`: Sisäinen skeeman tai projektimuodon versio.
-* `trashed`: Luettelo roskakoriin siirretyistä kohteista (pehmeästi poistetut).
-* `deletedDocs`: Tiedot pysyvästi poistetuista dokumenteista.
+#### Perustunnisteet ja metatiedot {#core-identification-&-metadata}
 
-#### Omistajuus ja käyttöoikeuksien hallinta
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Projektin id. | MongoDB |
+| `name` | String | Projektin nimi. | `Project.mjs:18` |
+| `description` | String | Projektin kuvaus. Oletuksena tyhjä. | `Project.mjs:50` |
+| `version` | Number | Kasvaa yhdellä jokaisen tiedostopuun muutoksen yhteydessä (lisäys, uudelleennimeäminen, siirto, poisto, korvaus). | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | `false`, kun projekti on poistettu käytöstä: sen dokumentit on arkistoitu pois Mongosta (`docs.inS3`). Projektin avaaminen palauttaa ne arkistosta ja asettaa arvon takaisin `true`. CE:ssä vanhat projektit käytöstä poistava cron-ajo toimii vain, kun `ENABLE_CRON_RESOURCE_DELETION=true`. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Käyttäjät, jotka ovat arkistoineet projektin. Arkistointi on käyttäjäkohtainen. Vanhat totuusarvot muunsi migraatio `20221111111111_ce_sp_convert_archived_state`. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Käyttäjät, jotka ovat siirtäneet projektin roskakoriinsa. Myös käyttäjäkohtainen. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Vanha kenttä, `{ _id, name, deletedAt }`. Poistetut dokumentit jäävät nyt kokoelmaan `docs` arvolla `deleted: true`. Tämä taulukko luetaan vain, kun vanha poistettu projekti palautetaan: merkinnät kopioidaan docstoreen ja taulukko tyhjennetään. Mikään ei kirjoita siihen. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Vain skeemassa: CE:n ydin ja moduulimme eivät käytä sitä. | `Project.mjs:28` |
 
-* `owner_ref`: Viittaus projektin omistavaan käyttäjään.
-* `collaberator_refs`: Käyttäjät, joilla on muokkausoikeudet.
-* `reviewer_refs`: Käyttäjät, joilla on arvioijatason oikeudet.
-* `readOnly_refs`: Käyttäjät, joilla on vain lukuoikeus.
-* `pendingEditor_refs` / `pendingReviewer_refs`: Odottavat kutsut.
+#### Omistajuus ja käyttöoikeuksien hallinta {#ownership-&-access-control}
 
-#### Tunnistepohjainen käyttöoikeus
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Omistaja. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Käyttäjät, jotka voivat muokata (kirjoitusasu on kentän todellinen nimi). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | Käyttäjät, jotka voivat tarkistaa: kommentoida ja ehdottaa muutosten seurannalla. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Käyttäjät, jotka voivat vain katsella. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | Eivät ole kutsuja (ne ovat kokoelmassa `projectInvites`). Käyttäjät, jotka lisättiin muokkaajiksi tai tarkistajiksi, kun omistajalla ei ollut vapaata yhteistyökumppanipaikkaa. Heidät lisätään kenttään `readOnly_refs` ja luetellaan tässä, kunnes heidät voidaan korottaa. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Katselijat, jotka ovat pyytäneet lisää oikeuksia: `userId`, `privilegeLevel`, `requestedAt`. Yksi merkintä käyttäjää kohden. Poistetaan, kun pyyntö hyväksytään tai hylätään tai käyttäjä poistuu projektista. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Muutosten seurannan tila. `true` tarkoittaa päällä kaikille (vanha muoto); muuten objekti, jonka avaimina ovat käyttäjien id:t ja arvona `true` jokaiselle käyttäjälle, jolla se on päällä. Moduuli `track-changes` kirjoittaa sen, ja ydin kytkee sen päälle käyttäjälle, josta tehdään tarkistaja. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | IEEE Collabratec -linkitykset: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. Ei käytössä CE:ssä. | `Project.mjs:104-116` |
 
-* `tokens`: Jaettujen linkkien tunnisterekisteri.
-* `tokenAccessReadOnly_refs`: Tunnisteet, jotka antavat vain lukuoikeuden.
-* `tokenAccessReadAndWrite_refs`: Tunnisteet, jotka antavat luku- ja kirjoitusoikeuden.
+#### Linkillä jakaminen {#link-sharing}
 
-#### Toiminnan seuranta
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` tai `tokenBased` (linkillä jakaminen päällä). Vanhoissa projekteissa voi yhä olla vanhat arvot `readOnly` tai `readAndWrite`. Arvoa `public` ei ole. Kirjoitusasu on kentän todellinen nimi. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Katselulinkin tunniste. Yksilöllinen. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Muokkauslinkin tunniste. Yksilöllinen. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Muokkaustunnisteen numeerinen etuliite, jolla tunniste haetaan. Yksilöllinen. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Käyttäjät, jotka liittyivät katselulinkin kautta (käyttäjien id:t, eivät tunnisteet). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Käyttäjät, jotka liittyivät muokkauslinkin kautta. | `Project.mjs:84` |
 
-* `lastUpdated`: Viimeisimmän muutoksen aikaleima.
-* `lastUpdatedBy`: Käyttäjä, joka teki viimeisimmän päivityksen.
-* `lastOpened`: Aikaleima siitä, milloin projekti avattiin viimeksi.
-* `deletedByExternalDataSource`: Käynnistikö poiston ulkoinen integraatio.
+Linkillä jakamisen poistaminen käytöstä poistaa kentän `tokens` ja palauttaa `publicAccesLevel`-arvoksi `private` (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Projektin rakenne
+#### Toiminnan seuranta {#activity-tracking}
 
-Juuridokumentti ja -kansio
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | Sisällön tai tiedostopuun viimeisimmän muutoksen aika. Liikkuu vain eteenpäin. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Viimeisimmän muutoksen tehnyt käyttäjä. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Viimeisin kerta, kun joku avasi projektin. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | `true`, kun projektikansio poistettiin Dropboxin puolella. Itse projektia ei poisteta; editori näyttää ilmoituksen, ja lippu tyhjennetään, kun projekti avataan seuraavan kerran. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | Jäänne overleaf.com v1 -tuonnista. Kun arvo on yli 0, projekti lähetetään Dropboxiin kerran latauksen yhteydessä ja laskuri nollataan. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: Pää-LaTeX-dokumentin ObjectId (yleensä `main.tex`).
-* `rootFolder`: Projektin tiedostopuun sisäkkäinen esitys.
+#### Projektin rakenne {#project-structure}
 
-Jokainen kansiomerkintä sisältää:
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Pääasiakirja, joka käännetään. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Projektin asetuksissa valittu pää-`.bib`-tiedosto. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Tiedostopuu. Aina yksi elementti: juurikansio. | `Project.mjs:43` |
 
-* `name` / `_id`: Kansion nimi ja tunniste.
-* `docs`: Luettelo LaTeX-lähdedokumenteista nimineen ja `_id`-tunnisteineen.
-* `fileRefs`: Viittaukset binääritiedostoihin (kuvat, datatiedostot), mukaan lukien:
-  * `name`: Tiedostonimi
-  * `created`: Latauksen aikaleima
-  * `rev`: Revisiolaskuri
-  * `hash`: Sisällön tiiviste kaksoiskappaleiden poistamiseen
-  * `linkedFileData`: Linkitys ulkoiseen tallennustilaan (jos on)
-* `folders`: Sisäkkäiset alikansiot.
+Jokainen kansio (`Folder.mjs`):
 
-#### Käännös- ja editoriasetukset
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Kansion id. | MongoDB |
+| `name` | String | Kansion nimi (juurikansion nimi on `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Muokattavat tekstitiedostot: vain `_id` ja `name`. `_id` on sama kuin `_id` kokoelmassa `docs`, joka sisältää tekstin. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | Binääritiedostot, katso alta. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Alikansiot. | `Folder.mjs:17` |
 
-* `compiler`: Valittu LaTeX-moottori (`pdflatex`, `xelatex`, `lualatex` jne.).
-* `spellCheckLanguage`: Projektin oikolukukieli.
+Jokainen tiedosto kentässä `fileRefs` (`File.mjs`):
 
-#### Julkisuus- ja jakoasetukset
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Tiedoston id. Muuttuu, kun tiedosto korvataan. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Tiedoston nimi. | `File.mjs:7` |
+| `created` | Date | Milloin tiedosto ladattiin tai viimeksi korvattiin. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Kasvaa yhdellä aina, kun tiedosto korvataan. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | Sisällön SHA-1. Tiedosto tallennetaan history-v1:n blob-tallennustilaan tämän tiivisteen alle, ja lataukset lukevat sen sieltä. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Asetetaan linkitetyille tiedostoille (URL-osoitteesta, toisesta projektista, tulostiedostosta, Zoterosta tai Mendeleystä): `provider`, sen lähdetiedot ja `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: Projektin näkyvyys (`private`, `readOnly`, `public` jne.).
-* `collabratecUsers`: Linkitetyt käyttäjät ulkoisista yhteistyöalustoista.
+#### Kääntämisen ja editorin asetukset {#compilation-&-editor-settings}
 
-#### Overleaf-kohtaiset laajennukset
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | LaTeX-moottori: jokin arvoista `Settings.safeCompilers` (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | TeX Live -levykuva, jota käytetään tälle projektille hiekkalaatikkokäännöksissä. Uusi projekti saa arvon `Settings.currentImageName`; mallivalikoima ja MCP-palvelin voivat muuttaa sitä. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Oikoluvun kieli. Uusi projekti kopioi omistajan `ace.spellCheckLanguage`-arvon. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Projektiasetus, joka tallennetaan asetuspyynnöstä (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Lähdeviitteiden muodon asetus. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Kustantajan brändäys. Mallivalikoima voi asettaa sen. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | overleaf.com v1 -malli, josta projekti on peräisin. Ei asetettu CE:ssä. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: Historiapalvelun käyttämä tunniste.
-  * `display`: Onko historia käytössä ja näkyvissä.
+#### Historia (`overleaf`) {#history-overleaf}
 
-#### Sisäinen versiointi
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Projektin id palveluissa project-history ja history-v1. Uudet projektit käyttävät projektin id:tä merkkijonona. Yksilöllinen. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | Uusissa projekteissa aina `true`; säilytetty vain yhteensopivuuden vuoksi. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Historia tallentaa myös kommentit ja seuratut muutokset. Version palautus palauttaa ne vain, kun tämä arvo on `true`. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Historian OT-päivitysmuotoon siirtymisen vaihe. Vain kasvaa. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Viimeisin kerta, kun historian uudelleensynkronointi valmistui. Kirjoittaja on project-history, ei web. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Jäänteitä siirtymisestä täyteen projektihistoriaan. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Asetetaan toisen projektin vianetsintäkopioon. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | overleaf.com v1 -tuonnin tiedot. Ei asetettu CE:ssä. Kentällä `overleaf.id` on yksilöllinen indeksi. | `Project.mjs:88-91` |
+| `__v` | Number | Mongoosen versioavain. | Mongoose |
 
-* `__v`: Mongoosen sisäinen versioavain samanaikaisuuden hallintaan.
+history-v1 voi kirjoittaa myös kentät `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt` ja `overleaf.backup.*`, mutta vain kun sen `backupStore` on määritetty (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE ei määritä sitä, joten näitä kenttiä ei esiinny.
+
+#### Indeksit {#indexes}
+
+Kaikki tulevat `server-ce`-tunnisteella merkityistä migraatioista hakemistossa `tools/migrations/`.
+
+| Nimi | Avaimet | Asetukset | Migraatio |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Huomioita {#notes}
+
+* Mongoosen `autoIndex` on pois päältä (`services/web/app/src/infrastructure/Mongoose.mjs:7`): skeeman `index`-asetukset ovat olemassa vain siksi, että yllä olevat migraatiot luovat ne.
+* Migraatio `20250620152657_ensure_collaborator_arrays` asettaa puuttuvat kentät `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs` ja `reviewer_refs` arvoon `[]`.
+* Projektin poistaminen siirtää dokumentin kokoelmaan `deletedProjects` (katso [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
 
 Tässä on todellinen esimerkki Overleaf-projektista.
 
