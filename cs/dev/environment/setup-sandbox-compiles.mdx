@@ -3,17 +3,32 @@ title: Nastavení kompilací v sandboxu
 icon: box-archive
 ---
 
-Pokud chcete nastavit kompilaci v sandboxu pro vývoj, existuje několik drobných rozdílů mezi vývojovým a produkčním prostředím. Musíte dbát na 3 věci:
+Kompilace v sandboxu fungují ve vývojovém prostředí trochu jinak než v produkčním image. Vývojové prostředí je už má nastavené; tato stránka vysvětluje nastavení a tři věci, na které je třeba pamatovat:
 
 * Problém s oprávněními souborů
 * Sdílení svazku mezi history-v1 a filestore
 * Problém s podadresáři
 
-### Povolení kompilací v sandboxu
+### Povolení kompilací v sandboxu {#enable-sandbox-compiles}
 
-Zde stačí povolit Sandbox Compiles stejně jako v Overleaf CE. Je však třeba dát pozor na uživatele. Zde ho nastavíme na root.
+Kompilace v sandboxu jsou ve výchozím stavu zapnuté. `develop/docker-compose.yml` nastavuje `SANDBOXED_COMPILES=true` pro `clsi` a `develop/dev.env` obsahuje zbytek:
 
-V produkčním prostředí používáme www-data jako sdíleného uživatele mezi kontejnerem Overleafu a kontejnerem pro kompilaci TeXu. Ve vývojovém prostředí je však výchozím uživatelem v kontejneru node a uživatel www-data, na kterého by se to dalo navázat, neexistuje. Jako náhradní řešení proto použijeme root.
+```dotenv title="develop/dev.env" wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+SANDBOXED_COMPILES_HOST_DIR_COMPILES=${PWD}/compiles
+SANDBOXED_COMPILES_HOST_DIR_OUTPUT=${PWD}/output
+TEXLIVE_IMAGE_USER=tex
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2026.1, ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2026, Texlive 2025
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+clsi sám image nestahuje, proto je jednou stáhněte příkazem `docker pull ghcr.io/ayaka-notes/texlive-full:2026.1` (a `:2025.1`).
+
+LaTeX běží v sesterských kontejnerech jako `TEXLIVE_IMAGE_USER`. Ve vývojovém prostředí je to `tex`, což je také výchozí hodnota clsi (`services/clsi/config/settings.defaults.cjs:154`). Produkční image místo toho používá `www-data`, když je `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` (`server-ce/config/env.sh:15-21`), protože tam soubory vytváří uživatel `www-data` kontejneru Overleaf.
 
 <Warning>
 
@@ -21,22 +36,11 @@ Nepoužívejte prosím vlastní sestavený image, mohli byste narazit na řadu c
 
 </Warning>
 
-```dotenv wrap
-#################
-#   Sandbox     #
-#################
-SANDBOXED_COMPILES=true
-TEXLIVE_IMAGE_USER=root
-ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
-ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
-TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
-```
+### Oprava oprávnění souborů {#fix-file-permissions}
 
-### Oprava oprávnění souborů
+Kontejner clsi se spouští jako root, předá složky `compiles`, `output` a `cache` uživateli `node` (uid `1000`) a pak spustí clsi jako `node` (`services/clsi/entrypoint.sh`). Proto `develop/compiles` na hostiteli patří uid `1000`, stejnému uid jako `tex` ve vývojovém prostředí (viz komentář v `develop/pandoc/Dockerfile`). S výše uvedeným nastavením vývojové prostředí kompiluje bez jakékoli změny oprávnění.
 
-LaTeX běží v sousedních kontejnerech pod uživatelem zadaným v proměnné prostředí `TEXLIVE_IMAGE_USER`. Ve výše uvedeném příkladu je nastaven na `root`, který má uid `0`. To způsobuje problém s výše uvedenými oprávněními, protože uživatel root nemá oprávnění zapisovat do podsložek `compiles`.
-
-Rychlou opravou je přidělit skupině `root` vlastnictví a oprávnění ke čtení a zápisu ke `compiles` a nastavit `setgid`, aby toto vlastnictví zdědily i nové podsložky:
+Pokud místo toho nastavíte `TEXLIVE_IMAGE_USER=root`, root (uid `0`) nemá oprávnění zapisovat do podsložek `compiles`. V takovém případě dejte skupině `root` vlastnictví a právo zápisu ke `compiles` a nastavte `setgid`, aby nové podsložky toto vlastnictví zdědily:
 
 ```bash title="bash"
 sudo chown -R 1000:root compiles
@@ -46,7 +50,13 @@ sudo chmod g+s compiles
 
 Podrobnou dokumentaci najdete v `services/clsi/README.md`.
 
-### Sdílení svazku mezi history-v1 a filestore
+### Sdílení svazku mezi history-v1 a filestore {#volume-share-between-history-v1-and-filestore}
+
+<Info>
+
+Nastavení v této a následující sekci už jsou v `develop/docker-compose.yml` a `develop/dev.env`. Mají význam jen při `S3_ENABLED=false` v `develop/dev.rc`. S výchozím `S3_ENABLED=true` ukládají filestore a history-v1 tyto soubory místo toho do bucketů RustFS (`develop/s3/docker-compose.yml`).
+
+</Info>
 
 Ve výchozím nastavení slouží filestore jako most mezi S3 a ostatními službami Overleafu. V Overleaf CE nebo Server Pro se však všechny soubory ve výchozím stavu ukládají lokálně. Overleaf proto zavedl velmi důmyslný postup.
 
@@ -73,7 +83,7 @@ switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
 }
 ```
 
-Zároveň `data/history` používá také služba history. Díky tomu mohou různé mikroslužby sdílet stejná data. Ve vývojovém prostředí musíte do služby filestore přidat svazek `history-v1-buckets`. Jinak **clsi nebude moci stahovat soubory blob ze služby filestore**.
+Zároveň `data/history` používá i služba historie. Takto mohou různé mikroslužby sdílet stejná data. Proto služba filestore v develop připojuje svazek `history-v1-buckets` ze služby history-v1. Bez něj **clsi nebude moci stahovat blob soubory ze služby filestore**.
 
 ```yml title="develop/docker-compose.yml" wrap
   filestore:
@@ -91,16 +101,16 @@ Zároveň `data/history` používá také služba history. Díky tomu mohou růz
       - history-v1-buckets:/buckets
 ```
 
-Do nastavení `dev.env` je také třeba přidat názvy BUCKETů:
+filestore najde buckety pomocí těchto nastavení v `dev.env`:
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
 OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 ```
 
-### Použití podadresářů
+### Použití podadresářů {#use-subdirectories}
 
-Filestore ve výchozím nastavení používá useSubdirectories s hodnotou true, ve vývojovém prostředí však history v1 <strong>ukládá všechna data naplocho.</strong> To způsobuje konflikty. Chcete-li to opravit, musíte přidat následující:&#x20;
+filestore vždy čte bloby historie s podadresáři (`services/filestore/app/js/KeyBuilder.js:58`, `:70`). Produkční image zapíná `useSubdirectories` pro history-v1 (`server-ce/config/production.json`), ale výchozí konfigurace history-v1 ne, takže ve vývoji by history-v1 <strong>všechna data zploštil.</strong> Proto `dev.env` nastavuje `NODE_CONFIG` pro history-v1:&#x20;
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
@@ -108,7 +118,7 @@ OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
 ```
 
-V history v1 jsou všechny soubory `project_blobs` původně uloženy takto:
+Bez toho history-v1 ukládá soubory `project_blobs` takto:
 
 ```bash wrap
 node@43eb5dac5b1b:/buckets/project_blobs$ ls
@@ -120,4 +130,4 @@ node@43eb5dac5b1b:/buckets/project_blobs$ ls
 
 ```
 
-Musíte nastavit useSubdirectories na `true`, aby se přepnul do režimu podadresářů. Původní `_` v názvu blobu se pak nahradí znakem `/` .
+S `useSubdirectories` nastaveným na `true` se `_` v těchto názvech změní na `/`, takže každý blob se uloží do podsložek.
