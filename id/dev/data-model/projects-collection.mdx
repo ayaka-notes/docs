@@ -3,79 +3,145 @@ title: Koleksi Projects
 icon: rectangle-vertical-history
 ---
 
-`Project` merepresentasikan satu proyek LaTeX di Overleaf. Koleksi ini menyimpan metadata proyek, kepemilikan dan kontrol akses, struktur file, pengaturan kompilasi, serta status kolaborasi.
+`projects` menyimpan satu dokumen per proyek: nama, pemilik dan anggota, berbagi, pohon berkas, dan pengaturan proyek. Teks dokumen tidak ada di sini (lihat [Koleksi Docs](/id/dev/data-model/docs-collection)), dan berkas biner berada di penyimpanan blob history-v1 di bawah `hash`-nya. Skemanya adalah `services/web/app/src/models/Project.mjs`, dengan pohon berkas di `Folder.mjs`, `File.mjs`, dan `Doc.mjs` di sebelahnya.
 
-#### Identifikasi Inti & Metadata
+Di kolom Sumber, `Project.mjs:N` adalah satu baris skema tersebut, nama berkas lain tanpa jalur berada di bawah `services/web/app/src/Features/`, dan `modules/...` berada di bawah `services/web/`. Nomor baris berasal dari `server-pro` pada saat penulisan.
 
-* `_id`: ObjectId MongoDB unik yang mengidentifikasi proyek.
-* `name`: Nama tampilan proyek.
-* `description`: Deskripsi teks opsional untuk proyek.
-* `active`: Menunjukkan apakah proyek sedang aktif.
-* `version`: Versi skema internal atau format proyek.
-* `trashed`: Daftar item yang dipindahkan ke tempat sampah (soft-delete).
-* `deletedDocs`: Catatan dokumen yang telah dihapus secara permanen.
+#### Identifikasi Inti & Metadata {#core-identification-&-metadata}
 
-#### Kepemilikan & Kontrol Akses
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id proyek. | MongoDB |
+| `name` | String | Nama proyek. | `Project.mjs:18` |
+| `description` | String | Deskripsi proyek. Kosong secara default. | `Project.mjs:50` |
+| `version` | Number | Bertambah 1 pada setiap perubahan pohon berkas (tambah, ubah nama, pindah, hapus, ganti). | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | `false` setelah proyek dinonaktifkan: dokumennya telah diarsipkan keluar dari Mongo (`docs.inS3`). Membuka proyek akan mengeluarkannya dari arsip dan mengembalikan nilainya ke `true`. Di CE, cron yang menonaktifkan proyek lama hanya berjalan dengan `ENABLE_CRON_RESOURCE_DELETION=true`. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Pengguna yang mengarsipkan proyek. Pengarsipan berlaku per pengguna. Nilai boolean lama dikonversi oleh migrasi `20221111111111_ce_sp_convert_archived_state`. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Pengguna yang memindahkan proyek ke tempat sampah mereka. Juga per pengguna. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Lama, `{ _id, name, deletedAt }`. Dokumen yang dihapus kini tetap berada di `docs` dengan `deleted: true`. Array ini hanya dibaca saat proyek lama yang dihapus dipulihkan: entri disalin ke docstore dan array dikosongkan. Tidak ada yang menulis ke dalamnya. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Hanya ada di skema: inti CE dan modul kami tidak menggunakannya. | `Project.mjs:28` |
 
-* `owner_ref`: Referensi ke pengguna pemilik proyek.
-* `collaberator_refs`: Pengguna dengan izin edit.
-* `reviewer_refs`: Pengguna dengan akses tingkat reviewer.
-* `readOnly_refs`: Pengguna dengan akses hanya-baca.
-* `pendingEditor_refs` / `pendingReviewer_refs`: Undangan yang tertunda.
+#### Kepemilikan & Kontrol Akses {#ownership-&-access-control}
 
-#### Akses Berbasis Token
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Pemilik. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Pengguna yang dapat mengedit (ejaan ini adalah nama bidang yang sebenarnya). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | Pengguna yang dapat meninjau: berkomentar dan memberi saran dengan pelacakan perubahan. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Pengguna yang hanya dapat melihat. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | Bukan undangan (undangan ada di `projectInvites`). Pengguna yang ditambahkan sebagai editor atau peninjau ketika pemilik tidak memiliki slot kolaborator kosong. Mereka ditambahkan ke `readOnly_refs` dan dicantumkan di sini sampai dapat ditingkatkan. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Penonton yang meminta akses lebih: `userId`, `privilegeLevel`, `requestedAt`. Satu entri per pengguna. Dihapus ketika permintaan dikabulkan, ditolak, atau pengguna keluar dari proyek. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Status pelacakan perubahan. `true` berarti aktif untuk semua orang (format lama); jika tidak, berupa objek dengan id pengguna sebagai kunci dan `true` untuk setiap pengguna yang mengaktifkannya. Modul `track-changes` menulisnya, dan inti mengaktifkannya untuk pengguna yang dijadikan peninjau. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | Tautan IEEE Collabratec: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. Tidak digunakan di CE. | `Project.mjs:104-116` |
 
-* `tokens`: Registri token untuk tautan berbagi.
-* `tokenAccessReadOnly_refs`: Token yang memberikan akses hanya-baca.
-* `tokenAccessReadAndWrite_refs`: Token yang memberikan akses baca–tulis.
+#### Berbagi Tautan {#link-sharing}
 
-#### Pelacakan Aktivitas
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` atau `tokenBased` (berbagi tautan aktif). Proyek lama mungkin masih memiliki nilai lama `readOnly` atau `readAndWrite`. Tidak ada `public`. Ejaan ini adalah nama bidang yang sebenarnya. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Token tautan khusus lihat. Unik. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Token tautan edit. Unik. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Prefiks numerik token edit, digunakan untuk mencari token. Unik. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Pengguna yang bergabung melalui tautan khusus lihat (id pengguna, bukan token). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Pengguna yang bergabung melalui tautan edit. | `Project.mjs:84` |
 
-* `lastUpdated`: Stempel waktu modifikasi terakhir.
-* `lastUpdatedBy`: Pengguna yang melakukan pembaruan terakhir.
-* `lastOpened`: Stempel waktu terakhir kali proyek dibuka.
-* `deletedByExternalDataSource`: Apakah penghapusan dipicu oleh integrasi eksternal.
+Menonaktifkan berbagi tautan akan menghapus `tokens` dan mengembalikan `publicAccesLevel` ke `private` (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Struktur Proyek
+#### Pelacakan Aktivitas {#activity-tracking}
 
-Dokumen & Folder Root
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | Waktu perubahan terakhir pada konten atau pohon berkas. Hanya bergerak maju. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Pengguna yang membuat perubahan terakhir tersebut. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Terakhir kali seseorang membuka proyek. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | `true` ketika folder proyek dihapus di sisi Dropbox. Proyeknya sendiri tidak dihapus; editor menampilkan pemberitahuan dan penanda dihapus saat proyek dibuka berikutnya. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | Peninggalan dari impor overleaf.com v1. Jika di atas 0, proyek didorong ke Dropbox sekali saat dimuat dan penghitung diatur ulang. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: ObjectId dari dokumen LaTeX utama (biasanya `main.tex`).
-* `rootFolder`: Representasi inline dari pohon file proyek.
+#### Struktur Proyek {#project-structure}
 
-Setiap entri folder berisi:
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Dokumen utama yang dikompilasi. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Berkas `.bib` utama yang dipilih di pengaturan proyek. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Pohon berkas. Selalu satu elemen: folder akar. | `Project.mjs:43` |
 
-* `name` / `_id`: Nama dan pengenal folder.
-* `docs`: Daftar dokumen sumber LaTeX beserta nama dan `_id`.
-* `fileRefs`: Referensi file biner (gambar, file data), termasuk:
-  * `name`: Nama file
-  * `created`: Stempel waktu unggah
-  * `rev`: Penghitung revisi
-  * `hash`: Hash konten untuk deduplikasi
-  * `linkedFileData`: Tautan penyimpanan eksternal (jika ada)
-* `folders`: Subfolder bertingkat.
+Setiap folder (`Folder.mjs`):
 
-#### Pengaturan Kompilasi & Editor
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id folder. | MongoDB |
+| `name` | String | Nama folder (folder akar bernama `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Berkas teks yang dapat diedit: hanya `_id` dan `name`. `_id` adalah `_id` di koleksi `docs`, yang menyimpan teksnya. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | Berkas biner, lihat di bawah. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Subfolder. | `Folder.mjs:17` |
 
-* `compiler`: Mesin LaTeX yang dipilih (`pdflatex`, `xelatex`, `lualatex`, dll.).
-* `spellCheckLanguage`: Bahasa pemeriksa ejaan untuk proyek ini.
+Setiap berkas di `fileRefs` (`File.mjs`):
 
-#### Pengaturan Publik & Berbagi
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id berkas. Berubah ketika berkas diganti. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Nama berkas. | `File.mjs:7` |
+| `created` | Date | Kapan berkas diunggah atau terakhir diganti. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Bertambah 1 setiap kali berkas diganti. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | SHA-1 dari konten. Berkas disimpan di penyimpanan blob history-v1 di bawah hash ini, dan unduhan membacanya dari sana. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Diatur untuk berkas tertaut (dari URL, proyek lain, berkas keluaran, Zotero, atau Mendeley): `provider`, data sumbernya, dan `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: Visibilitas proyek (`private`, `readOnly`, `public`, dll.).
-* `collabratecUsers`: Pengguna yang ditautkan dari platform kolaborasi eksternal.
+#### Pengaturan Kompilasi & Editor {#compilation-&-editor-settings}
 
-#### Ekstensi Khusus Overleaf
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | Mesin LaTeX: salah satu dari `Settings.safeCompilers` (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | Image TeX Live yang digunakan untuk proyek ini dengan kompilasi sandbox. Proyek baru mendapatkan `Settings.currentImageName`; galeri templat dan server MCP dapat mengubahnya. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Bahasa pemeriksa ejaan. Proyek baru menyalin `ace.spellCheckLanguage` milik pemilik. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Pengaturan proyek yang disimpan dari permintaan pengaturan (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Pengaturan format referensi. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Branding penerbit. Galeri templat dapat mengaturnya. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | Templat overleaf.com v1 asal proyek. Tidak diatur di CE. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: Pengenal yang digunakan oleh layanan riwayat.
-  * `display`: Apakah riwayat diaktifkan dan terlihat.
+#### Riwayat (`overleaf`) {#history-overleaf}
 
-#### Pembuatan Versi Internal
+| Bidang | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Id proyek di project-history dan history-v1. Proyek baru menggunakan id proyek sebagai string. Unik. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | Selalu `true` untuk proyek baru; dipertahankan hanya demi kompatibilitas. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Riwayat juga menyimpan komentar dan perubahan yang dilacak. Memulihkan versi hanya memulihkannya jika nilai ini `true`. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Tahap perpindahan ke format pembaruan OT riwayat. Hanya bertambah. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Terakhir kali sinkronisasi ulang riwayat selesai. Ditulis oleh project-history, bukan web. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Sisa dari perpindahan ke riwayat proyek lengkap. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Diatur pada salinan debug dari proyek lain. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | Data impor overleaf.com v1. Tidak diatur di CE. `overleaf.id` memiliki indeks unik. | `Project.mjs:88-91` |
+| `__v` | Number | Kunci versi Mongoose. | Mongoose |
 
-* `__v`: Kunci versi internal Mongoose untuk kontrol konkurensi.
+history-v1 juga dapat menulis `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt`, dan `overleaf.backup.*`, tetapi hanya jika `backupStore`-nya dikonfigurasi (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE tidak mengonfigurasinya, sehingga bidang-bidang ini tidak muncul.
 
-Berikut adalah contoh nyata untuk Pengguna Overleaf.
+#### Indeks {#indexes}
+
+Semuanya berasal dari migrasi bertag `server-ce` di `tools/migrations/`.
+
+| Nama | Kunci | Opsi | Migrasi |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Catatan {#notes}
+
+* `autoIndex` Mongoose dinonaktifkan (`services/web/app/src/infrastructure/Mongoose.mjs:7`): opsi `index` di skema hanya ada karena migrasi di atas membuatnya.
+* Migrasi `20250620152657_ensure_collaborator_arrays` mengatur `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs`, dan `reviewer_refs` yang tidak ada menjadi `[]`.
+* Menghapus proyek memindahkan dokumen ke `deletedProjects` (lihat [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
+
+Berikut contoh nyata sebuah proyek Overleaf.
 
 <Accordion title="Contoh Proyek">
 
