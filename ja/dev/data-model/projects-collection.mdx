@@ -3,79 +3,145 @@ title: Projects コレクション
 icon: rectangle-vertical-history
 ---
 
-`Project` は Overleaf における 1 つの LaTeX プロジェクトを表します。プロジェクトのメタデータ、所有権とアクセス制御、ファイル構造、コンパイル設定、共同編集の状態を保存します。
+`projects` にはプロジェクトごとに 1 つのドキュメントがあり、名前、オーナーとメンバー、共有、ファイルツリー、プロジェクト設定を保持します。ドキュメントの本文はここにはなく（[Docs コレクション](/ja/dev/data-model/docs-collection)を参照）、バイナリファイルは `hash` をキーに history-v1 の blob ストアに保存されます。スキーマは `services/web/app/src/models/Project.mjs` で、ファイルツリーは同じ場所にある `Folder.mjs`、`File.mjs`、`Doc.mjs` にあります。
 
-#### 基本識別情報とメタデータ
+「ソース」列の `Project.mjs:N` はそのスキーマの行番号です。パスのないその他のファイル名は `services/web/app/src/Features/` 配下、`modules/...` は `services/web/` 配下にあります。行番号は執筆時点の `server-pro` のものです。
 
-* `_id`: プロジェクトを識別する一意の MongoDB ObjectId。
-* `name`: プロジェクトの表示名。
-* `description`: プロジェクトの説明（任意）。
-* `active`: プロジェクトが現在アクティブかどうかを示します。
-* `version`: 内部スキーマまたはプロジェクト形式のバージョン。
-* `trashed`: ゴミ箱に移動された項目（ソフト削除）のリスト。
-* `deletedDocs`: 完全に削除されたドキュメントの記録。
+#### 基本識別情報とメタデータ {#core-identification-&-metadata}
 
-#### 所有権とアクセス制御
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | プロジェクトの id。 | MongoDB |
+| `name` | String | プロジェクト名。 | `Project.mjs:18` |
+| `description` | String | プロジェクトの説明。既定値は空。 | `Project.mjs:50` |
+| `version` | Number | ファイルツリーが変更される（追加、名前変更、移動、削除、置き換え）たびに 1 増えます。 | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | プロジェクトが非アクティブ化されると `false` になります。そのドキュメントは Mongo からアーカイブされています（`docs.inS3`）。プロジェクトを開くとアーカイブが解除され、値は `true` に戻ります。CE では、古いプロジェクトを非アクティブ化する cron は `ENABLE_CRON_RESOURCE_DELETION=true` のときだけ実行されます。 | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | プロジェクトをアーカイブしたユーザー。アーカイブはユーザーごとです。古いブール値はマイグレーション `20221111111111_ce_sp_convert_archived_state` で変換されました。 | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | プロジェクトを自分のゴミ箱に移したユーザー。これもユーザーごとです。 | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | レガシー、`{ _id, name, deletedAt }`。削除されたドキュメントは現在 `deleted: true` 付きで `docs` に残ります。この配列は古い削除済みプロジェクトを復元するときだけ読まれます。エントリが docstore にコピーされ、配列は空になります。書き込むコードはありません。 | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | スキーマにのみ存在します。CE コアと当プロジェクトのモジュールは使用しません。 | `Project.mjs:28` |
 
-* `owner_ref`: プロジェクトを所有するユーザーへの参照。
-* `collaberator_refs`: 編集権限を持つユーザー。
-* `reviewer_refs`: レビュアー権限を持つユーザー。
-* `readOnly_refs`: 読み取り専用アクセス権を持つユーザー。
-* `pendingEditor_refs` / `pendingReviewer_refs`: 保留中の招待。
+#### 所有権とアクセス制御 {#ownership-&-access-control}
 
-#### トークンベースのアクセス
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | オーナー。 | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | 編集できるユーザー（このスペルが実際のフィールド名です）。 | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | レビューできるユーザー。コメントと、変更履歴による提案ができます。 | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | 閲覧のみできるユーザー。 | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | 招待ではありません（招待は `projectInvites` にあります）。オーナーに空きのコラボレーター枠がないときに編集者またはレビュアーとして追加されたユーザーです。`readOnly_refs` に追加され、アップグレードできるようになるまでここに記録されます。 | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | より多くのアクセス権を求めた閲覧者：`userId`、`privilegeLevel`、`requestedAt`。ユーザーごとに 1 エントリ。リクエストが承認または拒否されたとき、またはユーザーがプロジェクトを離れたときに削除されます。 | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | 変更履歴の状態。`true` は全員に対して有効（古い形式）を意味します。それ以外の場合はユーザー id をキーとするオブジェクトで、有効にしている各ユーザーに `true` が入ります。`track-changes` モジュールが書き込み、コアはレビュアーにされたユーザーに対して有効にします。 | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | IEEE Collabratec のリンク：`user_id`、`collabratec_document_id`、`collabratec_privategroup_id`、`added_at`。CE では使用されません。 | `Project.mjs:104-116` |
 
-* `tokens`: 共有リンク用のトークンレジストリ。
-* `tokenAccessReadOnly_refs`: 読み取り専用アクセスを付与するトークン。
-* `tokenAccessReadAndWrite_refs`: 読み書きアクセスを付与するトークン。
+#### リンク共有 {#link-sharing}
 
-#### アクティビティの追跡
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` または `tokenBased`（リンク共有が有効）。古いプロジェクトには、レガシー値 `readOnly` または `readAndWrite` が残っている場合があります。`public` はありません。このスペルが実際のフィールド名です。 | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | 閲覧専用リンクのトークン。一意。 | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | 編集リンクのトークン。一意。 | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | 編集トークンの数値プレフィックス。トークンの検索に使われます。一意。 | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | 閲覧専用リンクから参加したユーザー（トークンではなくユーザー id）。 | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | 編集リンクから参加したユーザー。 | `Project.mjs:84` |
 
-* `lastUpdated`: 最後に変更された日時のタイムスタンプ。
-* `lastUpdatedBy`: 最後に更新を行ったユーザー。
-* `lastOpened`: プロジェクトが最後に開かれた日時のタイムスタンプ。
-* `deletedByExternalDataSource`: 削除が外部連携によって行われたかどうか。
+リンク共有をオフにすると `tokens` が削除され、`publicAccesLevel` が `private` に戻ります（`ProjectDetailsHandler.mjs:233-238`）。
 
-#### プロジェクト構造
+#### アクティビティの追跡 {#activity-tracking}
 
-ルートドキュメントとフォルダー
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | コンテンツまたはファイルツリーが最後に変更された時刻。前にしか進みません。 | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | その最後の変更を行ったユーザー。 | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | 最後に誰かがプロジェクトを開いた時刻。 | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | Dropbox 側でプロジェクトフォルダーが削除されたときに `true` になります。プロジェクト自体は削除されません。エディターに通知が表示され、次にプロジェクトを開いたときにフラグがクリアされます。 | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | overleaf.com v1 インポートの名残。0 より大きい場合、読み込み時にプロジェクトが一度 Dropbox にプッシュされ、カウンターがリセットされます。 | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: メインの LaTeX エントリードキュメント（通常は `main.tex`）の ObjectId。
-* `rootFolder`: プロジェクトのファイルツリーをインラインで表現したもの。
+#### プロジェクト構造 {#project-structure}
 
-各フォルダーエントリーには次のものが含まれます。
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | コンパイルされるメインドキュメント。 | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | プロジェクト設定で選択されたメインの `.bib` ファイル。 | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | ファイルツリー。常に 1 要素で、ルートフォルダーです。 | `Project.mjs:43` |
 
-* `name` / `_id`: フォルダー名と識別子。
-* `docs`: 名前と `_id` を持つ LaTeX ソースドキュメントのリスト。
-* `fileRefs`: バイナリファイル（画像、データファイル）への参照。以下を含みます。
-  * `name`: ファイル名
-  * `created`: アップロード日時のタイムスタンプ
-  * `rev`: リビジョンカウンター
-  * `hash`: 重複排除用のコンテンツハッシュ
-  * `linkedFileData`: 外部ストレージとのリンク（存在する場合）
-* `folders`: ネストされたサブフォルダー。
+各フォルダー（`Folder.mjs`）：
 
-#### コンパイルとエディターの設定
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | フォルダー id。 | MongoDB |
+| `name` | String | フォルダー名（ルートフォルダーの名前は `rootFolder`）。 | `Folder.mjs:9` |
+| `docs` | Array of Object | 編集可能なテキストファイル。`_id` と `name` のみ。`_id` は本文を保持する `docs` コレクションの `_id` です。 | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | バイナリファイル。以下を参照。 | `Folder.mjs:16` |
+| `folders` | Array of Folder | サブフォルダー。 | `Folder.mjs:17` |
 
-* `compiler`: 選択された LaTeX エンジン（`pdflatex`、`xelatex`、`lualatex` など）。
-* `spellCheckLanguage`: このプロジェクトのスペルチェック言語。
+`fileRefs` 内の各ファイル（`File.mjs`）：
 
-#### 公開と共有の設定
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | ファイル id。ファイルが置き換えられると変わります。 | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | ファイル名。 | `File.mjs:7` |
+| `created` | Date | ファイルがアップロードされた、または最後に置き換えられた時刻。 | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | ファイルが置き換えられるたびに 1 増えます。 | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | 内容の SHA-1。ファイルはこのハッシュで history-v1 の blob ストアに保存され、ダウンロードもそこから読み込まれます。 | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | リンクされたファイル（URL、別のプロジェクト、出力ファイル、Zotero、Mendeley から）に設定されます。`provider`、そのソースデータ、`importedAt` を持ちます。 | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: プロジェクトの公開範囲（`private`、`readOnly`、`public` など）。
-* `collabratecUsers`: 外部コラボレーションプラットフォームからリンクされたユーザー。
+#### コンパイルとエディターの設定 {#compilation-&-editor-settings}
 
-#### Overleaf 固有の拡張
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | LaTeX エンジン。`Settings.safeCompilers` のいずれか（`xelatex`、`pdflatex`、`latex`、`lualatex`）。 | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | サンドボックスコンパイルでこのプロジェクトに使われる TeX Live イメージ。新しいプロジェクトには `Settings.currentImageName` が設定されます。テンプレートギャラリーと MCP サーバーで変更できます。 | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | スペルチェックの言語。新しいプロジェクトはオーナーの `ace.spellCheckLanguage` をコピーします。 | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | 設定リクエスト（`body.png2pdf`）から保存されるプロジェクト設定。 | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | 参考文献の形式の設定。 | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | 出版社のブランディング。テンプレートギャラリーで設定できます。 | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | プロジェクトの元になった overleaf.com v1 のテンプレート。CE では設定されません。 | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: 履歴サービスで使用される識別子。
-  * `display`: 履歴が有効かつ表示されるかどうか。
+#### 履歴（`overleaf`） {#history-overleaf}
 
-#### 内部バージョン管理
+| フィールド | 型 | 意味 | ソース |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | project-history と history-v1 でのプロジェクトの id。新しいプロジェクトはプロジェクト id を文字列として使います。一意。 | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | 新しいプロジェクトでは常に `true`。互換性のためだけに残されています。 | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | 履歴にはコメントと変更履歴も保存されます。この値が `true` のときだけ、バージョンの復元でそれらも復元されます。 | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | 履歴の OT 更新形式への移行段階。増える一方です。 | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | 履歴の再同期が最後に完了した時刻。web ではなく project-history が書き込みます。 | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | 完全なプロジェクト履歴への移行時の名残。 | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | 別のプロジェクトのデバッグ用コピーに設定されます。 | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | overleaf.com v1 のインポートデータ。CE では設定されません。`overleaf.id` には一意インデックスがあります。 | `Project.mjs:88-91` |
+| `__v` | Number | Mongoose のバージョンキー。 | Mongoose |
 
-* `__v`: 同時実行制御のための Mongoose 内部バージョンキー。
+history-v1 は `overleaf.history.currentEndVersion`、`overleaf.history.currentEndTimestamp`、`overleaf.history.updatedAt`、`overleaf.backup.*` も書き込めますが、それは `backupStore` が設定されている場合に限ります（`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`）。CE では設定されないため、これらのフィールドは現れません。
 
-以下は Overleaf のプロジェクトの実際の例です。
+#### インデックス {#indexes}
+
+すべて `tools/migrations/` の `server-ce` タグ付きマイグレーションから作成されます。
+
+| 名前 | キー | オプション | マイグレーション |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### 補足 {#notes}
+
+* Mongoose の `autoIndex` はオフです（`services/web/app/src/infrastructure/Mongoose.mjs:7`）。スキーマ内の `index` オプションが存在するのは、上記のマイグレーションがそれらを作成するからにすぎません。
+* マイグレーション `20250620152657_ensure_collaborator_arrays` は、存在しない `collaberator_refs`、`pendingEditor_refs`、`pendingReviewer_refs`、`readOnly_refs`、`reviewer_refs` を `[]` に設定します。
+* プロジェクトを削除すると、ドキュメントは `deletedProjects` に移されます（[Deleted Projects Collection](/dev/data-model/deleted-projects-collection) を参照）。
+
+以下は実際の Overleaf プロジェクトの例です。
 
 <Accordion title="プロジェクトの例">
 
