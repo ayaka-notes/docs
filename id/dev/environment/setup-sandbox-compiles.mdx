@@ -3,17 +3,32 @@ title: Menyiapkan Sandbox Compiles
 icon: box-archive
 ---
 
-Ada sedikit perbedaan antara lingkungan pengembangan dan produksi jika Anda ingin menyiapkan kompilasi sandbox untuk pengembangan. Ada 3 hal yang perlu Anda perhatikan:
+Kompilasi sandbox bekerja sedikit berbeda di lingkungan pengembangan dibandingkan di image produksi. Lingkungan pengembangan sudah menyiapkannya; halaman ini menjelaskan pengaturannya dan tiga hal yang perlu diperhatikan:
 
 * Masalah izin file
 * Berbagi volume antara history-v1 dan filestore
 * Masalah subdirektori
 
-### Mengaktifkan Sandbox Compiles
+### Mengaktifkan Sandbox Compiles {#enable-sandbox-compiles}
 
-Di sini, kita cukup mengaktifkan Sandbox Compiles seperti yang kita lakukan di Overleaf CE. Namun, kita perlu memperhatikan penggunanya. Di sini kita mengaturnya ke root.
+Kompilasi sandbox aktif secara default. `develop/docker-compose.yml` menetapkan `SANDBOXED_COMPILES=true` untuk `clsi`, dan `develop/dev.env` berisi sisanya:
 
-Di lingkungan produksi, kami menggunakan www-data sebagai pengguna bersama antara kontainer Overleaf dan kontainer kompilasi TeX. Namun, di lingkungan pengembangan, node adalah pengguna default di dalam kontainer, dan tidak ada pengguna www-data yang dapat digunakan. Jadi, kami menggunakan root sebagai solusi sementara.
+```dotenv title="develop/dev.env" wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+SANDBOXED_COMPILES_HOST_DIR_COMPILES=${PWD}/compiles
+SANDBOXED_COMPILES_HOST_DIR_OUTPUT=${PWD}/output
+TEXLIVE_IMAGE_USER=tex
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2026.1, ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2026, Texlive 2025
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+clsi tidak menarik image sendiri, jadi tarik image sekali dengan `docker pull ghcr.io/ayaka-notes/texlive-full:2026.1` (dan `:2025.1`).
+
+LaTeX berjalan di container saudara sebagai `TEXLIVE_IMAGE_USER`. Di lingkungan pengembangan, nilainya `tex`, yang juga merupakan default clsi (`services/clsi/config/settings.defaults.cjs:154`). Image produksi menggunakan `www-data` sebagai gantinya ketika `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` (`server-ce/config/env.sh:15-21`), karena di sana file dibuat oleh pengguna `www-data` dari container Overleaf.
 
 <Warning>
 
@@ -21,22 +36,11 @@ Jangan gunakan image yang Anda bangun sendiri, karena Anda mungkin akan menemui 
 
 </Warning>
 
-```dotenv wrap
-#################
-#   Sandbox     #
-#################
-SANDBOXED_COMPILES=true
-TEXLIVE_IMAGE_USER=root
-ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
-ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
-TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
-```
+### Memperbaiki Izin File {#fix-file-permissions}
 
-### Memperbaiki Izin File
+Container clsi dimulai sebagai root, memberikan folder `compiles`, `output`, dan `cache` kepada pengguna `node` (uid `1000`), lalu menjalankan clsi sebagai `node` (`services/clsi/entrypoint.sh`). Jadi `develop/compiles` di host dimiliki oleh uid `1000`, uid yang sama dengan `tex` di lingkungan pengembangan (lihat komentar di `develop/pandoc/Dockerfile`). Dengan pengaturan di atas, lingkungan pengembangan mengompilasi tanpa perubahan izin apa pun.
 
-LaTeX berjalan di kontainer saudara (sibling container) sebagai pengguna yang ditentukan dalam variabel lingkungan `TEXLIVE_IMAGE_USER`. Pada contoh di atas, nilainya diatur ke `root`, yang memiliki uid `0`. Ini menimbulkan masalah dengan izin di atas, karena pengguna root tidak memiliki izin untuk menulis ke subfolder `compiles`.
-
-Perbaikan cepatnya adalah memberikan kepemilikan grup `root` serta izin baca-tulis pada `compiles`, dengan `setgid` diaktifkan agar subfolder baru juga mewarisi kepemilikan ini:
+Jika Anda menetapkan `TEXLIVE_IMAGE_USER=root` sebagai gantinya, root (uid `0`) tidak memiliki izin menulis ke subfolder `compiles`. Dalam hal itu, berikan grup `root` kepemilikan dan izin menulis pada `compiles`, dengan `setgid` diaktifkan agar subfolder baru mewarisi kepemilikan ini:
 
 ```bash title="bash"
 sudo chown -R 1000:root compiles
@@ -46,7 +50,13 @@ sudo chmod g+s compiles
 
 Untuk dokumentasi lebih rinci, Anda dapat melihat `services/clsi/README.md`.
 
-### Berbagi Volume antara history-v1 dan filestore
+### Berbagi Volume antara history-v1 dan filestore {#volume-share-between-history-v1-and-filestore}
+
+<Info>
+
+Pengaturan di bagian ini dan bagian berikutnya sudah ada di `develop/docker-compose.yml` dan `develop/dev.env`. Pengaturan ini hanya berpengaruh dengan `S3_ENABLED=false` di `develop/dev.rc`. Dengan default `S3_ENABLED=true`, filestore dan history-v1 menyimpan file ini di bucket RustFS sebagai gantinya (`develop/s3/docker-compose.yml`).
+
+</Info>
 
 Secara default, filestore berfungsi sebagai jembatan antara S3 dan layanan lain di Overleaf. Namun, di Overleaf CE atau Server Pro, semua file disimpan secara lokal secara default. Karena itu, Overleaf memperkenalkan metode yang cukup rumit.
 
@@ -73,7 +83,7 @@ switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
 }
 ```
 
-Pada saat yang sama, `data/history` juga digunakan oleh layanan history. Dengan cara ini, keduanya dapat berbagi data yang sama di antara microservice yang berbeda. Anda perlu menambahkan volume `history-v1-buckets` ini ke layanan filestore di lingkungan pengembangan. Jika tidak, **clsi tidak akan dapat mengambil file blob dari layanan filestore**.
+Sementara itu, `data/history` juga digunakan oleh layanan riwayat. Dengan cara ini, berbagai microservice dapat berbagi data yang sama. Itulah sebabnya layanan filestore di develop memasang volume `history-v1-buckets` milik history-v1. Tanpa volume itu, **clsi tidak akan dapat menarik file blob dari layanan filestore**.
 
 ```yml title="develop/docker-compose.yml" wrap
   filestore:
@@ -91,16 +101,16 @@ Pada saat yang sama, `data/history` juga digunakan oleh layanan history. Dengan 
       - history-v1-buckets:/buckets
 ```
 
-Anda juga perlu menambahkan nama BUCKET ke pengaturan `dev.env`:
+filestore menemukan bucket melalui pengaturan berikut di `dev.env`:
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
 OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 ```
 
-### Menggunakan Subdirektori
+### Menggunakan Subdirektori {#use-subdirectories}
 
-Filestore menggunakan useSubdirectories bernilai true secara default. Namun, di lingkungan pengembangan, history v1 akan <strong>meratakan (flatten) semua data.</strong> Hal ini menimbulkan konflik. Untuk memperbaikinya, Anda perlu menambahkan baris berikut:&#x20;
+filestore selalu membaca blob riwayat dengan subdirektori (`services/filestore/app/js/KeyBuilder.js:58`, `:70`). Image produksi mengaktifkan `useSubdirectories` untuk history-v1 (`server-ce/config/production.json`), tetapi konfigurasi default history-v1 tidak, sehingga dalam pengembangan history-v1 akan <strong>meratakan semua data.</strong> Karena itu `dev.env` menetapkan `NODE_CONFIG` untuk history-v1:&#x20;
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
@@ -108,7 +118,7 @@ OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
 ```
 
-Di history v1, semua file `project_blobs` awalnya disimpan seperti ini:
+Tanpa pengaturan itu, history-v1 menyimpan file `project_blobs` seperti ini:
 
 ```bash wrap
 node@43eb5dac5b1b:/buckets/project_blobs$ ls
@@ -120,4 +130,4 @@ node@43eb5dac5b1b:/buckets/project_blobs$ ls
 
 ```
 
-Anda perlu mengatur useSubdirectories ke `true` untuk mengubahnya ke mode subdirektori. Sekarang, karakter `_` asli dalam blob akan diganti dengan `/` .
+Dengan `useSubdirectories` bernilai `true`, `_` dalam nama-nama ini menjadi `/`, sehingga setiap blob disimpan dalam subfolder.

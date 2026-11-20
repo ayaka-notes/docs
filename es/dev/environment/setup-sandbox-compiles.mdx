@@ -3,17 +3,32 @@ title: Configurar compilaciones en sandbox
 icon: box-archive
 ---
 
-Hay algunas diferencias entre el entorno de desarrollo y el de producción si quieres configurar compilaciones en sandbox para desarrollo. Hay 3 cosas que debes tener en cuenta:
+Las compilaciones en sandbox funcionan un poco distinto en el entorno de desarrollo que en la imagen de producción. El entorno de desarrollo ya las tiene configuradas; esta página explica la configuración y tres cosas que hay que tener en cuenta:
 
 * Problema de permisos de archivos
 * Volumen compartido entre history-v1 y filestore
 * Problema de subdirectorios
 
-### Habilitar compilaciones en sandbox
+### Habilitar compilaciones en sandbox {#enable-sandbox-compiles}
 
-Aquí solo tenemos que habilitar las compilaciones en sandbox igual que en Overleaf CE. Sin embargo, debemos prestar atención al usuario. En este caso lo establecemos en root.
+Las compilaciones en sandbox están activadas por defecto. `develop/docker-compose.yml` establece `SANDBOXED_COMPILES=true` para `clsi`, y `develop/dev.env` contiene el resto:
 
-En el entorno de producción usamos www-data como usuario compartido entre el contenedor de Overleaf y el contenedor de compilación de TeX. Sin embargo, en el entorno de desarrollo, node es el usuario predeterminado del contenedor y no existe ningún usuario www-data con el que enlazarlo. Por eso usamos root como solución alternativa.
+```dotenv title="develop/dev.env" wrap
+#################
+#   Sandbox     #
+#################
+SANDBOXED_COMPILES=true
+SANDBOXED_COMPILES_HOST_DIR_COMPILES=${PWD}/compiles
+SANDBOXED_COMPILES_HOST_DIR_OUTPUT=${PWD}/output
+TEXLIVE_IMAGE_USER=tex
+ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2026.1, ghcr.io/ayaka-notes/texlive-full:2025.1
+ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2026, Texlive 2025
+TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2026.1
+```
+
+clsi no descarga imágenes por sí mismo, así que descárgalas una vez con `docker pull ghcr.io/ayaka-notes/texlive-full:2026.1` (y `:2025.1`).
+
+LaTeX se ejecuta en los contenedores hermanos como `TEXLIVE_IMAGE_USER`. En el entorno de desarrollo es `tex`, que también es el valor por defecto de clsi (`services/clsi/config/settings.defaults.cjs:154`). La imagen de producción usa `www-data` en su lugar cuando `SANDBOXED_COMPILES_SIBLING_CONTAINERS=true` (`server-ce/config/env.sh:15-21`), porque allí los archivos los crea el usuario `www-data` del contenedor de Overleaf.
 
 <Warning>
 
@@ -21,22 +36,11 @@ No uses tu propia imagen compilada; podrías encontrarte con una serie de errore
 
 </Warning>
 
-```dotenv wrap
-#################
-#   Sandbox     #
-#################
-SANDBOXED_COMPILES=true
-TEXLIVE_IMAGE_USER=root
-ALL_TEX_LIVE_DOCKER_IMAGES=ghcr.io/ayaka-notes/texlive-full:2025.1, ghcr.io/ayaka-notes/texlive-full:2024.1
-ALL_TEX_LIVE_DOCKER_IMAGE_NAMES=Texlive 2025, Texlive 2024
-TEX_LIVE_DOCKER_IMAGE=ghcr.io/ayaka-notes/texlive-full:2025.1
-```
+### Corregir los permisos de archivos {#fix-file-permissions}
 
-### Corregir los permisos de archivos
+El contenedor de clsi arranca como root, asigna las carpetas `compiles`, `output` y `cache` al usuario `node` (uid `1000`) y luego ejecuta clsi como `node` (`services/clsi/entrypoint.sh`). Por eso `develop/compiles` en el host pertenece al uid `1000`, el mismo uid que `tex` en el entorno de desarrollo (consulta el comentario en `develop/pandoc/Dockerfile`). Con la configuración anterior, el entorno de desarrollo compila sin ningún cambio de permisos.
 
-LaTeX se ejecuta en los contenedores hermanos como el usuario especificado en la variable de entorno `TEXLIVE_IMAGE_USER`. En el ejemplo anterior está establecida en `root`, que tiene el uid `0`. Esto genera un problema con los permisos anteriores, ya que el usuario root no tiene permiso para escribir en las subcarpetas de `compiles`.
-
-Una solución rápida es dar al grupo `root` la propiedad y permisos de lectura y escritura sobre `compiles`, con `setgid` establecido para que las nuevas subcarpetas también hereden esta propiedad:
+Si en cambio estableces `TEXLIVE_IMAGE_USER=root`, root (uid `0`) no tiene permiso para escribir en las subcarpetas de `compiles`. En ese caso, da al grupo `root` la propiedad y permiso de escritura sobre `compiles`, con `setgid` activado para que las nuevas subcarpetas hereden esta propiedad:
 
 ```bash title="bash"
 sudo chown -R 1000:root compiles
@@ -46,7 +50,13 @@ sudo chmod g+s compiles
 
 Para obtener documentación detallada, consulta `services/clsi/README.md`.
 
-### Volumen compartido entre history-v1 y filestore
+### Volumen compartido entre history-v1 y filestore {#volume-share-between-history-v1-and-filestore}
+
+<Info>
+
+La configuración de esta sección y de la siguiente ya está en `develop/docker-compose.yml` y `develop/dev.env`. Solo importa con `S3_ENABLED=false` en `develop/dev.rc`. Con el valor por defecto `S3_ENABLED=true`, filestore e history-v1 guardan estos archivos en buckets de RustFS (`develop/s3/docker-compose.yml`).
+
+</Info>
 
 De forma predeterminada, filestore actúa como puente entre S3 y los demás servicios de Overleaf. Sin embargo, en Overleaf CE o Server Pro, todos los archivos se almacenan localmente de forma predeterminada. Por ello, Overleaf introdujo un método muy ingenioso.
 
@@ -73,7 +83,7 @@ switch (process.env.OVERLEAF_FILESTORE_BACKEND) {
 }
 ```
 
-Al mismo tiempo, `data/history` también lo usa el servicio de historial. De esta forma, pueden compartir los mismos datos entre distintos microservicios. Debes añadir este volumen `history-v1-buckets` a tu servicio filestore en desarrollo. De lo contrario, **clsi no podrá obtener los archivos blob del servicio filestore**.
+Al mismo tiempo, `data/history` también lo usa el servicio de historial. De este modo, distintos microservicios pueden compartir los mismos datos. Por eso el servicio filestore en develop monta el volumen `history-v1-buckets` de history-v1. Sin él, **clsi no podrá obtener los archivos blob del servicio filestore**.
 
 ```yml title="develop/docker-compose.yml" wrap
   filestore:
@@ -91,16 +101,16 @@ Al mismo tiempo, `data/history` también lo usa el servicio de historial. De est
       - history-v1-buckets:/buckets
 ```
 
-También debes añadir el nombre del BUCKET a la configuración de `dev.env`:
+filestore encuentra los buckets mediante esta configuración en `dev.env`:
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
 OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 ```
 
-### Usar subdirectorios
+### Usar subdirectorios {#use-subdirectories}
 
-Filestore usa useSubdirectories con valor true de forma predeterminada; sin embargo, en desarrollo, history v1 <strong>aplana todos los datos.</strong> Esto provoca algunos conflictos. Para solucionarlo, debes añadir lo siguiente:&#x20;
+filestore siempre lee los blobs del historial con subdirectorios (`services/filestore/app/js/KeyBuilder.js:58`, `:70`). La imagen de producción activa `useSubdirectories` para history-v1 (`server-ce/config/production.json`), pero la configuración por defecto de history-v1 no, así que en desarrollo history-v1 <strong>aplanaría todos los datos.</strong> Por eso `dev.env` establece `NODE_CONFIG` para history-v1:&#x20;
 
 ```dotenv title="develop/dev.env"
 OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET='/buckets/project_blobs'
@@ -108,7 +118,7 @@ OVERLEAF_EDITOR_BLOBS_BUCKET='/buckets/blobs'
 NODE_CONFIG='{"persistor":{"useSubdirectories":true}}'
 ```
 
-En history v1, todos los archivos de `project_blobs` se almacenan originalmente así:
+Sin ello, history-v1 guarda los archivos de `project_blobs` así:
 
 ```bash wrap
 node@43eb5dac5b1b:/buckets/project_blobs$ ls
@@ -120,4 +130,4 @@ node@43eb5dac5b1b:/buckets/project_blobs$ ls
 
 ```
 
-Debes establecer useSubdirectories en `true` para cambiar al modo de subdirectorios. Ahora, el `_` original en el blob se sustituirá por `/`.
+Con `useSubdirectories` en `true`, el `_` de estos nombres se convierte en `/`, de modo que cada blob se guarda en subcarpetas.
