@@ -1,0 +1,62 @@
+---
+title: Collection Tokens
+icon: key
+---
+
+`tokens` contient les jetons à usage unique : le secret contenu dans un lien qui permet à quelqu'un de définir un mot de passe. Un document correspond à un jeton. Il n'y a pas de modèle Mongoose ; web écrit la collection via `services/web/app/src/Features/Security/OneTimeTokenHandler.mjs` avec le pilote natif.
+
+#### Champs {#fields}
+
+| Champ | Type | Signification | Source |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Identifiant du document. | `OneTimeTokenHandler.mjs:40` |
+| `use` | String | À quoi sert le jeton, voir [Usages](#uses) ci-dessous. Chaque recherche filtre sur ce champ. | `OneTimeTokenHandler.mjs:41` |
+| `token` | String | Le secret du lien : 32 octets aléatoires sous forme de 64 caractères hexadécimaux, stocké tel quel. | `OneTimeTokenHandler.mjs:38,42` |
+| `data` | Object | Ce que représente le jeton, renvoyé lors de son utilisation. | `OneTimeTokenHandler.mjs:43` |
+| `data.user_id` | String | Identifiant de l'utilisateur, écrit sous forme de chaîne par chaque appelant. | `services/web/app/src/Features/PasswordReset/PasswordResetHandler.mjs:27`, `services/web/app/src/Features/User/UserRegistrationHandler.mjs:117`, `services/web/modules/admin-tools/app/src/AdminUserManager.mjs:79` |
+| `data.email` | String | Adresse e-mail de l'utilisateur au moment de la création du jeton. Une réinitialisation de mot de passe recherche l'utilisateur par cette adresse principale (`PasswordResetHandler.mjs:66-70`). | comme `data.user_id` |
+| `createdAt` | Date | Date de création. L'index TTL supprime le jeton 90 jours plus tard. | `OneTimeTokenHandler.mjs:36,44` |
+| `expiresAt` | Date | `createdAt` plus `expiresIn` secondes : 1 heure par défaut, 1 semaine pour un lien d'activation. Les recherches ignorent un jeton après cette date. | `OneTimeTokenHandler.mjs:35-37,45` |
+| `peekCount` | Number | Nombre de fois où le jeton a été consulté sans être utilisé. Chaque `peekValueFromToken` ajoute 1 ; à 4 (`MAX_PEEKS`), le jeton cesse de fonctionner. | `OneTimeTokenHandler.mjs:8-31,107` |
+| `usedAt` | Date | Date à laquelle le jeton a été utilisé ou annulé. Les recherches ignorent un jeton qui en a une. | `OneTimeTokenHandler.mjs:51-104` |
+
+#### Usages {#uses}
+
+| `use` | Fonctionnalité | Expiration | Code |
+| ----- | ------- | ------ | ---- |
+| `password` | E-mail de réinitialisation du mot de passe, depuis la page « mot de passe oublié » | 1 heure | `PasswordResetHandler.mjs:14-42` |
+| `password` | Lien d'activation : un compte créé avec un mot de passe aléatoire, puis un lien pour en définir un. Utilisé par l'inscription publique (`services/web/modules/login-register/app/src/RegisterController.mjs:65`), la page d'inscription admin de `user-activate` (`services/web/modules/user-activate/app/src/UserActivateController.mjs:27-30`) et le script `create-user` (`services/web/modules/server-ce-scripts/scripts/create-user.mjs:21`) | 1 semaine | `UserRegistrationHandler.mjs:97-130` |
+| `password` | Lien d'activation ou de réinitialisation du mot de passe envoyé depuis le panneau d'administration (module `admin-tools`) | 1 semaine (activation), 1 heure (réinitialisation) | `AdminUserManager.mjs:76-103,196-206` |
+| `email_confirmation` | Lien de confirmation d'adresse e-mail. Uniquement lu : plus rien dans ce dépôt ne crée de tels jetons, car la confirmation envoie désormais un code à 6 chiffres (`services/web/app/src/Features/User/UserEmailsConfirmationHandler.mjs:15-35`) | | `UserEmailsConfirmationHandler.mjs:12,37-66` |
+
+#### Qui écrit {#who-writes-it}
+
+| Code | Rôle |
+| ---- | ------------ |
+| `OneTimeTokenHandler.mjs:34-49` (`getNewToken`) | Insère un jeton. Appelants : `PasswordResetHandler.mjs:28`, `UserRegistrationHandler.mjs:115-119`, `AdminUserManager.mjs:77-81`. |
+| `OneTimeTokenHandler.mjs:8-32` (`peekValueFromToken`) | Renvoie `data` d'un jeton valide et ajoute 1 à `peekCount`. Utilisé à l'ouverture de la page de réinitialisation du mot de passe (`services/web/app/src/Features/PasswordReset/PasswordResetController.mjs:195-208`), de nouveau lors de la définition du nouveau mot de passe (`PasswordResetHandler.mjs:94-96`), et par la confirmation d'e-mail (`UserEmailsConfirmationHandler.mjs:38-41`). |
+| `OneTimeTokenHandler.mjs:75-88` (`expireToken`) | Définit `usedAt` sur un jeton : après la définition d'un nouveau mot de passe (`PasswordResetHandler.mjs:44-48,119`) ou la confirmation d'une adresse e-mail (`UserEmailsConfirmationHandler.mjs:65`). |
+| `OneTimeTokenHandler.mjs:90-104` (`expireAllTokensForUser`) | Définit `usedAt` sur chaque jeton `password` ouvert d'un utilisateur, quand l'utilisateur change son mot de passe dans les paramètres (`services/web/app/src/Features/User/UserController.mjs:146-149`) ou qu'un administrateur le définit dans le panneau d'administration (`AdminUserManager.mjs:479-488`). |
+
+#### Qui lit {#who-reads-it}
+
+| Code | Rôle |
+| ---- | ------------ |
+| `PasswordResetHandler.mjs:50-70,94-119` | Transforme un jeton de réinitialisation ou d'activation en utilisateur, puis définit le mot de passe. La page d'activation de `user-activate` se contente de transmettre le jeton à ce formulaire. |
+| `UserEmailsConfirmationHandler.mjs:37-66` | Confirme une adresse e-mail à partir d'un jeton `email_confirmation` de l'utilisateur connecté. |
+| `AdminUserManager.mjs:213-223` (module `admin-tools`) | Trouve le jeton d'activation ouvert d'un utilisateur, pour afficher de nouveau le lien d'activation dans le panneau d'administration. Lit `db.tokens` directement. |
+
+#### Index {#indexes}
+
+| Nom | Clés | Options | Migration |
+| ---- | ---- | ------- | --------- |
+| `token_1_use_1` | `{ token: 1, use: 1 }` | unique | `20190912145031_create_tokens_indexes.mjs` |
+| `createdAt_1` | `{ createdAt: 1 }` | TTL, `expireAfterSeconds: 7776000` (90 jours) | `20210407085118_token-expiry-with-ttl-index.mjs` |
+| `data.user_id_1` | `{ "data.user_id": 1 }` | | `20231113173237_tokens_user_id_index.mjs` |
+
+Les migrations se trouvent dans `tools/migrations/`.
+
+#### Remarques {#notes}
+
+* Un jeton utilisé ou expiré n'est pas supprimé tout de suite : il reste, avec `usedAt` ou un `expiresAt` passé, jusqu'à ce que l'index TTL le supprime 90 jours après `createdAt`.
+* `OneTimeTokenHandler` possède aussi `getValueFromTokenAndExpire` (`OneTimeTokenHandler.mjs:51-73`), mais rien ne l'appelle.
