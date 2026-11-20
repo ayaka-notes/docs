@@ -1,0 +1,53 @@
+---
+title: Project-History-Failures-samlingen
+icon: triangle-exclamation
+---
+
+`projectHistoryFailures` inneholder ett dokument per prosjekt der project-history ikke kunne behandle historikkoppdateringene, eller som den startet en ny synkronisering for. Dokumentet slettes igjen så snart behandlingen fungerer. project-history skriver den i `services/project-history/app/js/ErrorRecorder.js`; typen står i `services/project-history/app/js/mongo-types.ts:3-24`. Web har også et Mongoose-skjema for den (`services/web/app/src/models/ProjectHistoryFailure.mjs:5-19`), men ingen web-kode bruker den modellen.
+
+#### Felter {#fields}
+
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Opprettes av upserten. | `ErrorRecorder.js:45-60` |
+| `project_id` | String | Prosjekt-id-en, lagret som en streng, ikke som ObjectId. | `ErrorRecorder.js:46`, `mongo-types.ts:5` |
+| `error` | String | Den siste feilen, som `error.toString()`. | `ErrorRecorder.js:37` |
+| `stack` | String | Stack for den siste feilen. | `ErrorRecorder.js:38` |
+| `queueSize` | Number | Oppdateringer som ventet i prosjektets Redis-kø ved den siste feilen (`services/project-history/app/js/UpdatesProcessor.js:375`); `-1` når feilen kom fra oppstart av en ny synkronisering (`services/project-history/app/js/SyncManager.js:75`, `96`). | `ErrorRecorder.js:36` |
+| `ts` | Date | Tidspunkt for den siste feilen. | `ErrorRecorder.js:39` |
+| `attempts` | Number | Antall feil registrert siden dokumentet ble opprettet. | `ErrorRecorder.js:49` |
+| `history` | Array of Object | De 10 siste hendelsene, nyeste først: feilposter `{ queueSize, error, stack, ts }` og starter av ny synkronisering `{ resyncStartedAt }`. | `ErrorRecorder.js:50-56`, `92-98` |
+| `resyncStartedAt` | Date | Når den siste nye synkroniseringen startet. | `ErrorRecorder.js:90` |
+| `resyncAttempts` | Number | Antall nye synkroniseringer startet siden dokumentet ble opprettet. | `ErrorRecorder.js:91` |
+| `forceDebug` | Boolean | Settes av project-history `POST /project/:project_id/force` (`?clear=true` setter den til `false`). Så lenge `true`, logges og ignoreres en ops-out-of-order-feil i den lagrede chunken (`UpdatesProcessor.js:574-592`). | `ErrorRecorder.js:72-82` |
+| `requestCount` | Number | I web-skjemaet (`ProjectHistoryFailure.mjs:16`). Bare `ErrorRecorder.getLastFailure` øker den, og ingenting kaller den funksjonen. | `ErrorRecorder.js:131-138` |
+
+#### Hvem skriver {#who-writes-it}
+
+| Kode | Hva den gjør |
+| ---- | ------------ |
+| `services/project-history/app/js/ErrorRecorder.js:34-66` | `record`: upsert av feilen, `attempts` +1, oppføring lagt til i `history`. Kalles når behandlingen av et prosjekts oppdateringer feiler (`UpdatesProcessor.js:91`, `169`, `242`, `293`, `345`) og når en ny synkronisering ikke kan starte (`SyncManager.js:75`, `96`). |
+| `ErrorRecorder.js:86-102` | `recordSyncStart`: upsert, `resyncStartedAt`, `resyncAttempts` +1, oppføring lagt til i `history`, hver gang en ny synkronisering starter (`SyncManager.js:104`). |
+| `ErrorRecorder.js:68-70` | `clearError`: sletter dokumentet etter en vellykket flush (`UpdatesProcessor.js:101`, `194`, `259`, `355`), ved project-history `DELETE /project/:project_id` (`services/project-history/app/js/HttpController.js:1386`) og for en ugyldig prosjekt-id under et nytt forsøk (`services/project-history/app/js/RetryManager.js:161`). |
+| `ErrorRecorder.js:72-82` | `setForceDebug`: upsert av `forceDebug` (`HttpController.js:1016-1035`, rute ved `services/project-history/app/js/Router.js:82`). |
+| `ErrorRecorder.js:109-119` | `cloneFailure`: kopierer dokumentet til et annet prosjekt, for project-history `POST /project/:project_id/clone` (`HttpController.js:135`), som ingenting i web kaller. |
+
+#### Hvem leser {#who-reads-it}
+
+| Kode | Hva den gjør |
+| ---- | ------------ |
+| `RetryManager.js:113-126` | Laster inn alle feil for cron-jobbene for nye forsøk (`server-ce/config/crontab-history`, project-history `POST /retry/failures`). Soft-jobben behandler køen på nytt; hard-jobben synkroniserer prosjektet på nytt, som hard synkronisering når `resyncAttempts` er minst 1 og feilen ikke er en pågående synkronisering (`RetryManager.js:30-31`, `35-56`, `106-111`). |
+| `services/project-history/app/js/FlushManager.js:73-82` | Flush av alle prosjekter hopper over prosjekter som har en feil. |
+| `UpdatesProcessor.js:578-592` | Leser `forceDebug`. |
+| `ErrorRecorder.js:124-129`, `140-145` | `getFailureRecord` og `getFailedProjects`: brukt av `GET /project/:project_id/debug-info` (`HttpController.js:571`) og `GET /status/failures`, `GET /status/failures-full` (`Router.js:88-90`). |
+
+#### Indekser {#indexes}
+
+| Navn | Nøkler | Alternativer | Migrering |
+| ---- | ---- | ------- | --------- |
+| `project_id_1` | `{ project_id: 1 }` |  | `tools/migrations/20190912145018_create_projectHistoryFailures_indexes.mjs` |
+
+#### Merknader {#notes}
+
+* Et dokument blir liggende til en flush av prosjektet lykkes eller prosjektet slettes (`clearError` ovenfor), så hvert dokument markerer et prosjekt der siste flush eller nye synkronisering ennå ikke har lykkes.
+* Feilstrenger som begynner med `OError:`, returneres som `Error:` (`ErrorRecorder.js:18-26`); den lagrede verdien endres ikke.

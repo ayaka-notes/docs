@@ -1,0 +1,53 @@
+---
+title: Rooms 集合
+icon: comments
+---
+
+`rooms` 中项目的每个聊天房间对应一个文档：项目聊天，或一个审阅评论线程。只有 chat 服务写入它，位置在 `services/chat/app/js/Features/Threads/ThreadManager.js`。没有 Mongoose schema。房间的消息保存在 [messages](/zh-CN/dev/data-model/messages-collection) 集合中。
+
+#### 字段 {#fields}
+
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 房间 ID。`messages.room_id` 指向这里。 | `ThreadManager.js:57-61` |
+| `project_id` | ObjectId | 房间所属的项目。 | `ThreadManager.js:43-54` |
+| `thread_id` | ObjectId | 仅存在于评论线程上：评论的 ID，与 `docs.ranges.comments` 中该评论的 `id` 和 `op.t` 相同（参见 [docs](/zh-CN/dev/data-model/docs-collection)）。项目聊天房间没有此字段。 | `ThreadManager.js:38-55`, `services/docstore/app/js/RangeManager.js:54-57` |
+| `resolved` | Object | 线程被解决时设置，重新打开时移除。没有此字段的线程处于打开状态。 | `ThreadManager.js:94-123` |
+| `resolved.user_id` | String | 解决该线程的用户 ID。以字符串而非 ObjectId 存储：请求体只校验其为有效 ID，不做转换。 | `ThreadManager.js:103`, `services/chat/app/js/Features/Messages/MessageHttpSchemas.js:70` |
+| `resolved.ts` | Date | 线程被解决的时间。 | `ThreadManager.js:104` |
+
+#### 写入方 {#who-writes-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `ThreadManager.js:31-63` `findOrCreateThread` | Upsert 房间。每次发送、读取、编辑和删除消息时都会运行（`services/chat/app/js/Features/Messages/MessageHttpController.js:183,204,227,236,245,280,301`），因此评论的第一条消息会创建其线程房间，读取项目聊天会创建项目聊天房间。 |
+| `ThreadManager.js:94-109` `resolveThread` | 设置 `resolved`。由 Web 中的 track-changes 模块（`services/web/modules/track-changes/app/src/TrackChangesController.mjs:142`）、历史恢复（`services/web/app/src/Features/History/RestoreManager.mjs:276`）和 mcp-server 模块（`services/web/modules/mcp-server/app/src/CommentTools.mjs:159`）调用。 |
+| `ThreadManager.js:111-123` `reopenThread` | 移除 `resolved`。调用方相同：`TrackChangesController.mjs:160`、`RestoreManager.mjs:285`、`CommentTools.mjs:183`。 |
+| `ThreadManager.js:154-172` `duplicateThread` | 插入一个带有新 `thread_id` 的新房间，并复制 `resolved`。在从历史恢复文档时使用（`RestoreManager.mjs:233`）。 |
+| `ThreadManager.js:12-29` `cloneThreads` | 把一个项目的所有线程房间复制到另一个项目，使用新的 `_id` 和相同的 `thread_id`。在连同范围一起复制项目时使用（`services/web/app/src/Features/Project/ProjectDuplicator.mjs:197`）。 |
+| `ThreadManager.js:125-131` `deleteThread` | 删除一个线程房间；随后控制器删除其消息（`MessageHttpController.js:167-175`）。由 track-changes 模块调用（`TrackChangesController.mjs:173`）。 |
+| `ThreadManager.js:133-137` `deleteAllThreadsInProject` | 删除项目的所有房间（`MessageHttpController.js:261-273`）。在已删除项目过期时调用（`services/web/app/src/Features/Project/ProjectDeleter.mjs:391`）。 |
+
+#### 读取方 {#who-reads-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `ThreadManager.js:65-78` `findAllThreadRooms` | 列出项目的线程房间及其消息（`MessageHttpController.js:71-81`），供 track-changes 模块的审阅面板（`TrackChangesController.mjs:82`）和 mcp-server 模块（`CommentTools.mjs:83`）使用。 |
+| `ThreadManager.js:139-152` `getResolvedThreadIds` | 返回已解决的线程 ID。Web 会把某个文档的这些 ID 加到它发送给 document-updater 的文档中（`services/web/app/src/Features/Documents/DocumentController.mjs:69-77`）。 |
+| `ThreadManager.js:174-188` `findThread` | 一个线程及其消息（`MessageHttpController.js:97-120`）。Web 用它让审阅者只能修改自己发起的线程（`services/web/app/src/Features/Authorization/AuthorizationManager.mjs:409`）。 |
+| `ThreadManager.js:190-197` `findThreadsById` | 给定 ID 的线程数据，供历史恢复使用（`RestoreManager.mjs:259`）。 |
+
+#### 索引 {#indexes}
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `project_id_1_thread_id_1` | `{ project_id: 1, thread_id: 1 }` |  | `tools/migrations/20250206103037_create_rooms_projectId_threadId_index.mjs` |
+
+旧的 `project_id` 索引（`20190912145026_create_rooms_indexes.mjs`）已被 `20250205145327_drop_rooms_projectId_index.mjs` 删除。
+
+#### 说明 {#notes}
+
+* 一个项目最多只有一个没有 `thread_id` 的房间，即项目聊天。chat 服务用 `thread_id: { $exists: false }` 查找它（`ThreadManager.js:38-45`）。
+* 评论的已解决状态只保存在这里。Docstore 在保存范围之前会去掉 `op.resolved`（`services/docstore/app/js/RangeManager.js:59-61`）。
+* 复制项目后，同一个 `thread_id` 会存在于两个项目中。请始终同时按 `project_id` 和 `thread_id` 查询，就像 chat 服务那样。
+* 已删除项目的房间会一直保留，直到已删除项目过期。
