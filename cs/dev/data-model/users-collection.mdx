@@ -3,84 +3,165 @@ title: Kolekce Users
 icon: user
 ---
 
-`User` představuje jeden uživatelský účet v systému Overleaf. Ukládá autentizační údaje, příznaky funkcí, předvolby editoru, přístupová oprávnění a metadata o aktivitě.
+`users` obsahuje jeden dokument na účet. Ukládá přihlašovací údaje, profil, nastavení editoru, funkce a aktivitu. Schéma je `services/web/app/src/models/User.mjs`; většina zápisů prochází přes `services/web/app/src/Features/User/UserUpdater.mjs`. Ve sloupci Zdroj je `User.mjs:N` řádek tohoto schématu, ostatní názvy souborů bez cesty jsou v `services/web/app/src/Features/` a `modules/...` je v `services/web/`. Čísla řádků odpovídají `server-pro` v době psaní.
 
-#### Základní identita a autentizace
+#### Základní identita a autentizace {#core-identity-&-authentication}
 
-* `_id`: Jedinečný MongoDB ObjectId uživatele.
-* `email` / `emails`: Primární e-mail a historické záznamy e-mailů.
-* `hashedPassword`: Heslo zahashované pomocí BCrypt, používané pro lokální autentizaci.
-* `first_name` / `last_name`: Pole se jménem v profilu uživatele.
-* `role` / `isAdmin` / `adminRoles`: Příznaky role a administrátorských oprávnění.
-* `twoFactorAuthentication`: Konfigurace dvoufaktorové autentizace (je-li povolena).
-* `samlIdentifiers` / `thirdPartyIdentifiers`: Vazby na externí poskytovatele identity.
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id uživatele. Ostatní kolekce sem odkazují pomocí `user_id`, `owner_ref` a podobných polí. | MongoDB |
+| `email` | String | Primární e-mail. Jedinečný, i bez ohledu na velikost písmen (viz Indexy). | `User.mjs:26` |
+| `emails` | Pole objektů Object | Všechny adresy účtu. Primární je položka rovná `email`. | `User.mjs:27` |
+| `emails.email` | String | Adresa. | `User.mjs:29` |
+| `emails.reversedHostname` | String | Doména adresy, obráceně (`moc.elpmaxe`). Nastaví se při přidání adresy. | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | Kdy byla adresa přidána. | `User.mjs:31` |
+| `emails.confirmedAt` | Date | Kdy byla adresa poprvé potvrzena (pozdější potvrzení zachová dřívější datum). Moduly LDAP, SAML a OIDC nastavují `emails.0.confirmedAt` při vytváření účtu. | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | Čas posledního potvrzení adresy. | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | Propojení adresy s institucionálním SSO. Institucionální SSO není součástí CE. | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | Stav příslušnosti k instituci. Není součástí CE. | `User.mjs:39` |
+| `first_name` / `last_name` | String | Jméno v profilu, nejvýše 255 znaků. LDAP, SAML a OIDC je mohou aktualizovat při každém přihlášení. | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | Volný text, který uživatel zadává jako pracovní roli a instituci v nastavení účtu. `role` není oprávnění. | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | bcrypt hash místního hesla. Chybí u účtů bez hesla: přihlášení přes LDAP a SAML jej odstraní a migrace `20260511150000_reset_hardcoded_admin_password` odstraní známé výchozí heslo. | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | Správce webu. LDAP, SAML a OIDC jej mohou nastavit z atributu IdP při každém přihlášení. | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | Jemnější role správců. Čtou se jen tehdy, když je nastaveno `Settings.adminRolesEnabled`. | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Pole objektů Object | Propojení přihlášení SAML. Modul `saml` zapisuje `samlIdentifiers.0.providerId` (vždy `'1'`), `externalUserId` a `userIdAttribute`. | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Pole objektů Object | Propojení přihlášení OIDC, zapisovaná jádrem `ThirdPartyIdentityManager` pro modul `oidc`. | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`, `enrolledAt`, `secretEncrypted`. Pouze ve schématu: jádro CE ani naše moduly jej nepoužívají. | `User.mjs:239-243` |
 
-#### Stav a životní cyklus účtu
+#### Stav a životní cyklus účtu {#account-status-&-lifecycle}
 
-* `signUpDate`: Časové razítko vytvoření účtu.
-* `holdingAccount`: Zda účet čeká na potvrzení nebo je omezen.
-* `must_reconfirm`: Určuje, zda musí uživatel znovu potvrdit svůj e-mail.
-* `lastPrimaryEmailCheck`: Čas posledního ověření primárního e-mailu.
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | Kdy byl účet vytvořen. | `User.mjs:75` |
+| `suspended` | Boolean | `true`, když správce účet zakázal. `UserUpdater.suspendUser` jej nastaví a ukončí relace; modul `admin-tools` jej volá a může jej vrátit zpět. Každý vstupní bod, který není za relací (tokeny, podepsané odkazy, websockety, webhooky), jej musí kontrolovat. | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | `true` pro zástupný účet, který nedokončil registraci. Registrace jej nastaví na `false`; kontakty zástupné účty přeskakují. | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | Při hodnotě `true` přihlášení pošle uživatele místo do editoru na stránku opětovného potvrzení. Obnovení hesla jej vrátí na `false`. Nic v CE jej nenastavuje na `true`. | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | Kdy uživatel naposledy potvrdil, že primární e-mail je stále jeho, nebo jej změnil. Kontroluje to jen overleaf.com (`saas`): když je hodnota příliš stará, seznam projektů přesměruje na stránku kontroly primárního e-mailu. | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | Povinné. Id používané pro analytické události. `UserCreator` odmítne vytvořit uživatele bez něj; registrační cesty a moduly LDAP, SAML a OIDC předávají náhodné UUID (`UserRegistrationHandler.mjs:103`, `modules/login-register/app/src/RegisterController.mjs:127`). Migrace `20260424120000` a `20260616070000_back_fill_users_analyticsId` jej u starých účtů doplnily z `_id`. | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | Kdy byl odeslán uvítací e-mail. E-mail se plánuje jen při zapnuté funkci `saas`, takže CE jej nenastavuje. | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | Pouze ve schématu: jádro CE ani naše moduly je nepoužívají. | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | `id`, `accessToken`, `refreshToken` propojeného účtu overleaf.com v1. `overleaf.id` má jedinečný index; nic v CE tato pole nezapisuje. | `User.mjs:230-234` |
 
-#### Sledování přihlášení a aktivity
+#### Sledování přihlášení a aktivity {#login-&-activity-tracking}
 
-* `lastLoginIp`: IP adresa posledního úspěšného přihlášení.
-* `loginCount`: Celkový počet úspěšných přihlášení.
-* `loginEpoch`: Interní čítač přihlašovacích relací.
-* `lastLoggedIn`: Časové razítko posledního přihlášení.
-* `lastActive`: Časové razítko poslední zaznamenané aktivity.
-* `lastFailedLogin`: Časové razítko posledního neúspěšného pokusu o přihlášení.
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | IP posledního přihlášení. | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | Počet úspěšných přihlášení. | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | Čas posledního úspěšného přihlášení. | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | Zámek pro přihlášení: každý pokus o přihlášení hodnotu zvýší a dokument aktualizuje jen tehdy, pokud má stále přečtenou hodnotu, takže dvě souběžná přihlášení nemohou projít obě. Moduly LDAP, SAML a OIDC postupují stejně. | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | Čas posledního chybného hesla. | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | Kdy uživatel naposledy otevřel projekt. | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### Předvolby editoru (`ace`)
+#### Předvolby editoru (`ace`) {#editor-preferences-ace}
 
-Definuje uživatelské předvolby pro online editor:
+Stránka nastavení účtu je ukládá přes `UserController.updateUserSettings` (`UserController.mjs:460-530`).
 
-* `theme` / `overallTheme`: Motiv editoru a uživatelského rozhraní.
-* `fontSize`: Velikost písma v editoru.
-* `autoComplete`, `autoPairDelimiters`: Funkce asistence při úpravách.
-* `spellCheckLanguage`: Jazyk používaný pro kontrolu pravopisu.
-* `pdfViewer`: Zvolený backend prohlížeče PDF.
-* `syntaxValidation`, `mathPreview`, `breadcrumbs`: Funkce UX editoru.
-* `enableNewEditor`: Zda je povoleno nové uživatelské rozhraní editoru.
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | Klávesové zkratky. Stránka nastavení ukládá `default`, `vim` nebo `emacs`; výchozí hodnota schématu je `none`. | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | Motiv editoru. Výchozí `textmate`. | `User.mjs:92` |
+| `ace.overallTheme` | String | Motiv rozhraní. `system` přepíná mezi `lightTheme` a `darkTheme`; `light-` nebo prázdná hodnota používá `theme`. | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | Motivy editoru používané s `overallTheme: system`. Výchozí `textmate` a `overleaf_dark`. | `User.mjs:96-97` |
+| `ace.fontSize` | Number | Velikost písma editoru. Výchozí 12. | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | Písmo a výška řádku editoru. | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | Automatické doplňování a uzavírání závorek. Výchozí `true`. | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | Jazyk kontroly pravopisu. Výchozí `en`. Nový projekt jej převezme. | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | Prohlížeč PDF. Výchozí `pdfjs`. | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | Kontrola kódu. | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | Náhled matematiky. Výchozí `true`. | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | Drobečková navigace nad editorem. Výchozí `false`. | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | Možnosti zobrazení editoru. Výchozí `false`, `true`, `false`, `false`, `true`. | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` nebo `simple`. | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | Nastavení správce citací: `enabled` (výchozí `true`), `groups` (pole `{ id }`), `disablePersonalLibrary`. | `User.mjs:10-22`, `:114-116` |
 
-#### Příznaky funkcí a limity (`features`)
+#### Příznaky funkcí a limity (`features`) {#feature-flags-&-limits-features}
 
-Řídí dostupnost funkcí pro uživatele:
+`features` je výsledek výpočtu, nic k ruční úpravě. `FeaturesUpdater` vychází z `Settings.defaultFeatures`, sloučí každou nevypršelou položku `featuresOverrides` a zapíše výsledek spolu s `featuresUpdatedAt` (`FeaturesUpdater.mjs:220-300`, `UserFeaturesUpdater.mjs:10-24`). Produkční image nastavuje jako výchozí `collaborators`, `dropbox`, `versioning`, `compileTimeout`, `compileGroup`, `trackChanges` a `references` (`server-ce/config/settings.js:301-309`); ostatní klíče zůstávají nenastavené.
 
-* `collaborators`: Maximální počet spolupracovníků (`-1` = neomezeně).
-* `versioning`, `trackChanges`: Funkce historie a sledování změn.
-* `dropbox`, `github`, `gitBridge`: Dostupnost externích integrací.
-* `compileTimeout`: Maximální doba kompilace (v sekundách).
-* `compileGroup`: Přiřazená skupina prostředků pro kompilaci.
-* `aiErrorAssistant`: Příznak AI asistenta pro chyby kompilace. Starší účty jej mohou stále mít, stejně jako `aiErrorAssistant.enabled` na nejvyšší úrovni, ale tato pole již nejsou součástí schématu a Ayakaleaf Pro nečte ani jedno z nich. Asistent pro chyby se zapíná pomocí nastavení AI instance a uživatelského `aiFeatures.enabled` (pokud není nastaveno, je AI zapnuta), stejně jako AI asistent.
+V Ayakaleaf Pro panel správce vypíná funkce pro jednotlivé uživatele. Modul `admin-tools` je ukládá jako položku `featuresOverrides` s `note: 'admin-panel'` (`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`) a modul `instance-features` považuje nenastavený klíč za zapnutý (`modules/instance-features/app/src/UserFeatures.mjs:12-14`).
 
-#### Řízení přístupu a oprávnění zaměstnanců (`staffAccess`)
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | Maximální počet spolupracovníků na projekt, `-1` = neomezeně. | `User.mjs:119` |
+| `features.versioning` | Boolean | Historie. | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Synchronizace s Dropboxem, synchronizace s GitHubem, GitLabem a Gitea a přístup přes Git. Kontrolují je tyto moduly, viz `requireUserFeature`. `gitlab` a `gitea` (od v6.3.4) nemají výchozí hodnotu: zůstávají nenastavené, což se počítá jako zapnuto, dokud je správce nevypne na kartě Features. Migrace `20230817081910_back_fill_gitBridge_feature_server_pro` nastavila `gitBridge: true` všem uživatelům. | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | Časový limit kompilace v sekundách. `COMPILE_TIMEOUT` nastavuje výchozí hodnotu. | `User.mjs:132` |
+| `features.compileGroup` | String | Skupina kompilace, například `standard`. | `User.mjs:136` |
+| `features.references` | Boolean | Zastaralé. U starších účtů stále zapíná `referencesSearch` a `mendeley`. | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | Sledování změn. Modul `track-changes` jej kontroluje u vlastníka projektu. | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | Propojení se správci citací. | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | Přepínače pro vyhledávání citací, paletu symbolů a offline režim. | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | Úroveň využití AI. Výchozí `basic`. | `User.mjs:159` |
+| `featuresOverrides` | Pole objektů Object | Změny výchozích hodnot pro konkrétního uživatele. Každá položka má `createdAt`, `expiresAt` (po tomto datu se ignoruje), `note` a `features` (stejné klíče jako výše, plus `templates`). | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | Kdy bylo `features` naposledy vypočteno. | `User.mjs:197` |
+| `featuresEpoch` | String | Kopie `Settings.featuresEpoch` při posledním výpočtu, slouží k obnově starých účtů. | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-Definuje jemně odstupňovaná přístupová práva zaměstnanců nebo vydavatelů:
+AI asistent a asistent chyb nejsou klíčem `features`. Řídí se nastavením AI instance a `aiFeatures.enabled`, viz níže.
 
-* Oprávnění k metrikám a správě pro vydavatele, instituce, skupiny, administrátory a experimenty.
+#### Integrace {#integrations}
 
-#### Registrace a integrace
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` vypne AI asistenta a asistenta chyb pro tohoto uživatele. Výchozí `true`. | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | Šifrované přihlašovací údaje propojeného správce citací, zapisované modulem `tpr-webmodule` (`{ encrypted }` pro Mendeley, `{ apiKeyEncrypted }` pro Zotero). Při odpojení se odstraní. | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Id účtu Dropbox. Není ve schématu: modul `dropbox` jej zapisuje přímo. Jedinečné, takže jeden účet Dropbox je propojen s jedním uživatelem. Jádro jej používá k nalezení uživatelů k synchronizaci. | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | Šifrovaný obnovovací token Dropboxu. Není ve schématu, zapisuje jej modul `dropbox`. Celý objekt `dropbox` se při odpojení odstraní. | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | Kurzor Dropboxu `list_folder` složky aplikace uživatele, aby další stažení četlo jen novější změny. Není ve schématu: zapisuje jej third-party-datastore, jen dokud je uživatel stále propojen se stejným účtem Dropbox. | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | Skupinové SSO (pole `sso` s `groupId`, `linkedAt`, `primary`) a pole spravovaných uživatelů (`managedBy`, `enrolledAt`). Skupinová předplatná nejsou součástí CE. | `User.mjs:56-72` |
+| `writefull` | Object | Stav Writefull: `initialized`, `autoCreatedAccount`, `isPremium`, `premiumSource`. Jádro jej zapisuje jen při zapnuté funkci `saas`, tedy ne v CE. | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | Pouze ve schématu: jádro CE ani naše moduly je nepoužívají. | `User.mjs:249-255` |
 
-* `enrollment.sso`: Propojené SSO registrace.
-* `refProviders`: Integrace poskytovatelů citací.
-* `writefull`: Stav účtu asistenta pro psaní Writefull.
-* `dsMobileApp`: Konfigurace mobilní aplikace (je-li k dispozici).
+#### Programy a experimenty {#programs-&-experiments}
 
-#### Programy a experimenty
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | Uživatel se připojil k beta programu. | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Alfa program. Migrace `20220826104236_disable_alpha_beta_program` nastavila jej i `betaProgram` všem uživatelům na `false`. | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Program Labs. Nic v CE je nenastavuje; migrace `20260615090000_back_fill_labsProgram` nastavila `labsProgram: false` tam, kde chybělo. | `User.mjs:228-229` |
+| `splitTests` | Mixed | Přiřazení do A/B testů podle názvu testu. | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: Účast v programech předběžného přístupu.
-* `labsExperiments`: Povolené experimentální funkce.
-* `awareOfV2`: Zda uživatel vzal na vědomí editor V2.
+#### Doporučení a tutoriály {#referrals-&-tutorials}
 
-#### Doporučení a tutoriály
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | Náhodné id doporučení, generované při vytvoření. | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | Pole ObjectId / Number | Uživatelé, kteří se zaregistrovali s tímto id doporučení. | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | Pro každý klíč tutoriálu: `{ state, updatedAt, postponedUntil }`. | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`, `refered_users`, `refered_user_count`: Sledování doporučení.
-* `completedTutorials`: Postup v úvodních a funkčních tutoriálech.
+#### Indexy {#indexes}
+
+Všechny pocházejí z migrací označených `server-ce` v `tools/migrations/`.
+
+| Název | Klíče | Možnosti | Migrace |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### Poznámky {#notes}
+
+* `autoIndex` v Mongoose je vypnutý (`services/web/app/src/infrastructure/Mongoose.mjs:7`), takže indexy vytvářejí jen výše uvedené migrace.
+* Smazání uživatele přesune celý dokument do `deletedUsers` (viz [Deleted Users Collection](/dev/data-model/deleted-users-collection)).
 
 ***
 
 Zde je skutečný příklad uživatele Overleaf.
+
+<Info>
+
+Tento účet byl vytvořen ve starší verzi. Stále má pole, která už ve schématu nejsou a která nic nečte: `staffAccess`, `ace.enableNewEditor`, `features.aiErrorAssistant`, `aiErrorAssistant` a `writefull.enabled` (nyní `writefull.initialized`). `ace.breadcrumbs` má nyní výchozí hodnotu `false`.
+
+</Info>
 
 <Accordion title="Příklad uživatele">
 
@@ -171,7 +252,7 @@ Zde je skutečný příklad uživatele Overleaf.
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),

@@ -3,84 +3,165 @@ title: Users-kokoelma
 icon: user
 ---
 
-`User` edustaa yksittäistä käyttäjätiliä Overleaf-järjestelmässä. Se tallentaa todennustiedot, ominaisuusliput, editorin asetukset, käyttöoikeudet ja aktiivisuuden metatiedot.
+`users` sisältää yhden dokumentin tiliä kohden. Se tallentaa kirjautumistiedot, profiilin, editorin asetukset, ominaisuudet ja aktiivisuuden. Skeema on `services/web/app/src/models/User.mjs`; useimmat kirjoitukset kulkevat `services/web/app/src/Features/User/UserUpdater.mjs`:n kautta. Lähde-sarakkeessa `User.mjs:N` on tuon skeeman rivi, muut poluttomat tiedostonimet ovat hakemistossa `services/web/app/src/Features/` ja `modules/...` on hakemistossa `services/web/`. Rivinumerot ovat `server-pro`:sta kirjoitushetkellä.
 
-#### Perusidentiteetti ja todennus
+#### Perusidentiteetti ja todennus {#core-identity-&-authentication}
 
-* `_id`: Käyttäjän yksilöllinen MongoDB ObjectId.
-* `email` / `emails`: Ensisijainen sähköpostiosoite ja aiemmat sähköpostitietueet.
-* `hashedPassword`: BCrypt-tiivistetty salasana, jota käytetään paikalliseen todennukseen.
-* `first_name` / `last_name`: Käyttäjäprofiilin nimikentät.
-* `role` / `isAdmin` / `adminRoles`: Rooli ja ylläpito-oikeuksien liput.
-* `twoFactorAuthentication`: Kaksivaiheisen todennuksen määritykset (jos käytössä).
-* `samlIdentifiers` / `thirdPartyIdentifiers`: Sidokset ulkoisiin identiteetintarjoajiin.
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Käyttäjän id. Muut kokoelmat viittaavat tänne kentillä `user_id`, `owner_ref` ja vastaavilla. | MongoDB |
+| `email` | String | Ensisijainen sähköposti. Yksilöllinen, myös kirjainkoosta riippumatta (katso Indeksit). | `User.mjs:26` |
+| `emails` | Object-taulukko | Kaikki tilin osoitteet. Ensisijainen on merkintä, joka on sama kuin `email`. | `User.mjs:27` |
+| `emails.email` | String | Osoite. | `User.mjs:29` |
+| `emails.reversedHostname` | String | Osoitteen verkkotunnus käännettynä (`moc.elpmaxe`). Asetetaan, kun osoite lisätään. | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | Milloin osoite lisättiin. | `User.mjs:31` |
+| `emails.confirmedAt` | Date | Milloin osoite vahvistettiin ensimmäisen kerran (myöhempi vahvistus säilyttää aiemman päivämäärän). LDAP-, SAML- ja OIDC-moduulit asettavat `emails.0.confirmedAt`, kun ne luovat tilin. | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | Osoitteen viimeisimmän vahvistuksen aika. | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | Osoitteen oppilaitos-SSO-linkki. Oppilaitos-SSO ei kuulu CE:hen. | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | Oppilaitokseen kuulumisen tila. Ei kuulu CE:hen. | `User.mjs:39` |
+| `first_name` / `last_name` | String | Profiilin nimi, enintään 255 merkkiä. LDAP, SAML ja OIDC voivat päivittää ne jokaisella kirjautumisella. | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | Vapaa teksti, jonka käyttäjä antaa tilin asetuksissa työtehtäväksi ja organisaatioksi. `role` ei ole käyttöoikeus. | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | Paikallisen salasanan bcrypt-tiiviste. Puuttuu tileiltä, joilla ei ole salasanaa: LDAP- ja SAML-kirjautumiset poistavat sen, ja migraatio `20260511150000_reset_hardcoded_admin_password` poistaa tunnetun oletussalasanan. | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | Sivuston ylläpitäjä. LDAP, SAML ja OIDC voivat asettaa sen IdP-attribuutista jokaisella kirjautumisella. | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | Tarkemmat ylläpitäjäroolit. Luetaan vain, kun `Settings.adminRolesEnabled` on asetettu. | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Object-taulukko | SAML-kirjautumislinkki. `saml`-moduuli kirjoittaa `samlIdentifiers.0.providerId` (aina `'1'`), `externalUserId` ja `userIdAttribute`. | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Object-taulukko | OIDC-kirjautumislinkit, jotka ytimen `ThirdPartyIdentityManager` kirjoittaa `oidc`-moduulia varten. | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`, `enrolledAt`, `secretEncrypted`. Vain skeemassa: CE:n ydin ja moduulimme eivät käytä sitä. | `User.mjs:239-243` |
 
-#### Tilin tila ja elinkaari
+#### Tilin tila ja elinkaari {#account-status-&-lifecycle}
 
-* `signUpDate`: Tilin luontiaikaleima.
-* `holdingAccount`: Onko tili vahvistusta odottava tai rajoitettu.
-* `must_reconfirm`: Ilmaisee, onko käyttäjän vahvistettava sähköpostiosoitteensa uudelleen.
-* `lastPrimaryEmailCheck`: Ajankohta, jolloin ensisijainen sähköpostiosoite viimeksi vahvistettiin.
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | Milloin tili luotiin. | `User.mjs:75` |
+| `suspended` | Boolean | `true`, kun ylläpitäjä on poistanut tilin käytöstä. `UserUpdater.suspendUser` asettaa sen ja päättää istunnot; `admin-tools`-moduuli kutsuu sitä ja voi palauttaa sen. Jokaisen sisääntulopisteen, joka ei ole istunnon takana (tunnukset, allekirjoitetut linkit, websocketit, webhookit), on tarkistettava se. | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | `true` paikkamerkkitilille, jonka rekisteröinti on kesken. Rekisteröinti asettaa sen arvoon `false`; yhteystiedot ohittavat paikkamerkkitilit. | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | Kun arvo on `true`, kirjautuminen ohjaa käyttäjän editorin sijaan uudelleenvahvistussivulle. Salasanan nollaus palauttaa arvon `false`. Mikään CE:ssä ei aseta sitä arvoon `true`. | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | Viimeisin kerta, kun käyttäjä vahvisti ensisijaisen sähköpostin olevan yhä hänen, tai vaihtoi ensisijaisen sähköpostin. Vain overleaf.com (`saas`) tarkistaa sen: kun se on liian vanha, projektiluettelo ohjaa ensisijaisen sähköpostin tarkistussivulle. | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | Pakollinen. Analytiikkatapahtumissa käytetty id. `UserCreator` kieltäytyy luomasta käyttäjää ilman sitä; rekisteröintipolut sekä LDAP-, SAML- ja OIDC-moduulit välittävät satunnaisen UUID:n (`UserRegistrationHandler.mjs:103`, `modules/login-register/app/src/RegisterController.mjs:127`). Migraatiot `20260424120000` ja `20260616070000_back_fill_users_analyticsId` täyttivät sen vanhoille tileille `_id`:stä. | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | Milloin perehdytyssähköposti lähetettiin. Sähköposti ajastetaan vain, kun `saas`-ominaisuus on päällä, joten CE ei aseta sitä. | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | Vain skeemassa: CE:n ydin ja moduulimme eivät käytä niitä. | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | Linkitetyn overleaf.com v1 -tilin `id`, `accessToken`, `refreshToken`. Kentällä `overleaf.id` on yksilöllinen indeksi; mikään CE:ssä ei kirjoita näitä kenttiä. | `User.mjs:230-234` |
 
-#### Kirjautumisten ja aktiivisuuden seuranta
+#### Kirjautumisten ja aktiivisuuden seuranta {#login-&-activity-tracking}
 
-* `lastLoginIp`: Viimeisimmän onnistuneen kirjautumisen IP-osoite.
-* `loginCount`: Onnistuneiden kirjautumisten kokonaismäärä.
-* `loginEpoch`: Kirjautumisistuntojen sisäinen laskuri.
-* `lastLoggedIn`: Viimeisimmän kirjautumisen aikaleima.
-* `lastActive`: Viimeisimmän kirjatun aktiivisuuden aikaleima.
-* `lastFailedLogin`: Viimeisimmän epäonnistuneen kirjautumisyrityksen aikaleima.
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | Viimeisimmän kirjautumisen IP. | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | Onnistuneiden kirjautumisten määrä. | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | Viimeisimmän onnistuneen kirjautumisen aika. | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | Kirjautumisten lukko: jokainen kirjautumisyritys kasvattaa arvoa ja päivittää dokumentin vain, jos sillä on yhä luettu arvo, joten kaksi rinnakkaista kirjautumista ei voi molemmat onnistua. LDAP-, SAML- ja OIDC-moduulit toimivat samoin. | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | Viimeisimmän väärän salasanan aika. | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | Viimeisin kerta, kun käyttäjä avasi projektin. | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### Editorin asetukset (`ace`)
+#### Editorin asetukset (`ace`) {#editor-preferences-ace}
 
-Määrittää käyttäjän asetukset verkkoeditorille:
+Tilin asetussivu tallentaa nämä `UserController.updateUserSettings`:n kautta (`UserController.mjs:460-530`).
 
-* `theme` / `overallTheme`: Editorin ja käyttöliittymän teema.
-* `fontSize`: Editorin fonttikoko.
-* `autoComplete`, `autoPairDelimiters`: Muokkausta avustavat ominaisuudet.
-* `spellCheckLanguage`: Oikeinkirjoituksen tarkistuksessa käytettävä kieli.
-* `pdfViewer`: Valittu PDF-katseluohjelman taustajärjestelmä.
-* `syntaxValidation`, `mathPreview`, `breadcrumbs`: Editorin käytettävyysominaisuudet.
-* `enableNewEditor`: Onko uusi editorin käyttöliittymä käytössä.
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | Pikanäppäimet. Asetussivu tallentaa `default`, `vim` tai `emacs`; skeeman oletus on `none`. | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | Editorin teema. Oletus `textmate`. | `User.mjs:92` |
+| `ace.overallTheme` | String | Käyttöliittymän teema. `system` vaihtaa `lightTheme`:n ja `darkTheme`:n välillä; `light-` tai tyhjä käyttää `theme`:a. | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | Editorin teemat, joita käytetään asetuksella `overallTheme: system`. Oletukset `textmate` ja `overleaf_dark`. | `User.mjs:96-97` |
+| `ace.fontSize` | Number | Editorin fonttikoko. Oletus 12. | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | Editorin fontti ja riviväli. | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | Automaattinen täydennys ja sulkevat sulkeet. Oletus `true`. | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | Oikeinkirjoituksen tarkistuksen kieli. Oletus `en`. Uusi projekti kopioi sen. | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | PDF-katselin. Oletus `pdfjs`. | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | Koodin tarkistus. | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | Matematiikan esikatselu. Oletus `true`. | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | Murupolku editorin yläpuolella. Oletus `false`. | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | Editorin näyttöasetukset. Oletukset `false`, `true`, `false`, `false`, `true`. | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` tai `simple`. | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | Viitteidenhallinnan asetukset: `enabled` (oletus `true`), `groups` (`{ id }`-taulukko), `disablePersonalLibrary`. | `User.mjs:10-22`, `:114-116` |
 
-#### Ominaisuusliput ja rajoitukset (`features`)
+#### Ominaisuusliput ja rajoitukset (`features`) {#feature-flags-&-limits-features}
 
-Ohjaa toimintojen saatavuutta käyttäjälle:
+`features` on laskennan tulos, ei käsin muokattava. `FeaturesUpdater` aloittaa `Settings.defaultFeatures`:sta, yhdistää jokaisen vanhentumattoman `featuresOverrides`-merkinnän ja kirjoittaa tuloksen `featuresUpdatedAt`:n kanssa (`FeaturesUpdater.mjs:220-300`, `UserFeaturesUpdater.mjs:10-24`). Tuotantokuva asettaa oletuksiksi `collaborators`, `dropbox`, `versioning`, `compileTimeout`, `compileGroup`, `trackChanges` ja `references` (`server-ce/config/settings.js:301-309`); muut avaimet jäävät asettamatta.
 
-* `collaborators`: Yhteistyökumppaneiden enimmäismäärä (`-1` = rajoittamaton).
-* `versioning`, `trackChanges`: Historia- ja muutostenseurantaominaisuudet.
-* `dropbox`, `github`, `gitBridge`: Ulkoisten integraatioiden saatavuus.
-* `compileTimeout`: Käännöksen enimmäisaika (sekunteina).
-* `compileGroup`: Määritetty käännösresurssiryhmä.
-* `aiErrorAssistant`: Tekoälypohjaisen käännösvirheavustajan lippu. Vanhemmilla tileillä se voi edelleen olla, samoin kuin ylätason `aiErrorAssistant.enabled`, mutta ne eivät enää kuulu skeemaan, eikä Ayakaleaf Pro lue kumpaakaan. Virheavustaja otetaan käyttöön instanssin tekoälyasetuksilla ja käyttäjän `aiFeatures.enabled`-kentällä (kun sitä ei ole asetettu, tekoäly on käytössä), samoin kuin tekoälyavustaja.
+Ayakaleaf Prossa ylläpitopaneeli kytkee ominaisuuksia pois käyttäjäkohtaisesti. `admin-tools`-moduuli tallentaa ne `featuresOverrides`-merkintänä, jolla on `note: 'admin-panel'` (`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`), ja `instance-features`-moduuli käsittelee asettamatonta avainta päällä olevana (`modules/instance-features/app/src/UserFeatures.mjs:12-14`).
 
-#### Pääsynhallinta ja henkilökunnan oikeudet (`staffAccess`)
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | Yhteistyökumppaneiden enimmäismäärä projektia kohden, `-1` = rajoittamaton. | `User.mjs:119` |
+| `features.versioning` | Boolean | Historia. | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Dropbox-synkronointi, GitHub-, GitLab- ja Gitea-synkronointi sekä Git-käyttö. Nämä moduulit tarkistavat ne, katso `requireUserFeature`. Avaimilla `gitlab` ja `gitea` (v6.3.4:stä alkaen) ei ole oletusta: ne jäävät asettamatta, mikä lasketaan päällä olevaksi, kunnes ylläpitäjä kytkee ne pois Features-välilehdellä. Migraatio `20230817081910_back_fill_gitBridge_feature_server_pro` asetti `gitBridge: true` kaikille käyttäjille. | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | Käännöksen aikakatkaisu sekunteina. `COMPILE_TIMEOUT` asettaa oletuksen. | `User.mjs:132` |
+| `features.compileGroup` | String | Käännösryhmä, esimerkiksi `standard`. | `User.mjs:136` |
+| `features.references` | Boolean | Vanhentunut. Vanhemmilla tileillä se kytkee yhä päälle `referencesSearch`:n ja `mendeley`:n. | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | Muutosten seuranta. `track-changes`-moduuli tarkistaa sen projektin omistajalta. | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | Viitteidenhallintojen linkit. | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | Kytkimet viitehaulle, symbolipaletille ja offline-tilalle. | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | Tekoälyn käyttötaso. Oletus `basic`. | `User.mjs:159` |
+| `featuresOverrides` | Object-taulukko | Käyttäjäkohtaiset muutokset oletuksiin. Jokaisella merkinnällä on `createdAt`, `expiresAt` (ohitetaan tämän päivämäärän jälkeen), `note` ja `features` (samat avaimet kuin yllä sekä `templates`). | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | Milloin `features` laskettiin viimeksi. | `User.mjs:197` |
+| `featuresEpoch` | String | Kopio `Settings.featuresEpoch`:sta viimeisimmän laskennan hetkellä, käytetään vanhojen tilien päivittämiseen. | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-Määrittää henkilökunnan tai julkaisijoiden hienojakoiset käyttöoikeudet:
+Tekoälyavustaja ja virheavustaja eivät ole `features`-avaimia. Ne noudattavat instanssin tekoälyasetuksia ja `aiFeatures.enabled`:ia, katso alla.
 
-* Mittari- ja hallintaoikeudet julkaisijoille, instituutioille, ryhmille, ylläpitäjille ja kokeiluille.
+#### Integraatiot {#integrations}
 
-#### Rekisteröitymiset ja integraatiot
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` kytkee tekoälyavustajan ja virheavustajan pois tältä käyttäjältä. Oletus `true`. | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | Linkitetyn viitteidenhallinnan salatut tunnistetiedot, jotka `tpr-webmodule`-moduuli kirjoittaa (`{ encrypted }` Mendeleylle, `{ apiKeyEncrypted }` Zoterolle). Poistetaan, kun linkitys puretaan. | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Dropbox-tilin id. Ei skeemassa: `dropbox`-moduuli kirjoittaa sen suoraan. Yksilöllinen, joten yksi Dropbox-tili linkittyy yhteen käyttäjään. Ydin käyttää sitä synkronoitavien käyttäjien etsimiseen. | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | Salattu Dropbox-päivitystunnus. Ei skeemassa, `dropbox`-moduulin kirjoittama. Koko `dropbox`-objekti poistetaan, kun linkitys puretaan. | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | Käyttäjän sovelluskansion Dropbox-kursori `list_folder`, jotta seuraava haku lukee vain uudemmat muutokset. Ei skeemassa: third-party-datastore kirjoittaa sen vain niin kauan kuin käyttäjä on yhä linkitetty samaan Dropbox-tiliin. | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | Ryhmä-SSO (`sso`-taulukko, jossa `groupId`, `linkedAt`, `primary`) ja hallittujen käyttäjien kentät (`managedBy`, `enrolledAt`). Ryhmätilaukset eivät kuulu CE:hen. | `User.mjs:56-72` |
+| `writefull` | Object | Writefullin tila: `initialized`, `autoCreatedAccount`, `isPremium`, `premiumSource`. Ydin kirjoittaa sen vain, kun `saas`-ominaisuus on päällä, joten ei CE:ssä. | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | Vain skeemassa: CE:n ydin ja moduulimme eivät käytä niitä. | `User.mjs:249-255` |
 
-* `enrollment.sso`: Linkitetyt SSO-rekisteröitymiset.
-* `refProviders`: Viitepalveluntarjoajien integraatiot.
-* `writefull`: Writefull-kirjoitusavustajan tilin tila.
-* `dsMobileApp`: Mobiilisovelluksen määritykset (jos olemassa).
+#### Ohjelmat ja kokeilut {#programs-&-experiments}
 
-#### Ohjelmat ja kokeilut
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | Käyttäjä liittyi beta-ohjelmaan. | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Alfa-ohjelma. Migraatio `20220826104236_disable_alpha_beta_program` asetti sen ja `betaProgram`:n arvoon `false` kaikille käyttäjille. | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Labs-ohjelma. Mikään CE:ssä ei aseta niitä; migraatio `20260615090000_back_fill_labsProgram` asetti `labsProgram: false`, missä se puuttui. | `User.mjs:228-229` |
+| `splitTests` | Mixed | A/B-testien määritykset testin nimen mukaan. | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: Osallistuminen ennakkokäyttöohjelmiin.
-* `labsExperiments`: Käytössä olevat kokeelliset ominaisuudet.
-* `awareOfV2`: Onko käyttäjä kuitannut V2-editorin.
+#### Suosittelut ja opetusohjelmat {#referrals-&-tutorials}
 
-#### Suosittelut ja opetusohjelmat
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | Satunnainen suositus-id, luodaan tilin luonnin yhteydessä. | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | ObjectId-taulukko / Number | Käyttäjät, jotka rekisteröityivät tällä suositus-id:llä. | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | Opetusohjelman avainta kohden: `{ state, updatedAt, postponedUntil }`. | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`, `refered_users`, `refered_user_count`: Suosittelujen seuranta.
-* `completedTutorials`: Käyttöönotto- ja ominaisuusopetusohjelmien edistyminen.
+#### Indeksit {#indexes}
+
+Kaikki tulevat `tools/migrations/`-hakemiston migraatioista, joilla on tunniste `server-ce`.
+
+| Nimi | Avaimet | Asetukset | Migraatio |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### Huomautukset {#notes}
+
+* Mongoosen `autoIndex` on pois päältä (`services/web/app/src/infrastructure/Mongoose.mjs:7`), joten vain yllä olevat migraatiot luovat indeksejä.
+* Käyttäjän poistaminen siirtää koko dokumentin kokoelmaan `deletedUsers` (katso [Deleted Users Collection](/dev/data-model/deleted-users-collection)).
 
 ***
 
-Tässä on todellinen esimerkki Overleafin käyttäjästä.
+Tässä on todellinen esimerkki Overleaf-käyttäjästä.
+
+<Info>
+
+Tämä tili luotiin vanhemmalla versiolla. Sillä on yhä kenttiä, jotka eivät enää ole skeemassa ja joita mikään ei lue: `staffAccess`, `ace.enableNewEditor`, `features.aiErrorAssistant`, `aiErrorAssistant` ja `writefull.enabled` (nyt `writefull.initialized`). `ace.breadcrumbs`:n oletus on nyt `false`.
+
+</Info>
 
 <Accordion title="Käyttäjäesimerkki">
 
@@ -171,7 +252,7 @@ Tässä on todellinen esimerkki Overleafin käyttäjästä.
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),
