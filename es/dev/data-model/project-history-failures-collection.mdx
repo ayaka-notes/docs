@@ -1,0 +1,53 @@
+---
+title: Colección Project History Failures
+icon: triangle-exclamation
+---
+
+`projectHistoryFailures` guarda un documento por proyecto cuyas actualizaciones de historial project-history no pudo procesar, o para el que inició una resincronización. El documento se vuelve a eliminar en cuanto el procesamiento funciona. project-history la escribe en `services/project-history/app/js/ErrorRecorder.js`; su tipo está en `services/project-history/app/js/mongo-types.ts:3-24`. Web también tiene un esquema de Mongoose para ella (`services/web/app/src/models/ProjectHistoryFailure.mjs:5-19`), pero ningún código de web usa ese modelo.
+
+#### Campos {#fields}
+
+| Campo | Tipo | Significado | Origen |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Creado por el upsert. | `ErrorRecorder.js:45-60` |
+| `project_id` | String | El id del proyecto, guardado como cadena, no como ObjectId. | `ErrorRecorder.js:46`, `mongo-types.ts:5` |
+| `error` | String | El último error, como `error.toString()`. | `ErrorRecorder.js:37` |
+| `stack` | String | Pila del último error. | `ErrorRecorder.js:38` |
+| `queueSize` | Number | Actualizaciones que esperaban en la cola de Redis del proyecto en el último error (`services/project-history/app/js/UpdatesProcessor.js:375`); `-1` cuando el error vino de iniciar una resincronización (`services/project-history/app/js/SyncManager.js:75`, `96`). | `ErrorRecorder.js:36` |
+| `ts` | Date | Hora del último error. | `ErrorRecorder.js:39` |
+| `attempts` | Number | Número de errores registrados desde que se creó el documento. | `ErrorRecorder.js:49` |
+| `history` | Array of Object | Los últimos 10 eventos, los más recientes primero: registros de error `{ queueSize, error, stack, ts }` e inicios de resincronización `{ resyncStartedAt }`. | `ErrorRecorder.js:50-56`, `92-98` |
+| `resyncStartedAt` | Date | Cuándo se inició la última resincronización. | `ErrorRecorder.js:90` |
+| `resyncAttempts` | Number | Número de resincronizaciones iniciadas desde que se creó el documento. | `ErrorRecorder.js:91` |
+| `forceDebug` | Boolean | Lo establece project-history `POST /project/:project_id/force` (`?clear=true` lo pone en `false`). Mientras `true`, un error ops-out-of-order en el chunk guardado se registra y se ignora (`UpdatesProcessor.js:574-592`). | `ErrorRecorder.js:72-82` |
+| `requestCount` | Number | En el esquema de web (`ProjectHistoryFailure.mjs:16`). Solo `ErrorRecorder.getLastFailure` lo incrementa, y nada llama a esa función. | `ErrorRecorder.js:131-138` |
+
+#### Quién la escribe {#who-writes-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `services/project-history/app/js/ErrorRecorder.js:34-66` | `record`: upsert del error, `attempts` +1, entrada añadida a `history`. Se llama cuando falla el procesamiento de las actualizaciones de un proyecto (`UpdatesProcessor.js:91`, `169`, `242`, `293`, `345`) y cuando no puede iniciarse una resincronización (`SyncManager.js:75`, `96`). |
+| `ErrorRecorder.js:86-102` | `recordSyncStart`: upsert, `resyncStartedAt`, `resyncAttempts` +1, entrada añadida a `history`, cada vez que se inicia una resincronización (`SyncManager.js:104`). |
+| `ErrorRecorder.js:68-70` | `clearError`: elimina el documento tras un flush correcto (`UpdatesProcessor.js:101`, `194`, `259`, `355`), en project-history `DELETE /project/:project_id` (`services/project-history/app/js/HttpController.js:1386`) y ante un id de proyecto incorrecto durante un reintento (`services/project-history/app/js/RetryManager.js:161`). |
+| `ErrorRecorder.js:72-82` | `setForceDebug`: upsert de `forceDebug` (`HttpController.js:1016-1035`, ruta en `services/project-history/app/js/Router.js:82`). |
+| `ErrorRecorder.js:109-119` | `cloneFailure`: copia el documento a otro proyecto, para project-history `POST /project/:project_id/clone` (`HttpController.js:135`), a la que nada en web llama. |
+
+#### Quién la lee {#who-reads-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `RetryManager.js:113-126` | Carga todos los fallos para las tareas cron de reintento (`server-ce/config/crontab-history`, project-history `POST /retry/failures`). La tarea soft vuelve a procesar la cola; la tarea hard resincroniza el proyecto, como resincronización hard cuando `resyncAttempts` es al menos 1 y el error no es una resincronización en curso (`RetryManager.js:30-31`, `35-56`, `106-111`). |
+| `services/project-history/app/js/FlushManager.js:73-82` | El flush de todos los proyectos omite los proyectos que tienen un fallo. |
+| `UpdatesProcessor.js:578-592` | Lee `forceDebug`. |
+| `ErrorRecorder.js:124-129`, `140-145` | `getFailureRecord` y `getFailedProjects`: los usan `GET /project/:project_id/debug-info` (`HttpController.js:571`) y `GET /status/failures`, `GET /status/failures-full` (`Router.js:88-90`). |
+
+#### Índices {#indexes}
+
+| Nombre | Claves | Opciones | Migración |
+| ---- | ---- | ------- | --------- |
+| `project_id_1` | `{ project_id: 1 }` |  | `tools/migrations/20190912145018_create_projectHistoryFailures_indexes.mjs` |
+
+#### Notas {#notes}
+
+* Un documento permanece hasta que un flush del proyecto tiene éxito o el proyecto se elimina (`clearError` arriba), así que cada documento marca un proyecto cuyo último flush o resincronización aún no ha tenido éxito.
+* Las cadenas de error que empiezan por `OError:` se devuelven como `Error:` (`ErrorRecorder.js:18-26`); el valor guardado no cambia.
