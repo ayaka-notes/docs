@@ -1,0 +1,43 @@
+---
+title: Project History Sharded Blobs 集合
+icon: cubes-stacked
+---
+
+`projectHistoryShardedBlobs` 保存放不進 [projectHistoryBlobs](/dev/data-model/project-history-blobs-collection) 的 blob 記錄：當某個雜湊前綴的桶在那裡已有 8 筆記錄時，後續記錄寫到這裡。一個專案在其中最多有 16 個文件，雜湊的每個首位十六進位數字各一個。沒有 Mongoose schema；history-v1 在 `services/history-v1/storage/lib/blob_store/mongo.js` 中寫入它（配置說明見 `mongo.js:1-16`）。
+
+#### 欄位 {#fields}
+
+| 欄位 | 型別 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | Binary | 13 位元組：專案的歷史 ID（一個 `0`）加上分片數字，以十六進位讀取（`<history id>0<digit>`）。分片數字是雜湊的第一位十六進位數字。 | `mongo.js:439-453` |
+| `blobs` | Object | 依桶分組的 blob 記錄。桶的鍵是雜湊的第 2 到第 4 位十六進位數字。 | `mongo.js:439-443` |
+| `blobs.<bcd>` | Array of Object | 該桶的記錄。程式碼不限制其大小。 | `mongo.js:399-407` |
+| `blobs.<bcd>[].h` | Binary | 雜湊，20 位元組，與 projectHistoryBlobs 中相同。 | `mongo.js:472` |
+| `blobs.<bcd>[].b` | Number | 內容的位元組長度。 | `mongo.js:473` |
+| `blobs.<bcd>[].s` | Number | 內容作為文字的長度；內容不是可編輯文字時為 `null`。 | `mongo.js:474` |
+
+#### 寫入方 {#who-writes-it}
+
+| 程式碼 | 作用 |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:399-407` | `insertRecordSharded`：以 `$addToSet` upsert 到桶中。projectHistoryBlobs 中的桶已滿時由 `insertBlob` 呼叫（`mongo.js:387-389`）。 |
+| `mongo.js:75-103` | `clone`：把專案的分片複製到另一個歷史 ID，用於 history-v1 `POST /projects/:project_id/clone`，Web 中沒有任何程式碼呼叫它。 |
+| `mongo.js:413-422` | `deleteBlobs`：在 history-v1 `DELETE /projects/:project_id` 時刪除專案的所有分片以及它的 projectHistoryBlobs 文件。 |
+
+#### 讀取方 {#who-reads-it}
+
+| 程式碼 | 作用 |
+| ---- | ------------ |
+| `mongo.js:144-157` | `findBlobSharded`：一個 blob，僅當它在 projectHistoryBlobs 中的桶已有 8 筆記錄且不包含它時才查找（`mongo.js:127-131`）。 |
+| `mongo.js:217-260` | `findBlobsSharded`：`findBlobs` 在 projectHistoryBlobs 中找不到的 blob（`mongo.js:202-206`）。 |
+| `mongo.js:285-306` | `getProjectBlobs`：一個專案的所有分片。 |
+| `mongo.js:337-361` | `getProjectBlobsBatch`：多個專案的所有分片，用於 blob 統計路由。 |
+
+#### 索引 {#indexes}
+
+只有預設的 `_id` 索引。`tools/migrations/` 中沒有遷移新增索引。
+
+#### 說明 {#notes}
+
+* 一個專案的分片依 `_id` 順序相鄰存放，因此程式碼用從 `<history id>00` 到 `<history id>0f` 的 `_id` 範圍查找它們（`mongo.js:75-80`、`287-295`）。
+* 只有當某個專案有超過 8 個 blob 共用相同的 3 位雜湊前綴時，這個集合才會出現，所以小型實例可能根本沒有它。

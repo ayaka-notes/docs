@@ -1,0 +1,43 @@
+---
+title: Project History Sharded Blobs 集合
+icon: cubes-stacked
+---
+
+`projectHistoryShardedBlobs` 保存放不进 [projectHistoryBlobs](/dev/data-model/project-history-blobs-collection) 的 blob 记录：当某个哈希前缀的桶在那里已有 8 条记录时，后续记录写到这里。一个项目在其中最多有 16 个文档，哈希的每个首位十六进制数字各一个。没有 Mongoose schema；history-v1 在 `services/history-v1/storage/lib/blob_store/mongo.js` 中写入它（布局说明见 `mongo.js:1-16`）。
+
+#### 字段 {#fields}
+
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | Binary | 13 字节：项目的历史 ID（一个 `0`）加上分片数字，按十六进制读取（`<history id>0<digit>`）。分片数字是哈希的第一位十六进制数字。 | `mongo.js:439-453` |
+| `blobs` | Object | 按桶分组的 blob 记录。桶的键是哈希的第 2 到第 4 位十六进制数字。 | `mongo.js:439-443` |
+| `blobs.<bcd>` | Array of Object | 该桶的记录。代码不限制其大小。 | `mongo.js:399-407` |
+| `blobs.<bcd>[].h` | Binary | 哈希，20 字节，与 projectHistoryBlobs 中相同。 | `mongo.js:472` |
+| `blobs.<bcd>[].b` | Number | 内容的字节长度。 | `mongo.js:473` |
+| `blobs.<bcd>[].s` | Number | 内容作为文本的长度；内容不是可编辑文本时为 `null`。 | `mongo.js:474` |
+
+#### 写入方 {#who-writes-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:399-407` | `insertRecordSharded`：用 `$addToSet` upsert 到桶中。projectHistoryBlobs 中的桶已满时由 `insertBlob` 调用（`mongo.js:387-389`）。 |
+| `mongo.js:75-103` | `clone`：把项目的分片复制到另一个历史 ID，用于 history-v1 `POST /projects/:project_id/clone`，Web 中没有任何代码调用它。 |
+| `mongo.js:413-422` | `deleteBlobs`：在 history-v1 `DELETE /projects/:project_id` 时删除项目的所有分片以及它的 projectHistoryBlobs 文档。 |
+
+#### 读取方 {#who-reads-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `mongo.js:144-157` | `findBlobSharded`：一个 blob，仅当它在 projectHistoryBlobs 中的桶已有 8 条记录且不包含它时才查找（`mongo.js:127-131`）。 |
+| `mongo.js:217-260` | `findBlobsSharded`：`findBlobs` 在 projectHistoryBlobs 中未找到的 blob（`mongo.js:202-206`）。 |
+| `mongo.js:285-306` | `getProjectBlobs`：一个项目的所有分片。 |
+| `mongo.js:337-361` | `getProjectBlobsBatch`：多个项目的所有分片，用于 blob 统计路由。 |
+
+#### 索引 {#indexes}
+
+只有默认的 `_id` 索引。`tools/migrations/` 中没有迁移添加索引。
+
+#### 说明 {#notes}
+
+* 一个项目的分片按 `_id` 顺序相邻存放，因此代码用从 `<history id>00` 到 `<history id>0f` 的 `_id` 范围查找它们（`mongo.js:75-80`、`287-295`）。
+* 只有当某个项目有超过 8 个 blob 共享相同的 3 位哈希前缀时，这个集合才会出现，所以小型实例可能根本没有它。
