@@ -3,84 +3,165 @@ title: Users-samlingen
 icon: user
 ---
 
-`User` repræsenterer en enkelt brugerkonto i Overleaf-systemet. Den gemmer godkendelsesdata, funktionsflag, editorpræferencer, adgangstilladelser og aktivitetsmetadata.
+`users` indeholder ét dokument pr. konto. Det gemmer logindata, profilen, editorindstillinger, funktioner og aktivitet. Skemaet er `services/web/app/src/models/User.mjs`; de fleste skrivninger går gennem `services/web/app/src/Features/User/UserUpdater.mjs`. I kolonnen Kilde er `User.mjs:N` en linje i det skema, andre filnavne uden sti ligger under `services/web/app/src/Features/`, og `modules/...` ligger under `services/web/`. Linjenumrene stammer fra `server-pro` på skrivetidspunktet.
 
-#### Grundlæggende identitet og godkendelse
+#### Grundlæggende identitet og godkendelse {#core-identity-&-authentication}
 
-* `_id`: Brugerens unikke MongoDB ObjectId.
-* `email` / `emails`: Primær e-mail og historiske e-mailposter.
-* `hashedPassword`: BCrypt-hashet adgangskode, der bruges til lokal godkendelse.
-* `first_name` / `last_name`: Navnefelter i brugerprofilen.
-* `role` / `isAdmin` / `adminRoles`: Flag for rolle og administrative rettigheder.
-* `twoFactorAuthentication`: Konfiguration af tofaktorgodkendelse (hvis aktiveret).
-* `samlIdentifiers` / `thirdPartyIdentifiers`: Tilknytninger til eksterne identitetsudbydere.
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Brugerens id. Andre samlinger peger hertil med `user_id`, `owner_ref` og lignende felter. | MongoDB |
+| `email` | String | Primær e-mail. Unik, også uden skelnen mellem store og små bogstaver (se Indekser). | `User.mjs:26` |
+| `emails` | Array af Object | Alle kontoens adresser. Den primære er posten, der er lig med `email`. | `User.mjs:27` |
+| `emails.email` | String | Adressen. | `User.mjs:29` |
+| `emails.reversedHostname` | String | Adressens domæne, omvendt (`moc.elpmaxe`). Sættes, når adressen tilføjes. | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | Hvornår adressen blev tilføjet. | `User.mjs:31` |
+| `emails.confirmedAt` | Date | Hvornår adressen første gang blev bekræftet (en senere bekræftelse beholder den tidligere dato). Modulerne LDAP, SAML og OIDC sætter `emails.0.confirmedAt`, når de opretter en konto. | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | Tidspunkt for den seneste bekræftelse af adressen. | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | Adressens institutions-SSO-tilknytning. Institutions-SSO er ikke en del af CE. | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | Status for institutionstilknytning. Ikke en del af CE. | `User.mjs:39` |
+| `first_name` / `last_name` | String | Profilnavn, højst 255 tegn. LDAP, SAML og OIDC kan opdatere dem ved hvert login. | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | Fritekst, som brugeren angiver som jobrolle og institution i kontoindstillingerne. `role` er ikke en tilladelse. | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | bcrypt-hash af den lokale adgangskode. Mangler for konti uden adgangskode: LDAP- og SAML-logins fjerner den, og migreringen `20260511150000_reset_hardcoded_admin_password` fjerner en kendt standardadgangskode. | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | Webstedsadministrator. LDAP, SAML og OIDC kan sætte det fra en IdP-attribut ved hvert login. | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | Finere administratorroller. Læses kun, når `Settings.adminRolesEnabled` er sat. | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Array af Object | SAML-loginforbindelse. Modulet `saml` skriver `samlIdentifiers.0.providerId` (altid `'1'`), `externalUserId` og `userIdAttribute`. | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Array af Object | OIDC-loginforbindelser, skrevet af kernens `ThirdPartyIdentityManager` for modulet `oidc`. | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`, `enrolledAt`, `secretEncrypted`. Kun i skemaet: CE-kernen og vores moduler bruger det ikke. | `User.mjs:239-243` |
 
-#### Kontostatus og livscyklus
+#### Kontostatus og livscyklus {#account-status-&-lifecycle}
 
-* `signUpDate`: Tidsstempel for oprettelse af kontoen.
-* `holdingAccount`: Om kontoen afventer bekræftelse eller er begrænset.
-* `must_reconfirm`: Angiver, om brugeren skal bekræfte sin e-mail igen.
-* `lastPrimaryEmailCheck`: Seneste tidspunkt, hvor den primære e-mail blev valideret.
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | Hvornår kontoen blev oprettet. | `User.mjs:75` |
+| `suspended` | Boolean | `true`, når en administrator har deaktiveret kontoen. `UserUpdater.suspendUser` sætter det og afslutter sessionerne; modulet `admin-tools` kalder det og kan sætte det tilbage. Ethvert indgangspunkt, der ikke ligger bag en session (tokens, signerede links, websockets, webhooks), skal kontrollere det. | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | `true` for en pladsholderkonto, der ikke har afsluttet registreringen. Registreringen sætter det til `false`; kontakter springer pladsholderkonti over. | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | Når det er `true`, sender login brugeren til siden for genbekræftelse i stedet for editoren. En nulstilling af adgangskoden sætter det tilbage til `false`. Intet i CE sætter det til `true`. | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | Sidste gang brugeren bekræftede, at den primære e-mail stadig er deres, eller ændrede den primære e-mail. Kun overleaf.com (`saas`) kontrollerer det: når det er for gammelt, omdirigerer projektlisten til siden for kontrol af den primære e-mail. | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | Påkrævet. Id, der bruges til analysehændelser. `UserCreator` nægter at oprette en bruger uden det; registreringsforløbene og modulerne LDAP, SAML og OIDC sender et tilfældigt UUID (`UserRegistrationHandler.mjs:103`, `modules/login-register/app/src/RegisterController.mjs:127`). Migreringerne `20260424120000` og `20260616070000_back_fill_users_analyticsId` udfyldte det fra `_id` for gamle konti. | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | Hvornår velkomstmailen blev sendt. Mailen planlægges kun, når funktionen `saas` er slået til, så CE sætter det ikke. | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | Kun i skemaet: CE-kernen og vores moduler bruger dem ikke. | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | `id`, `accessToken`, `refreshToken` for en tilknyttet overleaf.com v1-konto. `overleaf.id` har et unikt indeks; intet i CE skriver disse felter. | `User.mjs:230-234` |
 
-#### Login- og aktivitetssporing
+#### Login- og aktivitetssporing {#login-&-activity-tracking}
 
-* `lastLoginIp`: IP-adresse for det seneste vellykkede login.
-* `loginCount`: Samlet antal vellykkede logins.
-* `loginEpoch`: Intern tæller for login-sessioner.
-* `lastLoggedIn`: Tidsstempel for seneste login.
-* `lastActive`: Tidsstempel for seneste registrerede aktivitet.
-* `lastFailedLogin`: Tidsstempel for seneste mislykkede loginforsøg.
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | IP for det seneste login. | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | Antal vellykkede logins. | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | Tidspunkt for det seneste vellykkede login. | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | Lås for logins: hvert loginforsøg øger værdien og opdaterer kun dokumentet, hvis det stadig har den læste værdi, så to parallelle logins ikke begge kan komme igennem. Modulerne LDAP, SAML og OIDC gør det samme. | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | Tidspunkt for den seneste forkerte adgangskode. | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | Sidste gang brugeren åbnede et projekt. | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### Editorpræferencer (`ace`)
+#### Editorpræferencer (`ace`) {#editor-preferences-ace}
 
-Definerer brugerens præferencer for online-editoren:
+Siden med kontoindstillinger gemmer disse via `UserController.updateUserSettings` (`UserController.mjs:460-530`).
 
-* `theme` / `overallTheme`: Tema for editor og brugergrænseflade.
-* `fontSize`: Editorens skriftstørrelse.
-* `autoComplete`, `autoPairDelimiters`: Funktioner til redigeringshjælp.
-* `spellCheckLanguage`: Sprog, der bruges til stavekontrol.
-* `pdfViewer`: Valgt backend til PDF-visning.
-* `syntaxValidation`, `mathPreview`, `breadcrumbs`: Funktioner til editorens brugeroplevelse.
-* `enableNewEditor`: Om den nye editorbrugergrænseflade er aktiveret.
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | Tastaturgenveje. Indstillingssiden gemmer `default`, `vim` eller `emacs`; skemaets standard er `none`. | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | Editortema. Standard `textmate`. | `User.mjs:92` |
+| `ace.overallTheme` | String | Brugerfladetema. `system` skifter mellem `lightTheme` og `darkTheme`; `light-` eller tomt bruger `theme`. | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | Editortemaer, der bruges med `overallTheme: system`. Standard `textmate` og `overleaf_dark`. | `User.mjs:96-97` |
+| `ace.fontSize` | Number | Editorens skriftstørrelse. Standard 12. | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | Editorens skrifttype og linjehøjde. | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | Autofuldførelse og lukkende parenteser. Standard `true`. | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | Sprog for stavekontrol. Standard `en`. Et nyt projekt kopierer det. | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | PDF-fremviser. Standard `pdfjs`. | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | Kodekontrol. | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | Matematikforhåndsvisning. Standard `true`. | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | Brødkrummer over editoren. Standard `false`. | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | Visningsindstillinger for editoren. Standard `false`, `true`, `false`, `false`, `true`. | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` eller `simple`. | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | Indstillinger for referencehåndteringen: `enabled` (standard `true`), `groups` (array af `{ id }`), `disablePersonalLibrary`. | `User.mjs:10-22`, `:114-116` |
 
-#### Funktionsflag og grænser (`features`)
+#### Funktionsflag og grænser (`features`) {#feature-flags-&-limits-features}
 
-Styrer, hvilke funktioner der er tilgængelige for brugeren:
+`features` er resultatet af en beregning, ikke noget, der skal redigeres i hånden. `FeaturesUpdater` tager udgangspunkt i `Settings.defaultFeatures`, fletter hver post i `featuresOverrides`, der ikke er udløbet, og skriver resultatet med `featuresUpdatedAt` (`FeaturesUpdater.mjs:220-300`, `UserFeaturesUpdater.mjs:10-24`). Produktions-imaget sætter `collaborators`, `dropbox`, `versioning`, `compileTimeout`, `compileGroup`, `trackChanges` og `references` som standarder (`server-ce/config/settings.js:301-309`); de øvrige nøgler forbliver usatte.
 
-* `collaborators`: Maksimalt antal samarbejdspartnere (`-1` = ubegrænset).
-* `versioning`, `trackChanges`: Funktioner til historik og ændringssporing.
-* `dropbox`, `github`, `gitBridge`: Tilgængelighed af eksterne integrationer.
-* `compileTimeout`: Maksimal kompileringstid (sekunder).
-* `compileGroup`: Tildelt gruppe af kompileringsressourcer.
-* `aiErrorAssistant`: Flag for AI-baseret assistent til kompileringsfejl. Ældre konti kan stadig have det, samt det overordnede `aiErrorAssistant.enabled`, men de er ikke længere en del af skemaet, og Ayakaleaf Pro læser ingen af dem. Fejlassistenten aktiveres af instansens AI-indstillinger og brugerens `aiFeatures.enabled` (når den ikke er sat, er AI slået til), på samme måde som AI-assistenten.
+I Ayakaleaf Pro slår administratorpanelet funktioner fra pr. bruger. Modulet `admin-tools` gemmer dem som en post i `featuresOverrides` med `note: 'admin-panel'` (`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`), og modulet `instance-features` behandler en usat nøgle som slået til (`modules/instance-features/app/src/UserFeatures.mjs:12-14`).
 
-#### Adgangskontrol og medarbejdertilladelser (`staffAccess`)
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | Maksimalt antal samarbejdspartnere pr. projekt, `-1` = ubegrænset. | `User.mjs:119` |
+| `features.versioning` | Boolean | Historik. | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Dropbox-synkronisering, GitHub-, GitLab- og Gitea-synkronisering samt Git-adgang. Kontrolleres af disse moduler, se `requireUserFeature`. `gitlab` og `gitea` (fra v6.3.4) har ingen standard: de forbliver usatte, hvilket tæller som slået til, indtil en administrator slår dem fra på fanen Features. Migreringen `20230817081910_back_fill_gitBridge_feature_server_pro` satte `gitBridge: true` for alle brugere. | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | Kompileringstimeout i sekunder. `COMPILE_TIMEOUT` sætter standarden. | `User.mjs:132` |
+| `features.compileGroup` | String | Kompileringsgruppe, for eksempel `standard`. | `User.mjs:136` |
+| `features.references` | Boolean | Forældet. For ældre konti slår det stadig `referencesSearch` og `mendeley` til. | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | Spor ændringer. Modulet `track-changes` kontrollerer det hos projektejeren. | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | Forbindelser til referencehåndteringer. | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | Kontakter for referencesøgning, symbolpaletten og offlinetilstand. | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | Niveau for AI-brug. Standard `basic`. | `User.mjs:159` |
+| `featuresOverrides` | Array af Object | Ændringer af standarderne pr. bruger. Hver post har `createdAt`, `expiresAt` (ignoreres efter denne dato), `note` og `features` (samme nøgler som ovenfor plus `templates`). | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | Hvornår `features` sidst blev beregnet. | `User.mjs:197` |
+| `featuresEpoch` | String | Kopi af `Settings.featuresEpoch` ved den seneste beregning, bruges til at opdatere gamle konti. | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-Definerer finkornede adgangsrettigheder for medarbejdere eller udgivere:
+AI-assistenten og fejlassistenten er ikke en nøgle i `features`. De følger instansens AI-indstillinger og `aiFeatures.enabled`, se nedenfor.
 
-* Tilladelser til metrikker og administration for udgivere, institutioner, grupper, administratorer og eksperimenter.
+#### Integrationer {#integrations}
 
-#### Tilmeldinger og integrationer
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` slår AI-assistenten og fejlassistenten fra for denne bruger. Standard `true`. | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | Krypterede legitimationsoplysninger for den tilknyttede referencehåndtering, skrevet af modulet `tpr-webmodule` (`{ encrypted }` for Mendeley, `{ apiKeyEncrypted }` for Zotero). Fjernes ved frakobling. | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Dropbox-kontoens id. Ikke i skemaet: modulet `dropbox` skriver det direkte. Unikt, så én Dropbox-konto knyttes til én bruger. Kernen bruger det til at finde de brugere, der skal synkroniseres. | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | Krypteret Dropbox-opdateringstoken. Ikke i skemaet, skrevet af modulet `dropbox`. Hele objektet `dropbox` fjernes ved frakobling. | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | Dropbox-markøren `list_folder` for brugerens appmappe, så næste hentning kun læser nyere ændringer. Ikke i skemaet: skrives af third-party-datastore, kun så længe brugeren stadig er tilknyttet den samme Dropbox-konto. | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | Gruppe-SSO (arrayet `sso` med `groupId`, `linkedAt`, `primary`) og felter for administrerede brugere (`managedBy`, `enrolledAt`). Gruppeabonnementer er ikke en del af CE. | `User.mjs:56-72` |
+| `writefull` | Object | Writefull-status: `initialized`, `autoCreatedAccount`, `isPremium`, `premiumSource`. Kernen skriver det kun, når funktionen `saas` er slået til, altså ikke i CE. | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | Kun i skemaet: CE-kernen og vores moduler bruger dem ikke. | `User.mjs:249-255` |
 
-* `enrollment.sso`: Tilknyttede SSO-tilmeldinger.
-* `refProviders`: Integrationer med referenceudbydere.
-* `writefull`: Kontostatus for skriveassistenten Writefull.
-* `dsMobileApp`: Konfiguration af mobilapp (hvis til stede).
+#### Programmer og eksperimenter {#programs-&-experiments}
 
-#### Programmer og eksperimenter
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | Brugeren har tilmeldt sig betaprogrammet. | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Alfaprogram. Migreringen `20220826104236_disable_alpha_beta_program` satte det og `betaProgram` til `false` for alle brugere. | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Labs-program. Intet i CE sætter dem; migreringen `20260615090000_back_fill_labsProgram` satte `labsProgram: false`, hvor det manglede. | `User.mjs:228-229` |
+| `splitTests` | Mixed | Tildelinger til A/B-tests efter testnavn. | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: Deltagelse i programmer med tidlig adgang.
-* `labsExperiments`: Aktiverede eksperimentelle funktioner.
-* `awareOfV2`: Om brugeren har bekræftet kendskab til V2-editoren.
+#### Henvisninger og vejledninger {#referrals-&-tutorials}
 
-#### Henvisninger og vejledninger
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | Tilfældigt henvisnings-id, genereret ved oprettelse. | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | Array af ObjectId / Number | Brugere, der tilmeldte sig med dette henvisnings-id. | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | Pr. vejledningsnøgle: `{ state, updatedAt, postponedUntil }`. | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`, `refered_users`, `refered_user_count`: Sporing af henvisninger.
-* `completedTutorials`: Fremskridt i introduktions- og funktionsvejledninger.
+#### Indekser {#indexes}
+
+Alle kommer fra migreringer mærket `server-ce` i `tools/migrations/`.
+
+| Navn | Nøgler | Indstillinger | Migrering |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### Bemærkninger {#notes}
+
+* Mongoose `autoIndex` er slået fra (`services/web/app/src/infrastructure/Mongoose.mjs:7`), så kun migreringerne ovenfor opretter indekser.
+* Når en bruger slettes, flyttes hele dokumentet til `deletedUsers` (se [Deleted Users Collection](/dev/data-model/deleted-users-collection)).
 
 ***
 
-Her er et virkeligt eksempel på en Overleaf-bruger.
+Her er et rigtigt eksempel på en Overleaf-bruger.
+
+<Info>
+
+Denne konto blev oprettet i en ældre version. Den har stadig felter, der ikke længere er i skemaet, og som intet læser: `staffAccess`, `ace.enableNewEditor`, `features.aiErrorAssistant`, `aiErrorAssistant` og `writefull.enabled` (nu `writefull.initialized`). `ace.breadcrumbs` har nu standardværdien `false`.
+
+</Info>
 
 <Accordion title="Brugereksempel">
 
@@ -171,7 +252,7 @@ Her er et virkeligt eksempel på en Overleaf-bruger.
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),
