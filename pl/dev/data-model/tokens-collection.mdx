@@ -1,0 +1,62 @@
+---
+title: Kolekcja Tokens
+icon: key
+---
+
+`tokens` przechowuje tokeny jednorazowe: sekret w linku, który pozwala komuś ustawić hasło. Jeden dokument to jeden token. Nie ma modelu Mongoose; web zapisuje kolekcję przez `services/web/app/src/Features/Security/OneTimeTokenHandler.mjs` natywnym sterownikiem.
+
+#### Pola {#fields}
+
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id dokumentu. | `OneTimeTokenHandler.mjs:40` |
+| `use` | String | Do czego służy token, zobacz [Zastosowania](#uses) poniżej. Każde wyszukiwanie filtruje po tym polu. | `OneTimeTokenHandler.mjs:41` |
+| `token` | String | Sekret w linku: 32 losowe bajty jako 64 znaki szesnastkowe, zapisany bez zmian. | `OneTimeTokenHandler.mjs:38,42` |
+| `data` | Object | To, co reprezentuje token; zwracane przy jego użyciu. | `OneTimeTokenHandler.mjs:43` |
+| `data.user_id` | String | Id użytkownika, zapisywane jako ciąg znaków przez każdego wywołującego. | `services/web/app/src/Features/PasswordReset/PasswordResetHandler.mjs:27`, `services/web/app/src/Features/User/UserRegistrationHandler.mjs:117`, `services/web/modules/admin-tools/app/src/AdminUserManager.mjs:79` |
+| `data.email` | String | Adres e-mail użytkownika w chwili utworzenia tokenu. Reset hasła wyszukuje użytkownika po tym głównym adresie (`PasswordResetHandler.mjs:66-70`). | jak `data.user_id` |
+| `createdAt` | Date | Czas utworzenia. Indeks TTL usuwa token 90 dni później. | `OneTimeTokenHandler.mjs:36,44` |
+| `expiresAt` | Date | `createdAt` plus `expiresIn` sekund: domyślnie 1 godzina, 1 tydzień dla linku aktywacyjnego. Po tym czasie wyszukiwania pomijają token. | `OneTimeTokenHandler.mjs:35-37,45` |
+| `peekCount` | Number | Ile razy token odczytano bez użycia. Każde `peekValueFromToken` dodaje 1; przy 4 (`MAX_PEEKS`) token przestaje działać. | `OneTimeTokenHandler.mjs:8-31,107` |
+| `usedAt` | Date | Czas użycia lub anulowania tokenu. Wyszukiwania pomijają token, który ma to pole. | `OneTimeTokenHandler.mjs:51-104` |
+
+#### Zastosowania {#uses}
+
+| `use` | Funkcja | Wygasa po | Kod |
+| ----- | ------- | ------ | ---- |
+| `password` | E-mail resetu hasła, ze strony „nie pamiętam hasła” | 1 godzina | `PasswordResetHandler.mjs:14-42` |
+| `password` | Link aktywacyjny: konto z losowym hasłem, a potem link do ustawienia własnego. Używany przez publiczną rejestrację (`services/web/modules/login-register/app/src/RegisterController.mjs:65`), stronę rejestracji administratora z `user-activate` (`services/web/modules/user-activate/app/src/UserActivateController.mjs:27-30`) i skrypt `create-user` (`services/web/modules/server-ce-scripts/scripts/create-user.mjs:21`) | 1 tydzień | `UserRegistrationHandler.mjs:97-130` |
+| `password` | Link aktywacyjny lub link resetu hasła wysłany z panelu administracyjnego (moduł `admin-tools`) | 1 tydzień (aktywacja), 1 godzina (reset) | `AdminUserManager.mjs:76-103,196-206` |
+| `email_confirmation` | Link potwierdzenia adresu e-mail. Tylko odczytywany: nic w tym repozytorium nie tworzy już takich tokenów, bo potwierdzenie wysyła teraz 6-cyfrowy kod (`services/web/app/src/Features/User/UserEmailsConfirmationHandler.mjs:15-35`) | | `UserEmailsConfirmationHandler.mjs:12,37-66` |
+
+#### Kto zapisuje {#who-writes-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `OneTimeTokenHandler.mjs:34-49` (`getNewToken`) | Wstawia token. Wywołujący: `PasswordResetHandler.mjs:28`, `UserRegistrationHandler.mjs:115-119`, `AdminUserManager.mjs:77-81`. |
+| `OneTimeTokenHandler.mjs:8-32` (`peekValueFromToken`) | Zwraca `data` ważnego tokenu i dodaje 1 do `peekCount`. Używane przy otwarciu strony resetu hasła (`services/web/app/src/Features/PasswordReset/PasswordResetController.mjs:195-208`), ponownie przy ustawianiu nowego hasła (`PasswordResetHandler.mjs:94-96`) oraz przez potwierdzenie e-maila (`UserEmailsConfirmationHandler.mjs:38-41`). |
+| `OneTimeTokenHandler.mjs:75-88` (`expireToken`) | Ustawia `usedAt` w jednym tokenie: po ustawieniu nowego hasła (`PasswordResetHandler.mjs:44-48,119`) lub potwierdzeniu e-maila (`UserEmailsConfirmationHandler.mjs:65`). |
+| `OneTimeTokenHandler.mjs:90-104` (`expireAllTokensForUser`) | Ustawia `usedAt` we wszystkich otwartych tokenach `password` użytkownika, gdy użytkownik zmienia hasło w ustawieniach (`services/web/app/src/Features/User/UserController.mjs:146-149`) lub administrator ustawia je w panelu administracyjnym (`AdminUserManager.mjs:479-488`). |
+
+#### Kto odczytuje {#who-reads-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `PasswordResetHandler.mjs:50-70,94-119` | Zamienia token resetu lub aktywacji na użytkownika, a następnie ustawia hasło. Strona aktywacji z `user-activate` tylko przekazuje token do tego formularza. |
+| `UserEmailsConfirmationHandler.mjs:37-66` | Potwierdza adres e-mail na podstawie tokenu `email_confirmation` zalogowanego użytkownika. |
+| `AdminUserManager.mjs:213-223` (module `admin-tools`) | Znajduje otwarty token aktywacyjny użytkownika, aby ponownie pokazać link aktywacyjny w panelu administracyjnym. Odczytuje `db.tokens` bezpośrednio. |
+
+#### Indeksy {#indexes}
+
+| Nazwa | Klucze | Opcje | Migracja |
+| ---- | ---- | ------- | --------- |
+| `token_1_use_1` | `{ token: 1, use: 1 }` | unikalny | `20190912145031_create_tokens_indexes.mjs` |
+| `createdAt_1` | `{ createdAt: 1 }` | TTL, `expireAfterSeconds: 7776000` (90 dni) | `20210407085118_token-expiry-with-ttl-index.mjs` |
+| `data.user_id_1` | `{ "data.user_id": 1 }` | | `20231113173237_tokens_user_id_index.mjs` |
+
+Migracje znajdują się w `tools/migrations/`.
+
+#### Uwagi {#notes}
+
+* Użyty lub wygasły token nie jest usuwany od razu: zostaje, z `usedAt` lub przeszłym `expiresAt`, aż indeks TTL usunie go 90 dni po `createdAt`.
+* `OneTimeTokenHandler` ma też `getValueFromTokenAndExpire` (`OneTimeTokenHandler.mjs:51-73`), ale nic go nie wywołuje.

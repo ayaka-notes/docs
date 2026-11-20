@@ -1,0 +1,62 @@
+---
+title: Collezione Tokens
+icon: key
+---
+
+`tokens` contiene token monouso: il segreto in un link che permette a qualcuno di impostare una password. Un documento è un token. Non c'è un modello Mongoose; web scrive la collezione tramite `services/web/app/src/Features/Security/OneTimeTokenHandler.mjs` con il driver nativo.
+
+#### Campi {#fields}
+
+| Campo | Tipo | Significato | Fonte |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id del documento. | `OneTimeTokenHandler.mjs:40` |
+| `use` | String | A cosa serve il token, vedi [Usi](#uses) più sotto. Ogni ricerca filtra su questo campo. | `OneTimeTokenHandler.mjs:41` |
+| `token` | String | Il segreto nel link: 32 byte casuali come 64 caratteri esadecimali, salvato così com'è. | `OneTimeTokenHandler.mjs:38,42` |
+| `data` | Object | Ciò che il token rappresenta, restituito quando viene usato. | `OneTimeTokenHandler.mjs:43` |
+| `data.user_id` | String | Id dell'utente, scritto come stringa da ogni chiamante. | `services/web/app/src/Features/PasswordReset/PasswordResetHandler.mjs:27`, `services/web/app/src/Features/User/UserRegistrationHandler.mjs:117`, `services/web/modules/admin-tools/app/src/AdminUserManager.mjs:79` |
+| `data.email` | String | Email dell'utente al momento della creazione del token. Un reset della password cerca l'utente tramite questa email principale (`PasswordResetHandler.mjs:66-70`). | come `data.user_id` |
+| `createdAt` | Date | Momento della creazione. L'indice TTL elimina il token 90 giorni dopo. | `OneTimeTokenHandler.mjs:36,44` |
+| `expiresAt` | Date | `createdAt` più `expiresIn` secondi: 1 ora per impostazione predefinita, 1 settimana per un link di attivazione. Dopo questo momento le ricerche ignorano il token. | `OneTimeTokenHandler.mjs:35-37,45` |
+| `peekCount` | Number | Quante volte il token è stato consultato senza essere usato. Ogni `peekValueFromToken` aggiunge 1; a 4 (`MAX_PEEKS`) il token smette di funzionare. | `OneTimeTokenHandler.mjs:8-31,107` |
+| `usedAt` | Date | Momento in cui il token è stato usato o annullato. Le ricerche ignorano un token che lo possiede. | `OneTimeTokenHandler.mjs:51-104` |
+
+#### Usi {#uses}
+
+| `use` | Funzione | Scadenza | Codice |
+| ----- | ------- | ------ | ---- |
+| `password` | Email di reset della password, dalla pagina "password dimenticata" | 1 ora | `PasswordResetHandler.mjs:14-42` |
+| `password` | Link di attivazione: un account creato con una password casuale, poi un link per impostarne una. Usato dalla registrazione pubblica (`services/web/modules/login-register/app/src/RegisterController.mjs:65`), dalla pagina di registrazione admin di `user-activate` (`services/web/modules/user-activate/app/src/UserActivateController.mjs:27-30`) e dallo script `create-user` (`services/web/modules/server-ce-scripts/scripts/create-user.mjs:21`) | 1 settimana | `UserRegistrationHandler.mjs:97-130` |
+| `password` | Link di attivazione o di reset della password inviato dal pannello di amministrazione (modulo `admin-tools`) | 1 settimana (attivazione), 1 ora (reset) | `AdminUserManager.mjs:76-103,196-206` |
+| `email_confirmation` | Link di conferma dell'email. Solo letto: niente in questo repository crea più token di questo tipo, perché ora la conferma invia un codice a 6 cifre (`services/web/app/src/Features/User/UserEmailsConfirmationHandler.mjs:15-35`) | | `UserEmailsConfirmationHandler.mjs:12,37-66` |
+
+#### Chi scrive {#who-writes-it}
+
+| Codice | Cosa fa |
+| ---- | ------------ |
+| `OneTimeTokenHandler.mjs:34-49` (`getNewToken`) | Inserisce un token. Chiamanti: `PasswordResetHandler.mjs:28`, `UserRegistrationHandler.mjs:115-119`, `AdminUserManager.mjs:77-81`. |
+| `OneTimeTokenHandler.mjs:8-32` (`peekValueFromToken`) | Restituisce `data` di un token valido e aggiunge 1 a `peekCount`. Usato quando si apre la pagina di reset della password (`services/web/app/src/Features/PasswordReset/PasswordResetController.mjs:195-208`), di nuovo quando si imposta la nuova password (`PasswordResetHandler.mjs:94-96`), e dalla conferma dell'email (`UserEmailsConfirmationHandler.mjs:38-41`). |
+| `OneTimeTokenHandler.mjs:75-88` (`expireToken`) | Imposta `usedAt` su un token: dopo che è stata impostata una nuova password (`PasswordResetHandler.mjs:44-48,119`) o confermata un'email (`UserEmailsConfirmationHandler.mjs:65`). |
+| `OneTimeTokenHandler.mjs:90-104` (`expireAllTokensForUser`) | Imposta `usedAt` su ogni token `password` aperto di un utente, quando l'utente cambia la password nelle impostazioni (`services/web/app/src/Features/User/UserController.mjs:146-149`) o un amministratore la imposta nel pannello di amministrazione (`AdminUserManager.mjs:479-488`). |
+
+#### Chi legge {#who-reads-it}
+
+| Codice | Cosa fa |
+| ---- | ------------ |
+| `PasswordResetHandler.mjs:50-70,94-119` | Ricava l'utente da un token di reset o di attivazione, poi imposta la password. La pagina di attivazione di `user-activate` si limita a passare il token a questo modulo. |
+| `UserEmailsConfirmationHandler.mjs:37-66` | Conferma un'email da un token `email_confirmation` dell'utente connesso. |
+| `AdminUserManager.mjs:213-223` (module `admin-tools`) | Trova il token di attivazione aperto di un utente, per mostrare di nuovo il link di attivazione nel pannello di amministrazione. Legge `db.tokens` direttamente. |
+
+#### Indici {#indexes}
+
+| Nome | Chiavi | Opzioni | Migrazione |
+| ---- | ---- | ------- | --------- |
+| `token_1_use_1` | `{ token: 1, use: 1 }` | univoco | `20190912145031_create_tokens_indexes.mjs` |
+| `createdAt_1` | `{ createdAt: 1 }` | TTL, `expireAfterSeconds: 7776000` (90 giorni) | `20210407085118_token-expiry-with-ttl-index.mjs` |
+| `data.user_id_1` | `{ "data.user_id": 1 }` | | `20231113173237_tokens_user_id_index.mjs` |
+
+Le migrazioni si trovano in `tools/migrations/`.
+
+#### Note {#notes}
+
+* Un token usato o scaduto non viene eliminato subito: resta, con `usedAt` o un `expiresAt` passato, finché l'indice TTL non lo rimuove 90 giorni dopo `createdAt`.
+* `OneTimeTokenHandler` ha anche `getValueFromTokenAndExpire` (`OneTimeTokenHandler.mjs:51-73`), ma niente lo chiama.

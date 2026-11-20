@@ -1,0 +1,62 @@
+---
+title: Tokens 集合
+icon: key
+---
+
+`tokens` 保存一次性令牌：链接中让用户设置密码的那段密钥。一个文档对应一个令牌。它没有 Mongoose 模型；web 通过 `services/web/app/src/Features/Security/OneTimeTokenHandler.mjs` 使用原生驱动写入该集合。
+
+#### 字段 {#fields}
+
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 文档 id。 | `OneTimeTokenHandler.mjs:40` |
+| `use` | String | 令牌的用途，见下方的[用途](#uses)。每次查询都按它过滤。 | `OneTimeTokenHandler.mjs:41` |
+| `token` | String | 链接中的密钥：32 个随机字节，表示为 64 个十六进制字符，按原样存储。 | `OneTimeTokenHandler.mjs:38,42` |
+| `data` | Object | 令牌所代表的内容，在使用令牌时返回。 | `OneTimeTokenHandler.mjs:43` |
+| `data.user_id` | String | 用户 id，所有调用方都以字符串写入。 | `services/web/app/src/Features/PasswordReset/PasswordResetHandler.mjs:27`, `services/web/app/src/Features/User/UserRegistrationHandler.mjs:117`, `services/web/modules/admin-tools/app/src/AdminUserManager.mjs:79` |
+| `data.email` | String | 创建令牌时用户的邮箱。重置密码时按这个主邮箱查找用户（`PasswordResetHandler.mjs:66-70`）。 | 同 `data.user_id` |
+| `createdAt` | Date | 创建时间。TTL 索引在 90 天后删除该令牌。 | `OneTimeTokenHandler.mjs:36,44` |
+| `expiresAt` | Date | `createdAt` 加上 `expiresIn` 秒：默认 1 小时，激活链接为 1 周。过了这个时间，查询会忽略该令牌。 | `OneTimeTokenHandler.mjs:35-37,45` |
+| `peekCount` | Number | 令牌被查看但未使用的次数。每次 `peekValueFromToken` 加 1；达到 4（`MAX_PEEKS`）后令牌失效。 | `OneTimeTokenHandler.mjs:8-31,107` |
+| `usedAt` | Date | 令牌被使用或作废的时间。查询会忽略带有该字段的令牌。 | `OneTimeTokenHandler.mjs:51-104` |
+
+#### 用途 {#uses}
+
+| `use` | 功能 | 有效期 | 代码 |
+| ----- | ------- | ------ | ---- |
+| `password` | 从“忘记密码”页面发送的密码重置邮件 | 1 小时 | `PasswordResetHandler.mjs:14-42` |
+| `password` | 激活链接：先用随机密码创建账户，再发送设置密码的链接。用于公开注册（`services/web/modules/login-register/app/src/RegisterController.mjs:65`）、`user-activate` 的管理员注册页面（`services/web/modules/user-activate/app/src/UserActivateController.mjs:27-30`）以及 `create-user` 脚本（`services/web/modules/server-ce-scripts/scripts/create-user.mjs:21`） | 1 周 | `UserRegistrationHandler.mjs:97-130` |
+| `password` | 从管理面板（模块 `admin-tools`）发送的激活或密码重置链接 | 1 周（激活），1 小时（重置） | `AdminUserManager.mjs:76-103,196-206` |
+| `email_confirmation` | 邮箱确认链接。只会被读取：本仓库已不再创建此类令牌，因为确认邮箱现在改为发送 6 位验证码（`services/web/app/src/Features/User/UserEmailsConfirmationHandler.mjs:15-35`） | | `UserEmailsConfirmationHandler.mjs:12,37-66` |
+
+#### 写入方 {#who-writes-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `OneTimeTokenHandler.mjs:34-49` (`getNewToken`) | 插入令牌。调用方：`PasswordResetHandler.mjs:28`、`UserRegistrationHandler.mjs:115-119`、`AdminUserManager.mjs:77-81`。 |
+| `OneTimeTokenHandler.mjs:8-32` (`peekValueFromToken`) | 返回有效令牌的 `data`，并将 `peekCount` 加 1。在打开密码重置页面时（`services/web/app/src/Features/PasswordReset/PasswordResetController.mjs:195-208`）、设置新密码时再次（`PasswordResetHandler.mjs:94-96`），以及邮箱确认时（`UserEmailsConfirmationHandler.mjs:38-41`）使用。 |
+| `OneTimeTokenHandler.mjs:75-88` (`expireToken`) | 为单个令牌设置 `usedAt`：在设置新密码后（`PasswordResetHandler.mjs:44-48,119`）或确认邮箱后（`UserEmailsConfirmationHandler.mjs:65`）。 |
+| `OneTimeTokenHandler.mjs:90-104` (`expireAllTokensForUser`) | 当用户在设置中修改密码（`services/web/app/src/Features/User/UserController.mjs:146-149`）或管理员在管理面板中设置密码（`AdminUserManager.mjs:479-488`）时，为该用户所有未使用的 `password` 令牌设置 `usedAt`。 |
+
+#### 读取方 {#who-reads-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `PasswordResetHandler.mjs:50-70,94-119` | 由重置或激活令牌找到用户，然后设置密码。`user-activate` 的激活页面只是把令牌传给这个表单。 |
+| `UserEmailsConfirmationHandler.mjs:37-66` | 通过已登录用户的 `email_confirmation` 令牌确认邮箱。 |
+| `AdminUserManager.mjs:213-223` (module `admin-tools`) | 查找用户未使用的激活令牌，以便在管理面板中再次显示激活链接。直接读取 `db.tokens`。 |
+
+#### 索引 {#indexes}
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `token_1_use_1` | `{ token: 1, use: 1 }` | 唯一 | `20190912145031_create_tokens_indexes.mjs` |
+| `createdAt_1` | `{ createdAt: 1 }` | TTL，`expireAfterSeconds: 7776000`（90 天） | `20210407085118_token-expiry-with-ttl-index.mjs` |
+| `data.user_id_1` | `{ "data.user_id": 1 }` | | `20231113173237_tokens_user_id_index.mjs` |
+
+迁移位于 `tools/migrations/`。
+
+#### 说明 {#notes}
+
+* 已使用或已过期的令牌不会立即删除：它会带着 `usedAt` 或已过去的 `expiresAt` 保留下来，直到 TTL 索引在 `createdAt` 之后 90 天将其移除。
+* `OneTimeTokenHandler` 还有 `getValueFromTokenAndExpire`（`OneTimeTokenHandler.mjs:51-73`），但没有代码调用它。
