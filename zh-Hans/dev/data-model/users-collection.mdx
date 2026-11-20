@@ -3,84 +3,165 @@ title: Users 集合
 icon: user
 ---
 
-`User` 表示 Overleaf 系统中的单个用户账户。它存储身份验证数据、功能标志、编辑器偏好、访问权限以及活动元数据。
+`users` 为每个账户保存一个文档，存储登录数据、个人资料、编辑器设置、功能和活动。schema 为 `services/web/app/src/models/User.mjs`；大多数写入经由 `services/web/app/src/Features/User/UserUpdater.mjs`。在“来源”列中，`User.mjs:N` 表示该 schema 的某一行，其他不带路径的文件名位于 `services/web/app/src/Features/` 下，`modules/...` 位于 `services/web/` 下。行号取自撰写时的 `server-pro`。
 
-#### 核心身份与身份验证
+#### 核心身份与身份验证 {#core-identity-&-authentication}
 
-* `_id`：用户的唯一 MongoDB ObjectId。
-* `email` / `emails`：主邮箱及历史邮箱记录。
-* `hashedPassword`：用于本地身份验证的 BCrypt 哈希密码。
-* `first_name` / `last_name`：用户资料中的姓名字段。
-* `role` / `isAdmin` / `adminRoles`：角色及管理权限标志。
-* `twoFactorAuthentication`：双因素身份验证配置（如已启用）。
-* `samlIdentifiers` / `thirdPartyIdentifiers`：外部身份提供商绑定。
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 用户的 Id。其他集合通过 `user_id`、`owner_ref` 等类似字段指向这里。 | MongoDB |
+| `email` | String | 主邮箱。唯一，且不区分大小写时也唯一（见“索引”）。 | `User.mjs:26` |
+| `emails` | Object 数组 | 账户的所有地址。主地址是与 `email` 相等的那一项。 | `User.mjs:27` |
+| `emails.email` | String | 地址。 | `User.mjs:29` |
+| `emails.reversedHostname` | String | 地址的域名，按反向顺序存储（`moc.elpmaxe`）。添加地址时设置。 | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | 添加地址的时间。 | `User.mjs:31` |
+| `emails.confirmedAt` | Date | 地址首次确认的时间（之后的确认会保留较早的日期）。LDAP、SAML 和 OIDC 模块在创建账户时设置 `emails.0.confirmedAt`。 | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | 地址最近一次确认的时间。 | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | 地址的机构 SSO 关联。机构 SSO 不属于 CE。 | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | 机构隶属状态。不属于 CE。 | `User.mjs:39` |
+| `first_name` / `last_name` | String | 个人资料中的姓名，最多 255 个字符。LDAP、SAML 和 OIDC 可在每次登录时更新它们。 | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | 用户在账户设置中填写的职位和机构，为自由文本。`role` 不是权限。 | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | 本地密码的 bcrypt 哈希。没有密码的账户不含此字段：LDAP 和 SAML 登录会删除它，迁移 `20260511150000_reset_hardcoded_admin_password` 会删除一个已知的默认密码。 | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | 站点管理员。LDAP、SAML 和 OIDC 可在每次登录时根据 IdP 属性设置它。 | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | 更细粒度的管理员角色。仅在设置了 `Settings.adminRolesEnabled` 时读取。 | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Object 数组 | SAML 登录关联。`saml` 模块写入 `samlIdentifiers.0.providerId`（始终为 `'1'`）、`externalUserId` 和 `userIdAttribute`。 | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Object 数组 | OIDC 登录关联，由核心的 `ThirdPartyIdentityManager` 为 `oidc` 模块写入。 | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`、`enrolledAt`、`secretEncrypted`。仅存在于 schema 中：CE 核心和我们的模块都不使用它。 | `User.mjs:239-243` |
 
-#### 账户状态与生命周期
+#### 账户状态与生命周期 {#account-status-&-lifecycle}
 
-* `signUpDate`：账户创建时间戳。
-* `holdingAccount`：账户是否处于待确认或受限状态。
-* `must_reconfirm`：表示用户是否必须重新确认邮箱。
-* `lastPrimaryEmailCheck`：上次验证主邮箱的时间。
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | 账户创建的时间。 | `User.mjs:75` |
+| `suspended` | Boolean | 管理员停用账户时为 `true`。`UserUpdater.suspendUser` 设置它并结束会话；`admin-tools` 模块调用它，也可以将其恢复。所有不在会话之后的入口点（令牌、签名链接、websocket、webhook）都必须检查它。 | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | 尚未完成注册的占位账户为 `true`。注册会将其设为 `false`；联系人会跳过占位账户。 | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | 为 `true` 时，登录会将用户带到重新确认页面而不是编辑器。重置密码会将其改回 `false`。CE 中没有任何地方会将其设为 `true`。 | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | 用户最近一次确认主邮箱仍属于自己或更改主邮箱的时间。只有 overleaf.com（`saas`）会检查它：时间过久时，项目列表会重定向到主邮箱检查页面。 | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | 必填。用于分析事件的 Id。缺少它时 `UserCreator` 拒绝创建用户；注册流程以及 LDAP、SAML 和 OIDC 模块会传入一个随机 UUID（`UserRegistrationHandler.mjs:103`、`modules/login-register/app/src/RegisterController.mjs:127`）。迁移 `20260424120000` 和 `20260616070000_back_fill_users_analyticsId` 为旧账户根据 `_id` 填充了它。 | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | 欢迎邮件的发送时间。只有启用 `saas` 功能时才会安排该邮件，因此 CE 不会设置它。 | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | 仅存在于 schema 中：CE 核心和我们的模块都不使用它们。 | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | 已关联的 overleaf.com v1 账户的 `id`、`accessToken`、`refreshToken`。`overleaf.id` 有唯一索引；CE 中没有任何地方写入这些字段。 | `User.mjs:230-234` |
 
-#### 登录与活动跟踪
+#### 登录与活动跟踪 {#login-&-activity-tracking}
 
-* `lastLoginIp`：上次成功登录的 IP 地址。
-* `loginCount`：成功登录的总次数。
-* `loginEpoch`：登录会话的内部计数器。
-* `lastLoggedIn`：上次登录的时间戳。
-* `lastActive`：上次记录到活动的时间戳。
-* `lastFailedLogin`：上次登录失败的时间戳。
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | 最近一次登录的 IP。 | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | 成功登录的次数。 | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | 最近一次成功登录的时间。 | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | 登录锁：每次登录尝试都会使其递增，并且仅在文档仍保持读取到的值时才更新文档，因此两个并行登录不能同时通过。LDAP、SAML 和 OIDC 模块也采用同样的做法。 | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | 最近一次输错密码的时间。 | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | 用户最近一次打开项目的时间。 | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### 编辑器偏好（`ace`）
+#### 编辑器偏好（`ace`） {#editor-preferences-ace}
 
-定义用户在在线编辑器中的偏好：
+账户设置页面通过 `UserController.updateUserSettings`（`UserController.mjs:460-530`）保存这些值。
 
-* `theme` / `overallTheme`：编辑器和界面主题。
-* `fontSize`：编辑器字体大小。
-* `autoComplete`、`autoPairDelimiters`：编辑辅助功能。
-* `spellCheckLanguage`：拼写检查所用语言。
-* `pdfViewer`：所选的 PDF 查看器后端。
-* `syntaxValidation`、`mathPreview`、`breadcrumbs`：编辑器用户体验功能。
-* `enableNewEditor`：是否启用新版编辑器界面。
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | 键位绑定。设置页面保存 `default`、`vim` 或 `emacs`；schema 默认值为 `none`。 | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | 编辑器主题。默认 `textmate`。 | `User.mjs:92` |
+| `ace.overallTheme` | String | 界面主题。`system` 在 `lightTheme` 和 `darkTheme` 之间切换；`light-` 或空值使用 `theme`。 | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | 与 `overallTheme: system` 配合使用的编辑器主题。默认 `textmate` 和 `overleaf_dark`。 | `User.mjs:96-97` |
+| `ace.fontSize` | Number | 编辑器字号。默认 12。 | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | 编辑器字体和行高。 | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | 自动补全和自动闭合括号。默认 `true`。 | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | 拼写检查语言。默认 `en`。新项目会复制它。 | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | PDF 查看器。默认 `pdfjs`。 | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | 代码检查。 | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | 数学公式预览。默认 `true`。 | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | 编辑器上方的面包屑导航。默认 `false`。 | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | 编辑器显示选项。默认值依次为 `false`、`true`、`false`、`false`、`true`。 | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` 或 `simple`。 | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | 文献管理器设置：`enabled`（默认 `true`）、`groups`（`{ id }` 数组）、`disablePersonalLibrary`。 | `User.mjs:10-22`, `:114-116` |
 
-#### 功能标志与限制（`features`）
+#### 功能标志与限制（`features`） {#feature-flags-&-limits-features}
 
-控制用户可用的功能：
+`features` 是计算的结果，不应手动编辑。`FeaturesUpdater` 从 `Settings.defaultFeatures` 开始，合并每个未过期的 `featuresOverrides` 条目，并将结果连同 `featuresUpdatedAt` 一起写入（`FeaturesUpdater.mjs:220-300`、`UserFeaturesUpdater.mjs:10-24`）。生产镜像将 `collaborators`、`dropbox`、`versioning`、`compileTimeout`、`compileGroup`、`trackChanges` 和 `references` 设为默认值（`server-ce/config/settings.js:301-309`）；其他键保持未设置。
 
-* `collaborators`：协作者数量上限（`-1` = 无限制）。
-* `versioning`、`trackChanges`：历史记录和修订跟踪功能。
-* `dropbox`、`github`、`gitBridge`：外部集成的可用性。
-* `compileTimeout`：最长编译时间（秒）。
-* `compileGroup`：分配的编译资源组。
-* `aiErrorAssistant`：基于 AI 的编译错误助手标志。较旧的账户可能仍带有该字段以及顶层的 `aiErrorAssistant.enabled`，但它们已不在 schema 中，Ayakaleaf Pro 也不会读取其中任何一个。错误助手由实例的 AI 设置和用户的 `aiFeatures.enabled`（未设置时 AI 为开启状态）启用，与 AI 助手相同。
+在 Ayakaleaf Pro 中，管理面板按用户关闭功能。`admin-tools` 模块将其存储为带有 `note: 'admin-panel'` 的 `featuresOverrides` 条目（`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`），`instance-features` 模块将未设置的键视为开启（`modules/instance-features/app/src/UserFeatures.mjs:12-14`）。
 
-#### 访问控制与员工权限（`staffAccess`）
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | 每个项目的最大协作者数，`-1` 表示不限。 | `User.mjs:119` |
+| `features.versioning` | Boolean | 历史记录。 | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Dropbox 同步、GitHub、GitLab 和 Gitea 同步，以及 Git 访问。由相应模块检查，参见 `requireUserFeature`。`gitlab` 和 `gitea`（自 v6.3.4 起）没有默认值：在管理员于 Features 标签页将其关闭之前，它们保持未设置，视为开启。迁移 `20230817081910_back_fill_gitBridge_feature_server_pro` 为所有用户设置了 `gitBridge: true`。 | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | 编译超时时间（秒）。`COMPILE_TIMEOUT` 设置默认值。 | `User.mjs:132` |
+| `features.compileGroup` | String | 编译组，例如 `standard`。 | `User.mjs:136` |
+| `features.references` | Boolean | 已弃用。对于旧账户，它仍会开启 `referencesSearch` 和 `mendeley`。 | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | 修订跟踪。`track-changes` 模块在项目所有者身上检查它。 | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | 文献管理器关联。 | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | 文献搜索、符号面板和离线模式的开关。 | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | AI 使用等级。默认 `basic`。 | `User.mjs:159` |
+| `featuresOverrides` | Object 数组 | 针对单个用户对默认值的修改。每个条目包含 `createdAt`、`expiresAt`（此日期之后忽略）、`note` 和 `features`（与上面相同的键，另加 `templates`）。 | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | 最近一次计算 `features` 的时间。 | `User.mjs:197` |
+| `featuresEpoch` | String | 上次计算时 `Settings.featuresEpoch` 的副本，用于刷新旧账户。 | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-定义细粒度的员工或出版商访问权限：
+AI 助手和错误助手不是 `features` 中的键。它们遵循实例的 AI 设置和 `aiFeatures.enabled`，见下文。
 
-* 面向出版商、机构、群组、管理员和实验的指标及管理权限。
+#### 集成 {#integrations}
 
-#### 注册与集成
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | 为 `false` 时为该用户关闭 AI 助手和错误助手。默认 `true`。 | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | 已关联文献管理器的加密凭据，由 `tpr-webmodule` 模块写入（Mendeley 为 `{ encrypted }`，Zotero 为 `{ apiKeyEncrypted }`）。取消关联时删除。 | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Dropbox 账户 Id。不在 schema 中：由 `dropbox` 模块直接写入。唯一，因此一个 Dropbox 账户只关联一个用户。核心用它查找需要同步的用户。 | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | 加密的 Dropbox 刷新令牌。不在 schema 中，由 `dropbox` 模块写入。取消关联时会删除整个 `dropbox` 对象。 | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | 用户应用文件夹的 Dropbox `list_folder` 游标，使下一次拉取只读取更新的更改。不在 schema 中：由 third-party-datastore 写入，且仅在用户仍关联同一个 Dropbox 账户时写入。 | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | 群组 SSO（由 `groupId`、`linkedAt`、`primary` 组成的 `sso` 数组）和受管用户字段（`managedBy`、`enrolledAt`）。群组订阅不属于 CE。 | `User.mjs:56-72` |
+| `writefull` | Object | Writefull 状态：`initialized`、`autoCreatedAccount`、`isPremium`、`premiumSource`。核心仅在启用 `saas` 功能时写入它，因此 CE 中没有。 | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | 仅存在于 schema 中：CE 核心和我们的模块都不使用它们。 | `User.mjs:249-255` |
 
-* `enrollment.sso`：已关联的 SSO 注册。
-* `refProviders`：参考文献提供商集成。
-* `writefull`：Writefull 写作助手账户状态。
-* `dsMobileApp`：移动应用配置（如有）。
+#### 计划与实验 {#programs-&-experiments}
 
-#### 计划与实验
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | 用户已加入 beta 计划。 | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Alpha 计划。迁移 `20220826104236_disable_alpha_beta_program` 将它和 `betaProgram` 对所有用户设为 `false`。 | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Labs 计划。CE 中没有任何地方设置它们；迁移 `20260615090000_back_fill_labsProgram` 在缺失处设置了 `labsProgram: false`。 | `User.mjs:228-229` |
+| `splitTests` | Mixed | 按测试名称记录的 A/B 测试分配。 | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`：是否参与抢先体验计划。
-* `labsExperiments`：已启用的实验性功能。
-* `awareOfV2`：用户是否已知晓 V2 编辑器。
+#### 推荐与教程 {#referrals-&-tutorials}
 
-#### 推荐与教程
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | 随机推荐 Id，在创建时生成。 | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | ObjectId 数组 / Number | 使用此推荐 Id 注册的用户。 | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | 按教程键：`{ state, updatedAt, postponedUntil }`。 | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`、`refered_users`、`refered_user_count`：推荐跟踪。
-* `completedTutorials`：入门引导和功能教程的完成进度。
+#### 索引 {#indexes}
+
+全部来自 `tools/migrations/` 中带有 `server-ce` 标签的迁移。
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### 说明 {#notes}
+
+* Mongoose 的 `autoIndex` 已关闭（`services/web/app/src/infrastructure/Mongoose.mjs:7`），因此只有上述迁移会创建索引。
+* 删除用户会将整个文档移入 `deletedUsers`（参见 [Deleted Users Collection](/dev/data-model/deleted-users-collection)）。
 
 ***
 
-以下是一个 Overleaf 用户的真实示例。
+下面是一个真实的 Overleaf 用户示例。
+
+<Info>
+
+该账户是在旧版本中创建的。它仍带有已不在 schema 中、也没有任何地方读取的字段：`staffAccess`、`ace.enableNewEditor`、`features.aiErrorAssistant`、`aiErrorAssistant` 和 `writefull.enabled`（现为 `writefull.initialized`）。`ace.breadcrumbs` 现在默认为 `false`。
+
+</Info>
 
 <Accordion title="用户示例">
 
@@ -171,7 +252,7 @@ icon: user
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),

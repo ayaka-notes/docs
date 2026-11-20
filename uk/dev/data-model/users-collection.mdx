@@ -3,84 +3,165 @@ title: Колекція Users
 icon: user
 ---
 
-`User` представляє окремий обліковий запис користувача в системі Overleaf. Він зберігає дані автентифікації, прапорці функцій, налаштування редактора, права доступу та метадані активності.
+`users` зберігає по одному документу на обліковий запис: дані для входу, профіль, налаштування редактора, функції та активність. Схема розташована в `services/web/app/src/models/User.mjs`; більшість записів проходить через `services/web/app/src/Features/User/UserUpdater.mjs`. У стовпці «Джерело» `User.mjs:N` означає рядок цієї схеми, інші назви файлів без шляху розташовані в `services/web/app/src/Features/`, а `modules/...` розташовано в `services/web/`. Номери рядків взято з `server-pro` на момент написання.
 
-#### Основна ідентичність і автентифікація
+#### Основна ідентичність і автентифікація {#core-identity-&-authentication}
 
-* `_id`: унікальний MongoDB ObjectId користувача.
-* `email` / `emails`: основна електронна адреса та історичні записи адрес.
-* `hashedPassword`: пароль, хешований BCrypt, що використовується для локальної автентифікації.
-* `first_name` / `last_name`: поля імені в профілі користувача.
-* `role` / `isAdmin` / `adminRoles`: прапорці ролі та адміністративних привілеїв.
-* `twoFactorAuthentication`: конфігурація двофакторної автентифікації (якщо ввімкнено).
-* `samlIdentifiers` / `thirdPartyIdentifiers`: прив'язки до зовнішніх постачальників ідентичності.
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id користувача. Інші колекції посилаються сюди через `user_id`, `owner_ref` та подібні поля. | MongoDB |
+| `email` | String | Основна адреса електронної пошти. Унікальна, зокрема без урахування регістру (див. «Індекси»). | `User.mjs:26` |
+| `emails` | Масив Object | Усі адреси облікового запису. Основною вважається запис, що дорівнює `email`. | `User.mjs:27` |
+| `emails.email` | String | Адреса. | `User.mjs:29` |
+| `emails.reversedHostname` | String | Домен адреси у зворотному порядку (`moc.elpmaxe`). Задається під час додавання адреси. | `User.mjs:30`, `UserCreator.mjs:70`, `UserUpdater.mjs:123` |
+| `emails.createdAt` | Date | Коли адресу було додано. | `User.mjs:31` |
+| `emails.confirmedAt` | Date | Коли адресу вперше підтверджено (пізніше підтвердження зберігає ранішу дату). Модулі LDAP, SAML і OIDC задають `emails.0.confirmedAt` під час створення облікового запису. | `User.mjs:37`, `UserUpdater.mjs:402-404`, `modules/authentication/ldap/app/src/LDAPAuthenticationManager.mjs:56` |
+| `emails.reconfirmedAt` | Date | Час останнього підтвердження адреси. | `User.mjs:40`, `UserUpdater.mjs:399-401` |
+| `emails.samlProviderId` | String | Прив'язка адреси до SSO установи. SSO установ не входить до CE. | `User.mjs:38` |
+| `emails.affiliationUnchecked` | Boolean | Стан належності до установи. Не входить до CE. | `User.mjs:39` |
+| `first_name` / `last_name` | String | Ім'я в профілі, не більше 255 символів. LDAP, SAML і OIDC можуть оновлювати їх під час кожного входу. | `User.mjs:43`, `User.mjs:48` |
+| `role` / `institution` | String | Довільний текст, який користувач вводить як посаду та установу в налаштуваннях облікового запису. `role` не є дозволом. | `User.mjs:53-54`, `UserController.mjs:388`, `UserController.mjs:454` |
+| `hashedPassword` | String | bcrypt-хеш локального пароля. Відсутній в облікових записах без пароля: входи через LDAP і SAML видаляють його, а міграція `20260511150000_reset_hardcoded_admin_password` видаляє відомий пароль за замовчуванням. | `User.mjs:55`, `AuthenticationManager.mjs:108`, `LDAPAuthenticationManager.mjs:71` |
+| `isAdmin` | Boolean | Адміністратор сайту. LDAP, SAML і OIDC можуть задавати його з атрибута IdP під час кожного входу. | `User.mjs:73`, `LDAPAuthenticationManager.mjs:62-65` |
+| `adminRoles` | Array | Детальніші ролі адміністратора. Зчитуються лише тоді, коли задано `Settings.adminRolesEnabled`. | `User.mjs:74`, `AuthorizationManager.mjs:156` |
+| `samlIdentifiers` | Масив Object | Прив'язка входу через SAML. Модуль `saml` записує `samlIdentifiers.0.providerId` (завжди `'1'`), `externalUserId` і `userIdAttribute`. | `User.mjs:236`, `modules/authentication/saml/app/src/SAMLAuthenticationManager.mjs:36`, `:62-67` |
+| `thirdPartyIdentifiers` | Масив Object | Прив'язки входу через OIDC, які записує `ThirdPartyIdentityManager` ядра для модуля `oidc`. | `User.mjs:237`, `modules/authentication/oidc/app/src/OIDCAuthenticationManager.mjs:80` |
+| `twoFactorAuthentication` | Object | `createdAt`, `enrolledAt`, `secretEncrypted`. Лише в схемі: ядро CE і наші модулі його не використовують. | `User.mjs:239-243` |
 
-#### Стан і життєвий цикл облікового запису
+#### Стан і життєвий цикл облікового запису {#account-status-&-lifecycle}
 
-* `signUpDate`: часова позначка створення облікового запису.
-* `holdingAccount`: чи очікує обліковий запис підтвердження або чи він обмежений.
-* `must_reconfirm`: вказує, чи має користувач повторно підтвердити свою електронну адресу.
-* `lastPrimaryEmailCheck`: час останньої перевірки основної електронної адреси.
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `signUpDate` | Date | Коли обліковий запис було створено. | `User.mjs:75` |
+| `suspended` | Boolean | `true`, якщо адміністратор вимкнув обліковий запис. `UserUpdater.suspendUser` задає його та завершує сеанси; модуль `admin-tools` викликає його і може повернути значення назад. Кожна точка входу, не захищена сеансом (токени, підписані посилання, websocket, webhook), має його перевіряти. | `User.mjs:248`, `UserUpdater.mjs:613-616`, `modules/admin-tools/app/src/AdminUserManager.mjs:360` |
+| `holdingAccount` | Boolean | `true` для облікового запису-заглушки, який не завершив реєстрацію. Реєстрація встановлює `false`; контакти пропускають облікові записи-заглушки. | `User.mjs:89`, `UserRegistrationHandler.mjs:27-30`, `ContactController.mjs:45` |
+| `must_reconfirm` | Boolean | Якщо значення `true`, вхід перенаправляє користувача на сторінку повторного підтвердження замість редактора. Скидання пароля повертає значення `false`. Ніщо в CE не встановлює `true`. | `User.mjs:201`, `AuthenticationController.mjs:215`, `UserUpdater.mjs:603-610` |
+| `lastPrimaryEmailCheck` | Date | Коли користувач востаннє підтвердив, що основна адреса досі належить йому, або змінив основну адресу. Перевіряє це лише overleaf.com (`saas`): якщо значення надто старе, список проєктів перенаправляє на сторінку перевірки основної адреси. | `User.mjs:86`, `UserUpdater.mjs:259`, `UserEmailsController.mjs:488`, `Project/ProjectListController.mjs:234`, `:280-290` |
+| `analyticsId` | String | Обов'язкове. Id для подій аналітики. `UserCreator` відмовляється створювати користувача без нього; шляхи реєстрації та модулі LDAP, SAML і OIDC передають випадковий UUID (`UserRegistrationHandler.mjs:103`, `modules/login-register/app/src/RegisterController.mjs:127`). Міграції `20260424120000` і `20260616070000_back_fill_users_analyticsId` заповнили його з `_id` для старих облікових записів. | `User.mjs:246`, `UserCreator.mjs:57-58` |
+| `onboardingEmailSentAt` | Date | Коли було надіслано вітальний лист. Лист планується лише за увімкненої функції `saas`, тому CE його не задає. | `User.mjs:244`, `UserCreator.mjs:123-125`, `UserOnboardingEmailManager.mjs:24` |
+| `lastTrial`, `migratedAt`, `awareOfV2` | Date / Date / Boolean | Лише в схемі: ядро CE і наші модулі їх не використовують. | `User.mjs:87`, `:234`, `:231` |
+| `overleaf` | Object | `id`, `accessToken`, `refreshToken` пов'язаного облікового запису overleaf.com v1. `overleaf.id` має унікальний індекс; ніщо в CE не записує ці поля. | `User.mjs:230-234` |
 
-#### Відстеження входів і активності
+#### Відстеження входів і активності {#login-&-activity-tracking}
 
-* `lastLoginIp`: IP-адреса останнього успішного входу.
-* `loginCount`: загальна кількість успішних входів.
-* `loginEpoch`: внутрішній лічильник сеансів входу.
-* `lastLoggedIn`: часова позначка останнього входу.
-* `lastActive`: часова позначка останньої зафіксованої активності.
-* `lastFailedLogin`: часова позначка останньої невдалої спроби входу.
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `lastLoginIp` | String | IP останнього входу. | `User.mjs:85`, `AuthenticationController.mjs:381` |
+| `loginCount` | Number | Кількість успішних входів. | `User.mjs:88`, `AuthenticationController.mjs:623` |
+| `lastLoggedIn` | Date | Час останнього успішного входу. | `User.mjs:84`, `AuthenticationController.mjs:622` |
+| `loginEpoch` | Number | Блокування для входів: кожна спроба входу збільшує значення й оновлює документ лише тоді, коли в ньому досі прочитане значення, тож два паралельні входи не можуть пройти обидва. Модулі LDAP, SAML і OIDC роблять те саме. | `User.mjs:81`, `AuthenticationManager.mjs:130-137`, `OIDCAuthenticationManager.mjs:100` |
+| `lastFailedLogin` | Date | Час останнього неправильного пароля. | `User.mjs:83`, `AuthenticationManager.mjs:131-132` |
+| `lastActive` | Date | Коли користувач востаннє відкривав проєкт. | `User.mjs:82`, `ProjectController.mjs:919-921` |
 
-#### Налаштування редактора (`ace`)
+#### Налаштування редактора (`ace`) {#editor-preferences-ace}
 
-Визначає налаштування користувача для онлайн-редактора:
+Сторінка налаштувань облікового запису зберігає їх через `UserController.updateUserSettings` (`UserController.mjs:460-530`).
 
-* `theme` / `overallTheme`: тема редактора та інтерфейсу.
-* `fontSize`: розмір шрифту редактора.
-* `autoComplete`, `autoPairDelimiters`: функції допомоги під час редагування.
-* `spellCheckLanguage`: мова перевірки орфографії.
-* `pdfViewer`: вибраний бекенд для перегляду PDF.
-* `syntaxValidation`, `mathPreview`, `breadcrumbs`: функції UX редактора.
-* `enableNewEditor`: чи ввімкнено новий інтерфейс редактора.
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `ace.mode` | String | Комбінації клавіш. Сторінка налаштувань зберігає `default`, `vim` або `emacs`; у схемі за замовчуванням використовується `none`. | `User.mjs:91`, `services/web/frontend/js/features/ide-settings/components/editor-settings/keybinding-setting.tsx:6-16` |
+| `ace.theme` | String | Тема редактора. За замовчуванням `textmate`. | `User.mjs:92` |
+| `ace.overallTheme` | String | Тема інтерфейсу. `system` перемикає між `lightTheme` і `darkTheme`; `light-` або порожнє значення використовує `theme`. | `User.mjs:93-95` |
+| `ace.lightTheme` / `ace.darkTheme` | String | Теми редактора, що використовуються з `overallTheme: system`. За замовчуванням `textmate` і `overleaf_dark`. | `User.mjs:96-97` |
+| `ace.fontSize` | Number | Розмір шрифту редактора. За замовчуванням 12. | `User.mjs:98` |
+| `ace.fontFamily` / `ace.lineHeight` | String | Шрифт і висота рядка редактора. | `User.mjs:105-106` |
+| `ace.autoComplete` / `ace.autoPairDelimiters` | Boolean | Автодоповнення та закривальні дужки. За замовчуванням `true`. | `User.mjs:99-100` |
+| `ace.spellCheckLanguage` | String | Мова перевірки правопису. За замовчуванням `en`. Новий проєкт копіює її. | `User.mjs:101`, `ProjectCreationHandler.mjs:277` |
+| `ace.pdfViewer` | String | Переглядач PDF. За замовчуванням `pdfjs`. | `User.mjs:102` |
+| `ace.syntaxValidation` | Boolean | Перевірка коду. | `User.mjs:103` |
+| `ace.mathPreview` | Boolean | Попередній перегляд формул. За замовчуванням `true`. | `User.mjs:107` |
+| `ace.breadcrumbs` | Boolean | Навігаційний ланцюжок над редактором. За замовчуванням `false`. | `User.mjs:108` |
+| `ace.previewTabs`, `ace.editorTabs`, `ace.nonBlinkingCursor`, `ace.darkModePdf`, `ace.floatingMenu` | Boolean | Параметри відображення редактора. За замовчуванням `false`, `true`, `false`, `false`, `true`. | `User.mjs:104`, `:109-110`, `:112-113` |
+| `ace.referencesSearchMode` | String | `advanced` або `simple`. | `User.mjs:111`, `UserController.mjs:513-515` |
+| `ace.zotero` / `ace.mendeley` / `ace.papers` | Object | Налаштування менеджера бібліографії: `enabled` (за замовчуванням `true`), `groups` (масив `{ id }`), `disablePersonalLibrary`. | `User.mjs:10-22`, `:114-116` |
 
-#### Прапорці функцій і обмеження (`features`)
+#### Прапорці функцій і обмеження (`features`) {#feature-flags-&-limits-features}
 
-Керує доступністю функцій для користувача:
+`features` є результатом обчислення, і редагувати його вручну не потрібно. `FeaturesUpdater` починає з `Settings.defaultFeatures`, об'єднує кожен непрострочений запис `featuresOverrides` і записує результат разом із `featuresUpdatedAt` (`FeaturesUpdater.mjs:220-300`, `UserFeaturesUpdater.mjs:10-24`). Робочий образ задає за замовчуванням `collaborators`, `dropbox`, `versioning`, `compileTimeout`, `compileGroup`, `trackChanges` і `references` (`server-ce/config/settings.js:301-309`); решта ключів лишається незаданою.
 
-* `collaborators`: максимальна кількість співавторів (`-1` = без обмежень).
-* `versioning`, `trackChanges`: функції історії та відстеження змін.
-* `dropbox`, `github`, `gitBridge`: доступність зовнішніх інтеграцій.
-* `compileTimeout`: максимальний час компіляції (у секундах).
-* `compileGroup`: призначена група ресурсів компіляції.
-* `aiErrorAssistant`: прапорець ШІ-помічника для помилок компіляції. У старіших облікових записах він, а також `aiErrorAssistant.enabled` верхнього рівня, ще можуть бути, але їх більше немає в схемі, і Ayakaleaf Pro не зчитує жодного з них. Помічник з помилок вмикається налаштуваннями ШІ екземпляра та полем `aiFeatures.enabled` користувача (якщо його не задано, ШІ увімкнено) — так само, як і ШІ-помічник.
+В Ayakaleaf Pro панель адміністратора вимикає функції для окремих користувачів. Модуль `admin-tools` зберігає їх як запис `featuresOverrides` з `note: 'admin-panel'` (`modules/admin-tools/app/src/AdminFeatures.mjs:13-30`), а модуль `instance-features` вважає незаданий ключ увімкненим (`modules/instance-features/app/src/UserFeatures.mjs:12-14`).
 
-#### Контроль доступу та права персоналу (`staffAccess`)
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `features.collaborators` | Number | Максимум співавторів у проєкті, `-1` = без обмежень. | `User.mjs:119` |
+| `features.versioning` | Boolean | Історія. | `User.mjs:123` |
+| `features.dropbox` / `github` / `gitlab` / `gitea` / `gitBridge` | Boolean | Синхронізація з Dropbox, синхронізація з GitHub, GitLab і Gitea та доступ через Git. Перевіряються відповідними модулями, див. `requireUserFeature`. `gitlab` і `gitea` (починаючи з v6.3.4) не мають значення за замовчуванням: вони лишаються незаданими, що вважається увімкненим, доки адміністратор не вимкне їх на вкладці Features. Міграція `20230817081910_back_fill_gitBridge_feature_server_pro` встановила `gitBridge: true` для всіх користувачів. | `User.mjs:127-131` |
+| `features.compileTimeout` | Number | Тайм-аут компіляції в секундах. `COMPILE_TIMEOUT` задає значення за замовчуванням. | `User.mjs:132` |
+| `features.compileGroup` | String | Група компіляції, наприклад `standard`. | `User.mjs:136` |
+| `features.references` | Boolean | Застаріло. Для старих облікових записів досі вмикає `referencesSearch` і `mendeley`. | `User.mjs:140`, `ProjectEditorHandler.mjs:72-77` |
+| `features.trackChanges` | Boolean | Відстеження змін. Модуль `track-changes` перевіряє його у власника проєкту. | `User.mjs:144`, `modules/track-changes/app/src/TrackChangesRouter.mjs:17` |
+| `features.mendeley` / `zotero` / `papers` | Boolean | Прив'язки менеджерів бібліографії. | `User.mjs:148-150` |
+| `features.referencesSearch`, `symbolPalette`, `offlineMode` | Boolean | Перемикачі пошуку бібліографії, палітри символів і офлайн-режиму. | `User.mjs:151-163` |
+| `features.aiUsageQuota` | String | Рівень використання ШІ. За замовчуванням `basic`. | `User.mjs:159` |
+| `featuresOverrides` | Масив Object | Зміни значень за замовчуванням для окремого користувача. Кожен запис має `createdAt`, `expiresAt` (після цієї дати ігнорується), `note` і `features` (ті самі ключі, що вище, плюс `templates`). | `User.mjs:165-196`, `UserFeaturesUpdater.mjs:45-48` |
+| `featuresUpdatedAt` | Date | Коли `features` обчислювалося востаннє. | `User.mjs:197` |
+| `featuresEpoch` | String | Копія `Settings.featuresEpoch` на момент останнього обчислення, використовується для оновлення старих облікових записів. | `User.mjs:198`, `FeaturesUpdater.mjs:34-36` |
 
-Визначає детальні права доступу для персоналу або видавців:
+ШІ-асистент і помічник з помилками не є ключем `features`. Вони залежать від налаштувань ШІ екземпляра та `aiFeatures.enabled`, див. нижче.
 
-* Права на метрики та керування для видавців, установ, груп, адміністраторів і експериментів.
+#### Інтеграції {#integrations}
 
-#### Реєстрація та інтеграції
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `aiFeatures.enabled` | Boolean | `false` вимикає ШІ-асистента та помічника з помилками для цього користувача. За замовчуванням `true`. | `User.mjs:223-225`, `modules/workbench/app/src/PermissionsMiddleware.mjs:12` |
+| `refProviders.mendeley` / `refProviders.zotero` | Mixed | Зашифровані облікові дані прив'язаного менеджера бібліографії, які записує модуль `tpr-webmodule` (`{ encrypted }` для Mendeley, `{ apiKeyEncrypted }` для Zotero). Видаляються під час від'єднання. | `User.mjs:210-215`, `modules/tpr-webmodule/app/src/MendeleyApiClient.mjs:136`, `modules/tpr-webmodule/app/src/ZoteroApiClient.mjs:309` |
+| `dropbox.access_token.uid` | String | Id облікового запису Dropbox. Відсутній у схемі: модуль `dropbox` записує його напряму. Унікальний, тож один обліковий запис Dropbox прив'язаний до одного користувача. Ядро використовує його, щоб знайти користувачів для синхронізації. | `modules/dropbox/app/src/DropboxHandler.mjs:103-112`, `TpdsUpdateSender.mjs:202` |
+| `dropbox.access_token_oauth2.encrypted` | String | Зашифрований токен оновлення Dropbox. Відсутній у схемі, його записує модуль `dropbox`. Увесь об'єкт `dropbox` видаляється під час від'єднання. | `DropboxHandler.mjs:111`, `:181` |
+| `dropbox.cursor` | String | Курсор Dropbox `list_folder` папки застосунку користувача, щоб наступне отримання читало лише новіші зміни. Відсутній у схемі: його записує third-party-datastore, лише поки користувач досі прив'язаний до того самого облікового запису Dropbox. | `services/third-party-datastore/app/js/StateManager.mjs:179-183` |
+| `enrollment` | Object | Груповий SSO (масив `sso` з `groupId`, `linkedAt`, `primary`) і поля керованих користувачів (`managedBy`, `enrolledAt`). Групові підписки не входять до CE. | `User.mjs:56-72` |
+| `writefull` | Object | Стан Writefull: `initialized`, `autoCreatedAccount`, `isPremium`, `premiumSource`. Ядро записує його лише за увімкненої функції `saas`, тобто не в CE. | `User.mjs:216-222`, `ProjectController.mjs:966-1002`, `:1445-1465` |
+| `dsMobileApp.subscribed`, `stripeCustomerIds` | Boolean / Object | Лише в схемі: ядро CE і наші модулі їх не використовують. | `User.mjs:249-255` |
 
-* `enrollment.sso`: пов'язані реєстрації SSO.
-* `refProviders`: інтеграції з постачальниками бібліографічних посилань.
-* `writefull`: стан облікового запису помічника з письма Writefull.
-* `dsMobileApp`: конфігурація мобільного застосунку (якщо є).
+#### Програми та експерименти {#programs-&-experiments}
 
-#### Програми та експерименти
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `betaProgram` | Boolean | Користувач приєднався до бета-програми. | `User.mjs:227`, `BetaProgramHandler.mjs:20` |
+| `alphaProgram` | Boolean | Альфа-програма. Міграція `20220826104236_disable_alpha_beta_program` встановила її та `betaProgram` у `false` для всіх користувачів. | `User.mjs:226` |
+| `labsProgram` / `labsExperiments` | Boolean / Array | Програма Labs. Ніщо в CE їх не задає; міграція `20260615090000_back_fill_labsProgram` встановила `labsProgram: false` там, де його бракувало. | `User.mjs:228-229` |
+| `splitTests` | Mixed | Призначення в A/B-тестах за назвою тесту. | `User.mjs:245` |
 
-* `alphaProgram` / `betaProgram` / `labsProgram`: участь у програмах раннього доступу.
-* `labsExperiments`: увімкнені експериментальні функції.
-* `awareOfV2`: чи ознайомився користувач із редактором V2.
+#### Реферали та навчальні посібники {#referrals-&-tutorials}
 
-#### Реферали та навчальні посібники
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `referal_id` | String | Випадковий реферальний id, генерується під час створення. | `User.mjs:202-207` |
+| `refered_users` / `refered_user_count` | Масив ObjectId / Number | Користувачі, які зареєструвалися з цим реферальним id. | `User.mjs:208-209`, `ReferalHandler.mjs:5-7` |
+| `completedTutorials` | Mixed | За ключем навчального посібника: `{ state, updatedAt, postponedUntil }`. | `User.mjs:247`, `TutorialHandler.mjs:20-30` |
 
-* `referal_id`, `refered_users`, `refered_user_count`: відстеження рефералів.
-* `completedTutorials`: прогрес проходження вступних посібників і посібників з функцій.
+#### Індекси {#indexes}
+
+Усі вони походять із міграцій з тегом `server-ce` у `tools/migrations/`.
+
+| Назва | Ключі | Параметри | Міграція |
+| ---- | ---- | ------- | --------- |
+| `email_1` | `email: 1` | unique | `20190912145032_create_users_indexes` |
+| `email_case_insensitive` | `email: 1` | unique, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `emails_email_1` | `emails.email: 1` | unique, partial (`emails.email` exists) | `20190912145032_create_users_indexes` |
+| `emails_email_case_insensitive` | `emails.email: 1` | unique, partial, collation `en` strength 2 | `20190912145032_create_users_indexes` |
+| `thirdPartyIdentifiers.externalUserId_1_thirdPartyIdentifiers.providerId_1` | `thirdPartyIdentifiers.externalUserId: 1, thirdPartyIdentifiers.providerId: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `dropbox.access_token.uid_unique` | `dropbox.access_token.uid: 1` | unique, sparse | `20190912145032_create_users_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145032_create_users_indexes` |
+| `referal_id` | `referal_id: 1` | | `20190912145032_create_users_indexes` |
+| `signUpDate` | `signUpDate: 1` | | `20190912145032_create_users_indexes` |
+| `lastActive_1` | `lastActive: 1` | | `20240923131936_create_user_last_active_index` |
+| `emails.reversedHostname_1_email_1` | `emails.reversedHostname: 1, email: 1` | | `20250321135735_add_email_to_emails_reversed_hostname_index` |
+| `isAdmin_1` | `isAdmin: 1` | partial (`isAdmin: true`) | `20251103164405_users_isAdmin_index` |
+
+#### Примітки {#notes}
+
+* `autoIndex` у Mongoose вимкнено (`services/web/app/src/infrastructure/Mongoose.mjs:7`), тому індекси створюють лише наведені вище міграції.
+* Видалення користувача переміщує весь документ до `deletedUsers` (див. [Deleted Users Collection](/dev/data-model/deleted-users-collection)).
 
 ***
 
 Ось реальний приклад користувача Overleaf.
+
+<Info>
+
+Цей обліковий запис створено в старішій версії. У ньому досі є поля, яких більше немає в схемі і які ніщо не читає: `staffAccess`, `ace.enableNewEditor`, `features.aiErrorAssistant`, `aiErrorAssistant` і `writefull.enabled` (тепер `writefull.initialized`). `ace.breadcrumbs` тепер за замовчуванням `false`.
+
+</Info>
 
 <Accordion title="Приклад користувача">
 
@@ -171,7 +252,7 @@ icon: user
     featuresOverrides: [],
     referal_id: 'ncbyrxrr6rrfQzgp',
     __v: 0,
-    hashedPassword: '$2a$12$bkfRN7zw27mwaFpUbnSsC.naeFoMAwoRxU0qk7dlPH2obhj8jx.lK',
+    hashedPassword: '$2b$12$2EgV4.qEDjDt6Qx8y5vFduMTBt/LvVfGqspDrAiy8L0OPffvNxLo.',
     loginEpoch: 18,
     lastLoggedIn: ISODate('2026-01-19T05:09:01.075Z'),
     lastActive: ISODate('2026-01-19T05:06:43.145Z'),
