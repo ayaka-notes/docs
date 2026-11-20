@@ -3,79 +3,145 @@ title: Projects 集合
 icon: rectangle-vertical-history
 ---
 
-`Project` 代表 Overleaf 中的單一 LaTeX 專案。它儲存專案中繼資料、擁有權與存取控制、檔案結構、編譯設定以及協作狀態。
+`projects` 中每個專案對應一份文件：名稱、擁有者與成員、共用、檔案樹以及專案設定。文件的內文不在這裡（參見 [Docs 集合](/zh-Hant/dev/data-model/docs-collection)），二進位檔案則以其 `hash` 存放在 history-v1 的 blob 儲存空間中。Schema 為 `services/web/app/src/models/Project.mjs`，檔案樹定義在同目錄的 `Folder.mjs`、`File.mjs` 和 `Doc.mjs` 中。
 
-#### 核心識別與中繼資料
+在「來源」欄中，`Project.mjs:N` 表示該 schema 的某一行，其他不帶路徑的檔名位於 `services/web/app/src/Features/` 下，`modules/...` 位於 `services/web/` 下。行號取自撰寫時的 `server-pro`。
 
-* `_id`：識別專案的唯一 MongoDB ObjectId。
-* `name`：專案顯示名稱。
-* `description`：專案的選用文字描述。
-* `active`：表示專案目前是否為啟用狀態。
-* `version`：內部結構描述或專案格式版本。
-* `trashed`：移至垃圾桶（軟刪除）的項目清單。
-* `deletedDocs`：已永久刪除文件的紀錄。
+#### 核心識別與中繼資料 {#core-identification-&-metadata}
 
-#### 擁有權與存取控制
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 專案的 id。 | MongoDB |
+| `name` | String | 專案名稱。 | `Project.mjs:18` |
+| `description` | String | 專案描述。預設為空。 | `Project.mjs:50` |
+| `version` | Number | 檔案樹每次變更（新增、重新命名、移動、刪除、取代）時加 1。 | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | 專案停用後為 `false`：其文件已從 Mongo 中封存出去（`docs.inS3`）。開啟專案會解除封存並將其重新設為 `true`。在 CE 中，停用舊專案的 cron 僅在設定 `ENABLE_CRON_RESOURCE_DELETION=true` 時執行。 | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | 封存了該專案的使用者。封存依使用者分別進行。舊的布林值已由遷移 `20221111111111_ce_sp_convert_archived_state` 轉換。 | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | 將該專案移入自己垃圾桶的使用者。同樣依使用者分別進行。 | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | 舊版欄位，`{ _id, name, deletedAt }`。已刪除的文件現在以 `deleted: true` 保留在 `docs` 中。只有在還原舊的已刪除專案時才會讀取此陣列：項目會被複製到 docstore，然後陣列被清空。沒有任何程式碼寫入它。 | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | 僅存在於 schema 中：CE 核心和我們的模組都不使用它。 | `Project.mjs:28` |
 
-* `owner_ref`：指向擁有該專案之使用者的參照。
-* `collaberator_refs`：具有編輯權限的使用者。
-* `reviewer_refs`：具有審閱者層級存取權的使用者。
-* `readOnly_refs`：具有唯讀存取權的使用者。
-* `pendingEditor_refs` / `pendingReviewer_refs`：待處理的邀請。
+#### 擁有權與存取控制 {#ownership-&-access-control}
 
-#### 以權杖為基礎的存取
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | 擁有者。 | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | 可以編輯的使用者（這個拼字就是真實的欄位名稱）。 | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | 可以審閱的使用者：留言並透過追蹤修訂提出建議。 | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | 只能檢視的使用者。 | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | 不是邀請（邀請在 `projectInvites` 中）。在擁有者沒有空出的協作者名額時被新增為編輯者或審閱者的使用者。他們會被加入 `readOnly_refs`，並列在這裡，直到可以升級。 | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | 要求更多權限的檢視者：`userId`、`privilegeLevel`、`requestedAt`。每位使用者一筆。要求被核准、被拒絕或使用者離開專案時移除。 | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | 追蹤修訂狀態。`true` 表示對所有人開啟（舊格式）；否則是一個以使用者 id 為鍵的物件，每位開啟它的使用者對應 `true`。由 `track-changes` 模組寫入，核心也會為被設為審閱者的使用者開啟它。 | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | IEEE Collabratec 連結：`user_id`、`collabratec_document_id`、`collabratec_privategroup_id`、`added_at`。CE 中未使用。 | `Project.mjs:104-116` |
 
-* `tokens`：共用連結的權杖登錄表。
-* `tokenAccessReadOnly_refs`：授予唯讀存取權的權杖。
-* `tokenAccessReadAndWrite_refs`：授予讀寫存取權的權杖。
+#### 連結共用 {#link-sharing}
 
-#### 活動追蹤
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` 或 `tokenBased`（已開啟連結共用）。舊專案可能仍有舊版值 `readOnly` 或 `readAndWrite`。不存在 `public`。這個拼字就是真實的欄位名稱。 | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | 唯讀連結的權杖。唯一。 | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | 編輯連結的權杖。唯一。 | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | 編輯權杖的數字前綴，用於查詢權杖。唯一。 | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | 透過唯讀連結加入的使用者（使用者 id，而不是權杖）。 | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | 透過編輯連結加入的使用者。 | `Project.mjs:84` |
 
-* `lastUpdated`：最近一次修改的時間戳記。
-* `lastUpdatedBy`：執行最後一次更新的使用者。
-* `lastOpened`：最後一次開啟專案的時間戳記。
-* `deletedByExternalDataSource`：刪除是否由外部整合所觸發。
+關閉連結共用會移除 `tokens`，並將 `publicAccesLevel` 設回 `private`（`ProjectDetailsHandler.mjs:233-238`）。
 
-#### 專案結構
+#### 活動追蹤 {#activity-tracking}
 
-根文件與資料夾
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | 內容或檔案樹最後一次變更的時間。只會向前推進。 | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | 最後一次變更的使用者。 | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | 最後一次有人開啟專案的時間。 | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | 專案資料夾在 Dropbox 端被刪除時為 `true`。專案本身不會被刪除；編輯器會顯示提示，並在下次開啟專案時清除該旗標。 | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | 來自 overleaf.com v1 匯入的舊版欄位。大於 0 時，專案會在載入時推送到 Dropbox 一次，然後計數器被重設。 | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`：主要 LaTeX 進入點文件（通常為 `main.tex`）的 ObjectId。
-* `rootFolder`：專案檔案樹的內嵌表示。
+#### 專案結構 {#project-structure}
 
-每個資料夾項目包含：
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | 被編譯的主文件。 | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | 在專案設定中選擇的主 `.bib` 檔案。 | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | 檔案樹。始終只有一個元素，即根資料夾。 | `Project.mjs:43` |
 
-* `name` / `_id`：資料夾名稱與識別碼。
-* `docs`：LaTeX 原始碼文件清單，包含名稱與 `_id`。
-* `fileRefs`：二進位檔案參照（圖片、資料檔），包括：
-  * `name`：檔案名稱
-  * `created`：上傳時間戳記
-  * `rev`：修訂計數器
-  * `hash`：用於重複資料刪除的內容雜湊
-  * `linkedFileData`：外部儲存連結（如有）
-* `folders`：巢狀子資料夾。
+每個資料夾（`Folder.mjs`）：
 
-#### 編譯與編輯器設定
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 資料夾 id。 | MongoDB |
+| `name` | String | 資料夾名稱（根資料夾名為 `rootFolder`）。 | `Folder.mjs:9` |
+| `docs` | Array of Object | 可編輯的文字檔案：只有 `_id` 和 `name`。`_id` 即 `docs` 集合中保存內文的文件的 `_id`。 | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | 二進位檔案，見下文。 | `Folder.mjs:16` |
+| `folders` | Array of Folder | 子資料夾。 | `Folder.mjs:17` |
 
-* `compiler`：所選的 LaTeX 引擎（`pdflatex`、`xelatex`、`lualatex` 等）。
-* `spellCheckLanguage`：此專案的拼字檢查語言。
+`fileRefs` 中的每個檔案（`File.mjs`）：
 
-#### 公開與共用設定
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 檔案 id。取代檔案時會改變。 | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | 檔案名稱。 | `File.mjs:7` |
+| `created` | Date | 檔案上傳或最後一次被取代的時間。 | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | 每次取代檔案時加 1。 | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | 內容的 SHA-1。檔案以此雜湊存放在 history-v1 的 blob 儲存空間中，下載時也從那裡讀取。 | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | 為連結檔案設定（來自 URL、其他專案、輸出檔案、Zotero 或 Mendeley）：`provider`、其來源資料以及 `importedAt`。 | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`：專案可見性（`private`、`readOnly`、`public` 等）。
-* `collabratecUsers`：來自外部協作平台的連結使用者。
+#### 編譯與編輯器設定 {#compilation-&-editor-settings}
 
-#### Overleaf 專屬擴充
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | LaTeX 引擎：`Settings.safeCompilers` 之一（`xelatex`、`pdflatex`、`latex`、`lualatex`）。 | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | 該專案在沙盒編譯中使用的 TeX Live 映像檔。新專案取得 `Settings.currentImageName`；範本庫和 MCP 伺服器可以變更它。 | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | 拼字檢查語言。新專案會複製擁有者的 `ace.spellCheckLanguage`。 | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | 從設定要求中儲存的專案設定（`body.png2pdf`）。 | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | 參考文獻格式設定。 | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | 出版商品牌。範本庫可以設定它。 | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | 專案來源的 overleaf.com v1 範本。CE 中不會設定。 | `Project.mjs:85-86` |
 
-* `overleaf.history`：
-  * `id`：歷程記錄服務使用的識別碼。
-  * `display`：歷程記錄是否啟用且可見。
+#### 歷史記錄（`overleaf`） {#history-overleaf}
 
-#### 內部版本控制
+| 欄位 | 類型 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | 專案在 project-history 和 history-v1 中的 id。新專案使用字串形式的專案 id。唯一。 | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | 新專案始終為 `true`；僅為相容性而保留。 | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | 歷史記錄也會儲存留言和追蹤的修訂。只有當該值為 `true` 時，還原版本才會一併還原它們。 | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | 遷移到歷史記錄 OT 更新格式的階段。只增不減。 | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | 最後一次歷史記錄重新同步完成的時間。由 project-history 寫入，而不是 web。 | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | 遷移到完整專案歷史記錄時留下的欄位。 | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | 在另一個專案的除錯副本上設定。 | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | overleaf.com v1 匯入資料。CE 中不會設定。`overleaf.id` 有唯一索引。 | `Project.mjs:88-91` |
+| `__v` | Number | Mongoose 版本鍵。 | Mongoose |
 
-* `__v`：Mongoose 用於並行控制的內部版本鍵。
+history-v1 還可以寫入 `overleaf.history.currentEndVersion`、`overleaf.history.currentEndTimestamp`、`overleaf.history.updatedAt` 和 `overleaf.backup.*`，但僅在設定了其 `backupStore` 時（`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`）。CE 不設定它，因此這些欄位不會出現。
 
-以下是 Overleaf 專案的實際範例。
+#### 索引 {#indexes}
+
+全部來自 `tools/migrations/` 中帶有 `server-ce` 標籤的遷移。
+
+| 名稱 | 鍵 | 選項 | 遷移 |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### 說明 {#notes}
+
+* Mongoose 的 `autoIndex` 已關閉（`services/web/app/src/infrastructure/Mongoose.mjs:7`）：schema 中的 `index` 選項之所以存在，只是因為上面的遷移會建立它們。
+* 遷移 `20250620152657_ensure_collaborator_arrays` 會將缺少的 `collaberator_refs`、`pendingEditor_refs`、`pendingReviewer_refs`、`readOnly_refs` 和 `reviewer_refs` 設為 `[]`。
+* 刪除專案會把文件移到 `deletedProjects`（參見 [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)）。
+
+以下是一個真實的 Overleaf 專案範例。
 
 <Accordion title="專案範例">
 
