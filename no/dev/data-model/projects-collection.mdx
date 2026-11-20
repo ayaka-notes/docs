@@ -3,79 +3,145 @@ title: Prosjektsamlingen
 icon: rectangle-vertical-history
 ---
 
-`Project` representerer ett enkelt LaTeX-prosjekt i Overleaf. Det lagrer prosjektmetadata, eierskap og tilgangskontroll, filstruktur, kompileringsinnstillinger og samarbeidstilstand.
+`projects` inneholder ett dokument per prosjekt: navn, eier og medlemmer, deling, filtreet og prosjektinnstillingene. Teksten i dokumentene ligger ikke her (se [Docs-samlingen](/no/dev/data-model/docs-collection)), og binære filer ligger i blob-lageret til history-v1 under sin `hash`. Skjemaet er `services/web/app/src/models/Project.mjs`, med filtreet i `Folder.mjs`, `File.mjs` og `Doc.mjs` ved siden av.
 
-#### Kjerneidentifikasjon og metadata
+I kolonnen Kilde er `Project.mjs:N` en linje i det skjemaet, andre filnavn uten sti ligger under `services/web/app/src/Features/`, og `modules/...` ligger under `services/web/`. Linjenumrene er fra `server-pro` da dette ble skrevet.
 
-* `_id`: Unik MongoDB-ObjectId som identifiserer prosjektet.
-* `name`: Prosjektets visningsnavn.
-* `description`: Valgfri tekstlig beskrivelse av prosjektet.
-* `active`: Angir om prosjektet er aktivt for øyeblikket.
-* `version`: Intern skjema- eller prosjektformatversjon.
-* `trashed`: Liste over elementer som er flyttet til papirkurven (mykt slettet).
-* `deletedDocs`: Oppføringer for permanent slettede dokumenter.
+#### Grunnleggende identifikasjon og metadata {#core-identification-&-metadata}
 
-#### Eierskap og tilgangskontroll
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Prosjektets id. | MongoDB |
+| `name` | String | Prosjektnavn. | `Project.mjs:18` |
+| `description` | String | Prosjektbeskrivelse. Tom som standard. | `Project.mjs:50` |
+| `version` | Number | Økes med 1 ved hver endring i filtreet (legge til, gi nytt navn, flytte, slette, erstatte). | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | `false` etter at prosjektet er deaktivert: dokumentene er arkivert ut av Mongo (`docs.inS3`). Når prosjektet åpnes, blir de gjenopprettet, og verdien settes tilbake til `true`. I CE kjører cron-jobben som deaktiverer gamle prosjekter bare med `ENABLE_CRON_RESOURCE_DELETION=true`. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Brukere som har arkivert prosjektet. Arkivering gjelder per bruker. Gamle boolske verdier ble konvertert av migreringen `20221111111111_ce_sp_convert_archived_state`. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Brukere som har flyttet prosjektet til papirkurven sin. Også per bruker. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Foreldet, `{ _id, name, deletedAt }`. Slettede dokumenter blir nå liggende i `docs` med `deleted: true`. Denne arrayen leses bare når et gammelt slettet prosjekt gjenopprettes: oppføringene kopieres til docstore, og arrayen tømmes. Ingenting skriver til den. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Bare i skjemaet: CE-kjernen og modulene våre bruker det ikke. | `Project.mjs:28` |
 
-* `owner_ref`: Referanse til brukeren som eier prosjektet.
-* `collaberator_refs`: Brukere med redigeringstillatelser.
-* `reviewer_refs`: Brukere med tilgang på anmeldernivå.
-* `readOnly_refs`: Brukere med skrivebeskyttet tilgang.
-* `pendingEditor_refs` / `pendingReviewer_refs`: Ventende invitasjoner.
+#### Eierskap og tilgangskontroll {#ownership-&-access-control}
 
-#### Tokenbasert tilgang
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Eier. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Brukere som kan redigere (stavemåten er det faktiske feltnavnet). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | Brukere som kan gå gjennom: kommentere og foreslå med sporede endringer. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Brukere som bare kan se. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | Ikke invitasjoner (de ligger i `projectInvites`). Brukere som ble lagt til som redaktør eller gjennomgåer mens eieren ikke hadde ledig samarbeidsplass. De legges til i `readOnly_refs` og står her til de kan oppgraderes. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Lesere som har bedt om mer tilgang: `userId`, `privilegeLevel`, `requestedAt`. Én oppføring per bruker. Fjernes når forespørselen innvilges eller avslås, eller brukeren forlater prosjektet. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Tilstand for sporede endringer. `true` betyr på for alle (gammelt format); ellers et objekt med bruker-id-er som nøkler og `true` for hver bruker som har det på. Modulen `track-changes` skriver det, og kjernen slår det på for en bruker som blir gjort til gjennomgåer. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | IEEE Collabratec-koblinger: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. Brukes ikke i CE. | `Project.mjs:104-116` |
 
-* `tokens`: Tokenregister for delte lenker.
-* `tokenAccessReadOnly_refs`: Tokener som gir skrivebeskyttet tilgang.
-* `tokenAccessReadAndWrite_refs`: Tokener som gir lese- og skrivetilgang.
+#### Lenkedeling {#link-sharing}
 
-#### Aktivitetssporing
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` eller `tokenBased` (lenkedeling på). Gamle prosjekter kan fortsatt ha de foreldede verdiene `readOnly` eller `readAndWrite`. Det finnes ingen `public`. Stavemåten er det faktiske feltnavnet. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Token for visningslenken. Unik. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Token for redigeringslenken. Unik. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Numerisk prefiks for redigeringstokenet, brukes til å slå opp tokenet. Unik. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Brukere som ble med via visningslenken (bruker-id-er, ikke tokens). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Brukere som ble med via redigeringslenken. | `Project.mjs:84` |
 
-* `lastUpdated`: Tidsstempel for den siste endringen.
-* `lastUpdatedBy`: Brukeren som utførte den siste oppdateringen.
-* `lastOpened`: Tidsstempel for siste gang prosjektet ble åpnet.
-* `deletedByExternalDataSource`: Om slettingen ble utløst av en ekstern integrasjon.
+Når lenkedeling slås av, fjernes `tokens`, og `publicAccesLevel` settes tilbake til `private` (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Prosjektstruktur
+#### Aktivitetssporing {#activity-tracking}
 
-Rotdokument og mappe
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | Tidspunkt for siste endring i innholdet eller filtreet. Går bare fremover. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Brukeren bak den siste endringen. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Siste gang noen åpnet prosjektet. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | `true` når prosjektmappen ble slettet på Dropbox-siden. Selve prosjektet slettes ikke; redigeringsverktøyet viser et varsel, og flagget fjernes neste gang prosjektet åpnes. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | Rest fra importen fra overleaf.com v1. Når verdien er over 0, sendes prosjektet til Dropbox én gang ved innlasting, og telleren nullstilles. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: ObjectId for LaTeX-hoveddokumentet (vanligvis `main.tex`).
-* `rootFolder`: Innebygd representasjon av prosjektets filtre.
+#### Prosjektstruktur {#project-structure}
 
-Hver mappeoppføring inneholder:
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Hoveddokumentet som kompileres. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Hoved-`.bib`-filen som er valgt i prosjektinnstillingene. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Filtreet. Alltid ett element, rotmappen. | `Project.mjs:43` |
 
-* `name` / `_id`: Mappenavn og identifikator.
-* `docs`: Liste over LaTeX-kildedokumenter med navn og `_id`.
-* `fileRefs`: Referanser til binærfiler (bilder, datafiler), inkludert:
-  * `name`: Filnavn
-  * `created`: Tidsstempel for opplasting
-  * `rev`: Revisjonsteller
-  * `hash`: Innholdshash for deduplisering
-  * `linkedFileData`: Kobling til ekstern lagring (hvis noen)
-* `folders`: Nestede undermapper.
+Hver mappe (`Folder.mjs`):
 
-#### Kompilerings- og editorinnstillinger
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Mappens id. | MongoDB |
+| `name` | String | Mappenavn (rotmappen heter `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Redigerbare tekstfiler: bare `_id` og `name`. `_id` er `_id` i samlingen `docs`, som inneholder teksten. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | Binære filer, se nedenfor. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Undermapper. | `Folder.mjs:17` |
 
-* `compiler`: Valgt LaTeX-motor (`pdflatex`, `xelatex`, `lualatex` osv.).
-* `spellCheckLanguage`: Språk for stavekontroll i dette prosjektet.
+Hver fil i `fileRefs` (`File.mjs`):
 
-#### Innstillinger for offentlighet og deling
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Filens id. Endres når filen erstattes. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Filnavn. | `File.mjs:7` |
+| `created` | Date | Når filen ble lastet opp eller sist erstattet. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Økes med 1 hver gang filen erstattes. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | SHA-1 av innholdet. Filen lagres i blob-lageret til history-v1 under denne hashen, og nedlastinger leser den derfra. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Settes for koblede filer (fra en URL, et annet prosjekt, en utdatafil, Zotero eller Mendeley): `provider`, kildedataene og `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: Prosjektets synlighet (`private`, `readOnly`, `public` osv.).
-* `collabratecUsers`: Tilknyttede brukere fra eksterne samarbeidsplattformer.
+#### Kompilerings- og redigeringsinnstillinger {#compilation-&-editor-settings}
 
-#### Overleaf-spesifikke utvidelser
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | LaTeX-motor: en av `Settings.safeCompilers` (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | TeX Live-image som brukes for dette prosjektet ved sandkassekompilering. Et nytt prosjekt får `Settings.currentImageName`; malgalleriet og MCP-serveren kan endre det. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Språk for stavekontroll. Et nytt prosjekt kopierer eierens `ace.spellCheckLanguage`. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Prosjektinnstilling som lagres fra innstillingsforespørselen (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Innstilling for referanseformat. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Forlagsprofilering. Malgalleriet kan sette den. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | Mal fra overleaf.com v1 som prosjektet kom fra. Settes ikke i CE. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: Identifikator som brukes av historikktjenesten.
-  * `display`: Om historikk er aktivert og synlig.
+#### Historikk (`overleaf`) {#history-overleaf}
 
-#### Intern versjonering
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Prosjektets id i project-history og history-v1. Nye prosjekter bruker prosjekt-id-en som streng. Unik. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | Alltid `true` for nye prosjekter; beholdes bare for kompatibilitet. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Historikken lagrer også kommentarer og sporede endringer. Gjenoppretting av en versjon gjenoppretter dem bare når denne verdien er `true`. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Trinn i overgangen til historikkens OT-oppdateringsformat. Øker bare. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Siste gang en ny synkronisering av historikken ble fullført. Skrives av project-history, ikke web. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Igjen fra overgangen til full prosjekthistorikk. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Settes på en feilsøkingskopi av et annet prosjekt. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | Importdata fra overleaf.com v1. Settes ikke i CE. `overleaf.id` har en unik indeks. | `Project.mjs:88-91` |
+| `__v` | Number | Mongoose-versjonsnøkkel. | Mongoose |
 
-* `__v`: Mongooses interne versjonsnøkkel for samtidighetskontroll.
+history-v1 kan også skrive `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt` og `overleaf.backup.*`, men bare når `backupStore` er konfigurert (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE konfigurerer den ikke, så disse feltene forekommer ikke.
 
-Her er et ekte eksempel for en Overleaf-bruker.
+#### Indekser {#indexes}
+
+Alle kommer fra migreringer merket `server-ce` i `tools/migrations/`.
+
+| Navn | Nøkler | Alternativer | Migrering |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Merknader {#notes}
+
+* Mongoose `autoIndex` er slått av (`services/web/app/src/infrastructure/Mongoose.mjs:7`): `index`-alternativene i skjemaet finnes bare fordi migreringene ovenfor oppretter dem.
+* Migreringen `20250620152657_ensure_collaborator_arrays` setter manglende `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs` og `reviewer_refs` til `[]`.
+* Når et prosjekt slettes, flyttes dokumentet til `deletedProjects` (se [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
+
+Her er et ekte eksempel på et Overleaf-prosjekt.
 
 <Accordion title="Prosjekteksempel">
 

@@ -3,79 +3,145 @@ title: Kolekcja projektów
 icon: rectangle-vertical-history
 ---
 
-`Project` reprezentuje pojedynczy projekt LaTeX w Overleaf. Przechowuje metadane projektu, informacje o właścicielu i kontroli dostępu, strukturę plików, ustawienia kompilacji oraz stan współpracy.
+`projects` przechowuje jeden dokument na projekt: nazwę, właściciela i członków, udostępnianie, drzewo plików i ustawienia projektu. Treści dokumentów tu nie ma (zobacz [Kolekcja Docs](/pl/dev/data-model/docs-collection)), a pliki binarne znajdują się w magazynie blobów history-v1 pod swoim `hash`. Schemat to `services/web/app/src/models/Project.mjs`, a drzewo plików jest obok w `Folder.mjs`, `File.mjs` i `Doc.mjs`.
 
-#### Podstawowa identyfikacja i metadane
+W kolumnie Źródło `Project.mjs:N` to wiersz tego schematu, inne nazwy plików bez ścieżki znajdują się w `services/web/app/src/Features/`, a `modules/...` w `services/web/`. Numery wierszy pochodzą z `server-pro` w chwili pisania.
 
-* `_id`: Unikalny identyfikator MongoDB ObjectId projektu.
-* `name`: Wyświetlana nazwa projektu.
-* `description`: Opcjonalny tekstowy opis projektu.
-* `active`: Wskazuje, czy projekt jest obecnie aktywny.
-* `version`: Wewnętrzna wersja schematu lub formatu projektu.
-* `trashed`: Lista elementów przeniesionych do kosza (miękkie usunięcie).
-* `deletedDocs`: Rejestr trwale usuniętych dokumentów.
+#### Podstawowa identyfikacja i metadane {#core-identification-&-metadata}
 
-#### Własność i kontrola dostępu
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id projektu. | MongoDB |
+| `name` | String | Nazwa projektu. | `Project.mjs:18` |
+| `description` | String | Opis projektu. Domyślnie pusty. | `Project.mjs:50` |
+| `version` | Number | Zwiększany o 1 przy każdej zmianie drzewa plików (dodanie, zmiana nazwy, przeniesienie, usunięcie, zastąpienie). | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | `false` po dezaktywacji projektu: jego dokumenty zostały zarchiwizowane poza Mongo (`docs.inS3`). Otwarcie projektu przywraca je z archiwum i ponownie ustawia `true`. W CE cron, który dezaktywuje stare projekty, działa tylko z `ENABLE_CRON_RESOURCE_DELETION=true`. | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | Użytkownicy, którzy zarchiwizowali projekt. Archiwizacja dotyczy każdego użytkownika osobno. Stare wartości logiczne przekształciła migracja `20221111111111_ce_sp_convert_archived_state`. | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | Użytkownicy, którzy przenieśli projekt do swojego kosza. Również osobno dla każdego użytkownika. | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | Przestarzałe, `{ _id, name, deletedAt }`. Usunięte dokumenty pozostają teraz w `docs` z `deleted: true`. Ta tablica jest odczytywana tylko przy przywracaniu starego usuniętego projektu: wpisy są kopiowane do docstore, a tablica jest opróżniana. Nic do niej nie zapisuje. | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | Tylko w schemacie: rdzeń CE i nasze moduły go nie używają. | `Project.mjs:28` |
 
-* `owner_ref`: Odwołanie do użytkownika będącego właścicielem projektu.
-* `collaberator_refs`: Użytkownicy z uprawnieniami do edycji.
-* `reviewer_refs`: Użytkownicy z dostępem na poziomie recenzenta.
-* `readOnly_refs`: Użytkownicy z dostępem tylko do odczytu.
-* `pendingEditor_refs` / `pendingReviewer_refs`: Oczekujące zaproszenia.
+#### Własność i kontrola dostępu {#ownership-&-access-control}
 
-#### Dostęp oparty na tokenach
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | Właściciel. | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | Użytkownicy, którzy mogą edytować (ta pisownia to prawdziwa nazwa pola). | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | Użytkownicy, którzy mogą recenzować: komentować i proponować zmiany ze śledzeniem zmian. | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | Użytkownicy, którzy mogą tylko przeglądać. | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | To nie zaproszenia (te są w `projectInvites`). Użytkownicy dodani jako edytorzy lub recenzenci, gdy właściciel nie miał wolnego miejsca na współpracownika. Są dodawani do `readOnly_refs` i wymieniani tutaj, dopóki nie będzie można ich awansować. | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | Czytelnicy, którzy poprosili o większy dostęp: `userId`, `privilegeLevel`, `requestedAt`. Jeden wpis na użytkownika. Usuwany, gdy prośba zostanie przyjęta lub odrzucona albo użytkownik opuści projekt. | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | Stan śledzenia zmian. `true` oznacza włączone dla wszystkich (stary format); w przeciwnym razie obiekt z id użytkowników jako kluczami i `true` dla każdego użytkownika, który ma je włączone. Zapisuje je moduł `track-changes`, a rdzeń włącza je dla użytkownika mianowanego recenzentem. | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | Powiązania IEEE Collabratec: `user_id`, `collabratec_document_id`, `collabratec_privategroup_id`, `added_at`. Nieużywane w CE. | `Project.mjs:104-116` |
 
-* `tokens`: Rejestr tokenów dla udostępnianych linków.
-* `tokenAccessReadOnly_refs`: Tokeny przyznające dostęp tylko do odczytu.
-* `tokenAccessReadAndWrite_refs`: Tokeny przyznające dostęp do odczytu i zapisu.
+#### Udostępnianie przez link {#link-sharing}
 
-#### Śledzenie aktywności
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` lub `tokenBased` (udostępnianie przez link włączone). Stare projekty mogą nadal mieć przestarzałe wartości `readOnly` lub `readAndWrite`. Nie ma wartości `public`. Ta pisownia to prawdziwa nazwa pola. | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | Token linku tylko do odczytu. Unikalny. | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | Token linku do edycji. Unikalny. | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | Numeryczny prefiks tokenu edycji, używany do wyszukania tokenu. Unikalny. | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | Użytkownicy, którzy dołączyli przez link tylko do odczytu (id użytkowników, nie tokeny). | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | Użytkownicy, którzy dołączyli przez link do edycji. | `Project.mjs:84` |
 
-* `lastUpdated`: Znacznik czasu ostatniej modyfikacji.
-* `lastUpdatedBy`: Użytkownik, który dokonał ostatniej aktualizacji.
-* `lastOpened`: Znacznik czasu ostatniego otwarcia projektu.
-* `deletedByExternalDataSource`: Czy usunięcie zostało wywołane przez zewnętrzną integrację.
+Wyłączenie udostępniania przez link usuwa `tokens` i przywraca `publicAccesLevel` do `private` (`ProjectDetailsHandler.mjs:233-238`).
 
-#### Struktura projektu
+#### Śledzenie aktywności {#activity-tracking}
 
-Dokument główny i folder
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | Czas ostatniej zmiany treści lub drzewa plików. Tylko rośnie. | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | Użytkownik, który wprowadził tę ostatnią zmianę. | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | Ostatni raz, gdy ktoś otworzył projekt. | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | `true`, gdy folder projektu został usunięty po stronie Dropbox. Sam projekt nie jest usuwany; edytor wyświetla komunikat, a flaga jest czyszczona przy następnym otwarciu projektu. | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | Pozostałość po imporcie z overleaf.com v1. Gdy wartość jest większa niż 0, projekt jest jednorazowo wysyłany do Dropbox przy wczytaniu, a licznik jest zerowany. | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`: ObjectId głównego dokumentu wejściowego LaTeX (zwykle `main.tex`).
-* `rootFolder`: Osadzona reprezentacja drzewa plików projektu.
+#### Struktura projektu {#project-structure}
 
-Każdy wpis folderu zawiera:
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | Główny dokument, który jest kompilowany. | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | Główny plik `.bib` wybrany w ustawieniach projektu. | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | Drzewo plików. Zawsze jeden element: folder główny. | `Project.mjs:43` |
 
-* `name` / `_id`: Nazwę i identyfikator folderu.
-* `docs`: Listę dokumentów źródłowych LaTeX z nazwą i `_id`.
-* `fileRefs`: Odwołania do plików binarnych (obrazy, pliki danych), w tym:
-  * `name`: Nazwa pliku
-  * `created`: Znacznik czasu przesłania
-  * `rev`: Licznik rewizji
-  * `hash`: Skrót zawartości używany do deduplikacji
-  * `linkedFileData`: Powiązanie z zewnętrznym magazynem (jeśli istnieje)
-* `folders`: Zagnieżdżone podfoldery.
+Każdy folder (`Folder.mjs`):
 
-#### Ustawienia kompilacji i edytora
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id folderu. | MongoDB |
+| `name` | String | Nazwa folderu (folder główny nazywa się `rootFolder`). | `Folder.mjs:9` |
+| `docs` | Array of Object | Edytowalne pliki tekstowe: tylko `_id` i `name`. `_id` to `_id` w kolekcji `docs`, która przechowuje tekst. | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | Pliki binarne, zobacz niżej. | `Folder.mjs:16` |
+| `folders` | Array of Folder | Podfoldery. | `Folder.mjs:17` |
 
-* `compiler`: Wybrany silnik LaTeX (`pdflatex`, `xelatex`, `lualatex` itd.).
-* `spellCheckLanguage`: Język sprawdzania pisowni dla tego projektu.
+Każdy plik w `fileRefs` (`File.mjs`):
 
-#### Ustawienia publiczne i udostępniania
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id pliku. Zmienia się, gdy plik zostanie zastąpiony. | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | Nazwa pliku. | `File.mjs:7` |
+| `created` | Date | Kiedy plik został przesłany lub ostatnio zastąpiony. | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | Zwiększany o 1 przy każdym zastąpieniu pliku. | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | SHA-1 zawartości. Plik jest przechowywany w magazynie blobów history-v1 pod tym hashem, a pobrania odczytują go stamtąd. | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | Ustawiane dla plików połączonych (z adresu URL, innego projektu, pliku wynikowego, Zotero lub Mendeley): `provider`, jego dane źródłowe i `importedAt`. | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`: Widoczność projektu (`private`, `readOnly`, `public` itd.).
-* `collabratecUsers`: Powiązani użytkownicy z zewnętrznych platform współpracy.
+#### Ustawienia kompilacji i edytora {#compilation-&-editor-settings}
 
-#### Rozszerzenia specyficzne dla Overleaf
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | Silnik LaTeX: jeden z `Settings.safeCompilers` (`xelatex`, `pdflatex`, `latex`, `lualatex`). | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | Obraz TeX Live używany dla tego projektu przy kompilacjach w piaskownicy. Nowy projekt dostaje `Settings.currentImageName`; galeria szablonów i serwer MCP mogą go zmienić. | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | Język sprawdzania pisowni. Nowy projekt kopiuje `ace.spellCheckLanguage` właściciela. | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | Ustawienie projektu zapisywane z żądania ustawień (`body.png2pdf`). | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | Ustawienie formatu odwołań. | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | Branding wydawcy. Może go ustawić galeria szablonów. | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | Szablon overleaf.com v1, z którego pochodzi projekt. Nieustawiany w CE. | `Project.mjs:85-86` |
 
-* `overleaf.history`:
-  * `id`: Identyfikator używany przez usługę historii.
-  * `display`: Czy historia jest włączona i widoczna.
+#### Historia (`overleaf`) {#history-overleaf}
 
-#### Wewnętrzne wersjonowanie
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | Id projektu w project-history i history-v1. Nowe projekty używają id projektu jako ciągu znaków. Unikalny. | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | W nowych projektach zawsze `true`; zachowane tylko dla zgodności. | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | Historia przechowuje też komentarze i śledzone zmiany. Przywrócenie wersji przywraca je tylko wtedy, gdy ta wartość wynosi `true`. | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | Etap przejścia na format aktualizacji OT historii. Tylko rośnie. | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | Ostatni raz, gdy zakończyła się ponowna synchronizacja historii. Zapisywane przez project-history, nie przez web. | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | Pozostałość po przejściu na pełną historię projektu. | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | Ustawiane na kopii debugowej innego projektu. | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | Dane importu z overleaf.com v1. Nieustawiane w CE. `overleaf.id` ma unikalny indeks. | `Project.mjs:88-91` |
+| `__v` | Number | Klucz wersji Mongoose. | Mongoose |
 
-* `__v`: Wewnętrzny klucz wersji Mongoose służący do kontroli współbieżności.
+history-v1 może też zapisywać `overleaf.history.currentEndVersion`, `overleaf.history.currentEndTimestamp`, `overleaf.history.updatedAt` i `overleaf.backup.*`, ale tylko wtedy, gdy skonfigurowano jego `backupStore` (`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`). CE go nie konfiguruje, więc te pola się nie pojawiają.
 
-Oto rzeczywisty przykład dla użytkownika Overleaf.
+#### Indeksy {#indexes}
+
+Wszystkie pochodzą z migracji oznaczonych tagiem `server-ce` w `tools/migrations/`.
+
+| Nazwa | Klucze | Opcje | Migracja |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### Uwagi {#notes}
+
+* `autoIndex` w Mongoose jest wyłączony (`services/web/app/src/infrastructure/Mongoose.mjs:7`): opcje `index` w schemacie istnieją tylko dlatego, że tworzą je powyższe migracje.
+* Migracja `20250620152657_ensure_collaborator_arrays` ustawia brakujące `collaberator_refs`, `pendingEditor_refs`, `pendingReviewer_refs`, `readOnly_refs` i `reviewer_refs` na `[]`.
+* Usunięcie projektu przenosi dokument do `deletedProjects` (zobacz [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)).
+
+Oto prawdziwy przykład projektu Overleaf.
 
 <Accordion title="Przykład projektu">
 

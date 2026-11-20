@@ -3,79 +3,145 @@ title: Projects 集合
 icon: rectangle-vertical-history
 ---
 
-`Project` 表示 Overleaf 中的单个 LaTeX 项目。它存储项目元数据、所有权与访问控制、文件结构、编译设置以及协作状态。
+`projects` 中每个项目对应一个文档：名称、所有者和成员、共享、文件树以及项目设置。文档的正文不在这里（参见 [Docs 集合](/zh-CN/dev/data-model/docs-collection)），二进制文件则以其 `hash` 存放在 history-v1 的 blob 存储中。Schema 为 `services/web/app/src/models/Project.mjs`，文件树定义在同目录的 `Folder.mjs`、`File.mjs` 和 `Doc.mjs` 中。
 
-#### 核心标识与元数据
+在“来源”列中，`Project.mjs:N` 表示该 schema 的某一行，其他不带路径的文件名位于 `services/web/app/src/Features/` 下，`modules/...` 位于 `services/web/` 下。行号取自撰写时的 `server-pro`。
 
-* `_id`：标识该项目的唯一 MongoDB ObjectId。
-* `name`：项目显示名称。
-* `description`：可选的项目文字描述。
-* `active`：表示项目当前是否处于活跃状态。
-* `version`：内部 schema 或项目格式版本。
-* `trashed`：已移入回收站（软删除）的条目列表。
-* `deletedDocs`：已永久删除的文档记录。
+#### 核心标识与元数据 {#core-identification-&-metadata}
 
-#### 所有权与访问控制
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 项目的 id。 | MongoDB |
+| `name` | String | 项目名称。 | `Project.mjs:18` |
+| `description` | String | 项目描述。默认为空。 | `Project.mjs:50` |
+| `version` | Number | 文件树每次变更（添加、重命名、移动、删除、替换）时加 1。 | `Project.mjs:45`, `ProjectEntityMongoUpdateHandler.mjs:451-460` |
+| `active` | Boolean | 项目被停用后为 `false`：其文档已从 Mongo 中归档出去（`docs.inS3`）。打开项目会取消归档并将其重新设为 `true`。在 CE 中，停用旧项目的 cron 仅在设置 `ENABLE_CRON_RESOURCE_DELETION=true` 时运行。 | `Project.mjs:27`, `InactiveProjectManager.mjs:39-59`, `:94-123`, `server-ce/cron/deactivate-projects.sh` |
+| `archived` | Array of ObjectId | 归档了该项目的用户。归档按用户进行。旧的布尔值已由迁移 `20221111111111_ce_sp_convert_archived_state` 转换。 | `Project.mjs:51`, `ProjectDeleter.mjs:159`, `ProjectHelper.mjs:40` |
+| `trashed` | Array of ObjectId | 将该项目移入自己回收站的用户。同样按用户进行。 | `Project.mjs:52`, `ProjectDeleter.mjs:176`, `ProjectHelper.mjs:51` |
+| `deletedDocs` | Array of Object | 遗留字段，`{ _id, name, deletedAt }`。已删除的文档现在以 `deleted: true` 保留在 `docs` 中。只有在恢复旧的已删除项目时才会读取此数组：条目会被复制到 docstore，然后数组被清空。没有任何代码写入它。 | `Project.mjs:11-14`, `:53`, `ProjectDeleter.mjs:322-333` |
+| `readOnly` | Boolean | 仅存在于 schema 中：CE 核心和我们的模块都不使用它。 | `Project.mjs:28` |
 
-* `owner_ref`：指向项目所有者用户的引用。
-* `collaberator_refs`：拥有编辑权限的用户。
-* `reviewer_refs`：拥有审阅者级别访问权限的用户。
-* `readOnly_refs`：拥有只读访问权限的用户。
-* `pendingEditor_refs` / `pendingReviewer_refs`：待处理的邀请。
+#### 所有权与访问控制 {#ownership-&-access-control}
 
-#### 基于令牌的访问
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `owner_ref` | ObjectId | 所有者。 | `Project.mjs:29` |
+| `collaberator_refs` | Array of ObjectId | 可以编辑的用户（这个拼写就是真实的字段名）。 | `Project.mjs:30` |
+| `reviewer_refs` | Array of ObjectId | 可以审阅的用户：评论并通过修订追踪提出建议。 | `Project.mjs:31` |
+| `readOnly_refs` | Array of ObjectId | 只能查看的用户。 | `Project.mjs:32` |
+| `pendingEditor_refs` / `pendingReviewer_refs` | Array of ObjectId | 不是邀请（邀请在 `projectInvites` 中）。在所有者没有空闲协作者名额时被添加为编辑者或审阅者的用户。他们会被加入 `readOnly_refs`，并列在这里，直到可以升级。 | `Project.mjs:33-34`, `CollaboratorsHandler.mjs:132-136`, `TokenAccessController.mjs:362-373` |
+| `editAccessRequests` | Array of Object | 请求更多权限的查看者：`userId`、`privilegeLevel`、`requestedAt`。每个用户一条。请求被批准、被拒绝或用户离开项目时删除。 | `Project.mjs:35-41`, `CollaboratorsHandler.mjs:423-476` (request), `:477` (decline), `:322` (grant) |
+| `track_changes` | Boolean or Object | 修订追踪状态。`true` 表示对所有人开启（旧格式）；否则是一个以用户 id 为键的对象，每个开启了它的用户对应 `true`。由 `track-changes` 模块写入，核心也会为被设为审阅者的用户开启它。 | `Project.mjs:57`, `ProjectHelper.mjs:66-80`, `modules/track-changes/app/src/TrackChangesController.mjs:25`, `CollaboratorsHandler.mjs:344-357` |
+| `collabratecUsers` | Array of Object | IEEE Collabratec 关联：`user_id`、`collabratec_document_id`、`collabratec_privategroup_id`、`added_at`。CE 中未使用。 | `Project.mjs:104-116` |
 
-* `tokens`：用于共享链接的令牌注册表。
-* `tokenAccessReadOnly_refs`：授予只读访问权限的令牌。
-* `tokenAccessReadAndWrite_refs`：授予读写访问权限的令牌。
+#### 链接共享 {#link-sharing}
 
-#### 活动跟踪
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `publicAccesLevel` | String | `private` 或 `tokenBased`（已开启链接共享）。旧项目可能仍有遗留值 `readOnly` 或 `readAndWrite`。不存在 `public`。这个拼写就是真实的字段名。 | `Project.mjs:46`, `Authorization/PublicAccessLevels.mjs:3-20` |
+| `tokens.readOnly` | String | 只读链接的令牌。唯一。 | `Project.mjs:59-65`, `ProjectDetailsHandler.mjs:250-252` |
+| `tokens.readAndWrite` | String | 编辑链接的令牌。唯一。 | `Project.mjs:66-72`, `ProjectDetailsHandler.mjs:245-248` |
+| `tokens.readAndWritePrefix` | String | 编辑令牌的数字前缀，用于查找令牌。唯一。 | `Project.mjs:73-81`, `TokenAccessHandler.mjs:120` |
+| `tokenAccessReadOnly_refs` | Array of ObjectId | 通过只读链接加入的用户（用户 id，而不是令牌）。 | `Project.mjs:83` |
+| `tokenAccessReadAndWrite_refs` | Array of ObjectId | 通过编辑链接加入的用户。 | `Project.mjs:84` |
 
-* `lastUpdated`：最近一次修改的时间戳。
-* `lastUpdatedBy`：执行最近一次更新的用户。
-* `lastOpened`：项目最近一次被打开的时间戳。
-* `deletedByExternalDataSource`：删除操作是否由外部集成触发。
+关闭链接共享会删除 `tokens`，并将 `publicAccesLevel` 设回 `private`（`ProjectDetailsHandler.mjs:233-238`）。
 
-#### 项目结构
+#### 活动跟踪 {#activity-tracking}
 
-根文档与文件夹
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `lastUpdated` | Date | 内容或文件树最后一次变更的时间。只会向前推进。 | `Project.mjs:19`, `ProjectUpdateHandler.mjs:5-17` |
+| `lastUpdatedBy` | ObjectId | 最后一次变更的用户。 | `Project.mjs:25`, `ProjectUpdateHandler.mjs:17` |
+| `lastOpened` | Date | 最后一次有人打开项目的时间。 | `Project.mjs:26`, `ProjectUpdateHandler.mjs:24` |
+| `deletedByExternalDataSource` | Boolean | 项目文件夹在 Dropbox 端被删除时为 `true`。项目本身不会被删除；编辑器会显示提示，并在下次打开项目时清除该标志。 | `Project.mjs:49`, `TpdsUpdateHandler.mjs:83`, `Editor/EditorHttpController.mjs:76-77` |
+| `deferredTpdsFlushCounter` | Number | 来自 overleaf.com v1 导入的遗留字段。大于 0 时，项目会在加载时推送到 Dropbox 一次，然后计数器被重置。 | `Project.mjs:117`, `TpdsProjectFlusher.mjs:40-44`, `:90-99` |
 
-* `rootDoc_id`：LaTeX 主入口文档（通常为 `main.tex`）的 ObjectId。
-* `rootFolder`：项目文件树的内联表示。
+#### 项目结构 {#project-structure}
 
-每个文件夹条目包含：
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `rootDoc_id` | ObjectId | 被编译的主文档。 | `Project.mjs:42` |
+| `mainBibliographyDoc_id` | ObjectId | 在项目设置中选择的主 `.bib` 文件。 | `Project.mjs:44`, `ProjectEntityUpdateHandler.mjs:1188` |
+| `rootFolder` | Array of Folder | 文件树。始终只有一个元素，即根文件夹。 | `Project.mjs:43` |
 
-* `name` / `_id`：文件夹名称和标识符。
-* `docs`：LaTeX 源文档列表，包含名称和 `_id`。
-* `fileRefs`：二进制文件引用（图片、数据文件），包括：
-  * `name`：文件名
-  * `created`：上传时间戳
-  * `rev`：修订计数器
-  * `hash`：用于去重的内容哈希
-  * `linkedFileData`：外部存储关联（如有）
-* `folders`：嵌套的子文件夹。
+每个文件夹（`Folder.mjs`）：
 
-#### 编译与编辑器设置
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 文件夹 id。 | MongoDB |
+| `name` | String | 文件夹名称（根文件夹名为 `rootFolder`）。 | `Folder.mjs:9` |
+| `docs` | Array of Object | 可编辑的文本文件：只有 `_id` 和 `name`。`_id` 即 `docs` 集合中保存正文的文档的 `_id`。 | `Folder.mjs:15`, `Doc.mjs:7` |
+| `fileRefs` | Array of Object | 二进制文件，见下文。 | `Folder.mjs:16` |
+| `folders` | Array of Folder | 子文件夹。 | `Folder.mjs:17` |
 
-* `compiler`：所选的 LaTeX 引擎（`pdflatex`、`xelatex`、`lualatex` 等）。
-* `spellCheckLanguage`：该项目的拼写检查语言。
+`fileRefs` 中的每个文件（`File.mjs`）：
 
-#### 公开与共享设置
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 文件 id。替换文件时会改变。 | `ProjectEntityMongoUpdateHandler.mjs:167` |
+| `name` | String | 文件名。 | `File.mjs:7` |
+| `created` | Date | 文件上传或最后一次被替换的时间。 | `File.mjs:11`, `ProjectEntityMongoUpdateHandler.mjs:168` |
+| `rev` | Number | 每次替换文件时加 1。 | `File.mjs:17`, `ProjectEntityMongoUpdateHandler.mjs:176` |
+| `hash` | String | 内容的 SHA-1。文件以此哈希存放在 history-v1 的 blob 存储中，下载时也从那里读取。 | `File.mjs:19`, `FileStore/FileStoreController.mjs:87-92`, `History/HistoryManager.mjs:43-48` |
+| `linkedFileData` | Mixed | 为关联文件设置（来自 URL、其他项目、输出文件、Zotero 或 Mendeley）：`provider`、其来源数据以及 `importedAt`。 | `File.mjs:18`, `LinkedFiles/LinkedFilesController.mjs:52-58` |
 
-* `publicAccesLevel`：项目可见性（`private`、`readOnly`、`public` 等）。
-* `collabratecUsers`：来自外部协作平台的关联用户。
+#### 编译与编辑器设置 {#compilation-&-editor-settings}
 
-#### Overleaf 特有扩展
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `compiler` | String | LaTeX 引擎：`Settings.safeCompilers` 之一（`xelatex`、`pdflatex`、`latex`、`lualatex`）。 | `Project.mjs:47`, `ProjectOptionsHandler.mjs:16-31`, `services/web/config/settings.defaults.js:78` |
+| `imageName` | String | 该项目在沙盒编译中使用的 TeX Live 镜像。新项目获得 `Settings.currentImageName`；模板库和 MCP 服务器可以更改它。 | `Project.mjs:54`, `ProjectCreationHandler.mjs:265-269`, `modules/template-gallery/app/src/TemplatesManager.mjs:101-103`, `modules/mcp-server/app/src/ProjectTools.mjs:121` |
+| `spellCheckLanguage` | String | 拼写检查语言。新项目会复制所有者的 `ace.spellCheckLanguage`。 | `Project.mjs:48`, `ProjectCreationHandler.mjs:277` |
+| `png2pdf` | Boolean | 从设置请求中保存的项目设置（`body.png2pdf`）。 | `Project.mjs:55`, `ProjectController.mjs:216-217`, `ProjectOptionsHandler.mjs:62` |
+| `referenceFormat` | String | 参考文献格式设置。 | `Project.mjs:118`, `ProjectOptionsHandler.mjs:123-130` |
+| `brandVariationId` | String | 出版商品牌。模板库可以设置它。 | `Project.mjs:56`, `modules/template-gallery/app/src/TemplatesManager.mjs:128` |
+| `fromV1TemplateId` / `fromV1TemplateVersionId` | Number | 项目来源的 overleaf.com v1 模板。CE 中不会设置。 | `Project.mjs:85-86` |
 
-* `overleaf.history`：
-  * `id`：历史服务使用的标识符。
-  * `display`：历史记录是否启用并可见。
+#### 历史（`overleaf`） {#history-overleaf}
 
-#### 内部版本控制
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `overleaf.history.id` | Mixed | 项目在 project-history 和 history-v1 中的 id。新项目使用字符串形式的项目 id。唯一。 | `Project.mjs:93`, `ProjectCreationHandler.mjs:251-257` |
+| `overleaf.history.display` | Boolean | 新项目始终为 `true`；仅为兼容性而保留。 | `Project.mjs:94`, `ProjectCreationHandler.mjs:260-263` |
+| `overleaf.history.rangesSupportEnabled` | Boolean | 历史中也保存评论和修订。只有当该值为 `true` 时，恢复版本才会一并恢复它们。 | `Project.mjs:98`, `ProjectOptionsHandler.mjs:98-101`, `History/RestoreManager.mjs:119` |
+| `overleaf.history.otMigrationStage` | Number | 迁移到历史 OT 更新格式的阶段。只增不减。 | `Project.mjs:99`, `ProjectOptionsHandler.mjs:108-120` |
+| `overleaf.history.lastResyncedAt` | Date | 最后一次历史重新同步完成的时间。由 project-history 写入，而不是 web。 | `Project.mjs:100`, `services/project-history/app/js/SyncManager.js:239-246` |
+| `overleaf.history.upgradedAt`, `allowDowngrade`, `zipFileArchivedInProject` | Date / Boolean / Boolean | 迁移到完整项目历史时留下的字段。 | `Project.mjs:95-97` |
+| `overleaf.isDebugCopyOf` | ObjectId | 在另一个项目的调试副本上设置。 | `Project.mjs:102`, `ProjectCreationHandler.mjs:287-288` |
+| `overleaf.id`, `imported_at_ver_id`, `token`, `read_token` | Number / Number / String / String | overleaf.com v1 导入数据。CE 中不会设置。`overleaf.id` 有唯一索引。 | `Project.mjs:88-91` |
+| `__v` | Number | Mongoose 版本键。 | Mongoose |
 
-* `__v`：Mongoose 用于并发控制的内部版本键。
+history-v1 还可以写入 `overleaf.history.currentEndVersion`、`overleaf.history.currentEndTimestamp`、`overleaf.history.updatedAt` 和 `overleaf.backup.*`，但仅在配置了其 `backupStore` 时（`services/history-v1/storage/lib/chunk_store/mongo.js:238-258`）。CE 不配置它，因此这些字段不会出现。
 
-以下是一个 Overleaf 项目的真实示例。
+#### 索引 {#indexes}
+
+全部来自 `tools/migrations/` 中带有 `server-ce` 标签的迁移。
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `owner_ref_1` | `owner_ref: 1` | | `20190912145024_create_projects_indexes` |
+| `collaberator_refs_1` | `collaberator_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `readOnly_refs_1` | `readOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadOnly_refs_1` | `tokenAccessReadOnly_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokenAccessReadAndWrite_refs_1` | `tokenAccessReadAndWrite_refs: 1` | | `20190912145024_create_projects_indexes` |
+| `tokens.readOnly_1` | `tokens.readOnly: 1` | unique, partial (field exists) | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWrite_1` | `tokens.readAndWrite: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `tokens.readAndWritePrefix_1` | `tokens.readAndWritePrefix: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.history.id_1` | `overleaf.history.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `overleaf.id_1` | `overleaf.id: 1` | unique, partial | `20190912145024_create_projects_indexes` |
+| `collabratecUsers.user_id_1` | `collabratecUsers.user_id: 1` | sparse | `20190912145024_create_projects_indexes` |
+| `imageName_1` | `imageName: 1` | | `20240730155209_create_project_imageName_index` |
+| `reviewer_refs_1` | `reviewer_refs: 1` | | `20241204103349_create_reviewer_refs_index` |
+| `active_true_lastOpened_1` | `lastOpened: 1` | partial (`active: true`) | `20250320161029_update_inactive_project_index` |
+
+#### 说明 {#notes}
+
+* Mongoose 的 `autoIndex` 已关闭（`services/web/app/src/infrastructure/Mongoose.mjs:7`）：schema 中的 `index` 选项之所以存在，只是因为上面的迁移会创建它们。
+* 迁移 `20250620152657_ensure_collaborator_arrays` 会将缺失的 `collaberator_refs`、`pendingEditor_refs`、`pendingReviewer_refs`、`readOnly_refs` 和 `reviewer_refs` 设为 `[]`。
+* 删除项目会把文档移到 `deletedProjects`（参见 [Deleted Projects Collection](/dev/data-model/deleted-projects-collection)）。
+
+下面是一个真实的 Overleaf 项目示例。
 
 <Accordion title="项目示例">
 
