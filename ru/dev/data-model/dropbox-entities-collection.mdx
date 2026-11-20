@@ -1,0 +1,61 @@
+---
+title: Коллекция Dropbox Entities
+icon: file-arrow-up
+---
+
+`dropboxEntities` хранит по одному документу на каждый файл, который синхронизация с Dropbox скопировала между проектом и Dropbox одного пользователя, а также короткоживущие tombstone-записи. Коллекция относится к синхронизации с Dropbox: third-party-datastore (`services/third-party-datastore/app/js/StateManager.mjs`) записывает и читает её, а веб-модуль `dropbox` (`services/web/modules/dropbox/app/src/DropboxHandler.mjs`) очищает её. Схемы Mongoose нет.
+
+#### Поля {#fields}
+
+| Поле | Тип | Значение | Источник |
+| ---- | --- | -------- | -------- |
+| `_id` | ObjectId | Задаётся драйвером при вставке. | `StateManager.mjs:46,97` |
+| `overleaf.userId` | ObjectId | Пользователь, в чьём Dropbox находится файл. Задаётся в каждом документе. | `StateManager.mjs:48,98` |
+| `overleaf.projectId` | ObjectId | Проект doc или файла. Задаётся, когда известен; у tombstone его нет. | `StateManager.mjs:49-51` |
+| `overleaf.id` | ObjectId | `_id` doc или файла в `rootFolder` проекта. Задаётся, когда известен. | `StateManager.mjs:52` |
+| `overleaf.type` | String | `doc` или `file`. Текущий код записывает его, но не читает. | `StateManager.mjs:53`; значения из `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateSender.mjs:35,96` и `UpdateMerger.mjs:104,119` |
+| `dropbox.id` | String | `id` файла в метаданных файла Dropbox. У tombstone не задаётся. | `StateManager.mjs:56` |
+| `dropbox.pathLower` | String | Путь к файлу в Dropbox в нижнем регистре и без завершающей косой черты. Обновляется при перемещении файла или папки его проекта. | `StateManager.mjs:14-16,57,91,99` |
+| `dropbox.rev` | String | Ревизия Dropbox на момент последней синхронизации. Следующая загрузка передаёт её, чтобы файл, изменённый в Dropbox, не был перезаписан. | `StateManager.mjs:58`, `JobProcessor.mjs:114-122` |
+| `dropbox.contentHash` | String | Хеш содержимого Dropbox на момент последней синхронизации. Файл из списка с тем же хешем пропускается: это наша собственная загрузка или он уже применён. | `StateManager.mjs:59`, `PullManager.mjs:147-149` |
+| `tombstone` | Boolean | `true` помечает путь, который third-party-datastore сам удалил или переместил в Dropbox. Когда Dropbox сообщает об этом удалении в ответ, оно не применяется к проекту. | `StateManager.mjs:100`, `PullManager.mjs:189-192` |
+| `createdAt` | Date | Только для tombstone: когда запись создана. Завершённый pull удаляет tombstone-записи, созданные до его начала. | `StateManager.mjs:101,115-121` |
+
+У tombstone есть только `overleaf.userId`, `dropbox.pathLower`, `tombstone` и `createdAt` (`StateManager.mjs:96-103`).
+
+#### Кто записывает {#who-writes-it}
+
+| Код | Что делает |
+| --- | ---------- |
+| `services/third-party-datastore/app/js/StateManager.mjs:35-62` (`recordEntity`) | Удаляет документы пользователя с тем же `dropbox.id`, `dropbox.pathLower` или `overleaf.id`, затем вставляет новое состояние. |
+| `services/third-party-datastore/app/js/JobProcessor.mjs:102-134` (`addEntity`) | Записывает doc или файл после загрузки из Overleaf в Dropbox (`:125-133`). |
+| `services/third-party-datastore/app/js/PullManager.mjs:142-177` (`applyFile`) | Записывает файл Dropbox после того, как web применил его к проекту (`:168-176`). |
+| `StateManager.mjs:80-94` (`moveEntities`) | Переписывает `dropbox.pathLower` под перемещённым путём: переименование проекта (`JobProcessor.mjs:195`) и перемещение файла или папки (`JobProcessor.mjs:239`). |
+| `StateManager.mjs:96-103` (`addTombstone`) | После удаления (`JobProcessor.mjs:153`), переименования проекта (`:202`) или перемещения (`:240`) в Dropbox. |
+| `StateManager.mjs:72-78` (`removeEntities`) | Удаляет записи по пути и ниже, кроме tombstone: после удаления из Overleaf (`JobProcessor.mjs:152`) или в Dropbox (`PullManager.mjs:206`). |
+| `StateManager.mjs:115-121` (`clearTombstones`) | В конце pull (`PullManager.mjs:31,69`). |
+| `StateManager.mjs:186-190` (`removeUserState`), вызывается из `services/third-party-datastore/app/js/QueueWorker.mjs:43` | Удаляет все документы пользователя, когда third-party-datastore отвязывает аккаунт, который больше не может использовать. |
+| `DropboxHandler.mjs:142-146` (`removeUserState`) | Удаляет все документы пользователя при привязке (`:125`), при отвязке (`:183`) и когда истекает срок удалённого пользователя (`services/web/modules/dropbox/index.mjs:62-64`). |
+| `DropboxHandler.mjs:150-154` (`removeProjectState`) | Удаляет документы проекта, когда истекает срок удалённого проекта (`index.mjs:54-56`). |
+
+#### Кто читает {#who-reads-it}
+
+| Код | Что делает |
+| --- | ---------- |
+| `StateManager.mjs:64-70` (`findEntityByPath`) | Получает `dropbox.rev` перед загрузкой (`JobProcessor.mjs:114`) и `dropbox.contentHash` перед применением файла Dropbox (`PullManager.mjs:147`). |
+| `StateManager.mjs:106-112` (`findTombstone`) | Проверяет сообщённое удаление по пути или по одному из его родительских путей (`PullManager.mjs:189`). |
+| `StateManager.mjs:160-175` (`getSyncedPaths`) | Перечисляет пути синхронизированных файлов после сброса курсора, чтобы файл, отсутствующий в списке, считался удалённым (`PullManager.mjs:74-85`). |
+
+#### Индексы {#indexes}
+
+| Имя | Ключи | Параметры | Миграция |
+| --- | ----- | --------- | -------- |
+| `_id_` | `_id: 1` | | default |
+| `overleaf_userId_1_overleaf_projectId_1` | `overleaf.userId: 1, overleaf.projectId: 1` | | `tools/migrations/20250130104049_create_dropboxEntities_userId_projectId_index.mjs` |
+
+У `20220811111800_create_dropboxEntities_index.mjs` и `20220825160708_recreate_dropboxEntities.mjs` только тег `saas`, поэтому в CE нет ни их уникальных индексов по `(overleaf.userId, dropbox.id)` и `(overleaf.userId, overleaf.id)`, ни их хешированного индекса по `dropbox.pathLower`.
+
+#### Примечания {#notes}
+
+* Уникальность обеспечивается только удалением перед каждой вставкой в `recordEntity` (`StateManager.mjs:38-45`). Комментарий в `StateManager.mjs:3-11` упоминает уникальные индексы; в CE их нет.
+* Запросы по пользователю и пути (`findEntityByPath`, `findTombstone`, `removeEntities`) используют индекс только для `overleaf.userId`.
