@@ -1,0 +1,89 @@
+---
+title: Server kecil
+icon: memory
+---
+
+Ayakaleaf Pro dapat berjalan di server dengan 2 inti CPU dan memori 2 GB, termasuk integrasi Git, setelah Anda menambahkan swap 2 GB. Tanpa swap, memorinya habis saat proses mulai. Pengaturan di langkah 2 kemudian memangkas penggunaan swap hampir setengahnya.
+
+<Info>
+
+Kami mengukur ini pada Ayakaleaf Pro 6.3.1 dengan Toolkit, di mesin virtual QEMU/KVM 2 vCPU / 2 GiB yang menjalankan Ubuntu 24.04, dengan kompilasi sandbox (`texlive-basic:2025.1`) dan integrasi Git aktif.
+
+</Info>
+
+## Mengapa 2 GB tidak cukup secara default {#why-2-gb-is-not-enough-by-default}
+
+Saat idle dengan pengaturan default, Ayakaleaf Pro membutuhkan sekitar 1,9 GiB. Ubuntu dan Docker sudah memakai 364 MiB dari mesin 2 GiB, sehingga tersisa sekitar 1600 MiB.
+
+| Komponen            | Memori saat idle | Catatan                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 proses Node.js | 1620 MiB    | `web` dan `web-api` masing-masing sekitar 255 MiB, sisanya 85–150 MiB |
+| Integrasi Git      | 135 MiB     | Java mengambil setengah memori, 1 GiB, sebagai heap maksimum      |
+| MongoDB 8.0          | 125 MiB     | cache-nya dapat tumbuh hingga sekitar 512 MiB                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. Tambahkan swap 2 GB {#1-add-2-gb-of-swap}
+
+Ini langkah yang paling penting.
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. Kurangi penggunaan memori {#2-lower-memory-use}
+
+Tambahkan baris berikut ke `config/variables.env`. Container integrasi Git juga membaca file ini.
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+Untuk membatasi cache MongoDB, tambahkan entri `mongo` di bawah `services` dalam `config/docker-compose.override.yml` (file yang sama yang mengatur image Ayakaleaf Pro):
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+Lalu jalankan `bin/up -d`.
+
+| Pengaturan                                       | Efek                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | proses Node.js memakai total 470 MiB lebih sedikit; waktu kompilasi tetap sama |
+| `MALLOC_ARENA_MAX=2`                          | proses Node.js memakai total 65 MiB lebih sedikit                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | heap integrasi Git dibatasi 160 MiB, bukan 1 GiB |
+| `--wiredTigerCacheSizeGB 0.25`                | cache MongoDB dibatasi 256 MiB, bukan sekitar 512 MiB |
+
+<Warning>
+
+`NODE_OPTIONS` menggantikan nilai yang diatur di image, jadi baris tersebut harus tetap berisi `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs`. Tanpa keduanya, layanan Node.js tidak dapat memuat paketnya dan tidak akan berjalan. `--optimize-for-size` tidak dapat digunakan: Node.js menolaknya di `NODE_OPTIONS`.
+
+`--replSet overleaf` adalah nilai yang diteruskan Toolkit ke MongoDB secara default. Pertahankan.
+
+</Warning>
+
+Dengan heap 160 MiB, meng-clone atau push proyek besar melalui Git dapat kehabisan memori, dan container integrasi Git akan dimulai ulang. Kami tidak mengujinya. Jika itu terjadi, naikkan `-Xmx`.
+
+## Hasil {#results}
+
+Setiap pengujian mengompilasi dokumen LuaLaTeX 33 halaman dengan `fontspec` dan 30 gambar TikZ; kompilasi bersamaan menggunakan proyek yang berbeda.
+
+| Konfigurasi                         | 1 kompilasi | 2 sekaligus                 | 3 sekaligus | Puncak penggunaan swap |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| Default, tanpa swap              | kehabisan memori saat mulai | | |      |
+| Hanya langkah 2, tanpa swap          | 21 s      | `web` dihentikan, galat 502  | tidak diuji |              |
+| Hanya langkah 1                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| Langkah 1 dan 2                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+Tanpa swap, satu penghentian karena kehabisan memori memicu penghentian berikutnya: `web` dimulai ulang, proses mulainya kembali membutuhkan memori, dan server macet hingga reset paksa. Dengan swap, tiga kompilasi sekaligus memakan waktu kurang lebih sama dengan satu kompilasi, karena yang dipindahkan ke swap adalah halaman Node.js yang idle.
+
+Tidak diuji: beban clone dan push Git, banyak pengguna yang mengedit bersamaan, dan swap di disk lambat (host kami menggunakan SSD).
+
+## Kubernetes {#kubernetes}
+
+Panduan Kubernetes kami mematikan swap di node ([Siapkan node](/id/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)), jadi di sana hanya langkah 2 yang berlaku. Masukkan `NODE_OPTIONS` dan `MALLOC_ARENA_MAX` ke ConfigMap `overleaf-env` ([Personalisasi instance Anda](/id/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)). Cache MongoDB sudah diatur di [Deploy MongoDB dan Redis](/id/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis).

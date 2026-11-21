@@ -1,0 +1,89 @@
+---
+title: Küçük sunucu
+icon: memory
+---
+
+2 GB swap eklediğinizde Ayakaleaf Pro, Git entegrasyonu dahil olmak üzere 2 CPU çekirdeği ve 2 GB belleğe sahip bir sunucuda çalışır. Swap olmadan başlatılırken belleği tükenir. 2. adımdaki ayarlar ise swap kullanımını neredeyse yarıya indirir.
+
+<Info>
+
+Bunu Toolkit ile Ayakaleaf Pro 6.3.1 üzerinde, Ubuntu 24.04 çalıştıran 2 vCPU / 2 GiB QEMU/KVM sanal makinesinde, korumalı alan derlemeleri (`texlive-basic:2025.1`) ve Git entegrasyonu açıkken ölçtük.
+
+</Info>
+
+## Varsayılan olarak 2 GB neden yetmez {#why-2-gb-is-not-enough-by-default}
+
+Varsayılan ayarlarla boşta çalışırken Ayakaleaf Pro yaklaşık 1,9 GiB'a ihtiyaç duyar. Ubuntu ve Docker, 2 GiB'lık bir makinenin 364 MiB'ını zaten kullanır ve geriye yaklaşık 1600 MiB kalır.
+
+| Bileşen            | Boştaki bellek | Notlar                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 Node.js işlemi | 1620 MiB    | `web` ve `web-api` her biri yaklaşık 255 MiB, diğerleri 85–150 MiB |
+| Git entegrasyonu      | 135 MiB     | Java, belleğin yarısını (1 GiB) azami heap olarak alır      |
+| MongoDB 8.0          | 125 MiB     | önbelleği yaklaşık 512 MiB'a kadar büyüyebilir                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. 2 GB swap ekleyin {#1-add-2-gb-of-swap}
+
+En önemli adım budur.
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. Bellek kullanımını azaltın {#2-lower-memory-use}
+
+Bu satırları `config/variables.env` dosyasına ekleyin. Git entegrasyonu konteyneri de bu dosyayı okur.
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+MongoDB önbelleğini sınırlamak için `config/docker-compose.override.yml` dosyasında (Ayakaleaf Pro imajını ayarlayan dosya) `services` altına bir `mongo` girdisi ekleyin:
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+Ardından `bin/up -d` komutunu çalıştırın.
+
+| Ayar                                       | Etki                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | Node.js işlemleri toplamda 470 MiB daha az kullanır; derleme süreleri değişmez |
+| `MALLOC_ARENA_MAX=2`                          | Node.js işlemleri toplamda 65 MiB daha az kullanır                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | Git entegrasyonunun heap'i 1 GiB yerine 160 MiB ile sınırlanır |
+| `--wiredTigerCacheSizeGB 0.25`                | MongoDB önbelleği yaklaşık 512 MiB yerine 256 MiB ile sınırlanır |
+
+<Warning>
+
+`NODE_OPTIONS`, imajda ayarlanan değerin yerini alır; bu yüzden satırda `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs` korunmalıdır. Bunlar olmadan Node.js hizmetleri paketlerini yükleyemez ve başlamaz. `--optimize-for-size` kullanılamaz: Node.js bunu `NODE_OPTIONS` içinde reddeder.
+
+`--replSet overleaf`, Toolkit'in varsayılan olarak MongoDB'ye ilettiği değerdir. Bunu koruyun.
+
+</Warning>
+
+160 MiB'lık bir heap ile büyük bir projeyi Git üzerinden klonlamak veya push etmek belleği tüketebilir ve Git entegrasyonu konteyneri yeniden başlar. Bunu test etmedik. Böyle bir durumda `-Xmx` değerini artırın.
+
+## Sonuçlar {#results}
+
+Her test, `fontspec` ve 30 TikZ şekli içeren 33 sayfalık bir LuaLaTeX belgesini derledi; eşzamanlı derlemeler farklı projelerdi.
+
+| Kurulum                         | 1 derleme | Aynı anda 2                 | Aynı anda 3 | En yüksek swap kullanımı |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| Varsayılan, swap yok              | başlatılırken bellek tükenir | | |      |
+| Yalnızca 2. adım, swap yok          | 21 s      | `web` sonlandırıldı, 502 hataları  | test edilmedi |              |
+| Yalnızca 1. adım                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| 1. ve 2. adımlar                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+Swap olmadan bellek yetersizliğinden kaynaklanan bir sonlandırma bir sonrakine yol açar: `web` yeniden başlar, başlaması yine bellek gerektirir ve sunucu donanımsal bir sıfırlamaya kadar takılı kalır. Swap ile aynı anda üç derleme yaklaşık bir derleme kadar sürer, çünkü swap'e giden şey boştaki Node.js sayfalarıdır.
+
+Test edilmeyenler: Git klonlama ve push yükü, aynı anda düzenleme yapan çok sayıda kullanıcı ve yavaş disklerde swap (ana makinemiz SSD kullanıyordu).
+
+## Kubernetes {#kubernetes}
+
+Kubernetes kılavuzumuz düğümlerde swap'i kapatır ([Düğümleri hazırlayın](/tr/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)), bu nedenle orada yalnızca 2. adım geçerlidir. `NODE_OPTIONS` ve `MALLOC_ARENA_MAX` değerlerini `overleaf-env` ConfigMap'ine koyun ([Örneğinizi kişiselleştirme](/tr/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)). MongoDB önbelleği [MongoDB ve Redis'i dağıtın](/tr/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis) sayfasında zaten ayarlanmıştır.
