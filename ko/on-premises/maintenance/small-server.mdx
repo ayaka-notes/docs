@@ -1,0 +1,89 @@
+---
+title: 소규모 서버
+icon: memory
+---
+
+2 GB의 스왑을 추가하면 Ayakaleaf Pro는 Git 연동을 포함해 CPU 코어 2개, 메모리 2 GB인 서버에서 실행됩니다. 스왑이 없으면 시작하는 동안 메모리가 부족해집니다. 2단계의 설정을 적용하면 스왑 사용량을 거의 절반으로 줄일 수 있습니다.
+
+<Info>
+
+이 측정은 Ubuntu 24.04를 실행하는 2 vCPU / 2 GiB QEMU/KVM 가상 머신에서 Toolkit으로 설치한 Ayakaleaf Pro 6.3.1을 대상으로, 샌드박스 컴파일(`texlive-basic:2025.1`)과 Git 연동을 켠 상태로 수행했습니다.
+
+</Info>
+
+## 기본 설정에서 2 GB가 부족한 이유 {#why-2-gb-is-not-enough-by-default}
+
+기본 설정에서 Ayakaleaf Pro는 유휴 상태일 때 약 1.9 GiB가 필요합니다. 2 GiB 머신에서 Ubuntu와 Docker가 이미 364 MiB를 사용하므로 약 1600 MiB만 남습니다.
+
+| 구성 요소            | 유휴 메모리 | 참고                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| Node.js 프로세스 12개 | 1620 MiB    | `web`과 `web-api`는 각각 약 255 MiB, 나머지는 85–150 MiB |
+| Git 연동      | 135 MiB     | Java는 메모리의 절반인 1 GiB를 최대 힙으로 사용합니다      |
+| MongoDB 8.0          | 125 MiB     | 캐시가 약 512 MiB까지 커질 수 있습니다                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. 2 GB 스왑 추가 {#1-add-2-gb-of-swap}
+
+가장 중요한 단계입니다.
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. 메모리 사용량 줄이기 {#2-lower-memory-use}
+
+다음 줄을 `config/variables.env`에 추가합니다. Git 연동 컨테이너도 이 파일을 읽습니다.
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+MongoDB 캐시를 제한하려면 `config/docker-compose.override.yml`(Ayakaleaf Pro 이미지를 설정하는 파일과 같은 파일)의 `services` 아래에 `mongo` 항목을 추가합니다.
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+그런 다음 `bin/up -d`를 실행합니다.
+
+| 설정                                       | 효과                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | Node.js 프로세스 전체에서 470 MiB 절약, 컴파일 시간은 동일 |
+| `MALLOC_ARENA_MAX=2`                          | Node.js 프로세스 전체에서 65 MiB 절약                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | Git 연동 힙이 1 GiB 대신 160 MiB로 제한됨 |
+| `--wiredTigerCacheSizeGB 0.25`                | MongoDB 캐시가 약 512 MiB 대신 256 MiB로 제한됨 |
+
+<Warning>
+
+`NODE_OPTIONS`는 이미지에 설정된 값을 대체하므로 이 줄에는 반드시 `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs`가 남아 있어야 합니다. 이것이 없으면 Node.js 서비스가 패키지를 불러오지 못해 시작되지 않습니다. `--optimize-for-size`는 사용할 수 없습니다. Node.js가 `NODE_OPTIONS`에서 이 옵션을 거부합니다.
+
+`--replSet overleaf`는 Toolkit이 기본적으로 MongoDB에 전달하는 값입니다. 그대로 두세요.
+
+</Warning>
+
+힙이 160 MiB이면 큰 프로젝트를 Git으로 클론하거나 푸시할 때 메모리가 부족해져 Git 연동 컨테이너가 재시작될 수 있습니다. 이 경우는 테스트하지 않았습니다. 이런 일이 발생하면 `-Xmx`를 높이세요.
+
+## 결과 {#results}
+
+각 테스트에서는 `fontspec`과 TikZ 그림 30개가 포함된 33쪽 분량의 LuaLaTeX 문서를 컴파일했습니다. 동시 컴파일에는 서로 다른 프로젝트를 사용했습니다.
+
+| 구성                         | 컴파일 1개 | 동시 2개                 | 동시 3개 | 최대 스왑 사용량 |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| 기본값, 스왑 없음              | 시작 중 메모리 부족 | | |      |
+| 2단계만, 스왑 없음          | 21 s      | `web` 종료, 502 오류  | 테스트 안 함 |              |
+| 1단계만                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| 1단계와 2단계                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+스왑이 없으면 메모리 부족으로 인한 종료가 연쇄적으로 일어납니다. `web`이 재시작되고, 시작하는 데 다시 메모리가 필요해지며, 하드 리셋할 때까지 서버가 멈춥니다. 스왑이 있으면 동시에 세 번 컴파일해도 한 번 컴파일할 때와 거의 같은 시간이 걸립니다. 스왑으로 밀려나는 것은 유휴 상태의 Node.js 페이지이기 때문입니다.
+
+테스트하지 않은 항목: Git 클론 및 푸시 부하, 많은 사용자의 동시 편집, 느린 디스크에서의 스왑(테스트 호스트는 SSD를 사용했습니다).
+
+## Kubernetes {#kubernetes}
+
+Kubernetes 가이드에서는 노드의 스왑을 끄므로([노드 준비](/ko/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)) 여기서는 2단계만 적용됩니다. `NODE_OPTIONS`와 `MALLOC_ARENA_MAX`는 `overleaf-env` ConfigMap에 넣으세요([인스턴스 개인화](/ko/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)). MongoDB 캐시는 이미 [MongoDB 및 Redis 배포](/ko/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis)에서 설정되어 있습니다.
