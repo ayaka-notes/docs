@@ -1,0 +1,59 @@
+---
+title: Project History Chunks コレクション
+icon: layer-group
+---
+
+`projectHistoryChunks` には履歴チャンクごとに 1 つのドキュメントがあります。チャンクとは、1 つのプロジェクトの履歴における連続したバージョンの範囲です。Mongo にはチャンクのメタデータだけがあり、チャンク本体（スナップショットとその後の変更）は chunks バケット内の gzip 圧縮された JSON オブジェクトです。Mongoose スキーマはありません。history-v1 が `services/history-v1/storage/lib/chunk_store/mongo.js` でコレクションに書き込み、CE と同様に 16 進数 24 文字のすべての履歴 id にこれを使います（`services/history-v1/storage/lib/chunk_store/index.js:644-652`）。
+
+#### フィールド {#fields}
+
+| フィールド | 型 | 意味 | 出典 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | チャンク id。バケット内のチャンクオブジェクトの名前にもなります（補足を参照）。 | `mongo.js:183-185` |
+| `projectId` | ObjectId | プロジェクトの履歴 id。`projects.overleaf.history.id` の値です。CE では web がプロジェクト自身の `_id` で履歴を作成します（`services/web/app/src/Features/History/HistoryManager.mjs:51-55`）。 | `mongo.js:186` |
+| `startVersion` | Number | チャンク内の最初の変更より前のプロジェクトバージョン。 | `mongo.js:187` |
+| `endVersion` | Number | チャンク内の最後の変更より後のプロジェクトバージョン。 | `mongo.js:188` |
+| `endTimestamp` | Date | チャンク内の最後の変更の時刻。新しいプロジェクトの最初のチャンクのように変更がない場合は `null` です（`libraries/overleaf-editor-core/lib/chunk.js:146-149`）。 | `mongo.js:189` |
+| `state` | String | `pending`、`active`、`closed`、`deleted` のいずれか。補足を参照してください。 | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | 挿入時、有効化時、削除時に設定されます。チャンクを閉じても変わりません。 | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### 書き込み元 {#who-writes-it}
+
+| コード | 処理内容 |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`：チャンクオブジェクトのアップロード前に `pending` レコードを挿入します（`chunk_store/index.js:394-410`）。 |
+| `mongo.js:331-359` | `activateChunk`：アップロード完了後に `pending` から `active` にします。ここで重複キーが発生した場合は、別のチャンクがすでにそのバージョンから始まっていることを意味します。 |
+| `mongo.js:371-388` | `closeChunk`：新しいチャンクが続くときに `active` から `closed` にします（`confirmCreate`、`mongo.js:206-227`）。 |
+| `mongo.js:402-419` | `deleteActiveChunk`：開始バージョンが同じでより長いチャンクに置き換えられるときに `active` から `deleted` にします（`confirmUpdate`、`mongo.js:295-321`）。 |
+| `mongo.js:428-452` | `deleteChunk` と `deleteProjectChunks`：チャンクを `deleted` にします。後者は history-v1 の `DELETE /projects/:project_id` で実行されます（`services/history-v1/api/controllers/projects.js:361-373`）。 |
+| `mongo.js:144-174` | `clone`：history-v1 の `POST /projects/:project_id/clone` のために、プロジェクトのレコードを新しい履歴 id でコピーします。web にはこのルートのクライアントがあります（`HistoryManager.mjs:63-72`）が、web でそれを呼ぶものはありません。 |
+| `mongo.js:497-502` | `deleteOldChunks`：古い `deleted` と `pending` のレコードを削除します。`services/history-v1/storage/tasks/delete_old_chunks.js` からのみ実行されます。 |
+
+新しいチャンクは project-history から来ます。project-history はキューに入った編集を history-v1 の `POST /projects/:project_id/legacy_changes` に送り（`services/history-v1/api/routes/project_import.js:29-31`）、history-v1 は `chunkStore.update` または `chunkStore.create` を呼び出します（`services/history-v1/storage/lib/persist_changes.js:215`, `229`）。新しいプロジェクトは最初のチャンクを `chunkStore.initializeProject` から受け取ります（`chunk_store/index.js:54-80`）。
+
+#### 読み取り元 {#who-reads-it}
+
+| コード | 処理内容 |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`：プロジェクトの最新の `active` または `closed` チャンク。 |
+| `mongo.js:54-71` | `getChunkForVersion`：あるバージョンを含むチャンク。 |
+| `mongo.js:77-103` | `getChunkForTimestamp`：ある時点で最新だったチャンク。 |
+| `mongo.js:108-137` | `getProjectChunkIds` と `getProjectChunks`：プロジェクトの有効なすべてのチャンク。 |
+| `mongo.js:457-492` | `getOldChunksBatch`：クリーンアップタスク用の古い `deleted` と `pending` のレコード。 |
+| `services/history-v1/api/controllers/projects.js:115-265` | history-v1 の読み取りルート（最新の内容、あるバージョンの内容、履歴、変更）。`chunk_store/index.js` を通じてチャンクを読み込みます。 |
+
+#### インデックス {#indexes}
+
+| 名前 | キー | オプション | マイグレーション |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique、部分：`state` が `active`、`closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs`（`20221122191857_project_history_chunks_indexes.mjs` の `projectId_1_startVersion_1` を置き換え） |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | 部分：`state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs`（`state_1` を置き換え） |
+| `pending_updated_at` | `{ updatedAt: -1 }` | 部分：`state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs`（`20230217205311_fix_deleted_history_chunks_index.mjs` の `state_pending` を置き換え） |
+
+#### 補足 {#notes}
+
+* 状態の流れ：`pending`（レコード書き込み済み、アップロード中）→ `active`（最新のチャンク、まだ拡張可能）→ `closed`（より新しいチャンクが続く）または `deleted`（置き換えられた、またはプロジェクトが削除された）。読み取りは `active` と `closed` だけを対象にします。
+* チャンクオブジェクトは gzip 圧縮された JSON（`services/history-v1/storage/lib/history_store.js:151-170`）で、キー `<project key>/<chunk id>`（`history_store.js:65-67`）にあります。プロジェクトキーは、ゼロ埋めした履歴 id を反転し、3/3/残りの文字に分割したものです（`libraries/object-persistor/src/ProjectKey.js:8-15`）。バケットは `OVERLEAF_EDITOR_CHUNKS_BUCKET`（`services/history-v1/config/custom-environment-variables.json:53-56`）で、開発環境では `/buckets/chunks`（`develop/docker-compose.yml:90`）、`S3_ENABLED=true` では `overleaf-chunks`（`develop/s3/docker-compose.yml:51`）です。
+* `deleted` または `pending` 状態のレコードとそのバケットオブジェクトは、`delete_old_chunks.js` だけが削除します（`yarn delete_old_chunks`、`services/history-v1/package.json:79`）。CE イメージにはそのための cron ジョブがない（`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`）ため、CE では残り続けます。
+* web が削除済みプロジェクトを期限切れにするとき、history-v1 の `DELETE /projects/:history_id` を呼び出し（`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`）、プロジェクトのすべてのチャンクが `deleted` になります。
+* `backupStore` が設定されている場合、チャンクの確定時に `overleaf.history.currentEndVersion`、`currentEndTimestamp`、`updatedAt`、`overleaf.backup.pendingChangeAt` もプロジェクトに書き込まれます（`mongo.js:232-262`）。CE は `backupStore` を設定しないため、`mongo.js:238-240` で早期に戻ります。

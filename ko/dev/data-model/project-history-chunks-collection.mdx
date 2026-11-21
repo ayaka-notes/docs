@@ -1,0 +1,59 @@
+---
+title: Project History Chunks 컬렉션
+icon: layer-group
+---
+
+`projectHistoryChunks`에는 기록 청크마다 문서 하나가 있습니다. 청크는 한 프로젝트 기록에서 연속된 버전의 구간입니다. Mongo에는 청크의 메타데이터만 있으며, 청크 자체(스냅샷과 그 이후의 변경)는 chunks 버킷에 있는 gzip으로 압축된 JSON 객체입니다. Mongoose 스키마는 없습니다. history-v1이 `services/history-v1/storage/lib/chunk_store/mongo.js`에서 컬렉션에 쓰며, CE에서처럼 16진수 24자의 모든 기록 id에 이를 사용합니다(`services/history-v1/storage/lib/chunk_store/index.js:644-652`).
+
+#### 필드 {#fields}
+
+| 필드 | 타입 | 의미 | 출처 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 청크 id입니다. 버킷에 있는 청크 객체의 이름이기도 합니다(참고 항목 참고). | `mongo.js:183-185` |
+| `projectId` | ObjectId | 프로젝트의 기록 id로, `projects.overleaf.history.id`의 값입니다. CE에서는 web이 프로젝트 자체의 `_id`로 기록을 만듭니다(`services/web/app/src/Features/History/HistoryManager.mjs:51-55`). | `mongo.js:186` |
+| `startVersion` | Number | 청크의 첫 변경 이전의 프로젝트 버전입니다. | `mongo.js:187` |
+| `endVersion` | Number | 청크의 마지막 변경 이후의 프로젝트 버전입니다. | `mongo.js:188` |
+| `endTimestamp` | Date | 청크의 마지막 변경 시각입니다. 새 프로젝트의 첫 청크처럼 변경이 없으면 `null`입니다(`libraries/overleaf-editor-core/lib/chunk.js:146-149`). | `mongo.js:189` |
+| `state` | String | `pending`, `active`, `closed`, `deleted` 중 하나입니다. 참고 항목을 보세요. | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | 삽입, 활성화, 삭제 시 설정됩니다. 청크를 닫아도 바뀌지 않습니다. | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### 쓰는 코드 {#who-writes-it}
+
+| 코드 | 역할 |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`: 청크 객체를 업로드하기 전에 `pending` 레코드를 삽입합니다(`chunk_store/index.js:394-410`). |
+| `mongo.js:331-359` | `activateChunk`: 업로드가 끝나면 `pending`에서 `active`로 바꿉니다. 여기서 중복 키가 나면 다른 청크가 이미 그 버전에서 시작한다는 뜻입니다. |
+| `mongo.js:371-388` | `closeChunk`: 새 청크가 뒤따르면 `active`에서 `closed`로 바꿉니다(`confirmCreate`, `mongo.js:206-227`). |
+| `mongo.js:402-419` | `deleteActiveChunk`: 시작 버전이 같은 더 긴 청크로 대체되면 `active`에서 `deleted`로 바꿉니다(`confirmUpdate`, `mongo.js:295-321`). |
+| `mongo.js:428-452` | `deleteChunk`와 `deleteProjectChunks`: 청크를 `deleted`로 표시합니다. 후자는 history-v1 `DELETE /projects/:project_id`에서 실행됩니다(`services/history-v1/api/controllers/projects.js:361-373`). |
+| `mongo.js:144-174` | `clone`: history-v1 `POST /projects/:project_id/clone`을 위해 프로젝트의 레코드를 새 기록 id로 복사합니다. web에는 이 라우트의 클라이언트가 있지만(`HistoryManager.mjs:63-72`) web에서 이를 호출하는 곳은 없습니다. |
+| `mongo.js:497-502` | `deleteOldChunks`: 오래된 `deleted`와 `pending` 레코드를 제거합니다. `services/history-v1/storage/tasks/delete_old_chunks.js`에서만 실행됩니다. |
+
+새 청크는 project-history에서 옵니다. project-history는 대기 중인 편집을 history-v1 `POST /projects/:project_id/legacy_changes`로 보내고(`services/history-v1/api/routes/project_import.js:29-31`), history-v1은 `chunkStore.update` 또는 `chunkStore.create`를 호출합니다(`services/history-v1/storage/lib/persist_changes.js:215`, `229`). 새 프로젝트는 첫 청크를 `chunkStore.initializeProject`에서 받습니다(`chunk_store/index.js:54-80`).
+
+#### 읽는 코드 {#who-reads-it}
+
+| 코드 | 역할 |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`: 프로젝트의 가장 최근 `active` 또는 `closed` 청크입니다. |
+| `mongo.js:54-71` | `getChunkForVersion`: 특정 버전을 포함하는 청크입니다. |
+| `mongo.js:77-103` | `getChunkForTimestamp`: 특정 시점에 최신이었던 청크입니다. |
+| `mongo.js:108-137` | `getProjectChunkIds`와 `getProjectChunks`: 프로젝트의 모든 유효한 청크입니다. |
+| `mongo.js:457-492` | `getOldChunksBatch`: 정리 작업용 오래된 `deleted`와 `pending` 레코드입니다. |
+| `services/history-v1/api/controllers/projects.js:115-265` | history-v1 읽기 라우트(최신 내용, 특정 버전의 내용, 기록, 변경)로, `chunk_store/index.js`를 통해 청크를 불러옵니다. |
+
+#### 인덱스 {#indexes}
+
+| 이름 | 키 | 옵션 | 마이그레이션 |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique, 부분: `state`가 `active`, `closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs`(`20221122191857_project_history_chunks_indexes.mjs`의 `projectId_1_startVersion_1`을 대체) |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | 부분: `state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs`(`state_1`을 대체) |
+| `pending_updated_at` | `{ updatedAt: -1 }` | 부분: `state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs`(`20230217205311_fix_deleted_history_chunks_index.mjs`의 `state_pending`을 대체) |
+
+#### 참고 {#notes}
+
+* 상태 흐름: `pending`(레코드 작성됨, 업로드 중) → `active`(가장 최근 청크, 아직 확장 가능) → `closed`(더 새로운 청크가 뒤따름) 또는 `deleted`(대체되었거나 프로젝트가 삭제됨). 읽기는 `active`와 `closed`만 봅니다.
+* 청크 객체는 gzip으로 압축된 JSON(`services/history-v1/storage/lib/history_store.js:151-170`)이며 키 `<project key>/<chunk id>`(`history_store.js:65-67`)에 있습니다. 프로젝트 키는 0으로 채운 기록 id를 뒤집어 3/3/나머지 문자로 나눈 것입니다(`libraries/object-persistor/src/ProjectKey.js:8-15`). 버킷은 `OVERLEAF_EDITOR_CHUNKS_BUCKET`(`services/history-v1/config/custom-environment-variables.json:53-56`)으로, 개발 환경에서는 `/buckets/chunks`(`develop/docker-compose.yml:90`), `S3_ENABLED=true`에서는 `overleaf-chunks`(`develop/s3/docker-compose.yml:51`)입니다.
+* `deleted` 또는 `pending` 상태의 레코드와 그 버킷 객체는 `delete_old_chunks.js`만 제거합니다(`yarn delete_old_chunks`, `services/history-v1/package.json:79`). CE 이미지에는 이를 위한 cron 작업이 없으므로(`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`) CE에서는 계속 남아 있습니다.
+* web이 삭제된 프로젝트를 만료시킬 때 history-v1 `DELETE /projects/:history_id`를 호출하며(`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`), 이로써 프로젝트의 모든 청크가 `deleted`로 표시됩니다.
+* `backupStore`가 설정되어 있으면 청크를 확정할 때 `overleaf.history.currentEndVersion`, `currentEndTimestamp`, `updatedAt`, `overleaf.backup.pendingChangeAt`도 프로젝트에 씁니다(`mongo.js:232-262`). CE는 `backupStore`를 설정하지 않으므로 `mongo.js:238-240`에서 일찍 반환합니다.

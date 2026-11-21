@@ -3,49 +3,84 @@ title: Docs コレクション
 icon: file-lines
 ---
 
-`Docs`: Docs は、編集可能なファイルを指す Overleaf の内部用語です。例えば、純粋な `tex` ファイルや `.bib` ファイルなどです。ファイルの内容、リビジョン情報、削除状態を保存します。
+`docs` はプロジェクトの編集可能なテキストファイル（Overleaf では doc と呼びます）の内容を保持します。たとえば `main.tex` や `sample.bib` です。doc ごとに 1 つのドキュメントがあり、行、コメントと変更履歴、2 つのカウンター、削除状態を持ちます。ファイル名とツリー内の位置はここではなく `projects.rootFolder` にあります（[Projects コレクション](/ja/dev/data-model/projects-collection) を参照）。バイナリファイルもここにはありません。
 
-#### コア識別情報
+マイグレーションとメンテナンススクリプトを除き、このコレクションに書き込むのは docstore だけで、場所は `services/docstore/app/js/MongoManager.js` です。Mongoose モデルはなく、web と document-updater は docstore の HTTP API を通じてアクセスします（`services/docstore/app.js:31-70`）。出典列でパスのないファイル名は `services/docstore/app/js/` 配下です。
 
-* `_id`: このドキュメントレコードを識別する一意な MongoDB ObjectId。
-* `project_id`: このファイルが属するプロジェクト(`Project._id`)への参照。
-* `name`: プロジェクトのファイルツリーに表示されるファイル名(例: `main.tex`、`sample.bib`)。
+#### フィールド {#fields}
 
-#### リビジョンとバージョン管理
+| フィールド | 型 | 意味 | 出典 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | doc id。`projects.rootFolder` 内の doc エントリーの `_id` と同じです。 | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | doc のプロジェクト。 | `MongoManager.js:144` |
+| `lines` | Array of String | テキスト。1 行が 1 要素です。doc がアーカイブされている間（`inS3: true`）はありません。 | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | コメントと変更履歴。下記を参照してください。doc がアーカイブされている間はありません。 | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstore 独自のカウンター。1 から始まり、`lines` または `ranges` が変わるたびに 1 増えます。すべての更新は古い `rev` と照合するため、2 つの書き込みが互いを上書きすることはありません。履歴のバージョンではありません。 | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | document-updater からの doc の OT バージョンで、フラッシュ時に保存されます。docstore はより低いバージョンのフラッシュを拒否します。古い doc では `docOps` コレクションに保存されていましたが、マイグレーション `20231105000000_move_doc_versions_from_docops_to_docs` でここに移されました。 | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | doc がプロジェクトから削除されたときに `true` です。一度も削除されていない doc にはありません。 | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | doc が削除された日時。 | `HttpController.js:87` |
+| `name` | String | 削除時点のファイル名。doc が削除されたときだけ設定され、削除されていない doc にはここに `name` がありません。 | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `lines`、`ranges`、`rev` が docstore の persistor（`Settings.docstore.bucket`、キー `<project_id>/<doc_id>`）に移され、`lines` と `ranges` が Mongo から削除されたときに `true` です。doc が読み戻されると再び削除されます。 | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | doc のアーカイブ中に保持されるロック。 | `MongoManager.js:177-193` |
 
-* `rev`: プロジェクト履歴内でのこのドキュメントのリビジョン番号。
-* `version`: エディターのバックエンドで使用される内部スキーマまたはフォーマットのバージョン。
+#### Ranges {#ranges}
 
-これらのフィールドは、Overleaf 独自のバージョン管理システムで増分編集を追跡し、履歴やロールバックをサポートするために使用されます。
+`ranges` には 2 つの配列があります。document-updater が `libraries/ranges-tracker/index.cjs` で構築し、docstore が保存前に id を ObjectId に、`ts` を Date に変換します（`RangeManager.js:41-63`）。コメントも変更履歴もない doc は `ranges: {}` を持つか、`ranges` を持ちません。
 
-#### ファイルの内容
+| フィールド | 型 | 意味 | 出典 |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | コメントが付いたテキスト範囲。 | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | コメント id。`rooms` コレクション内のコメントのスレッド id である `op.t` と同じで、docstore が一致を強制します。 | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | doc 内のコメント対象のテキスト（コメントのメッセージではありません）。 | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | doc 内での `op.c` の開始位置の文字オフセット。 | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | スレッド id。`id` を参照してください。 | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | コメントの `user_id` と `ts`。 | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | 変更履歴。位置順に並びます。 | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | 変更の id。 | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | 挿入されたテキスト、または削除されたテキスト。どちらか一方です。 | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | 変更の文字オフセット。 | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | 作成者。匿名の編集者による変更は文字列 `anonymous-user` のままです。 | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | 変更が行われた日時。 | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    ファイルの内容を 1 行ずつ表す文字列の配列。\
-    各要素はソースファイルの 1 つの論理行に対応します。
+コメントとその返信のテキストは `docs` にはありません。`messages` コレクションの、`thread_id` がコメント id である room にあります。コメントが解決済みかどうかはここではなくその room に保存され、docstore は `resolved` フラグが送られてきても破棄します（`RangeManager.js:59-61`）。[Rooms コレクション](/ja/dev/data-model/rooms-collection) と [Messages コレクション](/ja/dev/data-model/messages-collection) を参照してください。
 
-    この例では、BibTeX エントリを保存しています。
+#### 書き込み元 {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: エディターの注釈や追跡範囲のために予約されたデータ構造\
-  (例: 選択範囲、コメント、変更履歴)。アクティブな範囲がない場合は空です。`op` コメントをドキュメント内の特定の位置に紐付ける操作オブジェクト。
-  * `op.c` — コメント対象として選択されたテキスト(文字内容)
-  * `op.p` — アンカー位置(文字オフセット)
-  * `id` このコメントエントリの一意な ObjectId。
-  * `metadata` 作成者とタイムスタンプの情報。
+| コード | 処理内容 |
+| ---- | ------------ |
+| `DocManager.js:223-338`（`POST /project/:project_id/doc/:doc_id`） | doc を作成または更新します：`lines`、`ranges`、`version`。web は doc の作成時と、document-updater が開いている doc をフラッシュするときに呼び出します（`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`）。 |
+| `DocManager.js:346-366`（`PATCH /project/:project_id/doc/:doc_id`） | `deleted`、`deletedAt`、`name` で doc を削除済みにします。 |
+| `DocArchiveManager.js:29-88` | doc をアーカイブします：`lines`、`ranges`、`rev` を persistor にコピーし、`inS3` を設定します。プロジェクトが非アクティブになるとプロジェクト全体に対して実行され、`ARCHIVE_ON_SOFT_DELETE=true` の場合は削除時に 1 つの doc に対して実行されます（`DocManager.js:355-363`）。 |
+| `DocArchiveManager.js:150-174` | アーカイブされた doc が読み込まれるときに Mongo に戻します（`DocManager.js:40-41`）。 |
+| `MongoManager.js:272-274` | プロジェクトが破棄されるときに、そのプロジェクトのすべての doc を削除します。 |
 
-#### 削除状態
+#### 読み取り元 {#who-reads-it}
 
-* `deleted`:\
-  このドキュメントがプロジェクトから削除されたかどうかを示します。
-* `deletedAt`:\
-  ドキュメントが削除された日時を記録するタイムスタンプ。
+| コード | 処理内容 |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | 誰かが doc を開いたときに（web を通じて）読み込みます。 |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | web のすべての読み取り：1 つの doc、プロジェクトのすべての doc、すべての ranges、削除済みの doc。 |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | プロジェクトをコピーします。先に document-updater をフラッシュします。 |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | 管理パネルでプロジェクトの削除済み doc を一覧表示します。 |
 
-削除されたドキュメントは通常、データベースからすぐに削除されるのではなく、履歴の復元やバージョンの閲覧のために保持されます。
+#### インデックス {#indexes}
 
-以下は Overleaf の `docs` の実際の例です。
+すべて `tools/migrations/` 内の `server-ce` タグ付きマイグレーションによるものです。
 
-<Accordion title="シンプルな例">
+| 名前 | キー | オプション | マイグレーション |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### 補足 {#notes}
+
+* doc が開いている間、最新のテキストはここではなく document-updater（Redis）にあります。Mongo は document-updater がフラッシュしたときにだけ更新されます（`services/document-updater/app/js/PersistenceManager.js:128-160`）。プロジェクト全体の doc を読むコードは、`ProjectDuplicator` のように先に `flushProjectToMongo` を呼ぶ必要があります。
+* 削除された doc は、プロジェクトが破棄されるまで `deleted: true` のままこのコレクションに残ります。docstore は新しい順に最大 `MAX_DELETED_DOCS`（デフォルト 2000）件を返します（`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`）。履歴パネルはこれらを使わず、history-v1 を読みます。
+* `rev` と `version` のカウンターは、history-v1 のプロジェクト履歴のバージョンとは関係ありません。
+
+以下は Overleaf の `docs` の実例です。
+
+<Accordion title="削除された doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ icon: file-lines
 
 </Accordion>
 
-<Accordion title="複雑な例">
+<Accordion title="コメント付きの doc">
 
 ```json5
 {
