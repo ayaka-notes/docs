@@ -3,49 +3,84 @@ title: Docs-samlingen
 icon: file-lines
 ---
 
-`Docs`: Docs er Overleafs interne betegnelse på en redigerbar fil, for eksempel en ren `tex`-fil eller en `.bib`-fil. Den lagrer filinnholdet, revisjonsinformasjon og slettestatus.
+`docs` inneholder innholdet i et prosjekts redigerbare tekstfiler (Overleaf kaller dem docs), for eksempel `main.tex` eller `sample.bib`. Ett dokument per doc: linjene, kommentarene og de sporede endringene, to tellere og slettestatusen. Filnavnet og plassen i treet ligger ikke her, men i `projects.rootFolder` (se [Prosjektsamlingen](/no/dev/data-model/projects-collection)). Binærfiler ligger heller ikke her.
 
-#### Kjerneidentifikasjon
+Bortsett fra migreringer og vedlikeholdsskript er det bare docstore som skriver denne samlingen, i `services/docstore/app/js/MongoManager.js`. Det finnes ingen Mongoose-modell; web og document-updater når den via HTTP-API-et til docstore (`services/docstore/app.js:31-70`). I kolonnen Kilde ligger rene filnavn under `services/docstore/app/js/`.
 
-* `_id`: Unik MongoDB-ObjectId som identifiserer denne dokumentposten.
-* `project_id`: Referanse til prosjektet (`Project._id`) som denne filen tilhører.
-* `name`: Filnavnet slik det vises i prosjektets filtre (f.eks. `main.tex`, `sample.bib`).
+#### Felter {#fields}
 
-#### Revisjon og versjonering
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Doc-id, det samme som `_id` for doc-oppføringen i `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Prosjektet til docet. | `MongoManager.js:144` |
+| `lines` | Array of String | Teksten, ett element per linje. Mangler mens docet er arkivert (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Kommentarer og sporede endringer, se nedenfor. Mangler mens docet er arkivert. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstores egen teller. Starter på 1 og øker med 1 hver gang `lines` eller `ranges` endres. Hver oppdatering matcher den gamle `rev`, så to skrivere kan ikke overskrive hverandre. Ikke en historikkversjon. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | Docets OT-versjon fra document-updater, lagret ved flush. docstore avviser en flush med lavere versjon. Eldre docs hadde den i samlingen `docOps`; migreringen `20231105000000_move_doc_versions_from_docops_to_docs` flyttet den hit. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true` når docet er slettet fra prosjektet. Mangler for docs som aldri er slettet. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Når docet ble slettet. | `HttpController.js:87` |
+| `name` | String | Filnavnet ved slettingen. Settes bare når docet slettes; levende docs har ingen `name` her. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true` når `lines`, `ranges` og `rev` er flyttet til docstores persistor (`Settings.docstore.bucket`, nøkkel `<project_id>/<doc_id>`) og `lines` og `ranges` er fjernet fra Mongo. Fjernes igjen når docet leses tilbake. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Lås som holdes mens docet arkiveres. | `MongoManager.js:177-193` |
 
-* `rev`: Revisjonsnummeret til dette dokumentet i prosjekthistorikken.
-* `version`: Intern skjema- eller formatversjon som brukes av editorens backend.
+#### Ranges {#ranges}
 
-Disse feltene brukes av Overleafs egne versjoneringssystem til å spore inkrementelle endringer og støtte historikk og tilbakerulling.
+`ranges` har to matriser. document-updater bygger dem med `libraries/ranges-tracker/index.cjs`; docstore gjør id-er om til ObjectIds og `ts` til Dates før lagring (`RangeManager.js:41-63`). Et doc uten kommentarer eller sporede endringer har `ranges: {}` eller ingen `ranges`.
 
-#### Filinnhold
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Kommenterte tekstavsnitt. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Kommentar-id. Den er lik `op.t`, trådens id for kommentaren i samlingen `rooms`; docstore tvinger dem til å samsvare. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Den kommenterte teksten i docet (ikke kommentarmeldingen). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Tegnposisjonen der `op.c` begynner i docet. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Tråd-id, se `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | Kommentarens `user_id` og `ts`. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Sporede endringer, sortert etter posisjon. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Endringens id. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Innsatt tekst eller slettet tekst. Én av de to. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Endringens tegnposisjon. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Forfatter. Endringer fra anonyme redaktører beholder strengen `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Når endringen ble gjort. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Array med strenger som representerer filinnholdet linje for linje.\
-    Hvert element tilsvarer én logisk linje i kildefilen.
+Teksten i en kommentar og svarene på den ligger ikke i `docs`: den ligger i samlingen `messages`, i rommet (room) der `thread_id` er kommentarens id. Om en kommentar er løst, lagres på det rommet, ikke her; docstore forkaster et `resolved`-flagg hvis det sendes (`RangeManager.js:59-61`). Se [Rooms-samlingen](/no/dev/data-model/rooms-collection) og [Messages-samlingen](/no/dev/data-model/messages-collection).
 
-    I dette eksemplet lagrer den en BibTeX-oppføring:
+#### Hvem skriver {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Datastruktur reservert for editorannoteringer eller sporede områder\
-  (f.eks. markeringer, kommentarer eller endringssporing). Tom når ingen aktive områder finnes. `op` Operasjonsobjekt som knytter kommentaren til en bestemt posisjon i dokumentet.
-  * `op.c` — Kommentert markert tekst (tegninnhold)
-  * `op.p` — Ankerposisjon (tegnforskyvning)
-  * `id` Unik ObjectId for denne kommentaroppføringen.
-  * `metadata` Informasjon om forfatter og tidsstempel.
+| Kode | Hva den gjør |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Oppretter eller oppdaterer et doc: `lines`, `ranges` og `version`. Web kaller den når et doc opprettes og når document-updater flusher et åpent doc (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Markerer et doc som slettet med `deleted`, `deletedAt` og `name`. |
+| `DocArchiveManager.js:29-88` | Arkiverer et doc: kopierer `lines`, `ranges` og `rev` til persistoren og setter `inS3`. Kjører for et helt prosjekt når det deaktiveres, og for ett doc ved sletting når `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Henter et arkivert doc tilbake til Mongo når det leses (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Sletter alle docs i et prosjekt når prosjektet ødelegges. |
 
-#### Slettestatus
+#### Hvem leser {#who-reads-it}
 
-* `deleted`:\
-  Angir om dette dokumentet er slettet fra prosjektet.
-* `deletedAt`:\
-  Tidsstempel som registrerer når dokumentet ble slettet.
+| Kode | Hva den gjør |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Laster inn et doc (via web) når noen åpner det. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Alle lesinger fra web: ett doc, alle docs i et prosjekt, alle ranges, slettede docs. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Kopierer et prosjekt; flusher document-updater først. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Lister de slettede docs i et prosjekt i administrasjonspanelet. |
 
-Slettede dokumenter beholdes vanligvis for gjenoppretting av historikk og versjonsvisning, i stedet for å bli fjernet fra databasen umiddelbart.
+#### Indekser {#indexes}
 
-Her er et ekte eksempel på et Overleaf-`docs`.
+Alle kommer fra migreringer merket `server-ce` i `tools/migrations/`.
 
-<Accordion title="Et enkelt eksempel">
+| Navn | Nøkler | Alternativer | Migrering |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Merknader {#notes}
+
+* Mens et doc er åpent, ligger den nyeste teksten i document-updater (Redis), ikke her. Mongo oppdateres bare når document-updater flusher (`services/document-updater/app/js/PersistenceManager.js:128-160`). Kode som leser docs for et helt prosjekt, bør først kalle `flushProjectToMongo`, slik `ProjectDuplicator` gjør.
+* Slettede docs blir liggende i denne samlingen, med `deleted: true`, til prosjektet ødelegges. docstore returnerer høyst `MAX_DELETED_DOCS` (standard 2000) av dem, nyeste først (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Historikkpanelet bruker dem ikke; det leser history-v1.
+* Tellerne `rev` og `version` har ingen sammenheng med prosjektets historikkversjoner i history-v1.
+
+Her er ekte eksempler på Overleaf-`docs`.
+
+<Accordion title="Et slettet doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Her er et ekte eksempel på et Overleaf-`docs`.
 
 </Accordion>
 
-<Accordion title="Et mer komplisert eksempel">
+<Accordion title="Et doc med kommentarer">
 
 ```json5
 {

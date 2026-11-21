@@ -3,49 +3,84 @@ title: Samlingen Docs
 icon: file-lines
 ---
 
-`Docs`: Docs är Overleafs interna term för en redigerbar fil, till exempel en ren `tex`-fil eller en `.bib`-fil. Den lagrar filens innehåll, revisionsinformation och raderingsstatus.
+`docs` innehåller innehållet i ett projekts redigerbara textfiler (Overleaf kallar dem docs), till exempel `main.tex` eller `sample.bib`. Ett dokument per doc: dess rader, dess kommentarer och spårade ändringar, två räknare och raderingsstatusen. Filnamnet och platsen i trädet finns inte här utan i `projects.rootFolder` (se [Samlingen Projects](/sv/dev/data-model/projects-collection)). Binära filer finns inte heller här.
 
-#### Grundläggande identifiering
+Förutom migreringar och underhållsskript skriver bara docstore den här samlingen, i `services/docstore/app/js/MongoManager.js`. Det finns ingen Mongoose-modell; web och document-updater når den via docstores HTTP-API (`services/docstore/app.js:31-70`). I kolumnen Källa ligger enbart filnamn under `services/docstore/app/js/`.
 
-* `_id`: Unikt MongoDB-ObjectId som identifierar denna dokumentpost.
-* `project_id`: Referens till projektet (`Project._id`) som filen tillhör.
-* `name`: Filnamnet som det visas i projektets filträd (t.ex. `main.tex`, `sample.bib`).
+#### Fält {#fields}
 
-#### Revision och versionshantering
+| Fält | Typ | Betydelse | Källa |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Doc-id, samma som `_id` för doc-posten i `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Docets projekt. | `MongoManager.js:144` |
+| `lines` | Array of String | Texten, ett element per rad. Saknas medan docet är arkiverat (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Kommentarer och spårade ändringar, se nedan. Saknas medan docet är arkiverat. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstores egen räknare. Börjar på 1 och ökar med 1 varje gång `lines` eller `ranges` ändras. Varje uppdatering matchar mot det gamla `rev`, så två skrivare kan inte skriva över varandra. Ingen historikversion. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | Docets OT-version från document-updater, sparad vid flush. docstore nekar en flush med lägre version. Äldre docs hade den i samlingen `docOps`; migreringen `20231105000000_move_doc_versions_from_docops_to_docs` flyttade den hit. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true` när docet har raderats från projektet. Saknas för docs som aldrig har raderats. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | När docet raderades. | `HttpController.js:87` |
+| `name` | String | Filnamnet vid raderingen. Sätts bara när docet raderas; levande docs har inget `name` här. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true` när `lines`, `ranges` och `rev` har flyttats till docstores persistor (`Settings.docstore.bucket`, nyckel `<project_id>/<doc_id>`) och `lines` och `ranges` har tagits bort från Mongo. Tas bort igen när docet läses tillbaka. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Lås som hålls medan docet arkiveras. | `MongoManager.js:177-193` |
 
-* `rev`: Revisionsnummer för detta dokument i projekthistoriken.
-* `version`: Intern schema- eller formatversion som används av editorns backend.
+#### Ranges {#ranges}
 
-Dessa fält används av Overleafs egna versionshanteringssystem för att spåra stegvisa ändringar och stödja historik och återställning.
+`ranges` har två arrayer. document-updater bygger dem med `libraries/ranges-tracker/index.cjs`; docstore gör om id till ObjectIds och `ts` till Dates innan det sparar (`RangeManager.js:41-63`). Ett doc utan kommentarer eller spårade ändringar har `ranges: {}` eller inget `ranges`.
 
-#### Filinnehåll
+| Fält | Typ | Betydelse | Källa |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Kommenterade textavsnitt. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Kommentar-id. Det är lika med `op.t`, kommentarens tråd-id i samlingen `rooms`; docstore tvingar dem att matcha. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Den kommenterade texten i docet (inte kommentarsmeddelandet). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Teckenposition för början av `op.c` i docet. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Tråd-id, se `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | Kommentarens `user_id` och `ts`. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Spårade ändringar, sorterade efter position. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Ändringens id. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Infogad text eller raderad text. Det ena av de två. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Ändringens teckenposition. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Författare. Ändringar från anonyma redigerare behåller strängen `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | När ändringen gjordes. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    En array av strängar som representerar filens innehåll rad för rad.\
-    Varje element motsvarar en logisk rad i källfilen.
+Texten i en kommentar och dess svar finns inte i `docs`: den finns i samlingen `messages`, i det room vars `thread_id` är kommentarens id. Om en kommentar är löst lagras i det rummet, inte här; docstore släpper en `resolved`-flagga om en skickas (`RangeManager.js:59-61`). Se [Samlingen Rooms](/sv/dev/data-model/rooms-collection) och [Samlingen Messages](/sv/dev/data-model/messages-collection).
 
-    I det här exemplet lagras en BibTeX-post:
+#### Vem skriver {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Datastruktur reserverad för editorannoteringar eller spårade intervall\
-  (t.ex. markeringar, kommentarer eller ändringsspårning). Tom när inga aktiva intervall finns. `op` är ett operationsobjekt som knyter kommentaren till en specifik position i dokumentet.
-  * `op.c` — Den kommenterade markerade texten (teckeninnehåll)
-  * `op.p` — Ankarposition (teckenförskjutning)
-  * `id` Unikt ObjectId för denna kommentarspost.
-  * `metadata` Information om författare och tidsstämpel.
+| Kod | Vad den gör |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Skapar eller uppdaterar ett doc: `lines`, `ranges` och `version`. Web anropar den när ett doc skapas och när document-updater flushar ett öppet doc (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Markerar ett doc som raderat med `deleted`, `deletedAt` och `name`. |
+| `DocArchiveManager.js:29-88` | Arkiverar ett doc: kopierar `lines`, `ranges` och `rev` till persistorn och sätter `inS3`. Körs för ett helt projekt när det inaktiveras, och för ett enskilt doc vid radering när `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Hämtar tillbaka ett arkiverat doc till Mongo när det läses (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Raderar alla docs i ett projekt när projektet förstörs. |
 
-#### Raderingsstatus
+#### Vem läser {#who-reads-it}
 
-* `deleted`:\
-  Anger om dokumentet har raderats från projektet.
-* `deletedAt`:\
-  Tidsstämpel som registrerar när dokumentet raderades.
+| Kod | Vad den gör |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Läser in ett doc (via web) när någon öppnar det. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Alla läsningar från web: ett doc, alla docs i ett projekt, alla ranges, raderade docs. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Kopierar ett projekt; flushar document-updater först. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Listar de raderade docs i ett projekt i adminpanelen. |
 
-Raderade dokument behålls vanligtvis för återställning av historik och bläddring bland versioner i stället för att omedelbart tas bort från databasen.
+#### Index {#indexes}
 
-Här är ett verkligt exempel på ett Overleaf-`docs`.
+Alla kommer från migreringar taggade `server-ce` i `tools/migrations/`.
 
-<Accordion title="Ett enkelt exempel">
+| Namn | Nycklar | Alternativ | Migrering |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Anteckningar {#notes}
+
+* Medan ett doc är öppet finns dess senaste text i document-updater (Redis), inte här. Mongo uppdateras bara när document-updater flushar (`services/document-updater/app/js/PersistenceManager.js:128-160`). Kod som läser docs för ett helt projekt bör först anropa `flushProjectToMongo`, som `ProjectDuplicator` gör.
+* Raderade docs ligger kvar i den här samlingen, med `deleted: true`, tills projektet förstörs. docstore returnerar högst `MAX_DELETED_DOCS` (standard 2000) av dem, nyast först (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Historikpanelen använder dem inte; den läser history-v1.
+* Räknarna `rev` och `version` har inget samband med projektets historikversioner i history-v1.
+
+Här är verkliga exempel på Overleaf-`docs`.
+
+<Accordion title="Ett raderat doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Här är ett verkligt exempel på ett Overleaf-`docs`.
 
 </Accordion>
 
-<Accordion title="Ett komplicerat exempel">
+<Accordion title="Ett doc med kommentarer">
 
 ```json5
 {

@@ -3,49 +3,84 @@ title: Docs 集合
 icon: file-lines
 ---
 
-`Docs`：Docs 是 Overleaf 對可編輯檔案的內部稱呼，例如純 `tex` 檔或 `.bib` 檔。它儲存檔案內容、修訂資訊以及刪除狀態。
+`docs` 保存專案中可編輯文字檔的內容（Overleaf 稱之為 docs），例如 `main.tex` 或 `sample.bib`。每個 doc 一個文件：它的行、註解與追蹤修訂、兩個計數器以及刪除狀態。檔案名稱與它在檔案樹中的位置不在這裡，而在 `projects.rootFolder` 中（請參閱 [Projects 集合](/zh-TW/dev/data-model/projects-collection)）。二進位檔案也不在這裡。
 
-#### 核心識別
+除了遷移與維護指令碼之外，只有 docstore 寫入此集合，位置在 `services/docstore/app/js/MongoManager.js`。沒有 Mongoose 模型；web 與 document-updater 透過 docstore 的 HTTP API 存取它（`services/docstore/app.js:31-70`）。在「來源」欄中，不含路徑的檔名位於 `services/docstore/app/js/` 之下。
 
-* `_id`：識別此文件記錄的唯一 MongoDB ObjectId。
-* `project_id`：此檔案所屬專案的參照（`Project._id`）。
-* `name`：專案檔案樹中顯示的檔名（例如 `main.tex`、`sample.bib`）。
+#### 欄位 {#fields}
 
-#### 修訂與版本控制
+| 欄位 | 型別 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Doc id，與 `projects.rootFolder` 中該 doc 項目的 `_id` 相同。 | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | doc 所屬的專案。 | `MongoManager.js:144` |
+| `lines` | Array of String | 文字，每行一個元素。doc 被封存時（`inS3: true`）缺少此欄位。 | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | 註解與追蹤修訂，見下文。doc 被封存時缺少此欄位。 | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstore 自己的計數器。從 1 開始，`lines` 或 `ranges` 每次變更時加 1。每次更新都會比對舊的 `rev`，因此兩個寫入方不會互相覆寫。它不是歷史版本。 | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | 來自 document-updater 的 doc OT 版本，在排清時儲存。docstore 會拒絕版本較低的排清。較舊的 doc 把它保存在 `docOps` 集合中；遷移 `20231105000000_move_doc_versions_from_docops_to_docs` 把它移到了這裡。 | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | doc 已從專案中刪除時為 `true`。從未刪除過的 doc 沒有此欄位。 | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | doc 被刪除的時間。 | `HttpController.js:87` |
+| `name` | String | 刪除時的檔案名稱。僅在 doc 被刪除時設定；未刪除的 doc 在這裡沒有 `name`。 | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | 當 `lines`、`ranges` 與 `rev` 已移至 docstore 持久化儲存（`Settings.docstore.bucket`，鍵為 `<project_id>/<doc_id>`），且 `lines` 與 `ranges` 已從 Mongo 中移除時為 `true`。doc 被讀回時再次移除。 | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | doc 封存期間持有的鎖。 | `MongoManager.js:177-193` |
 
-* `rev`：此文件在專案歷史中的修訂編號。
-* `version`：編輯器後端使用的內部結構描述或格式版本。
+#### Ranges {#ranges}
 
-這些欄位由 Overleaf 自訂的版本控制系統使用，用來追蹤增量編輯，並支援歷史記錄與回復。
+`ranges` 有兩個陣列。document-updater 使用 `libraries/ranges-tracker/index.cjs` 建立它們；docstore 在儲存前把 id 轉為 ObjectId，把 `ts` 轉為 Date（`RangeManager.js:41-63`）。沒有註解或追蹤修訂的 doc 具有 `ranges: {}`，或者沒有 `ranges`。
 
-#### 檔案內容
+| 欄位 | 型別 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | 被註解的文字片段。 | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | 註解 id。它等於 `op.t`，即 `rooms` 集合中該註解的討論串 id；docstore 會強制兩者一致。 | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | doc 中被註解的文字（不是註解訊息）。 | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | `op.c` 在 doc 中起始位置的字元偏移。 | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | 討論串 id，請參閱 `id`。 | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | 註解的 `user_id` 與 `ts`。 | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | 追蹤修訂，依位置排序。 | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | 變更的 id。 | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | 插入的文字或刪除的文字。兩者之一。 | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | 變更的字元偏移。 | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | 作者。匿名編輯者的變更保留字串 `anonymous-user`。 | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | 變更的時間。 | `RangeManager.js:42-43` |
 
-*   `lines`：\
-    以字串陣列逐行表示檔案內容。\
-    每個元素對應來源檔案中的一個邏輯行。
+註解及其回覆的文字不在 `docs` 中：它們在 `messages` 集合裡，位於 `thread_id` 等於註解 id 的 room 中。註解是否已解決保存在該 room 上，而不是這裡；如果收到 `resolved` 旗標，docstore 會將其捨棄（`RangeManager.js:59-61`）。請參閱 [Rooms 集合](/zh-TW/dev/data-model/rooms-collection) 與 [Messages 集合](/zh-TW/dev/data-model/messages-collection)。
 
-    在此範例中，它儲存了一筆 BibTeX 條目：
+#### 寫入方 {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`：保留給編輯器註解或追蹤範圍的資料結構\
-  （例如選取範圍、註解或變更追蹤）。沒有作用中的範圍時為空。`op` 是將註解綁定到文件中特定位置的操作物件。
-  * `op.c` — 註解所選取的文字（字元內容）
-  * `op.p` — 錨點位置（字元偏移量）
-  * `id` 此註解條目的唯一 ObjectId。
-  * `metadata` 作者與時間戳記資訊。
+| 程式碼 | 作用 |
+| ---- | ------------ |
+| `DocManager.js:223-338`（`POST /project/:project_id/doc/:doc_id`） | 建立或更新 doc：`lines`、`ranges` 與 `version`。web 在建立 doc 時以及 document-updater 排清已開啟的 doc 時呼叫它（`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`）。 |
+| `DocManager.js:346-366`（`PATCH /project/:project_id/doc/:doc_id`） | 以 `deleted`、`deletedAt` 與 `name` 將 doc 標記為已刪除。 |
+| `DocArchiveManager.js:29-88` | 封存 doc：把 `lines`、`ranges` 與 `rev` 複製到持久化儲存並設定 `inS3`。專案停用時對整個專案執行；當 `ARCHIVE_ON_SOFT_DELETE=true` 時，也會在刪除單一 doc 時執行（`DocManager.js:355-363`）。 |
+| `DocArchiveManager.js:150-174` | 讀取已封存的 doc 時將其取回 Mongo（`DocManager.js:40-41`）。 |
+| `MongoManager.js:272-274` | 專案被銷毀時刪除該專案的所有 doc。 |
 
-#### 刪除狀態
+#### 讀取方 {#who-reads-it}
 
-* `deleted`：\
-  表示此文件是否已從專案中刪除。
-* `deletedAt`：\
-  記錄文件被刪除時間的時間戳記。
+| 程式碼 | 作用 |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | 有人開啟 doc 時（透過 web）載入它。 |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | web 的所有讀取：單一 doc、專案的所有 doc、所有 ranges、已刪除的 doc。 |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | 複製專案；先排清 document-updater。 |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | 在管理面板中列出專案的已刪除 doc。 |
 
-已刪除的文件通常會保留下來，以供歷史復原與版本瀏覽，而不會立即從資料庫中移除。
+#### 索引 {#indexes}
 
-以下是一個 Overleaf `docs` 的真實範例。
+全部來自 `tools/migrations/` 中標記為 `server-ce` 的遷移。
 
-<Accordion title="簡單範例">
+| 名稱 | 鍵 | 選項 | 遷移 |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### 備註 {#notes}
+
+* doc 開啟期間，其最新文字在 document-updater（Redis）中，而不在這裡。只有 document-updater 排清時才會更新 Mongo（`services/document-updater/app/js/PersistenceManager.js:128-160`）。讀取整個專案所有 doc 的程式碼應先呼叫 `flushProjectToMongo`，就像 `ProjectDuplicator` 那樣。
+* 已刪除的 doc 以 `deleted: true` 留在此集合中，直到專案被銷毀。docstore 最多回傳 `MAX_DELETED_DOCS`（預設 2000）個，最新的在前（`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`）。歷史面板不使用它們，而是讀取 history-v1。
+* `rev` 與 `version` 計數器與 history-v1 中的專案歷史版本無關。
+
+以下是 Overleaf `docs` 的真實範例。
+
+<Accordion title="一個已刪除的 doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ icon: file-lines
 
 </Accordion>
 
-<Accordion title="複雜範例">
+<Accordion title="一個帶註解的 doc">
 
 ```json5
 {

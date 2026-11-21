@@ -1,0 +1,65 @@
+---
+title: Deleted Users 集合
+icon: user-xmark
+---
+
+`deletedUsers` 在用户账户被删除后保留该账户：每个被删除的账户一个文档，包含整个用户文档的副本以及删除者。Web 在 `services/web/app/src/Features/User/UserDeleter.mjs` 中写入它；schema 是 `services/web/app/src/models/DeletedUser.mjs`。硬删除延迟过后，过期处理会移除用户副本，但带有 `deleterData` 的记录会保留下来。
+
+删除用户也会删除该用户拥有的项目；它们以原因 `account-deletion` 进入 [Deleted Projects 集合](/zh-CN/dev/data-model/deleted-projects-collection)。
+
+#### 字段 {#fields}
+
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 记录 id，不是用户 id。 | `DeletedUser.mjs:21` |
+| `user` | Object | 删除时 `users` 文档的副本，使用用户 schema，参见 [Users 集合](/zh-CN/dev/data-model/users-collection)。过期时移除。 | `DeletedUser.mjs:24`, `UserDeleter.mjs:192-196,104,106` |
+| `deleterData` | Object | 谁删除了账户，以及过期后仍保留的摘要。 | `DeletedUser.mjs:7-19,23` |
+| `deleterData.deletedAt` | Date | 删除时间。过期在其后 `userHardDeletionDelay` 执行：90 天，或 `OVERLEAF_USER_HARD_DELETION_DELAY` 毫秒（`services/web/config/settings.defaults.js:739-741`）。 | `DeletedUser.mjs:10`, `UserDeleter.mjs:198` |
+| `deleterData.deleterId` | ObjectId | 删除账户的用户：在账户设置页面上的用户本人，或管理面板中的管理员。由 `delete-user` 脚本删除时缺失。 | `DeletedUser.mjs:8`, `UserDeleter.mjs:199` |
+| `deleterData.deleterIpAddress` | String | 该请求的 IP 地址；来自 `delete-user` 脚本时为 `0.0.0.0`（`services/web/modules/server-ce-scripts/scripts/delete-user.mjs:40-44`）。过期时移除。 | `DeletedUser.mjs:9`, `UserDeleter.mjs:200,105` |
+| `deleterData.deletedUserId` | ObjectId | 被删除用户的 `_id`。核心代码按它查找记录。 | `DeletedUser.mjs:11`, `UserDeleter.mjs:201` |
+| `deleterData.deletedUserLastLoggedIn` | Date | 用户的 `lastLoggedIn`。 | `DeletedUser.mjs:12`, `UserDeleter.mjs:202` |
+| `deleterData.deletedUserSignUpDate` | Date | 用户的 `signUpDate`。 | `DeletedUser.mjs:13`, `UserDeleter.mjs:203` |
+| `deleterData.deletedUserLoginCount` | Number | 用户的 `loginCount`。 | `DeletedUser.mjs:14`, `UserDeleter.mjs:204` |
+| `deleterData.deletedUserReferralId` | String | 用户的 `referal_id`。 | `DeletedUser.mjs:15`, `UserDeleter.mjs:205` |
+| `deleterData.deletedUserReferredUsers` | Array of ObjectId | 用户的 `refered_users`。 | `DeletedUser.mjs:16`, `UserDeleter.mjs:206` |
+| `deleterData.deletedUserReferredUserCount` | Number | 用户的 `refered_user_count`。 | `DeletedUser.mjs:17`, `UserDeleter.mjs:207` |
+| `deleterData.deletedUserOverleafId` | Number | 用户的 `overleaf.id`（如已设置）。 | `DeletedUser.mjs:18`, `UserDeleter.mjs:208` |
+
+#### 写入方 {#who-writes-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `UserDeleter.mjs:37-80`（`deleteUser`） | 添加一条 `delete-account` 审计日志，清理用户并触发 `deleteUser` hook，upsert 记录（`_createDeletedUser`，`UserDeleter.mjs:192-213`），删除用户的项目，除非被跳过否则发送安全提醒邮件，并删除 `users` 文档。调用方：账户设置页面（`services/web/app/src/Features/User/UserController.mjs:280-284`）、管理面板（`services/web/modules/admin-tools/app/src/AdminUserManager.mjs:604-612`）和 `delete-user` 脚本（`delete-user.mjs:40-45`）。 |
+| `UserDeleter.mjs:93-115`（`expireDeletedUser`） | 触发 `expireDeletedUser` hook，删除用户的引导数据，然后移除 `user` 和 `deleterData.deleterIpAddress`。 |
+| `UserDeleter.mjs:117-161`（`expireDeletedUsersAfterDuration`） | 让所有早于延迟时间的记录过期，并删除该用户的 `userAuditLogEntries`。路由 `POST /internal/expire-deleted-users-after-duration`（`services/web/app/src/router.mjs:847-851`），当 `ENABLE_CRON_RESOURCE_DELETION` 为 `true` 时，Community Edition 的 cron 每小时第 15 分钟调用它（`server-ce/cron/delete-users.sh:10-23`, `server-ce/config/crontab-deletion:2`）。单个用户：`POST /internal/users/:userId/expire`（`router.mjs:857-861`）。 |
+| `AdminUserManager.mjs:630-649`（`purgeDeletedUser`，模块 `admin-tools`） | 管理面板中的 Purge：执行 `expireDeletedUser` 并删除该用户的审计日志条目。 |
+| `AdminUserManager.mjs:651-696`（`restoreDeletedUser`，模块 `admin-tools`） | 管理面板中的恢复：根据 `user` 重新创建 `users` 文档（如果邮箱已被占用则拒绝），删除记录，并恢复随账户一起删除的项目。 |
+
+#### 读取方 {#who-reads-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `services/web/modules/admin-tools/app/src/AdminUserListManager.mjs:195-213,263-275` | 为管理面板列出并统计已删除用户，按 `user.*` 过滤。 |
+| `AdminUserListManager.mjs:428-452` | 显示一个尚未过期的已删除用户及删除者。 |
+| `AdminUserListManager.mjs:456-480` | 在其他管理列表中显示某行的所有者，所有者已删除时也是如此。 |
+| `AdminUserListManager.mjs:175-183` | 收集登录提供方 id，也包括已删除用户的。 |
+| `AdminUserManager.mjs:623-627,631-634,652` | 管理员删除、清除或恢复用户时读取记录；这些代码按 `user._id` 查找它。 |
+
+#### 索引 {#indexes}
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `deleterData.deleteUserId_1` | `{ "deleterData.deletedUserId": 1 }` | unique | `20200210121103_uniqueify-deletedthings-indexes.mjs` |
+| `deleterData_deletedAt_user_1` | `{ "deleterData.deletedAt": 1 }` | 部分索引：`user` 是对象 | `20250116090001_deletedUsers_non_expired_index.mjs` |
+| `user.email_1` | `{ "user.email": 1 }` | | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+| `user.emails.email_1` | `{ "user.emails.email": 1 }` | 部分索引：`user.emails.email` 存在 | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+
+迁移位于 `tools/migrations/`。索引名写的是 `deleteUserId`，但键是 `deletedUserId`。
+
+#### 说明 {#notes}
+
+* 监听 `expireDeletedUser` 的模块会删除它们自己保存的该用户数据：`dropbox`（`services/web/modules/dropbox/index.mjs:62`）、`github-sync`（`services/web/modules/github-sync/index.mjs:66`）、`gitlab-sync`（`services/web/modules/gitlab-sync/index.mjs:56`）和 `gitea-sync`（`services/web/modules/gitea-sync/index.mjs:56`）。
+* 过期的记录永远不会被删除：`deleterData` 会永久保留，只有 `user` 和 IP 地址会被移除。
+* 用户的个人访问令牌不会随账户一起删除，参见 [OAuth Access Tokens 集合](/zh-CN/dev/data-model/oauth-access-tokens-collection)。
+* Mongoose 还会给 `deleterData` 分配它自己的 `_id`，没有任何代码读取它。

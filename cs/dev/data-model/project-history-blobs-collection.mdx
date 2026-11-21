@@ -1,0 +1,52 @@
+---
+title: Kolekce Project History Blobs
+icon: cubes
+---
+
+`projectHistoryBlobs` obsahuje jeden dokument na historii projektu: metadata (hash a velikosti) každého blobu, který history-v1 pro daný projekt uložil. Blob je obsah souboru nebo doc v určitém bodě jeho historie. Samotné bajty jsou objekty v bucketu projektových blobů. Schéma Mongoose neexistuje: history-v1 zapisuje kolekci v `services/history-v1/storage/lib/blob_store/mongo.js`, který používá pro id historie o 24 hexadecimálních znacích, jako v CE (`services/history-v1/storage/lib/blob_store/index.js:108-116`).
+
+#### Pole {#fields}
+
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id historie projektu, hodnota v `projects.overleaf.history.id`. | `mongo.js:37-40` |
+| `blobs` | Object | Záznamy blobů seskupené do kbelíků. Klíčem kbelíku jsou první 3 hexadecimální číslice hashe. | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | Až 8 záznamů, jejichž hash začíná `abc`. Když už kbelík má 8 záznamů, další jde do [Kolekce Project History Sharded Blobs](/cs/dev/data-model/project-history-sharded-blobs-collection). | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | Hash, 20 bajtů: SHA-1 blobu gitu, `sha1("blob " + byteLength + "\0" + content)` (`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`). Jeho hexadecimální podoba je hash používaný jinde, například `fileRefs.hash` v projektech. | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | Délka obsahu v bajtech. | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | Délka obsahu jako textu; `null`, pokud obsah není upravitelný text (binární nebo příliš velký k úpravám) (`blob_utils.js:116-130`). | `mongo.js:474` |
+
+#### Kdo zapisuje {#who-writes-it}
+
+| Kód | Co dělá |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`: vloží `{ _id, blobs: {} }`, když history-v1 vytváří historii projektu (`services/history-v1/storage/lib/chunk_store/index.js:67-68`). |
+| `mongo.js:370-390` | `insertBlob`: `$addToSet` záznamu do jeho kbelíku, dokud má kbelík méně než 8 záznamů, jinak do shardované kolekce. Běží po nahrání bajtů, z `putString`, `putBlob` a `copyBlob` (`blob_store/index.js:223-237`, `271-278`, `456-467`). |
+| `mongo.js:54-105` | `clone`: zkopíruje kbelíky do jiného id historie pro `POST /projects/:project_id/clone` v history-v1. Nic ve web tuto trasu nevolá (viz [Kolekce Project History Chunks](/cs/dev/data-model/project-history-chunks-collection)). |
+| `mongo.js:413-422` | `deleteBlobs`: smaže dokument a shardované dokumenty projektu při `DELETE /projects/:project_id` v history-v1 (`services/history-v1/api/controllers/projects.js:361-373`). |
+
+Odkud přicházejí nové bloby:
+
+* Nahrávání souborů: web odešle soubor na `PUT /projects/:project_id/blobs/:hash` v history-v1 (`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`).
+* Kopie projektů: web požádá history-v1 o zkopírování blobu každého souboru pomocí `POST /projects/:project_id/blobs/:hash?copyFrom=` (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`).
+* Text docs: když history-v1 zapisuje chunk, uloží jako bloby text každého doc a jeho komentáře a sledované změny ve formátu JSON (`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`).
+
+#### Kdo čte {#who-reads-it}
+
+| Kód | Co dělá |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`: jeden blob podle hashe; při plném kbelíku hledá ve shardované kolekci. Používá jej `BlobStore.getBlob` (`blob_store/index.js:376-387`) pro trasy blobů (`projects.js:416-480`) a před vložením, aby přeskočil již existující bloby (`blob_store/index.js:441-448`). |
+| `mongo.js:165-260` | `findBlobs`: mnoho blobů najednou, pro načtení souborů chunku. |
+| `mongo.js:265-309` | `getProjectBlobs`: všechny bloby projektu. |
+| `mongo.js:316-363` | `getProjectBlobsBatch`: všechny bloby několika projektů pro `POST /projects/blob-stats` v history-v1 (`projects.js:620`). Modul admin-tools zobrazuje výsledek jako velikost projektu (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`). |
+
+#### Indexy {#indexes}
+
+Jen výchozí index `_id`. Žádná migrace v `tools/migrations/` další nepřidává.
+
+#### Poznámky {#notes}
+
+* Bajty blobu jsou pod klíčem `<project key>/<hash[0:2]>/<hash[2:]>` (`blob_store/index.js:51-53`) v bucketu `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:49-52`). Klíč projektu je id historie doplněné nulami, obrácené a rozdělené na 3/3/zbytek znaků (`libraries/object-persistor/src/ProjectKey.js:8-15`).
+* Blob se ukládá jednou na projekt: vložení hashe, který projekt už má, se přeskočí (`blob_store/index.js:227-230`, `249-252`).
+* Prázdný obsah nepotřebuje záznam; `getBlob` na něj odpoví bez vyhledávání (`blob_store/index.js:378-380`).
+* `projectHistoryGlobalBlobs` se čte při spuštění (`blob_store/index.js:138-148`), ale žádný kód CE do ní nezapisuje, takže v CE je každý blob projektovým blobem.

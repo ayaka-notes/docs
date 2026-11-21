@@ -1,0 +1,59 @@
+---
+title: Samlingen Project History Chunks
+icon: layer-group
+---
+
+`projectHistoryChunks` innehåller ett dokument per historikchunk, en följd av versioner i historiken för ett projekt. Mongo innehåller bara chunkens metadata; själva chunken (en ögonblicksbild plus ändringarna efter den) är ett gzip-komprimerat JSON-objekt i chunks-bucketen. Det finns inget Mongoose-schema: history-v1 skriver samlingen i `services/history-v1/storage/lib/chunk_store/mongo.js`, som den använder för varje historik-id med 24 hexadecimala tecken, som i CE (`services/history-v1/storage/lib/chunk_store/index.js:644-652`).
+
+#### Fält {#fields}
+
+| Fält | Typ | Betydelse | Källa |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Chunk-id. Det namnger också chunkobjektet i bucketen (se Anteckningar). | `mongo.js:183-185` |
+| `projectId` | ObjectId | Projektets historik-id, värdet i `projects.overleaf.history.id`. I CE skapar web historiken med projektets eget `_id` (`services/web/app/src/Features/History/HistoryManager.mjs:51-55`). | `mongo.js:186` |
+| `startVersion` | Number | Projektversion före den första ändringen i chunken. | `mongo.js:187` |
+| `endVersion` | Number | Projektversion efter den sista ändringen i chunken. | `mongo.js:188` |
+| `endTimestamp` | Date | Tidpunkt för den sista ändringen i chunken; `null` när chunken saknar ändringar, som den första chunken i ett nytt projekt (`libraries/overleaf-editor-core/lib/chunk.js:146-149`). | `mongo.js:189` |
+| `state` | String | `pending`, `active`, `closed` eller `deleted`, se Anteckningar. | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | Sätts vid infogning, aktivering och radering. Att stänga en chunk ändrar det inte. | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### Vem skriver {#who-writes-it}
+
+| Kod | Vad den gör |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`: infogar en `pending`-post innan chunkobjektet laddas upp (`chunk_store/index.js:394-410`). |
+| `mongo.js:331-359` | `activateChunk`: `pending` till `active` när uppladdningen är klar. En dubblettnyckel här betyder att en annan chunk redan börjar vid den versionen. |
+| `mongo.js:371-388` | `closeChunk`: `active` till `closed` när en ny chunk följer (`confirmCreate`, `mongo.js:206-227`). |
+| `mongo.js:402-419` | `deleteActiveChunk`: `active` till `deleted` när en längre chunk med samma startversion ersätter den (`confirmUpdate`, `mongo.js:295-321`). |
+| `mongo.js:428-452` | `deleteChunk` och `deleteProjectChunks`: markerar chunkar som `deleted`. Den andra körs vid history-v1 `DELETE /projects/:project_id` (`services/history-v1/api/controllers/projects.js:361-373`). |
+| `mongo.js:144-174` | `clone`: kopierar ett projekts poster under ett nytt historik-id, för history-v1 `POST /projects/:project_id/clone`. Web har en klient för den här rutten (`HistoryManager.mjs:63-72`), men inget i web anropar den. |
+| `mongo.js:497-502` | `deleteOldChunks`: tar bort gamla `deleted`- och `pending`-poster. Körs bara av `services/history-v1/storage/tasks/delete_old_chunks.js`. |
+
+Nya chunkar kommer från project-history, som skickar de köade redigeringarna till history-v1 `POST /projects/:project_id/legacy_changes` (`services/history-v1/api/routes/project_import.js:29-31`); history-v1 anropar sedan `chunkStore.update` eller `chunkStore.create` (`services/history-v1/storage/lib/persist_changes.js:215`, `229`). Ett nytt projekt får sin första chunk från `chunkStore.initializeProject` (`chunk_store/index.js:54-80`).
+
+#### Vem läser {#who-reads-it}
+
+| Kod | Vad den gör |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`: den nyaste `active`- eller `closed`-chunken i ett projekt. |
+| `mongo.js:54-71` | `getChunkForVersion`: chunken som innehåller en version. |
+| `mongo.js:77-103` | `getChunkForTimestamp`: chunken som var aktuell vid en tidpunkt. |
+| `mongo.js:108-137` | `getProjectChunkIds` och `getProjectChunks`: alla levande chunkar i ett projekt. |
+| `mongo.js:457-492` | `getOldChunksBatch`: gamla `deleted`- och `pending`-poster för städuppgiften. |
+| `services/history-v1/api/controllers/projects.js:115-265` | Läsrutterna i history-v1 (senaste innehåll, innehåll vid en version, historik, ändringar), som läser in chunkar via `chunk_store/index.js`. |
+
+#### Index {#indexes}
+
+| Namn | Nycklar | Alternativ | Migrering |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique, partiellt: `state` i `active`, `closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs` (ersätter `projectId_1_startVersion_1` från `20221122191857_project_history_chunks_indexes.mjs`) |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | partiellt: `state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (ersätter `state_1`) |
+| `pending_updated_at` | `{ updatedAt: -1 }` | partiellt: `state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (ersätter `state_pending` från `20230217205311_fix_deleted_history_chunks_index.mjs`) |
+
+#### Anteckningar {#notes}
+
+* Tillståndsflöde: `pending` (post skriven, uppladdning pågår) → `active` (den senaste chunken, kan fortfarande utökas) → `closed` (en nyare chunk följer) eller `deleted` (ersatt, eller projektet raderades). Läsningar tittar bara på `active` och `closed`.
+* Chunkobjektet är gzip-komprimerad JSON (`services/history-v1/storage/lib/history_store.js:151-170`) under nyckeln `<project key>/<chunk id>` (`history_store.js:65-67`). Projektnyckeln är historik-id:t utfyllt med nollor, omvänt och uppdelat i 3/3/resten av tecknen (`libraries/object-persistor/src/ProjectKey.js:8-15`). Bucketen är `OVERLEAF_EDITOR_CHUNKS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:53-56`): `/buckets/chunks` i utvecklingsmiljön (`develop/docker-compose.yml:90`), eller `overleaf-chunks` med `S3_ENABLED=true` (`develop/s3/docker-compose.yml:51`).
+* Poster i tillståndet `deleted` eller `pending`, och deras bucketobjekt, tas bara bort av `delete_old_chunks.js` (`yarn delete_old_chunks`, `services/history-v1/package.json:79`). CE-imagen har inget cronjobb för det (`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`), så i CE ligger de kvar.
+* När web låter ett raderat projekt gå ut anropar den history-v1 `DELETE /projects/:history_id` (`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`), vilket markerar alla projektets chunkar som `deleted`.
+* Med en konfigurerad `backupStore` skriver bekräftelsen av en chunk även `overleaf.history.currentEndVersion`, `currentEndTimestamp`, `updatedAt` och `overleaf.backup.pendingChangeAt` till projektet (`mongo.js:232-262`). CE konfigurerar inte `backupStore`, så `mongo.js:238-240` returnerar tidigt.

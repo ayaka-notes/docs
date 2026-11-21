@@ -1,0 +1,52 @@
+---
+title: Колекція Project History Blobs
+icon: cubes
+---
+
+`projectHistoryBlobs` містить один документ на історію проєкту: метадані (хеш і розміри) кожного blob, який history-v1 зберіг для цього проєкту. Blob є вмістом файлу або doc у певний момент його історії. Самі байти зберігаються як об'єкти в бакеті blob-ів проєкту. Схеми Mongoose немає: history-v1 записує колекцію в `services/history-v1/storage/lib/blob_store/mongo.js`, який він використовує для id історії з 24 шістнадцяткових символів, як у CE (`services/history-v1/storage/lib/blob_store/index.js:108-116`).
+
+#### Поля {#fields}
+
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id історії проєкту, значення з `projects.overleaf.history.id`. | `mongo.js:37-40` |
+| `blobs` | Object | Записи blob-ів, згруповані за кошиками. Ключ кошика: перші 3 шістнадцяткові цифри хешу. | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | До 8 записів, хеш яких починається з `abc`. Коли в кошику вже 8 записів, наступний потрапляє до [Колекція Project History Sharded Blobs](/uk/dev/data-model/project-history-sharded-blobs-collection). | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | Хеш, 20 байтів: SHA-1 git blob, `sha1("blob " + byteLength + "\0" + content)` (`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`). Його шістнадцяткова форма і є хешем, який використовується в інших місцях, наприклад `fileRefs.hash` у проєктах. | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | Довжина вмісту в байтах. | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | Довжина вмісту як тексту; `null`, якщо вміст не є редагованим текстом (двійковий або завеликий для редагування) (`blob_utils.js:116-130`). | `mongo.js:474` |
+
+#### Хто записує {#who-writes-it}
+
+| Код | Що робить |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`: вставляє `{ _id, blobs: {} }`, коли history-v1 створює історію проєкту (`services/history-v1/storage/lib/chunk_store/index.js:67-68`). |
+| `mongo.js:370-390` | `insertBlob`: `$addToSet` запису в його кошик, поки в кошику менше 8 записів, інакше в шардовану колекцію. Виконується після завантаження байтів із `putString`, `putBlob` і `copyBlob` (`blob_store/index.js:223-237`, `271-278`, `456-467`). |
+| `mongo.js:54-105` | `clone`: копіює кошики в інший id історії для `POST /projects/:project_id/clone` у history-v1. Ніщо в web не викликає цей маршрут (див. [Колекція Project History Chunks](/uk/dev/data-model/project-history-chunks-collection)). |
+| `mongo.js:413-422` | `deleteBlobs`: видаляє документ і шардовані документи проєкту під час `DELETE /projects/:project_id` у history-v1 (`services/history-v1/api/controllers/projects.js:361-373`). |
+
+Звідки беруться нові blob-и:
+
+* Завантаження файлів: web надсилає файл у `PUT /projects/:project_id/blobs/:hash` history-v1 (`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`).
+* Копії проєктів: web просить history-v1 скопіювати blob кожного файлу через `POST /projects/:project_id/blobs/:hash?copyFrom=` (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`).
+* Текст docs: коли history-v1 записує чанк, він зберігає як blob-и текст кожного doc, а також його коментарі й відстежувані зміни у вигляді JSON (`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`).
+
+#### Хто читає {#who-reads-it}
+
+| Код | Що робить |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`: один blob за хешем; шукає в шардованій колекції, якщо кошик заповнений. Використовується `BlobStore.getBlob` (`blob_store/index.js:376-387`) для маршрутів blob-ів (`projects.js:416-480`) і перед вставкою, щоб пропустити наявні blob-и (`blob_store/index.js:441-448`). |
+| `mongo.js:165-260` | `findBlobs`: багато blob-ів одразу, для завантаження файлів чанка. |
+| `mongo.js:265-309` | `getProjectBlobs`: усі blob-и проєкту. |
+| `mongo.js:316-363` | `getProjectBlobsBatch`: усі blob-и кількох проєктів, для `POST /projects/blob-stats` у history-v1 (`projects.js:620`). Модуль admin-tools показує результат як розмір проєкту (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`). |
+
+#### Індекси {#indexes}
+
+Лише стандартний індекс `_id`. Жодна міграція в `tools/migrations/` не додає інших.
+
+#### Примітки {#notes}
+
+* Байти blob зберігаються за ключем `<project key>/<hash[0:2]>/<hash[2:]>` (`blob_store/index.js:51-53`) у бакеті `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:49-52`). Ключ проєкту: id історії, доповнений нулями, перевернутий і поділений на 3/3/решту символів (`libraries/object-persistor/src/ProjectKey.js:8-15`).
+* Blob зберігається один раз на проєкт: вставку хешу, який у проєкті вже є, пропускають (`blob_store/index.js:227-230`, `249-252`).
+* Порожньому вмісту запис не потрібен; `getBlob` відповідає на нього без пошуку (`blob_store/index.js:378-380`).
+* `projectHistoryGlobalBlobs` читається під час запуску (`blob_store/index.js:138-148`), але жоден код CE у неї не пише, тому в CE кожен blob є blob-ом проєкту.

@@ -3,49 +3,84 @@ title: Koleksi Docs
 icon: file-lines
 ---
 
-`Docs`: Docs adalah istilah internal Overleaf untuk file yang dapat disunting, misalnya file `tex` biasa, atau file `.bib`. Koleksi ini menyimpan isi file, informasi revisi, dan status penghapusan.
+`docs` menyimpan isi file teks yang dapat disunting dalam sebuah proyek (Overleaf menyebutnya docs), misalnya `main.tex` atau `sample.bib`. Satu dokumen per doc: baris-barisnya, komentar dan perubahan terlacaknya, dua penghitung, dan status penghapusan. Nama file dan letaknya di pohon tidak ada di sini, melainkan di `projects.rootFolder` (lihat [Koleksi Projects](/id/dev/data-model/projects-collection)). File biner juga tidak ada di sini.
 
-#### Identifikasi Inti
+Selain migrasi dan skrip pemeliharaan, hanya docstore yang menulis koleksi ini, di `services/docstore/app/js/MongoManager.js`. Tidak ada model Mongoose; web dan document-updater mengaksesnya melalui API HTTP docstore (`services/docstore/app.js:31-70`). Di kolom Sumber, nama file tanpa path berada di bawah `services/docstore/app/js/`.
 
-* `_id`: ObjectId MongoDB unik yang mengidentifikasi catatan dokumen ini.
-* `project_id`: Referensi ke proyek (`Project._id`) tempat file ini berada.
-* `name`: Nama file seperti yang ditampilkan di pohon file proyek (misalnya `main.tex`, `sample.bib`).
+#### Field {#fields}
 
-#### Revisi & Versioning
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id doc, sama dengan `_id` entri doc di `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Proyek doc tersebut. | `MongoManager.js:144` |
+| `lines` | Array of String | Teks, satu elemen per baris. Tidak ada selama doc diarsipkan (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Komentar dan perubahan terlacak, lihat di bawah. Tidak ada selama doc diarsipkan. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | Penghitung milik docstore. Dimulai dari 1 dan bertambah 1 setiap kali `lines` atau `ranges` berubah. Setiap pembaruan dicocokkan dengan `rev` lama, sehingga dua penulis tidak dapat saling menimpa. Bukan versi riwayat. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | Versi OT doc dari document-updater, disimpan saat flush. docstore menolak flush dengan versi yang lebih rendah. Doc lama menyimpannya di koleksi `docOps`; migrasi `20231105000000_move_doc_versions_from_docops_to_docs` memindahkannya ke sini. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true` jika doc telah dihapus dari proyek. Tidak ada pada doc yang tidak pernah dihapus. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Kapan doc dihapus. | `HttpController.js:87` |
+| `name` | String | Nama file saat penghapusan. Hanya diatur ketika doc dihapus; doc yang masih aktif tidak memiliki `name` di sini. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true` jika `lines`, `ranges`, dan `rev` telah dipindahkan ke persistor docstore (`Settings.docstore.bucket`, kunci `<project_id>/<doc_id>`) dan `lines` serta `ranges` telah dihapus dari Mongo. Dihapus lagi ketika doc dibaca kembali. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Kunci yang dipegang selama doc diarsipkan. | `MongoManager.js:177-193` |
 
-* `rev`: Nomor revisi dokumen ini dalam riwayat proyek.
-* `version`: Versi skema atau format internal yang digunakan oleh backend editor.
+#### Ranges {#ranges}
 
-Kolom-kolom ini digunakan oleh sistem versioning kustom Overleaf untuk melacak suntingan inkremental serta mendukung riwayat dan rollback.
+`ranges` memiliki dua array. document-updater membangunnya dengan `libraries/ranges-tracker/index.cjs`; docstore mengubah id menjadi ObjectId dan `ts` menjadi Date sebelum menyimpan (`RangeManager.js:41-63`). Doc tanpa komentar atau perubahan terlacak memiliki `ranges: {}` atau tidak memiliki `ranges`.
 
-#### Isi File
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Rentang teks yang dikomentari. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Id komentar. Sama dengan `op.t`, id utas komentar di koleksi `rooms`; docstore memaksa keduanya cocok. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Teks yang dikomentari di doc (bukan pesan komentar). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Offset karakter awal `op.c` di doc. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Id utas, lihat `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | `user_id` dan `ts` komentar. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Perubahan terlacak, diurutkan berdasarkan posisi. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Id perubahan. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Teks yang disisipkan atau teks yang dihapus. Salah satu dari keduanya. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Offset karakter perubahan. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Penulis. Perubahan oleh penyunting anonim mempertahankan string `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Kapan perubahan dibuat. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Array string yang merepresentasikan isi file baris demi baris.\
-    Setiap elemen berkaitan dengan satu baris logis dalam file sumber.
+Teks komentar dan balasannya tidak ada di `docs`: teks tersebut ada di koleksi `messages`, dalam room yang `thread_id`-nya adalah id komentar. Apakah komentar sudah diselesaikan disimpan pada room tersebut, bukan di sini; docstore membuang flag `resolved` jika ada yang dikirim (`RangeManager.js:59-61`). Lihat [Koleksi Rooms](/id/dev/data-model/rooms-collection) dan [Koleksi Messages](/id/dev/data-model/messages-collection).
 
-    Dalam contoh ini, kolom tersebut menyimpan entri BibTeX:
+#### Siapa yang menulis {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Struktur data yang disediakan untuk anotasi editor atau rentang yang dilacak\
-  (misalnya seleksi, komentar, atau pelacakan perubahan). Kosong jika tidak ada rentang aktif. `op` Objek operasi yang mengikat komentar ke posisi tertentu dalam dokumen.
-  * `op.c` — Teks yang Dipilih untuk Dikomentari (Isi Karakter)
-  * `op.p` — Posisi Jangkar (Offset Karakter)
-  * `id` ObjectId unik dari entri komentar ini.
-  * `metadata` Informasi penulis dan stempel waktu.
+| Kode | Fungsinya |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Membuat atau memperbarui doc: `lines`, `ranges`, dan `version`. Web memanggilnya ketika doc dibuat dan ketika document-updater melakukan flush doc yang terbuka (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Menandai doc sebagai dihapus dengan `deleted`, `deletedAt`, dan `name`. |
+| `DocArchiveManager.js:29-88` | Mengarsipkan doc: menyalin `lines`, `ranges`, dan `rev` ke persistor dan mengatur `inS3`. Berjalan untuk seluruh proyek ketika proyek dinonaktifkan, dan untuk satu doc saat penghapusan ketika `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Mengembalikan doc yang diarsipkan ke Mongo ketika dibaca (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Menghapus semua doc sebuah proyek ketika proyek dimusnahkan. |
 
-#### Status Penghapusan
+#### Siapa yang membaca {#who-reads-it}
 
-* `deleted`:\
-  Menunjukkan apakah dokumen ini telah dihapus dari proyek.
-* `deletedAt`:\
-  Stempel waktu yang mencatat kapan dokumen dihapus.
+| Kode | Fungsinya |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Memuat doc (melalui web) ketika seseorang membukanya. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Semua pembacaan web: satu doc, semua doc sebuah proyek, semua ranges, doc yang dihapus. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Menyalin proyek; melakukan flush document-updater terlebih dahulu. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Mencantumkan doc yang dihapus dari sebuah proyek di panel admin. |
 
-Dokumen yang dihapus biasanya tetap disimpan untuk pemulihan riwayat dan penelusuran versi, alih-alih langsung dihapus dari database.
+#### Indeks {#indexes}
 
-Berikut adalah contoh nyata `docs` Overleaf.
+Semuanya berasal dari migrasi bertag `server-ce` di `tools/migrations/`.
 
-<Accordion title="Contoh Sederhana">
+| Nama | Kunci | Opsi | Migrasi |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Catatan {#notes}
+
+* Selama doc terbuka, teks terbarunya ada di document-updater (Redis), bukan di sini. Mongo hanya diperbarui ketika document-updater melakukan flush (`services/document-updater/app/js/PersistenceManager.js:128-160`). Kode yang membaca doc seluruh proyek sebaiknya memanggil `flushProjectToMongo` terlebih dahulu, seperti yang dilakukan `ProjectDuplicator`.
+* Doc yang dihapus tetap berada di koleksi ini, dengan `deleted: true`, sampai proyek dimusnahkan. docstore mengembalikan paling banyak `MAX_DELETED_DOCS` (bawaan 2000) di antaranya, terbaru lebih dulu (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Panel riwayat tidak menggunakannya; panel itu membaca history-v1.
+* Penghitung `rev` dan `version` tidak berkaitan dengan versi riwayat proyek di history-v1.
+
+Berikut contoh nyata `docs` Overleaf.
+
+<Accordion title="Doc yang dihapus">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Berikut adalah contoh nyata `docs` Overleaf.
 
 </Accordion>
 
-<Accordion title="Contoh yang Lebih Kompleks">
+<Accordion title="Doc dengan komentar">
 
 ```json5
 {

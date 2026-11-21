@@ -1,0 +1,59 @@
+---
+title: Kolekce Project History Chunks
+icon: layer-group
+---
+
+`projectHistoryChunks` obsahuje jeden dokument na chunk historie, tedy úsek verzí v historii jednoho projektu. Mongo uchovává jen metadata chunku; samotný chunk (snímek a změny po něm) je objekt JSON komprimovaný gzipem v bucketu chunků. Schéma Mongoose neexistuje: history-v1 zapisuje kolekci v `services/history-v1/storage/lib/chunk_store/mongo.js`, který používá pro každé id historie o 24 hexadecimálních znacích, jako v CE (`services/history-v1/storage/lib/chunk_store/index.js:644-652`).
+
+#### Pole {#fields}
+
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id chunku. Pojmenovává také objekt chunku v bucketu (viz Poznámky). | `mongo.js:183-185` |
+| `projectId` | ObjectId | Id historie projektu, hodnota v `projects.overleaf.history.id`. V CE web vytváří historii s vlastním `_id` projektu (`services/web/app/src/Features/History/HistoryManager.mjs:51-55`). | `mongo.js:186` |
+| `startVersion` | Number | Verze projektu před první změnou v chunku. | `mongo.js:187` |
+| `endVersion` | Number | Verze projektu po poslední změně v chunku. | `mongo.js:188` |
+| `endTimestamp` | Date | Čas poslední změny v chunku; `null`, když chunk nemá žádné změny, jako první chunk nového projektu (`libraries/overleaf-editor-core/lib/chunk.js:146-149`). | `mongo.js:189` |
+| `state` | String | `pending`, `active`, `closed` nebo `deleted`, viz Poznámky. | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | Nastaví se při vložení, aktivaci a smazání. Uzavření chunku jej nemění. | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### Kdo zapisuje {#who-writes-it}
+
+| Kód | Co dělá |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`: vloží záznam `pending` před nahráním objektu chunku (`chunk_store/index.js:394-410`). |
+| `mongo.js:331-359` | `activateChunk`: z `pending` na `active` po dokončení nahrávání. Duplicitní klíč zde znamená, že od této verze už začíná jiný chunk. |
+| `mongo.js:371-388` | `closeChunk`: z `active` na `closed`, když za ním následuje nový chunk (`confirmCreate`, `mongo.js:206-227`). |
+| `mongo.js:402-419` | `deleteActiveChunk`: z `active` na `deleted`, když jej nahradí delší chunk se stejnou počáteční verzí (`confirmUpdate`, `mongo.js:295-321`). |
+| `mongo.js:428-452` | `deleteChunk` a `deleteProjectChunks`: označí chunky jako `deleted`. Druhá běží při `DELETE /projects/:project_id` v history-v1 (`services/history-v1/api/controllers/projects.js:361-373`). |
+| `mongo.js:144-174` | `clone`: zkopíruje záznamy projektu pod nové id historie pro `POST /projects/:project_id/clone` v history-v1. Web má pro tuto trasu klienta (`HistoryManager.mjs:63-72`), ale nic ve web jej nevolá. |
+| `mongo.js:497-502` | `deleteOldChunks`: odstraní staré záznamy `deleted` a `pending`. Spouští jej jen `services/history-v1/storage/tasks/delete_old_chunks.js`. |
+
+Nové chunky přicházejí z project-history, které posílá zařazené úpravy na `POST /projects/:project_id/legacy_changes` v history-v1 (`services/history-v1/api/routes/project_import.js:29-31`); history-v1 pak zavolá `chunkStore.update` nebo `chunkStore.create` (`services/history-v1/storage/lib/persist_changes.js:215`, `229`). Nový projekt dostane svůj první chunk z `chunkStore.initializeProject` (`chunk_store/index.js:54-80`).
+
+#### Kdo čte {#who-reads-it}
+
+| Kód | Co dělá |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`: nejnovější chunk projektu ve stavu `active` nebo `closed`. |
+| `mongo.js:54-71` | `getChunkForVersion`: chunk, který obsahuje danou verzi. |
+| `mongo.js:77-103` | `getChunkForTimestamp`: chunk, který byl aktuální v daném čase. |
+| `mongo.js:108-137` | `getProjectChunkIds` a `getProjectChunks`: všechny živé chunky projektu. |
+| `mongo.js:457-492` | `getOldChunksBatch`: staré záznamy `deleted` a `pending` pro úlohu čištění. |
+| `services/history-v1/api/controllers/projects.js:115-265` | Čtecí trasy history-v1 (nejnovější obsah, obsah ve verzi, historie, změny), které načítají chunky přes `chunk_store/index.js`. |
+
+#### Indexy {#indexes}
+
+| Název | Klíče | Volby | Migrace |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique, částečný: `state` v `active`, `closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs` (nahrazuje `projectId_1_startVersion_1` z `20221122191857_project_history_chunks_indexes.mjs`) |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | částečný: `state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (nahrazuje `state_1`) |
+| `pending_updated_at` | `{ updatedAt: -1 }` | částečný: `state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (nahrazuje `state_pending` z `20230217205311_fix_deleted_history_chunks_index.mjs`) |
+
+#### Poznámky {#notes}
+
+* Průběh stavů: `pending` (záznam zapsán, probíhá nahrávání) → `active` (nejnovější chunk, lze jej ještě rozšířit) → `closed` (následuje novější chunk) nebo `deleted` (nahrazen, nebo byl projekt smazán). Čtení bere v úvahu jen `active` a `closed`.
+* Objekt chunku je JSON komprimovaný gzipem (`services/history-v1/storage/lib/history_store.js:151-170`) pod klíčem `<project key>/<chunk id>` (`history_store.js:65-67`). Klíč projektu je id historie doplněné nulami, obrácené a rozdělené na 3/3/zbytek znaků (`libraries/object-persistor/src/ProjectKey.js:8-15`). Bucket je `OVERLEAF_EDITOR_CHUNKS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:53-56`): `/buckets/chunks` ve vývojovém prostředí (`develop/docker-compose.yml:90`), nebo `overleaf-chunks` s `S3_ENABLED=true` (`develop/s3/docker-compose.yml:51`).
+* Záznamy ve stavu `deleted` nebo `pending` a jejich objekty v bucketu odstraňuje jen `delete_old_chunks.js` (`yarn delete_old_chunks`, `services/history-v1/package.json:79`). Obraz CE pro to nemá úlohu cron (`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`), takže v CE zůstávají.
+* Když web nechá vypršet smazaný projekt, zavolá `DELETE /projects/:history_id` v history-v1 (`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`), což označí všechny chunky projektu jako `deleted`.
+* S nakonfigurovaným `backupStore` zapíše potvrzení chunku do projektu také `overleaf.history.currentEndVersion`, `currentEndTimestamp`, `updatedAt` a `overleaf.backup.pendingChangeAt` (`mongo.js:232-262`). CE `backupStore` nekonfiguruje, takže `mongo.js:238-240` skončí předčasně.

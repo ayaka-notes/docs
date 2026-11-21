@@ -3,49 +3,84 @@ title: Docs 컬렉션
 icon: file-lines
 ---
 
-`Docs`: Docs는 편집 가능한 파일을 가리키는 Overleaf의 내부 용어로, 예를 들어 순수 `tex` 파일이나 `.bib` 파일이 이에 해당합니다. 파일 내용, 리비전 정보 및 삭제 상태를 저장합니다.
+`docs`는 프로젝트의 편집 가능한 텍스트 파일(Overleaf에서는 doc이라고 부릅니다)의 내용을 담습니다. 예를 들어 `main.tex`나 `sample.bib`입니다. doc마다 문서 하나가 있으며, 줄, 댓글과 변경 내용 추적, 카운터 두 개, 삭제 상태가 들어 있습니다. 파일 이름과 트리에서의 위치는 여기가 아니라 `projects.rootFolder`에 있습니다([Projects 컬렉션](/ko/dev/data-model/projects-collection) 참고). 바이너리 파일도 여기에 없습니다.
 
-#### 핵심 식별 정보
+마이그레이션과 유지 관리 스크립트를 제외하면 이 컬렉션에 쓰는 것은 docstore뿐이며, 위치는 `services/docstore/app/js/MongoManager.js`입니다. Mongoose 모델은 없고, web과 document-updater는 docstore HTTP API를 통해 접근합니다(`services/docstore/app.js:31-70`). 출처 열에서 경로 없는 파일 이름은 `services/docstore/app/js/` 아래에 있습니다.
 
-* `_id`: 이 문서 레코드를 식별하는 고유 MongoDB ObjectId입니다.
-* `project_id`: 이 파일이 속한 프로젝트(`Project._id`)에 대한 참조입니다.
-* `name`: 프로젝트 파일 트리에 표시되는 파일 이름입니다(예: `main.tex`, `sample.bib`).
+#### 필드 {#fields}
 
-#### 리비전 및 버전 관리
+| 필드 | 타입 | 의미 | 출처 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | doc id로, `projects.rootFolder`에 있는 doc 항목의 `_id`와 같습니다. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | doc이 속한 프로젝트입니다. | `MongoManager.js:144` |
+| `lines` | Array of String | 텍스트로, 한 줄이 한 요소입니다. doc이 보관(아카이브)된 동안(`inS3: true`)에는 없습니다. | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | 댓글과 변경 내용 추적입니다. 아래를 참고하세요. doc이 보관된 동안에는 없습니다. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstore 자체 카운터입니다. 1에서 시작하며 `lines` 또는 `ranges`가 바뀔 때마다 1씩 늘어납니다. 모든 업데이트는 이전 `rev`와 대조하므로 두 작성자가 서로 덮어쓸 수 없습니다. 기록 버전이 아닙니다. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | document-updater에서 온 doc의 OT 버전으로, 플러시할 때 저장됩니다. docstore는 더 낮은 버전의 플러시를 거부합니다. 오래된 doc은 이를 `docOps` 컬렉션에 두었으며, 마이그레이션 `20231105000000_move_doc_versions_from_docops_to_docs`가 여기로 옮겼습니다. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | doc이 프로젝트에서 삭제되었으면 `true`입니다. 삭제된 적이 없는 doc에는 없습니다. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | doc이 삭제된 시각입니다. | `HttpController.js:87` |
+| `name` | String | 삭제 시점의 파일 이름입니다. doc이 삭제될 때만 설정되며, 삭제되지 않은 doc에는 여기에 `name`이 없습니다. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `lines`, `ranges`, `rev`가 docstore persistor(`Settings.docstore.bucket`, 키 `<project_id>/<doc_id>`)로 옮겨지고 `lines`와 `ranges`가 Mongo에서 제거되었으면 `true`입니다. doc을 다시 읽어 오면 다시 제거됩니다. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | doc을 보관하는 동안 잡는 잠금입니다. | `MongoManager.js:177-193` |
 
-* `rev`: 프로젝트 기록 내에서 이 문서의 리비전 번호입니다.
-* `version`: 편집기 백엔드에서 사용하는 내부 스키마 또는 형식 버전입니다.
+#### Ranges {#ranges}
 
-이 필드들은 Overleaf의 자체 버전 관리 시스템에서 증분 편집을 추적하고 기록 및 롤백을 지원하는 데 사용됩니다.
+`ranges`에는 배열 두 개가 있습니다. document-updater가 `libraries/ranges-tracker/index.cjs`로 만들고, docstore는 저장하기 전에 id를 ObjectId로, `ts`를 Date로 바꿉니다(`RangeManager.js:41-63`). 댓글도 변경 내용 추적도 없는 doc은 `ranges: {}`를 갖거나 `ranges`가 없습니다.
 
-#### 파일 내용
+| 필드 | 타입 | 의미 | 출처 |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | 댓글이 달린 텍스트 구간입니다. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | 댓글 id입니다. `rooms` 컬렉션에서 댓글의 스레드 id인 `op.t`와 같으며, docstore가 일치를 강제합니다. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | doc에서 댓글이 달린 텍스트입니다(댓글 메시지가 아닙니다). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | doc에서 `op.c`가 시작하는 문자 오프셋입니다. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | 스레드 id입니다. `id`를 참고하세요. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | 댓글의 `user_id`와 `ts`입니다. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | 변경 내용 추적으로, 위치순으로 정렬됩니다. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | 변경의 id입니다. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | 삽입된 텍스트 또는 삭제된 텍스트입니다. 둘 중 하나입니다. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | 변경의 문자 오프셋입니다. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | 작성자입니다. 익명 편집자의 변경은 문자열 `anonymous-user`를 유지합니다. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | 변경된 시각입니다. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    파일 내용을 한 줄씩 나타내는 문자열 배열입니다.\
-    각 요소는 소스 파일의 논리적 한 줄에 해당합니다.
+댓글과 답글의 텍스트는 `docs`에 없습니다. `messages` 컬렉션에서 `thread_id`가 댓글 id인 room에 있습니다. 댓글의 해결 여부는 여기가 아니라 그 room에 저장되며, docstore는 `resolved` 플래그가 전송되면 버립니다(`RangeManager.js:59-61`). [Rooms 컬렉션](/ko/dev/data-model/rooms-collection)과 [Messages 컬렉션](/ko/dev/data-model/messages-collection)을 참고하세요.
 
-    이 예시에서는 BibTeX 항목을 저장합니다.
+#### 쓰는 코드 {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: 편집기 주석 또는 추적 범위(예: 선택 영역, 댓글 또는 변경 내용 추적)를 위해 예약된 데이터 구조입니다.\
-  활성 범위가 없으면 비어 있습니다. `op` 댓글을 문서의 특정 위치에 연결하는 작업 객체입니다.
-  * `op.c` — 댓글이 달린 선택 텍스트(문자 내용)
-  * `op.p` — 앵커 위치(문자 오프셋)
-  * `id` 이 댓글 항목의 고유 ObjectId입니다.
-  * `metadata` 작성자 및 타임스탬프 정보입니다.
+| 코드 | 역할 |
+| ---- | ------------ |
+| `DocManager.js:223-338`(`POST /project/:project_id/doc/:doc_id`) | doc을 만들거나 갱신합니다: `lines`, `ranges`, `version`. web은 doc이 만들어질 때와 document-updater가 열린 doc을 플러시할 때 이를 호출합니다(`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366`(`PATCH /project/:project_id/doc/:doc_id`) | `deleted`, `deletedAt`, `name`으로 doc을 삭제됨으로 표시합니다. |
+| `DocArchiveManager.js:29-88` | doc을 보관합니다: `lines`, `ranges`, `rev`를 persistor로 복사하고 `inS3`를 설정합니다. 프로젝트가 비활성화되면 프로젝트 전체에 대해, `ARCHIVE_ON_SOFT_DELETE=true`이면 삭제 시 doc 하나에 대해 실행됩니다(`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | 보관된 doc을 읽을 때 Mongo로 다시 가져옵니다(`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | 프로젝트가 파기될 때 프로젝트의 모든 doc을 삭제합니다. |
 
-#### 삭제 상태
+#### 읽는 코드 {#who-reads-it}
 
-* `deleted`:\
-  이 문서가 프로젝트에서 삭제되었는지 여부를 나타냅니다.
-* `deletedAt`:\
-  문서가 삭제된 시간을 기록하는 타임스탬프입니다.
+| 코드 | 역할 |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | 누군가 doc을 열면 (web을 통해) 불러옵니다. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | web의 모든 읽기: doc 하나, 프로젝트의 모든 doc, 모든 ranges, 삭제된 doc. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | 프로젝트를 복사합니다. 먼저 document-updater를 플러시합니다. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | 관리자 패널에서 프로젝트의 삭제된 doc을 나열합니다. |
 
-삭제된 문서는 데이터베이스에서 즉시 제거되지 않고, 일반적으로 기록 복구 및 버전 탐색을 위해 보관됩니다.
+#### 인덱스 {#indexes}
+
+모두 `tools/migrations/`에서 `server-ce` 태그가 붙은 마이그레이션에서 옵니다.
+
+| 이름 | 키 | 옵션 | 마이그레이션 |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### 참고 {#notes}
+
+* doc이 열려 있는 동안 최신 텍스트는 여기가 아니라 document-updater(Redis)에 있습니다. Mongo는 document-updater가 플러시할 때만 갱신됩니다(`services/document-updater/app/js/PersistenceManager.js:128-160`). 프로젝트 전체의 doc을 읽는 코드는 `ProjectDuplicator`처럼 먼저 `flushProjectToMongo`를 호출해야 합니다.
+* 삭제된 doc은 프로젝트가 파기될 때까지 `deleted: true` 상태로 이 컬렉션에 남습니다. docstore는 최신순으로 최대 `MAX_DELETED_DOCS`(기본값 2000)개를 반환합니다(`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). 기록 패널은 이를 사용하지 않고 history-v1을 읽습니다.
+* `rev`와 `version` 카운터는 history-v1의 프로젝트 기록 버전과 관련이 없습니다.
 
 다음은 Overleaf `docs`의 실제 예시입니다.
 
-<Accordion title="간단한 예시">
+<Accordion title="삭제된 doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ icon: file-lines
 
 </Accordion>
 
-<Accordion title="복잡한 예시">
+<Accordion title="댓글이 있는 doc">
 
 ```json5
 {

@@ -1,0 +1,52 @@
+---
+title: Koleksi Project History Blobs
+icon: cubes
+---
+
+`projectHistoryBlobs` menyimpan satu dokumen per riwayat proyek: metadata (hash dan ukuran) setiap blob yang disimpan history-v1 untuk proyek tersebut. Blob adalah isi sebuah file atau doc pada suatu titik dalam riwayatnya. Byte-nya sendiri adalah objek di bucket blob proyek. Tidak ada skema Mongoose: history-v1 menulis koleksi ini di `services/history-v1/storage/lib/blob_store/mongo.js`, yang digunakannya untuk id riwayat berupa 24 karakter heksadesimal, seperti di CE (`services/history-v1/storage/lib/blob_store/index.js:108-116`).
+
+#### Field {#fields}
+
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id riwayat proyek, nilai di `projects.overleaf.history.id`. | `mongo.js:37-40` |
+| `blobs` | Object | Catatan blob yang dikelompokkan dalam ember. Kunci sebuah ember adalah 3 digit heksadesimal pertama dari hash. | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | Hingga 8 catatan yang hash-nya diawali `abc`. Jika sebuah ember sudah berisi 8, catatan berikutnya masuk ke [Koleksi Project History Sharded Blobs](/id/dev/data-model/project-history-sharded-blobs-collection). | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | Hash, 20 byte: SHA-1 blob git, `sha1("blob " + byteLength + "\0" + content)` (`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`). Bentuk heksadesimalnya adalah hash yang digunakan di tempat lain, misalnya `fileRefs.hash` di proyek. | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | Panjang isi dalam byte. | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | Panjang isi sebagai teks; `null` jika isi bukan teks yang dapat diedit (biner, atau terlalu besar untuk diedit) (`blob_utils.js:116-130`). | `mongo.js:474` |
+
+#### Siapa yang menulis {#who-writes-it}
+
+| Kode | Fungsinya |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`: memasukkan `{ _id, blobs: {} }` ketika history-v1 membuat riwayat proyek (`services/history-v1/storage/lib/chunk_store/index.js:67-68`). |
+| `mongo.js:370-390` | `insertBlob`: `$addToSet` catatan ke embernya selama ember berisi kurang dari 8 catatan, jika tidak ke koleksi yang di-shard. Berjalan setelah byte diunggah, dari `putString`, `putBlob`, dan `copyBlob` (`blob_store/index.js:223-237`, `271-278`, `456-467`). |
+| `mongo.js:54-105` | `clone`: menyalin ember ke id riwayat lain, untuk history-v1 `POST /projects/:project_id/clone`. Tidak ada apa pun di web yang memanggil rute itu (lihat [Koleksi Project History Chunks](/id/dev/data-model/project-history-chunks-collection)). |
+| `mongo.js:413-422` | `deleteBlobs`: menghapus dokumen dan dokumen ter-shard milik proyek, pada history-v1 `DELETE /projects/:project_id` (`services/history-v1/api/controllers/projects.js:361-373`). |
+
+Asal blob baru:
+
+* Unggahan file: web mengirim file ke history-v1 `PUT /projects/:project_id/blobs/:hash` (`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`).
+* Salinan proyek: web meminta history-v1 menyalin blob setiap file dengan `POST /projects/:project_id/blobs/:hash?copyFrom=` (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`).
+* Teks doc: ketika history-v1 menulis sebuah chunk, ia menyimpan teks setiap doc, serta komentar dan perubahan terlacaknya dalam bentuk JSON, sebagai blob (`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`).
+
+#### Siapa yang membaca {#who-reads-it}
+
+| Kode | Fungsinya |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`: satu blob berdasarkan hash; mencari di koleksi ter-shard jika ember penuh. Digunakan oleh `BlobStore.getBlob` (`blob_store/index.js:376-387`) untuk rute blob (`projects.js:416-480`), dan sebelum penyisipan untuk melewati blob yang sudah ada (`blob_store/index.js:441-448`). |
+| `mongo.js:165-260` | `findBlobs`: banyak blob sekaligus, untuk memuat file sebuah chunk. |
+| `mongo.js:265-309` | `getProjectBlobs`: semua blob dalam satu proyek. |
+| `mongo.js:316-363` | `getProjectBlobsBatch`: semua blob dari beberapa proyek, untuk history-v1 `POST /projects/blob-stats` (`projects.js:620`). Modul admin-tools menampilkan hasilnya sebagai ukuran proyek (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`). |
+
+#### Indeks {#indexes}
+
+Hanya indeks bawaan `_id`. Tidak ada migrasi di `tools/migrations/` yang menambahkan indeks lain.
+
+#### Catatan {#notes}
+
+* Byte sebuah blob berada di kunci `<project key>/<hash[0:2]>/<hash[2:]>` (`blob_store/index.js:51-53`) dalam bucket `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:49-52`). Kunci proyek adalah id riwayat yang diisi nol, dibalik, dan dipecah menjadi 3/3/sisa karakter (`libraries/object-persistor/src/ProjectKey.js:8-15`).
+* Sebuah blob disimpan sekali per proyek: penyisipan hash yang sudah dimiliki proyek akan dilewati (`blob_store/index.js:227-230`, `249-252`).
+* Isi kosong tidak memerlukan catatan; `getBlob` menjawabnya tanpa pencarian (`blob_store/index.js:378-380`).
+* `projectHistoryGlobalBlobs` dibaca saat startup (`blob_store/index.js:138-148`), tetapi tidak ada kode CE yang menulisnya, sehingga di CE setiap blob adalah blob proyek.

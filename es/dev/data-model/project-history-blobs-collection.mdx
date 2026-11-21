@@ -1,0 +1,52 @@
+---
+title: Colección Project History Blobs
+icon: cubes
+---
+
+`projectHistoryBlobs` contiene un documento por historial de proyecto: los metadatos (hash y tamaños) de cada blob que history-v1 ha guardado para ese proyecto. Un blob es el contenido de un archivo o de un doc en algún momento de su historial. Los bytes en sí son objetos en el bucket de blobs de proyecto. No hay esquema de Mongoose: history-v1 escribe la colección en `services/history-v1/storage/lib/blob_store/mongo.js`, que usa para ids de historial de 24 caracteres hexadecimales, como en CE (`services/history-v1/storage/lib/blob_store/index.js:108-116`).
+
+#### Campos {#fields}
+
+| Campo | Tipo | Significado | Origen |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id de historial del proyecto, el valor de `projects.overleaf.history.id`. | `mongo.js:37-40` |
+| `blobs` | Object | Registros de blobs agrupados en buckets. La clave de un bucket son los 3 primeros dígitos hexadecimales del hash. | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | Hasta 8 registros cuyo hash empieza por `abc`. Cuando un bucket ya tiene 8, el siguiente registro va a [Colección Project History Sharded Blobs](/es/dev/data-model/project-history-sharded-blobs-collection). | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | El hash, 20 bytes: SHA-1 de blob de git, `sha1("blob " + byteLength + "\0" + content)` (`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`). Su forma hexadecimal es el hash que se usa en otros sitios, por ejemplo `fileRefs.hash` en los proyectos. | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | Longitud del contenido en bytes. | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | Longitud del contenido como texto; `null` cuando el contenido no es texto editable (binario, o demasiado grande para editarlo) (`blob_utils.js:116-130`). | `mongo.js:474` |
+
+#### Quién escribe {#who-writes-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`: inserta `{ _id, blobs: {} }` cuando history-v1 crea el historial del proyecto (`services/history-v1/storage/lib/chunk_store/index.js:67-68`). |
+| `mongo.js:370-390` | `insertBlob`: `$addToSet` del registro en su bucket mientras el bucket tenga menos de 8 registros; si no, en la colección fragmentada. Se ejecuta después de subir los bytes, desde `putString`, `putBlob` y `copyBlob` (`blob_store/index.js:223-237`, `271-278`, `456-467`). |
+| `mongo.js:54-105` | `clone`: copia los buckets a otro id de historial, para `POST /projects/:project_id/clone` de history-v1. Nada en web llama a esa ruta (consulta [Colección Project History Chunks](/es/dev/data-model/project-history-chunks-collection)). |
+| `mongo.js:413-422` | `deleteBlobs`: elimina el documento y los documentos fragmentados del proyecto, en `DELETE /projects/:project_id` de history-v1 (`services/history-v1/api/controllers/projects.js:361-373`). |
+
+De dónde vienen los blobs nuevos:
+
+* Subidas de archivos: web envía el archivo a `PUT /projects/:project_id/blobs/:hash` de history-v1 (`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`).
+* Copias de proyectos: web pide a history-v1 que copie el blob de cada archivo con `POST /projects/:project_id/blobs/:hash?copyFrom=` (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`).
+* Texto de los docs: cuando history-v1 escribe un chunk, guarda como blobs el texto de cada doc y sus comentarios y cambios con seguimiento en JSON (`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`).
+
+#### Quién lee {#who-reads-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`: un blob por hash; busca en la colección fragmentada cuando el bucket está lleno. Lo usa `BlobStore.getBlob` (`blob_store/index.js:376-387`) para las rutas de blobs (`projects.js:416-480`), y antes de una inserción para omitir los blobs que ya existen (`blob_store/index.js:441-448`). |
+| `mongo.js:165-260` | `findBlobs`: muchos blobs a la vez, para cargar los archivos de un chunk. |
+| `mongo.js:265-309` | `getProjectBlobs`: todos los blobs de un proyecto. |
+| `mongo.js:316-363` | `getProjectBlobsBatch`: todos los blobs de varios proyectos, para `POST /projects/blob-stats` de history-v1 (`projects.js:620`). El módulo admin-tools muestra el resultado como tamaño del proyecto (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`). |
+
+#### Índices {#indexes}
+
+Solo el índice predeterminado de `_id`. Ninguna migración de `tools/migrations/` añade otro.
+
+#### Notas {#notes}
+
+* Los bytes de un blob están en la clave `<project key>/<hash[0:2]>/<hash[2:]>` (`blob_store/index.js:51-53`) del bucket `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:49-52`). La clave del proyecto es el id de historial rellenado con ceros, invertido y dividido en 3/3/resto caracteres (`libraries/object-persistor/src/ProjectKey.js:8-15`).
+* Un blob se guarda una vez por proyecto: se omite la inserción de un hash que el proyecto ya tiene (`blob_store/index.js:227-230`, `249-252`).
+* El contenido vacío no necesita registro; `getBlob` lo responde sin búsqueda (`blob_store/index.js:378-380`).
+* `projectHistoryGlobalBlobs` se lee al arrancar (`blob_store/index.js:138-148`), pero ningún código de CE lo escribe, así que en CE todo blob es un blob de proyecto.

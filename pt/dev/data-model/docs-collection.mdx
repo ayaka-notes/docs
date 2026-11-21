@@ -3,49 +3,84 @@ title: Coleção Docs
 icon: file-lines
 ---
 
-`Docs`: Docs é o termo interno do Overleaf para um arquivo editável, por exemplo, um arquivo `tex` puro ou um arquivo `.bib`. Ele armazena o conteúdo do arquivo, informações de revisão e o estado de exclusão.
+`docs` guarda o conteúdo dos arquivos de texto editáveis de um projeto (o Overleaf os chama de docs), por exemplo `main.tex` ou `sample.bib`. Um documento por doc: suas linhas, seus comentários e alterações rastreadas, dois contadores e o estado de exclusão. O nome do arquivo e sua posição na árvore não ficam aqui, mas em `projects.rootFolder` (veja [Coleção Projects](/pt/dev/data-model/projects-collection)). Arquivos binários também não ficam aqui.
 
-#### Identificação principal
+Além de migrações e scripts de manutenção, apenas o docstore escreve esta coleção, em `services/docstore/app/js/MongoManager.js`. Não há modelo Mongoose; o web e o document-updater a acessam pela API HTTP do docstore (`services/docstore/app.js:31-70`). Na coluna Origem, nomes de arquivo sem caminho ficam em `services/docstore/app/js/`.
 
-* `_id`: ObjectId único do MongoDB que identifica este registro de documento.
-* `project_id`: Referência ao projeto (`Project._id`) ao qual este arquivo pertence.
-* `name`: Nome do arquivo como exibido na árvore de arquivos do projeto (por exemplo, `main.tex`, `sample.bib`).
+#### Campos {#fields}
 
-#### Revisão e versionamento
+| Campo | Tipo | Significado | Origem |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id do doc, o mesmo que o `_id` da entrada do doc em `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Projeto do doc. | `MongoManager.js:144` |
+| `lines` | Array of String | O texto, um elemento por linha. Ausente enquanto o doc está arquivado (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Comentários e alterações rastreadas, veja abaixo. Ausente enquanto o doc está arquivado. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | O contador próprio do docstore. Começa em 1 e aumenta em 1 sempre que `lines` ou `ranges` mudam. Toda atualização confere o `rev` antigo, para que dois escritores não sobrescrevam um ao outro. Não é uma versão do histórico. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | A versão OT do doc vinda do document-updater, salva no flush. O docstore rejeita um flush com versão menor. Docs mais antigos a guardavam na coleção `docOps`; a migração `20231105000000_move_doc_versions_from_docops_to_docs` a moveu para cá. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true` quando o doc foi excluído do projeto. Ausente em docs que nunca foram excluídos. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Quando o doc foi excluído. | `HttpController.js:87` |
+| `name` | String | Nome do arquivo no momento da exclusão. Só é definido quando o doc é excluído; docs ativos não têm `name` aqui. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true` quando `lines`, `ranges` e `rev` foram movidos para o persistor do docstore (`Settings.docstore.bucket`, chave `<project_id>/<doc_id>`) e `lines` e `ranges` foram removidos do Mongo. Removido de novo quando o doc é lido de volta. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Bloqueio mantido enquanto o doc está sendo arquivado. | `MongoManager.js:177-193` |
 
-* `rev`: Número de revisão deste documento no histórico do projeto.
-* `version`: Versão interna do esquema ou formato usada pelo backend do editor.
+#### Ranges {#ranges}
 
-Esses campos são usados pelo sistema de versionamento personalizado do Overleaf para rastrear edições incrementais e oferecer suporte ao histórico e à reversão.
+`ranges` tem dois arrays. O document-updater os monta com `libraries/ranges-tracker/index.cjs`; o docstore converte ids em ObjectIds e `ts` em Dates antes de salvar (`RangeManager.js:41-63`). Um doc sem comentários nem alterações rastreadas tem `ranges: {}` ou nenhum `ranges`.
 
-#### Conteúdo do arquivo
+| Campo | Tipo | Significado | Origem |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Trechos de texto comentados. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Id do comentário. É igual a `op.t`, o id da thread do comentário na coleção `rooms`; o docstore força a correspondência. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | O texto comentado no doc (não a mensagem do comentário). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Deslocamento em caracteres do início de `op.c` no doc. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Id da thread, veja `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | `user_id` e `ts` do comentário. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Alterações rastreadas, ordenadas por posição. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Id da alteração. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Texto inserido ou texto excluído. Um dos dois. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Deslocamento em caracteres da alteração. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Autor. Alterações feitas por editores anônimos mantêm a string `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Quando a alteração foi feita. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Array de strings que representa o conteúdo do arquivo linha por linha.\
-    Cada elemento corresponde a uma linha lógica no arquivo de origem.
+O texto de um comentário e de suas respostas não fica em `docs`: fica na coleção `messages`, na room cujo `thread_id` é o id do comentário. Se um comentário está resolvido é armazenado nessa room, não aqui; o docstore descarta um sinalizador `resolved` se ele for enviado (`RangeManager.js:59-61`). Veja [Coleção Rooms](/pt/dev/data-model/rooms-collection) e [Coleção Messages](/pt/dev/data-model/messages-collection).
 
-    Neste exemplo, ele armazena uma entrada BibTeX:
+#### Quem escreve {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Estrutura de dados reservada para anotações do editor ou intervalos rastreados\
-  (por exemplo, seleções, comentários ou rastreamento de alterações). Fica vazia quando não há intervalos ativos. `op` Objeto de operação que vincula o comentário a uma posição específica no documento.
-  * `op.c` — Texto selecionado do comentário (conteúdo em caracteres)
-  * `op.p` — Posição de ancoragem (deslocamento em caracteres)
-  * `id` ObjectId único desta entrada de comentário.
-  * `metadata` Informações de autor e data/hora.
+| Código | O que faz |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Cria ou atualiza um doc: `lines`, `ranges` e `version`. O web o chama quando um doc é criado e quando o document-updater faz o flush de um doc aberto (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Marca um doc como excluído com `deleted`, `deletedAt` e `name`. |
+| `DocArchiveManager.js:29-88` | Arquiva um doc: copia `lines`, `ranges` e `rev` para o persistor e define `inS3`. Executa para um projeto inteiro quando ele é desativado, e para um único doc na exclusão quando `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Traz um doc arquivado de volta ao Mongo quando ele é lido (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Exclui todos os docs de um projeto quando o projeto é destruído. |
 
-#### Estado de exclusão
+#### Quem lê {#who-reads-it}
 
-* `deleted`:\
-  Indica se este documento foi excluído do projeto.
-* `deletedAt`:\
-  Data e hora que registra quando o documento foi excluído.
+| Código | O que faz |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Carrega um doc (pelo web) quando alguém o abre. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Todas as leituras do web: um doc, todos os docs de um projeto, todos os ranges, docs excluídos. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Copia um projeto; faz antes o flush do document-updater. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Lista os docs excluídos de um projeto no painel de administração. |
 
-Documentos excluídos geralmente são mantidos para recuperação do histórico e navegação entre versões, em vez de serem removidos imediatamente do banco de dados.
+#### Índices {#indexes}
 
-Aqui está um exemplo real de um `docs` do Overleaf.
+Todos vêm de migrações marcadas com `server-ce` em `tools/migrations/`.
 
-<Accordion title="Um exemplo simples">
+| Nome | Chaves | Opções | Migração |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Notas {#notes}
+
+* Enquanto um doc está aberto, seu texto mais recente fica no document-updater (Redis), não aqui. O Mongo só é atualizado quando o document-updater faz o flush (`services/document-updater/app/js/PersistenceManager.js:128-160`). Código que lê os docs de um projeto inteiro deve chamar `flushProjectToMongo` primeiro, como faz o `ProjectDuplicator`.
+* Docs excluídos permanecem nesta coleção, com `deleted: true`, até o projeto ser destruído. O docstore retorna no máximo `MAX_DELETED_DOCS` (padrão 2000) deles, do mais recente ao mais antigo (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). O painel de histórico não os usa; ele lê o history-v1.
+* Os contadores `rev` e `version` não têm relação com as versões do histórico do projeto no history-v1.
+
+Aqui estão exemplos reais de `docs` do Overleaf.
+
+<Accordion title="Um doc excluído">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Aqui está um exemplo real de um `docs` do Overleaf.
 
 </Accordion>
 
-<Accordion title="Um exemplo complexo">
+<Accordion title="Um doc com comentários">
 
 ```json5
 {

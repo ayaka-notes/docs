@@ -1,0 +1,59 @@
+---
+title: Collection Project History Chunks
+icon: layer-group
+---
+
+`projectHistoryChunks` lưu một tài liệu cho mỗi chunk lịch sử, tức một dãy phiên bản trong lịch sử của một dự án. Mongo chỉ lưu siêu dữ liệu của chunk; bản thân chunk (một snapshot cộng với các thay đổi sau nó) là một đối tượng JSON được nén gzip trong bucket chunks. Không có schema Mongoose: history-v1 ghi collection trong `services/history-v1/storage/lib/chunk_store/mongo.js`, được dùng cho mọi id lịch sử gồm 24 ký tự thập lục phân, như trong CE (`services/history-v1/storage/lib/chunk_store/index.js:644-652`).
+
+#### Các trường {#fields}
+
+| Trường | Kiểu | Ý nghĩa | Nguồn |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id của chunk. Nó cũng là tên của đối tượng chunk trong bucket (xem Ghi chú). | `mongo.js:183-185` |
+| `projectId` | ObjectId | Id lịch sử của dự án, giá trị trong `projects.overleaf.history.id`. Trong CE, web tạo lịch sử bằng chính `_id` của dự án (`services/web/app/src/Features/History/HistoryManager.mjs:51-55`). | `mongo.js:186` |
+| `startVersion` | Number | Phiên bản dự án trước thay đổi đầu tiên trong chunk. | `mongo.js:187` |
+| `endVersion` | Number | Phiên bản dự án sau thay đổi cuối cùng trong chunk. | `mongo.js:188` |
+| `endTimestamp` | Date | Thời điểm của thay đổi cuối cùng trong chunk; là `null` khi chunk không có thay đổi, như chunk đầu tiên của một dự án mới (`libraries/overleaf-editor-core/lib/chunk.js:146-149`). | `mongo.js:189` |
+| `state` | String | `pending`, `active`, `closed` hoặc `deleted`, xem Ghi chú. | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | Được đặt khi chèn, khi kích hoạt và khi xóa. Đóng một chunk không làm thay đổi nó. | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### Ai ghi {#who-writes-it}
+
+| Mã | Chức năng |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`: chèn một bản ghi `pending` trước khi tải đối tượng chunk lên (`chunk_store/index.js:394-410`). |
+| `mongo.js:331-359` | `activateChunk`: từ `pending` sang `active` khi tải lên xong. Khóa trùng ở đây nghĩa là đã có một chunk khác bắt đầu tại phiên bản đó. |
+| `mongo.js:371-388` | `closeChunk`: từ `active` sang `closed` khi có chunk mới theo sau (`confirmCreate`, `mongo.js:206-227`). |
+| `mongo.js:402-419` | `deleteActiveChunk`: từ `active` sang `deleted` khi một chunk dài hơn với cùng phiên bản bắt đầu thay thế nó (`confirmUpdate`, `mongo.js:295-321`). |
+| `mongo.js:428-452` | `deleteChunk` và `deleteProjectChunks`: đánh dấu các chunk là `deleted`. Hàm thứ hai chạy khi gọi history-v1 `DELETE /projects/:project_id` (`services/history-v1/api/controllers/projects.js:361-373`). |
+| `mongo.js:144-174` | `clone`: sao chép các bản ghi của một dự án dưới một id lịch sử mới, cho history-v1 `POST /projects/:project_id/clone`. Web có một client cho route này (`HistoryManager.mjs:63-72`) nhưng không có gì trong web gọi nó. |
+| `mongo.js:497-502` | `deleteOldChunks`: gỡ bỏ các bản ghi `deleted` và `pending` cũ. Chỉ được chạy bởi `services/history-v1/storage/tasks/delete_old_chunks.js`. |
+
+Chunk mới đến từ project-history, dịch vụ gửi các chỉnh sửa đang xếp hàng đến history-v1 `POST /projects/:project_id/legacy_changes` (`services/history-v1/api/routes/project_import.js:29-31`); sau đó history-v1 gọi `chunkStore.update` hoặc `chunkStore.create` (`services/history-v1/storage/lib/persist_changes.js:215`, `229`). Một dự án mới nhận chunk đầu tiên từ `chunkStore.initializeProject` (`chunk_store/index.js:54-80`).
+
+#### Ai đọc {#who-reads-it}
+
+| Mã | Chức năng |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`: chunk `active` hoặc `closed` mới nhất của một dự án. |
+| `mongo.js:54-71` | `getChunkForVersion`: chunk chứa một phiên bản. |
+| `mongo.js:77-103` | `getChunkForTimestamp`: chunk hiện hành tại một thời điểm. |
+| `mongo.js:108-137` | `getProjectChunkIds` và `getProjectChunks`: tất cả chunk còn hiệu lực của một dự án. |
+| `mongo.js:457-492` | `getOldChunksBatch`: các bản ghi `deleted` và `pending` cũ cho tác vụ dọn dẹp. |
+| `services/history-v1/api/controllers/projects.js:115-265` | Các route đọc của history-v1 (nội dung mới nhất, nội dung tại một phiên bản, lịch sử, thay đổi), tải chunk thông qua `chunk_store/index.js`. |
+
+#### Chỉ mục {#indexes}
+
+| Tên | Khóa | Tùy chọn | Migration |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique, một phần: `state` thuộc `active`, `closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs` (thay thế `projectId_1_startVersion_1` của `20221122191857_project_history_chunks_indexes.mjs`) |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | một phần: `state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (thay thế `state_1`) |
+| `pending_updated_at` | `{ updatedAt: -1 }` | một phần: `state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (thay thế `state_pending` của `20230217205311_fix_deleted_history_chunks_index.mjs`) |
+
+#### Ghi chú {#notes}
+
+* Luồng trạng thái: `pending` (bản ghi đã ghi, đang tải lên) → `active` (chunk mới nhất, vẫn có thể mở rộng) → `closed` (có chunk mới hơn theo sau) hoặc `deleted` (bị thay thế, hoặc dự án đã bị xóa). Các thao tác đọc chỉ xét `active` và `closed`.
+* Đối tượng chunk là JSON được nén gzip (`services/history-v1/storage/lib/history_store.js:151-170`) ở khóa `<project key>/<chunk id>` (`history_store.js:65-67`). Khóa dự án là id lịch sử được đệm số 0, đảo ngược và chia thành 3/3/phần còn lại của các ký tự (`libraries/object-persistor/src/ProjectKey.js:8-15`). Bucket là `OVERLEAF_EDITOR_CHUNKS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:53-56`): `/buckets/chunks` trong môi trường phát triển (`develop/docker-compose.yml:90`), hoặc `overleaf-chunks` với `S3_ENABLED=true` (`develop/s3/docker-compose.yml:51`).
+* Các bản ghi ở trạng thái `deleted` hoặc `pending`, cùng các đối tượng bucket của chúng, chỉ bị gỡ bỏ bởi `delete_old_chunks.js` (`yarn delete_old_chunks`, `services/history-v1/package.json:79`). Image CE không có cron job cho việc này (`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`), nên trong CE chúng vẫn còn đó.
+* Khi web làm hết hạn một dự án đã xóa, nó gọi history-v1 `DELETE /projects/:history_id` (`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`), việc này đánh dấu mọi chunk của dự án là `deleted`.
+* Khi có cấu hình `backupStore`, việc xác nhận một chunk cũng ghi `overleaf.history.currentEndVersion`, `currentEndTimestamp`, `updatedAt` và `overleaf.backup.pendingChangeAt` vào dự án (`mongo.js:232-262`). CE không cấu hình `backupStore`, nên `mongo.js:238-240` trả về sớm.

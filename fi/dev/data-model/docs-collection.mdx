@@ -3,49 +3,84 @@ title: Docs-kokoelma
 icon: file-lines
 ---
 
-`Docs`: Docs on Overleafin sisäinen termi muokattavalle tiedostolle, esimerkiksi pelkälle `tex`-tiedostolle tai `.bib`-tiedostolle. Se tallentaa tiedoston sisällön, revisiotiedot ja poistotilan.
+`docs` sisältää projektin muokattavien tekstitiedostojen (Overleaf kutsuu niitä docseiksi) sisällön, esimerkiksi `main.tex` tai `sample.bib`. Yksi dokumentti docia kohden: sen rivit, kommentit ja seuratut muutokset, kaksi laskuria ja poistotila. Tiedostonimi ja paikka puussa eivät ole täällä vaan kentässä `projects.rootFolder` (katso [Projects-kokoelma](/fi/dev/data-model/projects-collection)). Binääritiedostotkaan eivät ole täällä.
 
-#### Perustunnisteet
+Migraatioita ja ylläpitoskriptejä lukuun ottamatta tähän kokoelmaan kirjoittaa vain docstore, tiedostossa `services/docstore/app/js/MongoManager.js`. Mongoose-mallia ei ole; web ja document-updater käyttävät kokoelmaa docstoren HTTP-rajapinnan kautta (`services/docstore/app.js:31-70`). Lähde-sarakkeessa pelkät tiedostonimet ovat hakemistossa `services/docstore/app/js/`.
 
-* `_id`: Yksilöllinen MongoDB ObjectId, joka tunnistaa tämän dokumenttitietueen.
-* `project_id`: Viittaus projektiin (`Project._id`), johon tämä tiedosto kuuluu.
-* `name`: Tiedostonimi sellaisena kuin se näkyy projektin tiedostopuussa (esim. `main.tex`, `sample.bib`).
+#### Kentät {#fields}
 
-#### Revisiot ja versiointi
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Docin tunniste, sama kuin doc-merkinnän `_id` kentässä `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Docin projekti. | `MongoManager.js:144` |
+| `lines` | Array of String | Teksti, yksi alkio riviä kohden. Puuttuu, kun doc on arkistoitu (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Kommentit ja seuratut muutokset, katso alla. Puuttuu, kun doc on arkistoitu. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | Docstoren oma laskuri. Alkaa arvosta 1 ja kasvaa yhdellä aina, kun `lines` tai `ranges` muuttuu. Jokainen päivitys täsmää vanhaan `rev`-arvoon, joten kaksi kirjoittajaa ei voi ylikirjoittaa toisiaan. Ei historian versio. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | Docin OT-versio document-updaterista, tallennetaan flushissa. docstore hylkää flushin, jonka versio on pienempi. Vanhemmat docsit pitivät sen kokoelmassa `docOps`; migraatio `20231105000000_move_doc_versions_from_docops_to_docs` siirsi sen tänne. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true`, kun doc on poistettu projektista. Puuttuu docseista, joita ei ole koskaan poistettu. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Milloin doc poistettiin. | `HttpController.js:87` |
+| `name` | String | Tiedostonimi poistohetkellä. Asetetaan vain, kun doc poistetaan; elävillä docseilla ei ole tässä kenttää `name`. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true`, kun `lines`, `ranges` ja `rev` on siirretty docstoren persistoriin (`Settings.docstore.bucket`, avain `<project_id>/<doc_id>`) ja `lines` ja `ranges` on poistettu Mongosta. Poistetaan uudelleen, kun doc luetaan takaisin. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Lukitus, jota pidetään docin arkistoinnin ajan. | `MongoManager.js:177-193` |
 
-* `rev`: Tämän dokumentin revisionumero projektin historiassa.
-* `version`: Editorin taustajärjestelmän käyttämä sisäinen skeema- tai formaattiversio.
+#### Ranges {#ranges}
 
-Overleafin oma versiointijärjestelmä käyttää näitä kenttiä inkrementaalisten muokkausten seuraamiseen sekä historian ja palautusten tukemiseen.
+`ranges` sisältää kaksi taulukkoa. document-updater rakentaa ne kirjastolla `libraries/ranges-tracker/index.cjs`; docstore muuntaa tunnisteet ObjectId-arvoiksi ja kentän `ts` Date-arvoksi ennen tallennusta (`RangeManager.js:41-63`). Docilla, jossa ei ole kommentteja eikä seurattuja muutoksia, on `ranges: {}` tai ei lainkaan kenttää `ranges`.
 
-#### Tiedoston sisältö
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Kommentoidut tekstijaksot. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Kommentin tunniste. Se on sama kuin `op.t`, kommentin ketjun tunniste kokoelmassa `rooms`; docstore pakottaa ne täsmäämään. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Kommentoitu teksti docissa (ei kommentin viesti). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Kohdan `op.c` alun merkkisijainti docissa. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Ketjun tunniste, katso `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | Kommentin `user_id` ja `ts`. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Seuratut muutokset sijainnin mukaan järjestettyinä. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Muutoksen tunniste. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Lisätty tai poistettu teksti. Jompikumpi. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Muutoksen merkkisijainti. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Tekijä. Anonyymien muokkaajien muutokset säilyttävät merkkijonon `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Milloin muutos tehtiin. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Merkkijonotaulukko, joka esittää tiedoston sisällön rivi riviltä.\
-    Jokainen alkio vastaa yhtä loogista riviä lähdetiedostossa.
+Kommentin ja sen vastausten teksti ei ole kokoelmassa `docs`: se on kokoelmassa `messages`, siinä roomissa, jonka `thread_id` on kommentin tunniste. Tieto siitä, onko kommentti ratkaistu, tallennetaan tuohon roomiin, ei tänne; docstore hylkää `resolved`-lipun, jos sellainen lähetetään (`RangeManager.js:59-61`). Katso [Rooms-kokoelma](/fi/dev/data-model/rooms-collection) ja [Messages-kokoelma](/fi/dev/data-model/messages-collection).
 
-    Tässä esimerkissä se tallentaa BibTeX-merkinnän:
+#### Kuka kirjoittaa {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Editorin merkinnöille tai seuratuille alueille varattu tietorakenne\
-  (esim. valinnat, kommentit tai muutosten seuranta). Tyhjä, kun aktiivisia alueita ei ole. `op` Operaatio-objekti, joka sitoo kommentin tiettyyn kohtaan dokumentissa.
-  * `op.c` — Kommentoitu valittu teksti (merkkisisältö)
-  * `op.p` — Ankkurin sijainti (merkkisiirtymä)
-  * `id` Tämän kommenttimerkinnän yksilöllinen ObjectId.
-  * `metadata` Tekijä- ja aikaleimatiedot.
+| Koodi | Mitä se tekee |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Luo tai päivittää docin: `lines`, `ranges` ja `version`. Web kutsuu sitä, kun doc luodaan ja kun document-updater tekee flushin avoimelle docille (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Merkitsee docin poistetuksi kentillä `deleted`, `deletedAt` ja `name`. |
+| `DocArchiveManager.js:29-88` | Arkistoi docin: kopioi kentät `lines`, `ranges` ja `rev` persistoriin ja asettaa kentän `inS3`. Suoritetaan koko projektille, kun se poistetaan käytöstä, ja yksittäiselle docille poistettaessa, kun `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Tuo arkistoidun docin takaisin Mongoon, kun se luetaan (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Poistaa projektin kaikki docsit, kun projekti tuhotaan. |
 
-#### Poistotila
+#### Kuka lukee {#who-reads-it}
 
-* `deleted`:\
-  Ilmaisee, onko tämä dokumentti poistettu projektista.
-* `deletedAt`:\
-  Aikaleima, joka kertoo, milloin dokumentti poistettiin.
+| Koodi | Mitä se tekee |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Lataa docin (webin kautta), kun joku avaa sen. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Kaikki webin luvut: yksi doc, projektin kaikki docsit, kaikki ranges, poistetut docsit. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Kopioi projektin; tekee ensin flushin document-updaterille. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Listaa projektin poistetut docsit hallintapaneelissa. |
 
-Poistettuja dokumentteja säilytetään yleensä historian palauttamista ja versioiden selaamista varten sen sijaan, että ne poistettaisiin heti tietokannasta.
+#### Indeksit {#indexes}
 
-Tässä on todellinen esimerkki Overleafin `docs`-tietueesta.
+Kaikki tulevat `server-ce`-merkityistä migraatioista hakemistossa `tools/migrations/`.
 
-<Accordion title="Yksinkertainen esimerkki">
+| Nimi | Avaimet | Asetukset | Migraatio |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Huomautukset {#notes}
+
+* Kun doc on auki, sen uusin teksti on document-updaterissa (Redis), ei täällä. Mongo päivittyy vasta, kun document-updater tekee flushin (`services/document-updater/app/js/PersistenceManager.js:128-160`). Koodin, joka lukee koko projektin docsit, pitäisi ensin kutsua `flushProjectToMongo`, kuten `ProjectDuplicator` tekee.
+* Poistetut docsit pysyvät tässä kokoelmassa arvolla `deleted: true`, kunnes projekti tuhotaan. docstore palauttaa niistä enintään `MAX_DELETED_DOCS` (oletus 2000), uusin ensin (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Historiapaneeli ei käytä niitä; se lukee history-v1:tä.
+* Laskurit `rev` ja `version` eivät liity history-v1:n projektihistorian versioihin.
+
+Tässä on todellisia esimerkkejä Overleafin `docs`-dokumenteista.
+
+<Accordion title="Poistettu doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Tässä on todellinen esimerkki Overleafin `docs`-tietueesta.
 
 </Accordion>
 
-<Accordion title="Monimutkainen esimerkki">
+<Accordion title="Doc kommentteineen">
 
 ```json5
 {

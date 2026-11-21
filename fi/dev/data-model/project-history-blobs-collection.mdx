@@ -1,0 +1,52 @@
+---
+title: Project History Blobs -kokoelma
+icon: cubes
+---
+
+`projectHistoryBlobs` sisältää yhden dokumentin projektihistoriaa kohden: jokaisen blobin metatiedot (hash ja koot), jonka history-v1 on tallentanut kyseiselle projektille. Blob on tiedoston tai docin sisältö jossakin sen historian kohdassa. Itse tavut ovat objekteja projektiblobien bucketissa. Mongoose-skeemaa ei ole: history-v1 kirjoittaa kokoelman tiedostossa `services/history-v1/storage/lib/blob_store/mongo.js`, jota se käyttää 24 heksamerkin historiatunnisteille, kuten CE:ssä (`services/history-v1/storage/lib/blob_store/index.js:108-116`).
+
+#### Kentät {#fields}
+
+| Kenttä | Tyyppi | Merkitys | Lähde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Projektin historiatunniste, arvo kentässä `projects.overleaf.history.id`. | `mongo.js:37-40` |
+| `blobs` | Object | Blob-tietueet ryhmiteltyinä lokeroihin. Lokeron avain on hashin kolme ensimmäistä heksanumeroa. | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | Enintään 8 tietuetta, joiden hash alkaa merkkijonolla `abc`. Kun lokerossa on jo 8, seuraava tietue menee kokoelmaan [Project-History-Sharded-Blobs-kokoelma](/fi/dev/data-model/project-history-sharded-blobs-collection). | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | Hash, 20 tavua: git-blobin SHA-1, `sha1("blob " + byteLength + "\0" + content)` (`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`). Sen heksamuoto on muualla käytetty hash, esimerkiksi projektien `fileRefs.hash`. | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | Sisällön pituus tavuina. | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | Sisällön pituus tekstinä; `null`, kun sisältö ei ole muokattavaa tekstiä (binääriä tai liian suuri muokattavaksi) (`blob_utils.js:116-130`). | `mongo.js:474` |
+
+#### Kuka kirjoittaa {#who-writes-it}
+
+| Koodi | Mitä se tekee |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`: lisää `{ _id, blobs: {} }`, kun history-v1 luo projektihistorian (`services/history-v1/storage/lib/chunk_store/index.js:67-68`). |
+| `mongo.js:370-390` | `insertBlob`: lisää tietueen `$addToSet`-operaatiolla lokeroonsa niin kauan kuin lokerossa on alle 8 tietuetta, muuten shardattuun kokoelmaan. Suoritetaan tavujen latauksen jälkeen funktioista `putString`, `putBlob` ja `copyBlob` (`blob_store/index.js:223-237`, `271-278`, `456-467`). |
+| `mongo.js:54-105` | `clone`: kopioi lokerot toiseen historiatunnisteeseen history-v1:n reittiä `POST /projects/:project_id/clone` varten. Mikään webissä ei kutsu tätä reittiä (katso [Project History Chunks -kokoelma](/fi/dev/data-model/project-history-chunks-collection)). |
+| `mongo.js:413-422` | `deleteBlobs`: poistaa dokumentin ja projektin shardatut dokumentit history-v1:n reitissä `DELETE /projects/:project_id` (`services/history-v1/api/controllers/projects.js:361-373`). |
+
+Mistä uudet blobit tulevat:
+
+* Tiedostojen lataukset: web lähettää tiedoston history-v1:n reitille `PUT /projects/:project_id/blobs/:hash` (`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`).
+* Projektien kopiot: web pyytää history-v1:tä kopioimaan jokaisen tiedoston blobin reitillä `POST /projects/:project_id/blobs/:hash?copyFrom=` (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`).
+* Docin teksti: kun history-v1 kirjoittaa chunkin, se tallentaa jokaisen docin tekstin sekä sen kommentit ja seuratut muutokset JSON-muodossa blobeina (`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`).
+
+#### Kuka lukee {#who-reads-it}
+
+| Koodi | Mitä se tekee |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`: yksi blob hashin perusteella; etsii shardatusta kokoelmasta, kun lokero on täynnä. Käyttää `BlobStore.getBlob` (`blob_store/index.js:376-387`) blob-reiteille (`projects.js:416-480`) ja ennen lisäystä jo olemassa olevien blobien ohittamiseen (`blob_store/index.js:441-448`). |
+| `mongo.js:165-260` | `findBlobs`: monta blobia kerralla chunkin tiedostojen lataamista varten. |
+| `mongo.js:265-309` | `getProjectBlobs`: projektin kaikki blobit. |
+| `mongo.js:316-363` | `getProjectBlobsBatch`: useamman projektin kaikki blobit history-v1:n reittiä `POST /projects/blob-stats` varten (`projects.js:620`). admin-tools-moduuli näyttää tuloksen projektin kokona (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`). |
+
+#### Indeksit {#indexes}
+
+Vain oletusindeksi kentälle `_id`. Mikään migraatio hakemistossa `tools/migrations/` ei lisää muita.
+
+#### Huomautukset {#notes}
+
+* Blobin tavut ovat avaimessa `<project key>/<hash[0:2]>/<hash[2:]>` (`blob_store/index.js:51-53`) bucketissa `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:49-52`). Projektiavain on nollilla täydennetty historiatunniste käännettynä ja jaettuna osiin 3/3/loput merkit (`libraries/object-persistor/src/ProjectKey.js:8-15`).
+* Blob tallennetaan kerran projektia kohden: sellaisen hashin lisäys, joka projektilla jo on, ohitetaan (`blob_store/index.js:227-230`, `249-252`).
+* Tyhjä sisältö ei tarvitse tietuetta; `getBlob` vastaa siihen ilman hakua (`blob_store/index.js:378-380`).
+* `projectHistoryGlobalBlobs` luetaan käynnistyksessä (`blob_store/index.js:138-148`), mutta mikään CE-koodi ei kirjoita sitä, joten CE:ssä jokainen blob on projektiblob.
