@@ -1,0 +1,65 @@
+---
+title: Colección Deleted Users
+icon: user-xmark
+---
+
+`deletedUsers` conserva una cuenta de usuario después de eliminarla: un documento por cuenta eliminada, con una copia del documento completo del usuario y quién la eliminó. Web la escribe en `services/web/app/src/Features/User/UserDeleter.mjs`; el esquema es `services/web/app/src/models/DeletedUser.mjs`. Cuando pasa el plazo de eliminación definitiva, la expiración quita la copia del usuario, pero el registro con `deleterData` permanece.
+
+Eliminar un usuario también elimina los proyectos de los que es propietario; van a [Colección Deleted Projects](/es/dev/data-model/deleted-projects-collection) con el motivo `account-deletion`.
+
+#### Campos {#fields}
+
+| Campo | Tipo | Significado | Origen |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id del registro, no el id del usuario. | `DeletedUser.mjs:21` |
+| `user` | Object | Copia del documento de `users` en el momento de la eliminación, con el esquema de usuario, consulta [Colección Users](/es/dev/data-model/users-collection). Se quita al expirar. | `DeletedUser.mjs:24`, `UserDeleter.mjs:192-196,104,106` |
+| `deleterData` | Object | Quién eliminó la cuenta y un resumen que permanece tras la expiración. | `DeletedUser.mjs:7-19,23` |
+| `deleterData.deletedAt` | Date | Momento de la eliminación. La expiración se ejecuta `userHardDeletionDelay` después: 90 días, o `OVERLEAF_USER_HARD_DELETION_DELAY` milisegundos (`services/web/config/settings.defaults.js:739-741`). | `DeletedUser.mjs:10`, `UserDeleter.mjs:198` |
+| `deleterData.deleterId` | ObjectId | Usuario que eliminó la cuenta: el propio usuario en la página de configuración de la cuenta, o el administrador en el panel de administración. Falta cuando la eliminó el script `delete-user`. | `DeletedUser.mjs:8`, `UserDeleter.mjs:199` |
+| `deleterData.deleterIpAddress` | String | Dirección IP de esa solicitud; `0.0.0.0` desde el script `delete-user` (`services/web/modules/server-ce-scripts/scripts/delete-user.mjs:40-44`). Se quita al expirar. | `DeletedUser.mjs:9`, `UserDeleter.mjs:200,105` |
+| `deleterData.deletedUserId` | ObjectId | `_id` del usuario eliminado. El núcleo busca los registros por este valor. | `DeletedUser.mjs:11`, `UserDeleter.mjs:201` |
+| `deleterData.deletedUserLastLoggedIn` | Date | `lastLoggedIn` del usuario. | `DeletedUser.mjs:12`, `UserDeleter.mjs:202` |
+| `deleterData.deletedUserSignUpDate` | Date | `signUpDate` del usuario. | `DeletedUser.mjs:13`, `UserDeleter.mjs:203` |
+| `deleterData.deletedUserLoginCount` | Number | `loginCount` del usuario. | `DeletedUser.mjs:14`, `UserDeleter.mjs:204` |
+| `deleterData.deletedUserReferralId` | String | `referal_id` del usuario. | `DeletedUser.mjs:15`, `UserDeleter.mjs:205` |
+| `deleterData.deletedUserReferredUsers` | Array of ObjectId | `refered_users` del usuario. | `DeletedUser.mjs:16`, `UserDeleter.mjs:206` |
+| `deleterData.deletedUserReferredUserCount` | Number | `refered_user_count` del usuario. | `DeletedUser.mjs:17`, `UserDeleter.mjs:207` |
+| `deleterData.deletedUserOverleafId` | Number | `overleaf.id` del usuario, si está definido. | `DeletedUser.mjs:18`, `UserDeleter.mjs:208` |
+
+#### Quién escribe {#who-writes-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `UserDeleter.mjs:37-80` (`deleteUser`) | Añade una entrada de registro de auditoría `delete-account`, limpia el usuario y dispara el hook `deleteUser`, hace un upsert del registro (`_createDeletedUser`, `UserDeleter.mjs:192-213`), elimina los proyectos del usuario, envía el correo de alerta de seguridad salvo que se omita y elimina el documento de `users`. Llamadores: la página de configuración de la cuenta (`services/web/app/src/Features/User/UserController.mjs:280-284`), el panel de administración (`services/web/modules/admin-tools/app/src/AdminUserManager.mjs:604-612`) y el script `delete-user` (`delete-user.mjs:40-45`). |
+| `UserDeleter.mjs:93-115` (`expireDeletedUser`) | Dispara el hook `expireDeletedUser`, elimina los datos de onboarding del usuario y luego quita `user` y `deleterData.deleterIpAddress`. |
+| `UserDeleter.mjs:117-161` (`expireDeletedUsersAfterDuration`) | Hace expirar cada registro más antiguo que el plazo y elimina las `userAuditLogEntries` del usuario. Ruta `POST /internal/expire-deleted-users-after-duration` (`services/web/app/src/router.mjs:847-851`), que el cron de la Community Edition llama cada hora en el minuto 15 cuando `ENABLE_CRON_RESOURCE_DELETION` es `true` (`server-ce/cron/delete-users.sh:10-23`, `server-ce/config/crontab-deletion:2`). Un solo usuario: `POST /internal/users/:userId/expire` (`router.mjs:857-861`). |
+| `AdminUserManager.mjs:630-649` (`purgeDeletedUser`, módulo `admin-tools`) | Purge en el panel de administración: ejecuta `expireDeletedUser` y elimina las entradas del registro de auditoría del usuario. |
+| `AdminUserManager.mjs:651-696` (`restoreDeletedUser`, módulo `admin-tools`) | Restaurar en el panel de administración: vuelve a crear el documento de `users` a partir de `user` (se rechaza si el correo está en uso), elimina el registro y restaura los proyectos eliminados con la cuenta. |
+
+#### Quién lee {#who-reads-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `services/web/modules/admin-tools/app/src/AdminUserListManager.mjs:195-213,263-275` | Lista y cuenta los usuarios eliminados para el panel de administración, filtrando por `user.*`. |
+| `AdminUserListManager.mjs:428-452` | Muestra un usuario eliminado que no ha expirado, con quien lo eliminó. |
+| `AdminUserListManager.mjs:456-480` | Nombra al propietario de una fila en otras listas de administración, también cuando el propietario está eliminado. |
+| `AdminUserListManager.mjs:175-183` | Recoge los ids de proveedores de inicio de sesión, también de usuarios eliminados. |
+| `AdminUserManager.mjs:623-627,631-634,652` | Lee el registro cuando un administrador elimina, purga o restaura un usuario; estos lo buscan por `user._id`. |
+
+#### Índices {#indexes}
+
+| Nombre | Claves | Opciones | Migración |
+| ---- | ---- | ------- | --------- |
+| `deleterData.deleteUserId_1` | `{ "deleterData.deletedUserId": 1 }` | unique | `20200210121103_uniqueify-deletedthings-indexes.mjs` |
+| `deleterData_deletedAt_user_1` | `{ "deleterData.deletedAt": 1 }` | parcial: `user` es un objeto | `20250116090001_deletedUsers_non_expired_index.mjs` |
+| `user.email_1` | `{ "user.email": 1 }` | | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+| `user.emails.email_1` | `{ "user.emails.email": 1 }` | parcial: `user.emails.email` existe | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+
+Las migraciones están en `tools/migrations/`. El nombre del índice dice `deleteUserId`, pero la clave es `deletedUserId`.
+
+#### Notas {#notes}
+
+* Los módulos que escuchan `expireDeletedUser` eliminan sus propios datos del usuario: `dropbox` (`services/web/modules/dropbox/index.mjs:62`), `github-sync` (`services/web/modules/github-sync/index.mjs:66`), `gitlab-sync` (`services/web/modules/gitlab-sync/index.mjs:56`) y `gitea-sync` (`services/web/modules/gitea-sync/index.mjs:56`).
+* Un registro expirado nunca se elimina: `deleterData` permanece para siempre, solo se quitan `user` y la dirección IP.
+* Los tokens de acceso personal del usuario no se eliminan con la cuenta, consulta [Colección OAuth Access Tokens](/es/dev/data-model/oauth-access-tokens-collection).
+* Mongoose también da a `deleterData` su propio `_id`, que nada lee.

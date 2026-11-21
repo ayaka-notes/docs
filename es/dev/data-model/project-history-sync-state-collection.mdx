@@ -1,0 +1,58 @@
+---
+title: Colección Project History Sync State
+icon: rotate
+---
+
+`projectHistorySyncState` contiene un documento por proyecto que se ha resincronizado: el estado de la resincronización actual o de la última, cuando project-history reconstruye el historial de un proyecto a partir de lo que tienen web y docstore. Pertenece a project-history y no tiene esquema de Mongoose; el código es la clase `SyncState` y sus funciones auxiliares en `services/project-history/app/js/SyncManager.js`.
+
+#### Campos {#fields}
+
+| Campo | Tipo | Significado | Origen |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Creado por el upsert. | `SyncManager.js:233-237` |
+| `project_id` | ObjectId | El proyecto. | `SyncManager.js:233-237` |
+| `resyncProjectStructure` | Boolean | `true` mientras project-history espera la estructura del proyecto (árbol de archivos) de web. | `SyncManager.js:457`, `536-543` |
+| `resyncDocContents` | Array of String | Rutas de los docs cuyo contenido aún espera. | `SyncManager.js:458`, `482`, `545-546` |
+| `origin` | Object | Quién pidió la resincronización, por ejemplo `{ kind: 'history-resync' }`, el valor predeterminado. | `SyncManager.js:150`, `459` |
+| `hardResync` | Boolean | `true` para una resincronización completa, que primero descarta las actualizaciones en cola y el estado de sincronización anterior. | `SyncManager.js:81-100`, `152`, `460` |
+| `recoverCorruptedFiles` | Boolean | Opción de la solicitud de resincronización (`HttpController.js:963-964`). En una resincronización completa, un doc cuyo contenido de historial está dañado se quita y se vuelve a añadir desde docstore (`SyncManager.js:942-951`). | `SyncManager.js:153`, `461` |
+| `history` | Array of Object | Los últimos 100 estados, del más reciente al más antiguo, cada uno `{ syncState, timestamp }`; `syncState` contiene los cinco campos anteriores. | `SyncManager.js:41`, `202-208` |
+| `lastUpdated` | Date | Hora de la última escritura. | `SyncManager.js:209` |
+| `resyncCount` | Number | Número de resincronizaciones iniciadas. | `SyncManager.js:215` |
+| `resyncPendingSince` | Date | Cuándo empezó la resincronización en curso; se quita cuando termina. | `SyncManager.js:217`, `224-225` |
+| `expiresAt` | Date | Se fija a 90 días después de que termine una resincronización y se quita mientras hay una en curso. El índice TTL elimina el documento en ese momento. | `SyncManager.js:42`, `216`, `221-223` |
+| `stuckClearCount` | Number | Cuántas veces se limpió y reinició una resincronización atascada; se quita cuando termina una resincronización. | `SyncManager.js:261`, `226` |
+| `lastStuckClearAt` | Date | Hora de la última limpieza de ese tipo. | `SyncManager.js:262`, `227` |
+| `lastStuckDocPaths` | Array of String | Rutas de docs aún pendientes en la última limpieza. | `SyncManager.js:262`, `228` |
+
+#### Quién escribe {#who-writes-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `services/project-history/app/js/SyncManager.js:195-249` | `setResyncState`: upsert del estado. Se llama cuando empieza una resincronización (`SyncManager.js:163`) y mientras project-history procesa las actualizaciones de resincronización (`services/project-history/app/js/UpdatesProcessor.js:637`, `784`). |
+| `SyncManager.js:257-266` | `_recordStuckClearInSyncState`: cuenta una resincronización atascada que se limpia. |
+| `SyncManager.js:251-255` | `clearResyncState`: elimina el documento al inicio de una resincronización completa (`SyncManager.js:87`), en `DELETE /project/:project_id` de project-history (`services/project-history/app/js/HttpController.js:1363-1396`) y cuando una resincronización solo de estructura tiene que empezar de nuevo (`SyncManager.js:705-716`). |
+| `SyncManager.js:273-289` | `clearResyncStateIfAllAfter`: elimina un estado terminado cuyo historial es posterior en su totalidad a una fecha. Nada en `app/js` lo llama. |
+| `SyncManager.js:171-181` | `cloneResyncState`: copia el estado a otro proyecto, para `POST /project/:project_id/clone` de project-history (`HttpController.js:57`, `124`), que nada en web llama. |
+
+Una resincronización la inicia `POST /project/:project_id/resync` de project-history (`HttpController.js:950-994`), las tareas cron de reintento (`services/project-history/app/js/RetryManager.js:156-179`, `server-ce/config/crontab-history`) y el propio project-history cuando el procesamiento de actualizaciones necesita una (`UpdatesProcessor.js:75`, `224`).
+
+#### Quién lee {#who-reads-it}
+
+| Código | Qué hace |
+| ---- | ------------ |
+| `SyncManager.js:187-193` | `getResyncState`: carga el estado. Se usa para decidir si hay una resincronización en curso antes de iniciar otra (`SyncManager.js:106-149`), para omitir las actualizaciones normales mientras se ejecuta (`SyncManager.js:291-300`) y, tras un flush, para informar de una resincronización en curso (`UpdatesProcessor.js:463-466`). |
+| `HttpController.js:533-545` | `GET /project/:project_id/resync-pending`: si hay una resincronización en curso o atascada. |
+| `HttpController.js:563-585` | `GET /project/:project_id/debug-info`: el estado de sincronización con el registro de fallo. |
+
+#### Índices {#indexes}
+
+| Nombre | Claves | Opciones | Migración |
+| ---- | ---- | ------- | --------- |
+| `project_id_1` | `{ project_id: 1 }` | | `tools/migrations/20190912145021_create_projectHistorySyncState_indexes.mjs` |
+| `expiresAt_1` | `{ expiresAt: 1 }` | TTL, `expireAfterSeconds: 0` | `tools/migrations/20190912145021_create_projectHistorySyncState_indexes.mjs` |
+
+#### Notas {#notes}
+
+* Una resincronización está en curso mientras `resyncProjectStructure` es `true` o `resyncDocContents` no está vacío (`SyncManager.js:565-567`). Se considera atascada después de 4 horas, y atascada de forma permanente después de 5 limpiezas (`SyncManager.js:43-44`, `569-585`).
+* Cuando termina una resincronización, project-history también establece `overleaf.history.lastResyncedAt` en el proyecto (`SyncManager.js:239-248`).
