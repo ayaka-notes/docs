@@ -1,0 +1,89 @@
+---
+title: Petit serveur
+icon: memory
+---
+
+Ayakaleaf Pro fonctionne sur un serveur doté de 2 cœurs de processeur et de 2 Go de mémoire, intégration Git comprise, dès que vous ajoutez 2 Go de swap. Sans swap, il manque de mémoire pendant son démarrage. Les réglages de l'étape 2 réduisent ensuite l'utilisation du swap de près de moitié.
+
+<Info>
+
+Nous avons mesuré cela avec Ayakaleaf Pro 6.3.1 et le Toolkit, dans une machine virtuelle QEMU/KVM 2 vCPU / 2 Gio sous Ubuntu 24.04, avec les compilations en sandbox (`texlive-basic:2025.1`) et l'intégration Git activées.
+
+</Info>
+
+## Pourquoi 2 Go ne suffisent pas par défaut {#why-2-gb-is-not-enough-by-default}
+
+Au repos, avec les réglages par défaut, Ayakaleaf Pro a besoin d'environ 1,9 Gio. Ubuntu et Docker utilisent déjà 364 Mio d'une machine de 2 Gio, ce qui laisse environ 1600 Mio.
+
+| Composant            | Mémoire au repos | Remarques                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 processus Node.js | 1620 MiB    | `web` et `web-api` environ 255 MiB chacun, les autres 85–150 MiB |
+| Intégration Git      | 135 MiB     | Java prend la moitié de la mémoire, 1 GiB, comme tas maximal      |
+| MongoDB 8.0          | 125 MiB     | son cache peut atteindre environ 512 MiB                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. Ajouter 2 Go de swap {#1-add-2-gb-of-swap}
+
+C'est l'étape la plus importante.
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. Réduire l'utilisation de la mémoire {#2-lower-memory-use}
+
+Ajoutez ces lignes à `config/variables.env`. Le conteneur de l'intégration Git lit lui aussi ce fichier.
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+Pour plafonner le cache de MongoDB, ajoutez une entrée `mongo` sous `services` dans `config/docker-compose.override.yml` (le fichier qui définit l'image Ayakaleaf Pro) :
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+Exécutez ensuite `bin/up -d`.
+
+| Réglage                                       | Effet                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | les processus Node.js utilisent 470 MiB de moins au total ; les temps de compilation restent identiques |
+| `MALLOC_ARENA_MAX=2`                          | les processus Node.js utilisent 65 MiB de moins au total                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | le tas de l'intégration Git est plafonné à 160 MiB au lieu de 1 GiB |
+| `--wiredTigerCacheSizeGB 0.25`                | le cache de MongoDB est plafonné à 256 MiB au lieu d'environ 512 MiB |
+
+<Warning>
+
+`NODE_OPTIONS` remplace la valeur définie dans l'image : la ligne doit donc conserver `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs`. Sans ces options, les services Node.js ne peuvent pas charger leurs paquets et ne démarrent pas. `--optimize-for-size` n'est pas utilisable : Node.js le refuse dans `NODE_OPTIONS`.
+
+`--replSet overleaf` est ce que le Toolkit transmet à MongoDB par défaut. Conservez-le.
+
+</Warning>
+
+Avec un tas de 160 MiB, cloner ou pousser un gros projet via Git peut épuiser la mémoire, et le conteneur de l'intégration Git redémarre. Nous ne l'avons pas testé. Si cela se produit, augmentez `-Xmx`.
+
+## Résultats {#results}
+
+Chaque test compilait un document LuaLaTeX de 33 pages avec `fontspec` et 30 figures TikZ ; les compilations simultanées portaient sur des projets différents.
+
+| Configuration                         | 1 compilation | 2 simultanées                 | 3 simultanées | Pic d'utilisation du swap |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| Par défaut, sans swap              | manque de mémoire au démarrage | | |      |
+| Étape 2 seule, sans swap          | 21 s      | `web` tué, erreurs 502  | non testé |              |
+| Étape 1 seule                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| Étapes 1 et 2                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+Sans swap, un arrêt pour manque de mémoire en entraîne un autre : `web` redémarre, son démarrage a de nouveau besoin de mémoire, et le serveur se bloque jusqu'à une réinitialisation matérielle. Avec du swap, trois compilations simultanées prennent à peu près autant de temps qu'une seule, car ce qui part dans le swap, ce sont des pages Node.js inactives.
+
+Non testé : la charge des clones et pushs Git, de nombreux utilisateurs modifiant en même temps, et le swap sur des disques lents (notre hôte utilisait un SSD).
+
+## Kubernetes {#kubernetes}
+
+Notre guide Kubernetes désactive le swap sur les nœuds ([Préparer les nœuds](/fr/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)), donc seule l'étape 2 s'applique. Placez `NODE_OPTIONS` et `MALLOC_ARENA_MAX` dans la ConfigMap `overleaf-env` ([Personnaliser votre instance](/fr/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)). Le cache de MongoDB est déjà défini dans [Déployer MongoDB et Redis](/fr/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis).

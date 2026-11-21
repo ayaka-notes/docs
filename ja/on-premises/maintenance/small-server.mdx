@@ -1,0 +1,89 @@
+---
+title: 小規模サーバー
+icon: memory
+---
+
+2 GB のスワップを追加すれば、Ayakaleaf Pro は Git 連携を含めて 2 CPU コア・2 GB メモリのサーバーで動作します。スワップがないと、起動中にメモリ不足になります。さらにステップ 2 の設定で、スワップ使用量をほぼ半分に減らせます。
+
+<Info>
+
+この測定は、Ubuntu 24.04 を実行する 2 vCPU / 2 GiB の QEMU/KVM 仮想マシン上で、Toolkit を使った Ayakaleaf Pro 6.3.1 に対し、サンドボックスコンパイル（`texlive-basic:2025.1`）と Git 連携を有効にして行いました。
+
+</Info>
+
+## デフォルトでは 2 GB では足りない理由 {#why-2-gb-is-not-enough-by-default}
+
+デフォルト設定のままだと、Ayakaleaf Pro はアイドル時に約 1.9 GiB を必要とします。2 GiB のマシンでは Ubuntu と Docker がすでに 364 MiB を使用しているため、残りは約 1600 MiB です。
+
+| コンポーネント            | アイドル時のメモリ | 備考                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 個の Node.js プロセス | 1620 MiB    | `web` と `web-api` がそれぞれ約 255 MiB、その他は 85–150 MiB |
+| Git 連携      | 135 MiB     | Java はメモリの半分の 1 GiB を最大ヒープとして確保します      |
+| MongoDB 8.0          | 125 MiB     | キャッシュは約 512 MiB まで増加することがあります                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. 2 GB のスワップを追加する {#1-add-2-gb-of-swap}
+
+これが最も重要なステップです。
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. メモリ使用量を減らす {#2-lower-memory-use}
+
+次の行を `config/variables.env` に追加します。Git 連携コンテナもこのファイルを読み込みます。
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+MongoDB のキャッシュに上限を設けるには、`config/docker-compose.override.yml`（Ayakaleaf Pro イメージを設定しているのと同じファイル）の `services` の下に `mongo` エントリを追加します。
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+その後、`bin/up -d` を実行します。
+
+| 設定                                       | 効果                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | Node.js プロセス全体で 470 MiB 削減。コンパイル時間は変わりません |
+| `MALLOC_ARENA_MAX=2`                          | Node.js プロセス全体で 65 MiB 削減                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | Git 連携のヒープ上限が 1 GiB ではなく 160 MiB になります |
+| `--wiredTigerCacheSizeGB 0.25`                | MongoDB のキャッシュ上限が約 512 MiB ではなく 256 MiB になります |
+
+<Warning>
+
+`NODE_OPTIONS` はイメージで設定された値を置き換えるため、この行には `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs` を残す必要があります。これらがないと、Node.js サービスはパッケージを読み込めず、起動しません。`--optimize-for-size` は使用できません。Node.js は `NODE_OPTIONS` でこのオプションを受け付けません。
+
+`--replSet overleaf` は、Toolkit がデフォルトで MongoDB に渡すオプションです。削除しないでください。
+
+</Warning>
+
+ヒープが 160 MiB の場合、大きなプロジェクトを Git でクローンまたはプッシュするとメモリ不足になり、Git 連携コンテナが再起動することがあります。これはテストしていません。発生した場合は `-Xmx` を引き上げてください。
+
+## 結果 {#results}
+
+各テストでは、`fontspec` と 30 個の TikZ 図を含む 33 ページの LuaLaTeX 文書をコンパイルしました。同時コンパイルでは別々のプロジェクトを使用しました。
+
+| 構成                         | 1 件のコンパイル | 2 件同時                 | 3 件同時 | スワップ使用量のピーク |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| デフォルト、スワップなし              | 起動中にメモリ不足 | | |      |
+| ステップ 2 のみ、スワップなし          | 21 s      | `web` が強制終了され 502 エラー  | 未テスト |              |
+| ステップ 1 のみ                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| ステップ 1 と 2                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+スワップがないと、1 回のメモリ不足による強制終了が次の強制終了を招きます。`web` が再起動し、その起動に再びメモリが必要になり、ハードリセットするまでサーバーが応答しなくなります。スワップがあれば、3 件の同時コンパイルでも 1 件とほぼ同じ時間で終わります。スワップに追い出されるのはアイドル状態の Node.js のページだからです。
+
+未テストの項目：Git のクローンとプッシュの負荷、多数のユーザーによる同時編集、低速ディスク上のスワップ（今回のホストは SSD を使用）。
+
+## Kubernetes {#kubernetes}
+
+Kubernetes ガイドではノードのスワップを無効にしているため（[ノードの準備](/ja/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)）、そこで適用できるのはステップ 2 だけです。`NODE_OPTIONS` と `MALLOC_ARENA_MAX` は `overleaf-env` ConfigMap に設定してください（[インスタンスのカスタマイズ](/ja/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)）。MongoDB のキャッシュは [MongoDB と Redis のデプロイ](/ja/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis) ですでに設定されています。

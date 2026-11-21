@@ -1,0 +1,89 @@
+---
+title: Máy chủ nhỏ
+icon: memory
+---
+
+Ayakaleaf Pro chạy được trên máy chủ có 2 lõi CPU và 2 GB bộ nhớ, kể cả tích hợp Git, khi bạn thêm 2 GB swap. Không có swap, nó hết bộ nhớ trong lúc khởi động. Các thiết lập ở bước 2 còn giảm mức dùng swap gần một nửa.
+
+<Info>
+
+Chúng tôi đo trên Ayakaleaf Pro 6.3.1 với Toolkit, trong một máy ảo QEMU/KVM 2 vCPU / 2 GiB chạy Ubuntu 24.04, với biên dịch trong sandbox (`texlive-basic:2025.1`) và tích hợp Git được bật.
+
+</Info>
+
+## Vì sao 2 GB không đủ với thiết lập mặc định {#why-2-gb-is-not-enough-by-default}
+
+Khi nhàn rỗi với thiết lập mặc định, Ayakaleaf Pro cần khoảng 1,9 GiB. Ubuntu và Docker đã dùng 364 MiB của máy 2 GiB, chỉ còn lại khoảng 1600 MiB.
+
+| Thành phần            | Bộ nhớ khi nhàn rỗi | Ghi chú                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 tiến trình Node.js | 1620 MiB    | `web` và `web-api` mỗi cái khoảng 255 MiB, các tiến trình khác 85–150 MiB |
+| Tích hợp Git      | 135 MiB     | Java lấy một nửa bộ nhớ, 1 GiB, làm heap tối đa      |
+| MongoDB 8.0          | 125 MiB     | bộ đệm của nó có thể tăng lên khoảng 512 MiB                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. Thêm 2 GB swap {#1-add-2-gb-of-swap}
+
+Đây là bước quan trọng nhất.
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. Giảm mức dùng bộ nhớ {#2-lower-memory-use}
+
+Thêm các dòng sau vào `config/variables.env`. Container tích hợp Git cũng đọc tệp này.
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+Để giới hạn bộ đệm MongoDB, thêm mục `mongo` dưới `services` trong `config/docker-compose.override.yml` (chính tệp đặt image Ayakaleaf Pro):
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+Sau đó chạy `bin/up -d`.
+
+| Thiết lập                                       | Tác dụng                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | các tiến trình Node.js dùng ít hơn tổng cộng 470 MiB; thời gian biên dịch không đổi |
+| `MALLOC_ARENA_MAX=2`                          | các tiến trình Node.js dùng ít hơn tổng cộng 65 MiB                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | heap của tích hợp Git bị giới hạn ở 160 MiB thay vì 1 GiB |
+| `--wiredTigerCacheSizeGB 0.25`                | bộ đệm MongoDB bị giới hạn ở 256 MiB thay vì khoảng 512 MiB |
+
+<Warning>
+
+`NODE_OPTIONS` thay thế giá trị được đặt trong image, nên dòng này phải giữ `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs`. Thiếu chúng, các dịch vụ Node.js không tải được gói của mình và không khởi động. Không thể dùng `--optimize-for-size`: Node.js từ chối tùy chọn này trong `NODE_OPTIONS`.
+
+`--replSet overleaf` là giá trị Toolkit truyền cho MongoDB theo mặc định. Hãy giữ nguyên.
+
+</Warning>
+
+Với heap 160 MiB, việc clone hoặc push một dự án lớn qua Git có thể hết bộ nhớ, và container tích hợp Git sẽ khởi động lại. Chúng tôi chưa kiểm thử trường hợp này. Nếu điều đó xảy ra, hãy tăng `-Xmx`.
+
+## Kết quả {#results}
+
+Mỗi lần kiểm thử biên dịch một tài liệu LuaLaTeX 33 trang có `fontspec` và 30 hình TikZ; các lần biên dịch đồng thời là các dự án khác nhau.
+
+| Cấu hình                         | 1 lần biên dịch | 2 lần cùng lúc                 | 3 lần cùng lúc | Mức dùng swap cao nhất |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| Mặc định, không swap              | hết bộ nhớ khi khởi động | | |      |
+| Chỉ bước 2, không swap          | 21 s      | `web` bị dừng, lỗi 502  | chưa kiểm thử |              |
+| Chỉ bước 1                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| Bước 1 và 2                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+Không có swap, một lần bị dừng do hết bộ nhớ sẽ kéo theo lần tiếp theo: `web` khởi động lại, việc khởi động lại cần bộ nhớ, và máy chủ treo cho đến khi bị reset cứng. Có swap, ba lần biên dịch cùng lúc mất thời gian gần bằng một lần, vì những gì bị đẩy vào swap là các trang Node.js nhàn rỗi.
+
+Chưa kiểm thử: tải clone và push Git, nhiều người dùng chỉnh sửa cùng lúc, và swap trên ổ đĩa chậm (máy chủ của chúng tôi dùng SSD).
+
+## Kubernetes {#kubernetes}
+
+Hướng dẫn Kubernetes của chúng tôi tắt swap trên các node ([Chuẩn bị các node](/vi/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)), nên ở đó chỉ áp dụng bước 2. Đặt `NODE_OPTIONS` và `MALLOC_ARENA_MAX` vào ConfigMap `overleaf-env` ([Cá nhân hóa phiên bản của bạn](/vi/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)). Bộ đệm MongoDB đã được đặt trong [Triển khai MongoDB và Redis](/vi/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis).

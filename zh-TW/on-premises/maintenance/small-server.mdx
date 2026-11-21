@@ -1,0 +1,89 @@
+---
+title: 小型伺服器
+icon: memory
+---
+
+加上 2 GB 的交換空間（swap）後，Ayakaleaf Pro 可以在 2 個 CPU 核心、2 GB 記憶體的伺服器上執行，包含 Git 整合。沒有交換空間時，它會在啟動過程中耗盡記憶體。第 2 步中的設定還能將交換空間的使用量減少近一半。
+
+<Info>
+
+我們在 Ayakaleaf Pro 6.3.1 上使用 Toolkit 進行量測，環境為執行 Ubuntu 24.04 的 2 vCPU / 2 GiB QEMU/KVM 虛擬機，並開啟沙箱編譯（`texlive-basic:2025.1`）與 Git 整合。
+
+</Info>
+
+## 為什麼預設情況下 2 GB 不夠用 {#why-2-gb-is-not-enough-by-default}
+
+在預設設定下，Ayakaleaf Pro 閒置時大約需要 1.9 GiB。Ubuntu 和 Docker 已經佔用了 2 GiB 機器中的 364 MiB，剩下大約 1600 MiB。
+
+| 元件            | 閒置記憶體 | 說明                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 個 Node.js 行程 | 1620 MiB    | `web` 和 `web-api` 各約 255 MiB，其他行程 85–150 MiB |
+| Git 整合      | 135 MiB     | Java 將一半記憶體（1 GiB）作為最大堆積      |
+| MongoDB 8.0          | 125 MiB     | 其快取可成長到約 512 MiB                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. 加上 2 GB 交換空間 {#1-add-2-gb-of-swap}
+
+這是最重要的一步。
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. 降低記憶體用量 {#2-lower-memory-use}
+
+將以下幾行加入 `config/variables.env`。Git 整合容器也會讀取這個檔案。
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+若要限制 MongoDB 快取，請在 `config/docker-compose.override.yml`（也就是設定 Ayakaleaf Pro 映像檔的同一個檔案）的 `services` 下加入一個 `mongo` 項目：
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+然後執行 `bin/up -d`。
+
+| 設定                                       | 效果                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | Node.js 行程總共少用 470 MiB；編譯時間不變 |
+| `MALLOC_ARENA_MAX=2`                          | Node.js 行程總共少用 65 MiB                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | Git 整合的堆積上限為 160 MiB，而不是 1 GiB |
+| `--wiredTigerCacheSizeGB 0.25`                | MongoDB 快取上限為 256 MiB，而不是約 512 MiB |
+
+<Warning>
+
+`NODE_OPTIONS` 會取代映像檔中設定的值，因此這一行必須保留 `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs`。少了它們，Node.js 服務無法載入其套件，也無法啟動。不能使用 `--optimize-for-size`：Node.js 不允許在 `NODE_OPTIONS` 中使用它。
+
+`--replSet overleaf` 是 Toolkit 預設傳給 MongoDB 的參數。請保留它。
+
+</Warning>
+
+當堆積為 160 MiB 時，透過 Git 複製或推送大型專案可能會耗盡記憶體，Git 整合容器會隨之重新啟動。我們沒有測試這種情況。如果發生這種情況，請調高 `-Xmx`。
+
+## 結果 {#results}
+
+每次測試都編譯一份 33 頁的 LuaLaTeX 文件，使用 `fontspec` 和 30 個 TikZ 圖形；並行編譯使用的是不同的專案。
+
+| 配置                         | 1 次編譯 | 同時 2 次                 | 同時 3 次 | 交換空間峰值用量 |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| 預設，無交換空間              | 啟動時耗盡記憶體 | | |      |
+| 僅第 2 步，無交換空間          | 21 s      | `web` 被終止，出現 502 錯誤  | 未測試 |              |
+| 僅第 1 步                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| 第 1 步和第 2 步                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+沒有交換空間時，一次記憶體不足終止會引發下一次：`web` 重新啟動，啟動又需要記憶體，伺服器會一直停滯，直到硬重設。有交換空間時，同時進行三次編譯所需時間與一次編譯差不多，因為被換出到交換空間的是閒置的 Node.js 記憶體頁面。
+
+未測試：Git 複製和推送負載、大量使用者同時編輯，以及慢速磁碟上的交換空間（我們的主機使用的是 SSD）。
+
+## Kubernetes {#kubernetes}
+
+我們的 Kubernetes 指南會在節點上關閉交換空間（[準備節點](/zh-TW/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)），因此那裡只適用第 2 步。請將 `NODE_OPTIONS` 和 `MALLOC_ARENA_MAX` 放入 `overleaf-env` ConfigMap（[個人化您的執行個體](/zh-TW/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)）。MongoDB 快取已在[部署 MongoDB 與 Redis](/zh-TW/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis) 中設定。
