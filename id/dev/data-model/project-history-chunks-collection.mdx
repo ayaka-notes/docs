@@ -1,0 +1,59 @@
+---
+title: Koleksi Project History Chunks
+icon: layer-group
+---
+
+`projectHistoryChunks` menyimpan satu dokumen per chunk riwayat, yaitu rangkaian versi dalam riwayat satu proyek. Mongo hanya menyimpan metadata chunk; chunk itu sendiri (sebuah snapshot beserta perubahan setelahnya) adalah objek JSON terkompresi gzip di bucket chunks. Tidak ada skema Mongoose: history-v1 menulis koleksi ini di `services/history-v1/storage/lib/chunk_store/mongo.js`, yang digunakannya untuk setiap id riwayat berupa 24 karakter heksadesimal, seperti di CE (`services/history-v1/storage/lib/chunk_store/index.js:644-652`).
+
+#### Field {#fields}
+
+| Field | Tipe | Arti | Sumber |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id chunk. Juga menjadi nama objek chunk di bucket (lihat Catatan). | `mongo.js:183-185` |
+| `projectId` | ObjectId | Id riwayat proyek, nilai di `projects.overleaf.history.id`. Di CE, web membuat riwayat dengan `_id` milik proyek itu sendiri (`services/web/app/src/Features/History/HistoryManager.mjs:51-55`). | `mongo.js:186` |
+| `startVersion` | Number | Versi proyek sebelum perubahan pertama dalam chunk. | `mongo.js:187` |
+| `endVersion` | Number | Versi proyek setelah perubahan terakhir dalam chunk. | `mongo.js:188` |
+| `endTimestamp` | Date | Waktu perubahan terakhir dalam chunk; `null` jika chunk tidak memiliki perubahan, seperti chunk pertama proyek baru (`libraries/overleaf-editor-core/lib/chunk.js:146-149`). | `mongo.js:189` |
+| `state` | String | `pending`, `active`, `closed`, atau `deleted`, lihat Catatan. | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | Diatur saat penyisipan, aktivasi, dan penghapusan. Menutup chunk tidak mengubahnya. | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### Siapa yang menulis {#who-writes-it}
+
+| Kode | Fungsinya |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`: memasukkan catatan `pending` sebelum objek chunk diunggah (`chunk_store/index.js:394-410`). |
+| `mongo.js:331-359` | `activateChunk`: dari `pending` ke `active` setelah unggahan selesai. Kunci duplikat di sini berarti chunk lain sudah dimulai pada versi tersebut. |
+| `mongo.js:371-388` | `closeChunk`: dari `active` ke `closed` ketika chunk baru menyusul (`confirmCreate`, `mongo.js:206-227`). |
+| `mongo.js:402-419` | `deleteActiveChunk`: dari `active` ke `deleted` ketika chunk yang lebih panjang dengan versi awal yang sama menggantikannya (`confirmUpdate`, `mongo.js:295-321`). |
+| `mongo.js:428-452` | `deleteChunk` dan `deleteProjectChunks`: menandai chunk sebagai `deleted`. Yang kedua berjalan pada history-v1 `DELETE /projects/:project_id` (`services/history-v1/api/controllers/projects.js:361-373`). |
+| `mongo.js:144-174` | `clone`: menyalin catatan proyek di bawah id riwayat baru, untuk history-v1 `POST /projects/:project_id/clone`. Web memiliki klien untuk rute ini (`HistoryManager.mjs:63-72`), tetapi tidak ada apa pun di web yang memanggilnya. |
+| `mongo.js:497-502` | `deleteOldChunks`: menghapus catatan `deleted` dan `pending` yang lama. Hanya dijalankan oleh `services/history-v1/storage/tasks/delete_old_chunks.js`. |
+
+Chunk baru berasal dari project-history, yang mengirim suntingan yang mengantre ke history-v1 `POST /projects/:project_id/legacy_changes` (`services/history-v1/api/routes/project_import.js:29-31`); history-v1 lalu memanggil `chunkStore.update` atau `chunkStore.create` (`services/history-v1/storage/lib/persist_changes.js:215`, `229`). Proyek baru mendapatkan chunk pertamanya dari `chunkStore.initializeProject` (`chunk_store/index.js:54-80`).
+
+#### Siapa yang membaca {#who-reads-it}
+
+| Kode | Fungsinya |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`: chunk `active` atau `closed` terbaru dari sebuah proyek. |
+| `mongo.js:54-71` | `getChunkForVersion`: chunk yang berisi suatu versi. |
+| `mongo.js:77-103` | `getChunkForTimestamp`: chunk yang berlaku pada suatu waktu. |
+| `mongo.js:108-137` | `getProjectChunkIds` dan `getProjectChunks`: semua chunk aktif dari sebuah proyek. |
+| `mongo.js:457-492` | `getOldChunksBatch`: catatan `deleted` dan `pending` lama untuk tugas pembersihan. |
+| `services/history-v1/api/controllers/projects.js:115-265` | Rute baca history-v1 (isi terbaru, isi pada suatu versi, riwayat, perubahan), yang memuat chunk melalui `chunk_store/index.js`. |
+
+#### Indeks {#indexes}
+
+| Nama | Kunci | Opsi | Migrasi |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique, parsial: `state` dalam `active`, `closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs` (menggantikan `projectId_1_startVersion_1` dari `20221122191857_project_history_chunks_indexes.mjs`) |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | parsial: `state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (menggantikan `state_1`) |
+| `pending_updated_at` | `{ updatedAt: -1 }` | parsial: `state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (menggantikan `state_pending` dari `20230217205311_fix_deleted_history_chunks_index.mjs`) |
+
+#### Catatan {#notes}
+
+* Alur status: `pending` (catatan ditulis, unggahan berjalan) → `active` (chunk terbaru, masih bisa diperpanjang) → `closed` (chunk yang lebih baru menyusul) atau `deleted` (diganti, atau proyek dihapus). Pembacaan hanya memperhatikan `active` dan `closed`.
+* Objek chunk adalah JSON terkompresi gzip (`services/history-v1/storage/lib/history_store.js:151-170`) di kunci `<project key>/<chunk id>` (`history_store.js:65-67`). Kunci proyek adalah id riwayat yang diisi nol, dibalik, dan dipecah menjadi 3/3/sisa karakter (`libraries/object-persistor/src/ProjectKey.js:8-15`). Bucket-nya adalah `OVERLEAF_EDITOR_CHUNKS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:53-56`): `/buckets/chunks` di lingkungan pengembangan (`develop/docker-compose.yml:90`), atau `overleaf-chunks` dengan `S3_ENABLED=true` (`develop/s3/docker-compose.yml:51`).
+* Catatan dalam status `deleted` atau `pending`, beserta objek bucket-nya, hanya dihapus oleh `delete_old_chunks.js` (`yarn delete_old_chunks`, `services/history-v1/package.json:79`). Image CE tidak memiliki cron job untuk itu (`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`), sehingga di CE catatan tersebut tetap ada.
+* Ketika web mengedaluwarsakan proyek yang dihapus, ia memanggil history-v1 `DELETE /projects/:history_id` (`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`), yang menandai semua chunk proyek sebagai `deleted`.
+* Dengan `backupStore` yang dikonfigurasi, mengonfirmasi chunk juga menulis `overleaf.history.currentEndVersion`, `currentEndTimestamp`, `updatedAt`, dan `overleaf.backup.pendingChangeAt` ke proyek (`mongo.js:232-262`). CE tidak mengonfigurasi `backupStore`, sehingga `mongo.js:238-240` kembali lebih awal.
