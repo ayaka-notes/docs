@@ -1,0 +1,65 @@
+---
+title: Коллекция Deleted Users
+icon: user-xmark
+---
+
+`deletedUsers` хранит учётную запись пользователя после удаления: один документ на каждую удалённую учётную запись, с копией всего документа пользователя и сведениями о том, кто её удалил. Web записывает коллекцию в `services/web/app/src/Features/User/UserDeleter.mjs`; схема: `services/web/app/src/models/DeletedUser.mjs`. Когда истекает срок до окончательного удаления, процедура истечения удаляет копию пользователя, но запись с `deleterData` остаётся.
+
+Удаление пользователя удаляет и проекты, которыми он владеет; они попадают в [Коллекция Deleted Projects](/ru/dev/data-model/deleted-projects-collection) с причиной `account-deletion`.
+
+#### Поля {#fields}
+
+| Поле | Тип | Значение | Источник |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id записи, а не id пользователя. | `DeletedUser.mjs:21` |
+| `user` | Object | Копия документа `users` на момент удаления со схемой пользователя, см. [Коллекция users](/ru/dev/data-model/users-collection). Удаляется при истечении. | `DeletedUser.mjs:24`, `UserDeleter.mjs:192-196,104,106` |
+| `deleterData` | Object | Кто удалил учётную запись, и сводка, которая остаётся после истечения. | `DeletedUser.mjs:7-19,23` |
+| `deleterData.deletedAt` | Date | Время удаления. Истечение выполняется через `userHardDeletionDelay` после него: 90 дней или `OVERLEAF_USER_HARD_DELETION_DELAY` миллисекунд (`services/web/config/settings.defaults.js:739-741`). | `DeletedUser.mjs:10`, `UserDeleter.mjs:198` |
+| `deleterData.deleterId` | ObjectId | Пользователь, удаливший учётную запись: сам пользователь на странице настроек учётной записи или администратор в панели администратора. Отсутствует, если её удалил скрипт `delete-user`. | `DeletedUser.mjs:8`, `UserDeleter.mjs:199` |
+| `deleterData.deleterIpAddress` | String | IP-адрес этого запроса; `0.0.0.0` для скрипта `delete-user` (`services/web/modules/server-ce-scripts/scripts/delete-user.mjs:40-44`). Удаляется при истечении. | `DeletedUser.mjs:9`, `UserDeleter.mjs:200,105` |
+| `deleterData.deletedUserId` | ObjectId | `_id` удалённого пользователя. Ядро ищет записи по нему. | `DeletedUser.mjs:11`, `UserDeleter.mjs:201` |
+| `deleterData.deletedUserLastLoggedIn` | Date | `lastLoggedIn` пользователя. | `DeletedUser.mjs:12`, `UserDeleter.mjs:202` |
+| `deleterData.deletedUserSignUpDate` | Date | `signUpDate` пользователя. | `DeletedUser.mjs:13`, `UserDeleter.mjs:203` |
+| `deleterData.deletedUserLoginCount` | Number | `loginCount` пользователя. | `DeletedUser.mjs:14`, `UserDeleter.mjs:204` |
+| `deleterData.deletedUserReferralId` | String | `referal_id` пользователя. | `DeletedUser.mjs:15`, `UserDeleter.mjs:205` |
+| `deleterData.deletedUserReferredUsers` | Array of ObjectId | `refered_users` пользователя. | `DeletedUser.mjs:16`, `UserDeleter.mjs:206` |
+| `deleterData.deletedUserReferredUserCount` | Number | `refered_user_count` пользователя. | `DeletedUser.mjs:17`, `UserDeleter.mjs:207` |
+| `deleterData.deletedUserOverleafId` | Number | `overleaf.id` пользователя, если задан. | `DeletedUser.mjs:18`, `UserDeleter.mjs:208` |
+
+#### Кто пишет {#who-writes-it}
+
+| Код | Что делает |
+| ---- | ------------ |
+| `UserDeleter.mjs:37-80` (`deleteUser`) | Добавляет запись журнала аудита `delete-account`, очищает данные пользователя и вызывает хук `deleteUser`, делает upsert записи (`_createDeletedUser`, `UserDeleter.mjs:192-213`), удаляет проекты пользователя, отправляет письмо с предупреждением о безопасности, если оно не пропущено, и удаляет документ `users`. Вызывающие: страница настроек учётной записи (`services/web/app/src/Features/User/UserController.mjs:280-284`), панель администратора (`services/web/modules/admin-tools/app/src/AdminUserManager.mjs:604-612`) и скрипт `delete-user` (`delete-user.mjs:40-45`). |
+| `UserDeleter.mjs:93-115` (`expireDeletedUser`) | Вызывает хук `expireDeletedUser`, удаляет данные онбординга пользователя, затем удаляет `user` и `deleterData.deleterIpAddress`. |
+| `UserDeleter.mjs:117-161` (`expireDeletedUsersAfterDuration`) | Завершает срок всех записей старше заданной задержки и удаляет `userAuditLogEntries` пользователя. Маршрут `POST /internal/expire-deleted-users-after-duration` (`services/web/app/src/router.mjs:847-851`), который cron Community Edition вызывает каждый час в 15 минут, когда `ENABLE_CRON_RESOURCE_DELETION` равно `true` (`server-ce/cron/delete-users.sh:10-23`, `server-ce/config/crontab-deletion:2`). Один пользователь: `POST /internal/users/:userId/expire` (`router.mjs:857-861`). |
+| `AdminUserManager.mjs:630-649` (`purgeDeletedUser`, модуль `admin-tools`) | Purge в панели администратора: выполняет `expireDeletedUser` и удаляет записи журнала аудита пользователя. |
+| `AdminUserManager.mjs:651-696` (`restoreDeletedUser`, модуль `admin-tools`) | Восстановление в панели администратора: заново создаёт документ `users` из `user` (отказ, если адрес электронной почты занят), удаляет запись и восстанавливает проекты, удалённые вместе с учётной записью. |
+
+#### Кто читает {#who-reads-it}
+
+| Код | Что делает |
+| ---- | ------------ |
+| `services/web/modules/admin-tools/app/src/AdminUserListManager.mjs:195-213,263-275` | Выводит список и количество удалённых пользователей для панели администратора с фильтрацией по `user.*`. |
+| `AdminUserListManager.mjs:428-452` | Показывает одного удалённого пользователя, срок которого не истёк, вместе с тем, кто его удалил. |
+| `AdminUserListManager.mjs:456-480` | Показывает владельца строки в других списках администратора, даже если владелец удалён. |
+| `AdminUserListManager.mjs:175-183` | Собирает id поставщиков входа, в том числе удалённых пользователей. |
+| `AdminUserManager.mjs:623-627,631-634,652` | Читает запись, когда администратор удаляет, окончательно удаляет или восстанавливает пользователя; эти места ищут её по `user._id`. |
+
+#### Индексы {#indexes}
+
+| Имя | Ключи | Параметры | Миграция |
+| ---- | ---- | ------- | --------- |
+| `deleterData.deleteUserId_1` | `{ "deleterData.deletedUserId": 1 }` | unique | `20200210121103_uniqueify-deletedthings-indexes.mjs` |
+| `deleterData_deletedAt_user_1` | `{ "deleterData.deletedAt": 1 }` | частичный: `user` является объектом | `20250116090001_deletedUsers_non_expired_index.mjs` |
+| `user.email_1` | `{ "user.email": 1 }` | | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+| `user.emails.email_1` | `{ "user.emails.email": 1 }` | частичный: `user.emails.email` существует | `20250321112055_create_deletedUsers_email_indexes.mjs` |
+
+Миграции находятся в `tools/migrations/`. В имени индекса написано `deleteUserId`, но ключ называется `deletedUserId`.
+
+#### Примечания {#notes}
+
+* Модули, которые слушают `expireDeletedUser`, удаляют свои данные пользователя: `dropbox` (`services/web/modules/dropbox/index.mjs:62`), `github-sync` (`services/web/modules/github-sync/index.mjs:66`), `gitlab-sync` (`services/web/modules/gitlab-sync/index.mjs:56`) и `gitea-sync` (`services/web/modules/gitea-sync/index.mjs:56`).
+* Истёкшая запись никогда не удаляется: `deleterData` остаётся навсегда, удаляются только `user` и IP-адрес.
+* Персональные токены доступа пользователя не удаляются вместе с учётной записью, см. [Коллекция OAuth Access Tokens](/ru/dev/data-model/oauth-access-tokens-collection).
+* Mongoose также присваивает `deleterData` собственный `_id`, который никто не читает.

@@ -1,0 +1,59 @@
+---
+title: Коллекция Project History Chunks
+icon: layer-group
+---
+
+`projectHistoryChunks` содержит один документ на чанк истории, то есть последовательность версий в истории одного проекта. В Mongo хранятся только метаданные чанка; сам чанк (снимок плюс изменения после него) представляет собой сжатый gzip JSON-объект в бакете чанков. Схемы Mongoose нет: history-v1 записывает коллекцию в `services/history-v1/storage/lib/chunk_store/mongo.js`, который он использует для любого id истории из 24 шестнадцатеричных символов, как в CE (`services/history-v1/storage/lib/chunk_store/index.js:644-652`).
+
+#### Поля {#fields}
+
+| Поле | Тип | Значение | Источник |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id чанка. Он же задаёт имя объекта чанка в бакете (см. Примечания). | `mongo.js:183-185` |
+| `projectId` | ObjectId | Id истории проекта, значение из `projects.overleaf.history.id`. В CE web создаёт историю с собственным `_id` проекта (`services/web/app/src/Features/History/HistoryManager.mjs:51-55`). | `mongo.js:186` |
+| `startVersion` | Number | Версия проекта перед первым изменением в чанке. | `mongo.js:187` |
+| `endVersion` | Number | Версия проекта после последнего изменения в чанке. | `mongo.js:188` |
+| `endTimestamp` | Date | Время последнего изменения в чанке; `null`, если в чанке нет изменений, как в первом чанке нового проекта (`libraries/overleaf-editor-core/lib/chunk.js:146-149`). | `mongo.js:189` |
+| `state` | String | `pending`, `active`, `closed` или `deleted`, см. Примечания. | `mongo.js:190`, `343`, `378`, `409` |
+| `updatedAt` | Date | Устанавливается при вставке, активации и удалении. Закрытие чанка его не меняет. | `mongo.js:191`, `343`, `409`, `434`, `450` |
+
+#### Кто пишет {#who-writes-it}
+
+| Код | Что делает |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/chunk_store/mongo.js:179-194` | `insertPendingChunk`: вставляет запись `pending` перед загрузкой объекта чанка (`chunk_store/index.js:394-410`). |
+| `mongo.js:331-359` | `activateChunk`: из `pending` в `active` после завершения загрузки. Дубликат ключа здесь означает, что с этой версии уже начинается другой чанк. |
+| `mongo.js:371-388` | `closeChunk`: из `active` в `closed`, когда за ним следует новый чанк (`confirmCreate`, `mongo.js:206-227`). |
+| `mongo.js:402-419` | `deleteActiveChunk`: из `active` в `deleted`, когда его заменяет более длинный чанк с той же начальной версией (`confirmUpdate`, `mongo.js:295-321`). |
+| `mongo.js:428-452` | `deleteChunk` и `deleteProjectChunks`: помечают чанки как `deleted`. Вторая выполняется при `DELETE /projects/:project_id` в history-v1 (`services/history-v1/api/controllers/projects.js:361-373`). |
+| `mongo.js:144-174` | `clone`: копирует записи проекта под новым id истории для `POST /projects/:project_id/clone` в history-v1. У web есть клиент для этого маршрута (`HistoryManager.mjs:63-72`), но ничто в web его не вызывает. |
+| `mongo.js:497-502` | `deleteOldChunks`: удаляет старые записи `deleted` и `pending`. Запускается только `services/history-v1/storage/tasks/delete_old_chunks.js`. |
+
+Новые чанки приходят от project-history, который отправляет накопленные правки в `POST /projects/:project_id/legacy_changes` history-v1 (`services/history-v1/api/routes/project_import.js:29-31`); затем history-v1 вызывает `chunkStore.update` или `chunkStore.create` (`services/history-v1/storage/lib/persist_changes.js:215`, `229`). Новый проект получает первый чанк из `chunkStore.initializeProject` (`chunk_store/index.js:54-80`).
+
+#### Кто читает {#who-reads-it}
+
+| Код | Что делает |
+| ---- | ------------ |
+| `mongo.js:23-43` | `getLatestChunk`: самый новый чанк проекта в состоянии `active` или `closed`. |
+| `mongo.js:54-71` | `getChunkForVersion`: чанк, содержащий версию. |
+| `mongo.js:77-103` | `getChunkForTimestamp`: чанк, который был текущим в заданный момент. |
+| `mongo.js:108-137` | `getProjectChunkIds` и `getProjectChunks`: все действующие чанки проекта. |
+| `mongo.js:457-492` | `getOldChunksBatch`: старые записи `deleted` и `pending` для задачи очистки. |
+| `services/history-v1/api/controllers/projects.js:115-265` | Маршруты чтения history-v1 (последнее содержимое, содержимое на версии, история, изменения), которые загружают чанки через `chunk_store/index.js`. |
+
+#### Индексы {#indexes}
+
+| Имя | Ключи | Параметры | Миграция |
+| ---- | ---- | ------- | --------- |
+| `projectId_1_startVersion_1_v2` | `{ projectId: 1, startVersion: 1 }` | unique, частичный: `state` в `active`, `closed` | `tools/migrations/20250411200550_active_chunk_index_update.mjs` (заменяет `projectId_1_startVersion_1` из `20221122191857_project_history_chunks_indexes.mjs`) |
+| `deleted_updated_at` | `{ updatedAt: 1 }` | частичный: `state: 'deleted'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (заменяет `state_1`) |
+| `pending_updated_at` | `{ updatedAt: -1 }` | частичный: `state: 'pending'` | `tools/migrations/20230428154643_history_chunks_garbage_collection_index.mjs` (заменяет `state_pending` из `20230217205311_fix_deleted_history_chunks_index.mjs`) |
+
+#### Примечания {#notes}
+
+* Смена состояний: `pending` (запись создана, идёт загрузка) → `active` (последний чанк, ещё может расширяться) → `closed` (за ним следует более новый чанк) или `deleted` (заменён или проект удалён). Чтение учитывает только `active` и `closed`.
+* Объект чанка представляет собой сжатый gzip JSON (`services/history-v1/storage/lib/history_store.js:151-170`) по ключу `<project key>/<chunk id>` (`history_store.js:65-67`). Ключ проекта: id истории, дополненный нулями, перевёрнутый и разбитый на 3/3/остальные символы (`libraries/object-persistor/src/ProjectKey.js:8-15`). Бакет: `OVERLEAF_EDITOR_CHUNKS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:53-56`): `/buckets/chunks` в среде разработки (`develop/docker-compose.yml:90`) или `overleaf-chunks` с `S3_ENABLED=true` (`develop/s3/docker-compose.yml:51`).
+* Записи в состоянии `deleted` или `pending` и их объекты в бакете удаляет только `delete_old_chunks.js` (`yarn delete_old_chunks`, `services/history-v1/package.json:79`). В образе CE для этого нет задания cron (`server-ce/config/crontab-history`, `server-ce/config/crontab-deletion`), поэтому в CE они остаются.
+* Когда web завершает срок удалённого проекта, он вызывает `DELETE /projects/:history_id` в history-v1 (`services/web/app/src/Features/Project/ProjectDeleter.mjs:385-391`, `HistoryManager.mjs:127-135`, `152-162`), и все чанки проекта помечаются как `deleted`.
+* Если настроен `backupStore`, подтверждение чанка также записывает в проект `overleaf.history.currentEndVersion`, `currentEndTimestamp`, `updatedAt` и `overleaf.backup.pendingChangeAt` (`mongo.js:232-262`). CE не настраивает `backupStore`, поэтому `mongo.js:238-240` возвращается раньше.

@@ -3,49 +3,84 @@ title: Колекція Docs
 icon: file-lines
 ---
 
-`Docs`: Docs — це внутрішній термін Overleaf для файлу, який можна редагувати, наприклад звичайного файлу `tex` або файлу `.bib`. Він зберігає вміст файлу, інформацію про ревізію та стан видалення.
+`docs` зберігає вміст редагованих текстових файлів проєкту (Overleaf називає їх docs), наприклад `main.tex` або `sample.bib`. Один документ на кожен doc: його рядки, коментарі й відстежувані зміни, два лічильники та стан видалення. Назви файлу та його місця в дереві тут немає, вони зберігаються в `projects.rootFolder` (див. [Колекція Projects](/uk/dev/data-model/projects-collection)). Двійкових файлів тут теж немає.
 
-#### Основна ідентифікація
+Окрім міграцій і скриптів обслуговування, у цю колекцію пише лише docstore, у `services/docstore/app/js/MongoManager.js`. Моделі Mongoose немає; web і document-updater звертаються до колекції через HTTP API docstore (`services/docstore/app.js:31-70`). У стовпці «Джерело» назви файлів без шляху містяться в `services/docstore/app/js/`.
 
-* `_id`: унікальний MongoDB ObjectId, що ідентифікує цей запис документа.
-* `project_id`: посилання на проєкт (`Project._id`), до якого належить цей файл.
-* `name`: ім'я файлу, як воно відображається в дереві файлів проєкту (наприклад, `main.tex`, `sample.bib`).
+#### Поля {#fields}
 
-#### Ревізії та версіонування
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id doc, збігається з `_id` запису doc у `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Проєкт doc. | `MongoManager.js:144` |
+| `lines` | Array of String | Текст, один елемент на рядок. Відсутній, поки doc заархівовано (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Коментарі та відстежувані зміни, див. нижче. Відсутній, поки doc заархівовано. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | Власний лічильник docstore. Починається з 1 і збільшується на 1 щоразу, коли змінюються `lines` або `ranges`. Кожне оновлення звіряється зі старим `rev`, тому два записувачі не можуть перезаписати одне одного. Це не версія історії. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | OT-версія doc із document-updater, що зберігається під час скидання на диск. docstore відхиляє скидання з нижчою версією. Старі docs зберігали її в колекції `docOps`; міграція `20231105000000_move_doc_versions_from_docops_to_docs` перенесла її сюди. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true`, якщо doc видалено з проєкту. Відсутній у docs, які ніколи не видалялися. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Коли doc було видалено. | `HttpController.js:87` |
+| `name` | String | Назва файлу на момент видалення. Встановлюється лише під час видалення doc; у чинних docs тут немає `name`. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true`, якщо `lines`, `ranges` і `rev` перенесено до сховища docstore (`Settings.docstore.bucket`, ключ `<project_id>/<doc_id>`), а `lines` і `ranges` видалено з Mongo. Знову прибирається, коли doc зчитують назад. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Блокування, що утримується під час архівації doc. | `MongoManager.js:177-193` |
 
-* `rev`: номер ревізії цього документа в історії проєкту.
-* `version`: внутрішня версія схеми або формату, яку використовує бекенд редактора.
+#### Ranges {#ranges}
 
-Ці поля використовуються власною системою версіонування Overleaf для відстеження інкрементних змін і підтримки історії та відкату.
+`ranges` містить два масиви. document-updater будує їх за допомогою `libraries/ranges-tracker/index.cjs`; docstore перед збереженням перетворює id на ObjectId, а `ts` на Date (`RangeManager.js:41-63`). Doc без коментарів і відстежуваних змін має `ranges: {}` або не має `ranges`.
 
-#### Вміст файлу
+| Поле | Тип | Значення | Джерело |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Прокоментовані фрагменти тексту. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Id коментаря. Він дорівнює `op.t`, id гілки коментаря в колекції `rooms`; docstore забезпечує їхній збіг. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Прокоментований текст у doc (не повідомлення коментаря). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Зміщення в символах початку `op.c` у doc. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Id гілки, див. `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | `user_id` і `ts` коментаря. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Відстежувані зміни, відсортовані за позицією. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Id зміни. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Вставлений або видалений текст. Одне з двох. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Зміщення зміни в символах. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Автор. Зміни анонімних редакторів зберігають рядок `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Коли було зроблено зміну. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Масив рядків, що представляє вміст файлу рядок за рядком.\
-    Кожен елемент відповідає одному логічному рядку вихідного файлу.
+Тексту коментаря та відповідей на нього немає в `docs`: він зберігається в колекції `messages`, у room, у якої `thread_id` дорівнює id коментаря. Чи розв'язано коментар, зберігається в цій room, а не тут; docstore відкидає прапорець `resolved`, якщо його передали (`RangeManager.js:59-61`). Див. [Колекція Rooms](/uk/dev/data-model/rooms-collection) і [Колекція Messages](/uk/dev/data-model/messages-collection).
 
-    У цьому прикладі він зберігає запис BibTeX:
+#### Хто записує {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: структура даних, зарезервована для анотацій редактора або відстежуваних діапазонів\
-  (наприклад, виділень, коментарів або відстеження змін). Порожня, якщо активних діапазонів немає. `op` — об'єкт операції, який прив'язує коментар до певної позиції в документі.
-  * `op.c` — прокоментований виділений текст (символьний вміст)
-  * `op.p` — позиція прив'язки (зміщення в символах)
-  * `id` — унікальний ObjectId цього запису коментаря.
-  * `metadata` — інформація про автора та часову позначку.
+| Код | Що робить |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Створює або оновлює doc: `lines`, `ranges` і `version`. Web викликає його під час створення doc і коли document-updater скидає відкритий doc на диск (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Позначає doc як видалений за допомогою `deleted`, `deletedAt` і `name`. |
+| `DocArchiveManager.js:29-88` | Архівує doc: копіює `lines`, `ranges` і `rev` у сховище й встановлює `inS3`. Виконується для всього проєкту під час його деактивації та для окремого doc під час видалення, якщо `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Повертає заархівований doc у Mongo під час читання (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Видаляє всі docs проєкту, коли проєкт знищують. |
 
-#### Стан видалення
+#### Хто читає {#who-reads-it}
 
-* `deleted`:\
-  Вказує, чи було цей документ видалено з проєкту.
-* `deletedAt`:\
-  Часова позначка, що фіксує момент видалення документа.
+| Код | Що робить |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Завантажує doc (через web), коли хтось його відкриває. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Усі читання web: один doc, усі docs проєкту, усі ranges, видалені docs. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Копіює проєкт; спершу скидає document-updater на диск. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Показує видалені docs проєкту в панелі адміністратора. |
 
-Видалені документи зазвичай зберігаються для відновлення історії та перегляду версій, а не одразу видаляються з бази даних.
+#### Індекси {#indexes}
 
-Ось реальний приклад `docs` в Overleaf.
+Усі вони створені міграціями з тегом `server-ce` у `tools/migrations/`.
 
-<Accordion title="Простий приклад">
+| Назва | Ключі | Параметри | Міграція |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Примітки {#notes}
+
+* Поки doc відкритий, його найновіший текст міститься в document-updater (Redis), а не тут. Mongo оновлюється лише тоді, коли document-updater скидає дані на диск (`services/document-updater/app/js/PersistenceManager.js:128-160`). Код, що читає docs усього проєкту, має спершу викликати `flushProjectToMongo`, як це робить `ProjectDuplicator`.
+* Видалені docs залишаються в цій колекції з `deleted: true`, доки проєкт не знищать. docstore повертає не більше `MAX_DELETED_DOCS` (типово 2000) з них, новіші першими (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Панель історії їх не використовує; вона читає history-v1.
+* Лічильники `rev` і `version` не пов'язані з версіями історії проєкту в history-v1.
+
+Нижче наведено реальні приклади `docs` в Overleaf.
+
+<Accordion title="Видалений doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ icon: file-lines
 
 </Accordion>
 
-<Accordion title="Складний приклад">
+<Accordion title="Doc із коментарями">
 
 ```json5
 {
