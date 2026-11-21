@@ -1,0 +1,54 @@
+---
+title: Kolekcja Gitea Sync Project States
+icon: code-pull-request
+---
+
+`giteaSyncProjectStates` przechowuje jeden dokument na każdy projekt połączony z repozytorium Gitea: które to repozytorium i gdzie zatrzymała się ostatnia synchronizacja. Kolekcja należy do modułu web `gitea-sync` (`services/web/modules/gitea-sync`). Schemat znajduje się w `services/web/modules/gitea-sync/app/models/giteaSyncProjectStates.mjs`, a cały dostęp przechodzi przez `services/web/modules/gitea-sync/app/src/SyncStateManager.mjs`. Pola są takie same jak w [GitHub Sync Project States](/pl/dev/data-model/github-sync-project-states-collection).
+
+#### Pola {#fields}
+
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Ustawiane przez Mongoose przy tworzeniu. | |
+| `projectId` | ObjectId | Połączony projekt. Wymagane. Schemat podaje `unique: true`, ale żaden indeks nie jest budowany (zobacz Indeksy). | `giteaSyncProjectStates.mjs:8` |
+| `repoFullName` | String | Repozytorium w postaci `owner/name` (`full_name` w Gitea). Wymagane. | `giteaSyncProjectStates.mjs:9`, `GiteaApiClient.mjs:315` |
+| `defaultBranchName` | String | Gałąź, z którą synchronizuje się projekt. Ustawiana przy łączeniu projektu i później niezmieniana: przy imporcie to gałąź wysłana przez formularz importu, przy eksporcie domyślna gałąź nowego repozytorium albo `main`, gdy API jej nie podaje. Domyślnie `null`. | `giteaSyncProjectStates.mjs:10`, `GiteaSyncHandler.mjs:175-181,233-239`, `GiteaApiClient.mjs:314-317` |
+| `mergeStatus` | String | `clean`, `conflict` lub `diverged`. Domyślnie `clean`. | `giteaSyncProjectStates.mjs:11` |
+| `lastSyncCommit` | String | SHA commita na synchronizowanej gałęzi w chwili ostatniej synchronizacji. Domyślnie `null`. | `giteaSyncProjectStates.mjs:12` |
+| `lastSyncVersion` | Number | Wersja historii projektu w chwili ostatniej synchronizacji, z `GET /project/:id/version` usługi project-history, odczytana po opróżnieniu historii. Domyślnie `null`. | `giteaSyncProjectStates.mjs:13`, `services/web/modules/gitea-sync/app/src/HistoryManager.mjs:8-17` |
+| `unmergedBranchName` | String | Podczas konfliktu: tymczasowa gałąź ze zmianami z Overleaf, o nazwie `overleaf-YYYY-MM-DD-HHMMSS`. `null`, gdy nie ma konfliktu. | `giteaSyncProjectStates.mjs:14`, `GitMerge.mjs:814-818` |
+| `unmergedBranchHead` | String | Podczas konfliktu: commit head tej gałęzi. Domyślnie `null`. | `giteaSyncProjectStates.mjs:15` |
+| `conflictVersion` | Number | Podczas konfliktu: wersja historii projektu w chwili zapisania konfliktu. Domyślnie `null`. | `giteaSyncProjectStates.mjs:16` |
+| `__v` | Number | Klucz wersji Mongoose. Schemat go nie wyłącza. | Domyślnie w Mongoose |
+
+#### Kto zapisuje {#who-writes-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `SyncStateManager.mjs:9-14` (`createProjectState`) | Tworzy dokument: po zaimportowaniu repozytorium jako nowego projektu (`services/web/modules/gitea-sync/app/src/GiteaSyncHandler.mjs:175-181`) albo po wyeksportowaniu projektu do nowego repozytorium (`GiteaSyncHandler.mjs:233-239`, tylko właściciel, odmowa, gdy projekt jest już połączony). |
+| `SyncStateManager.mjs:16-21` (`updateProjectState`) | `$set` zmienionych pól. `getMergeOverview` ustawia `mergeStatus: 'diverged'`, gdy `lastSyncCommit` nie jest już przodkiem synchronizowanej gałęzi (`services/web/modules/gitea-sync/app/src/GiteaApiClient.mjs:431`) albo commit zniknął, a użytkownik może wypychać (`GiteaSyncHandler.mjs:123,126-137`). Synchronizacja (`services/web/modules/gitea-sync/app/src/GitMerge.mjs`) po powodzeniu przesuwa `lastSyncCommit`/`lastSyncVersion` (na przykład `:152,189,231`), zapisuje konflikt w `unmergedBranchName`, `unmergedBranchHead` i `conflictVersion` (`:214-220`) i czyści je po jego rozwiązaniu (`:257-264`). |
+| `SyncStateManager.mjs:23-25` (`removeProjectState`) | Usuwa dokument, gdy właściciel odłącza projekt (`GiteaSyncHandler.mjs:83-97`) i gdy wygasa usunięty projekt (`services/web/modules/gitea-sync/index.mjs:46-48`). |
+
+#### Kto odczytuje {#who-reads-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `GiteaSyncHandler.mjs:39-60` (`getProjectState`) | Przekazuje edytorowi `mergeStatus`, `repoFullName` i `unmergedBranchName`. Bez dokumentu odpowiada `need-export`, wartością, która nigdy nie jest zapisywana. |
+| `GiteaSyncHandler.mjs:110-143` (`getMergeOverview`) | Porównuje `lastSyncCommit` i `lastSyncVersion` z Gitea i historią projektu, aby wypisać nowe commity. |
+| `GiteaSyncHandler.mjs:200` (`exportProject`) | Odmawia eksportu projektu, który jest już połączony. |
+| `GitMerge.mjs:36` (`doGitMergeWithoutLock`) | Wczytuje stan na początku synchronizacji. |
+
+#### Indeksy {#indexes}
+
+| Nazwa | Klucze | Opcje | Migracja |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+
+`autoIndex` w Mongoose jest wyłączony (`services/web/app/src/infrastructure/Mongoose.mjs:7`), więc `unique: true` ze schematu na `projectId` niczego nie tworzy. Żadna migracja nie tworzy indeksów dla tej kolekcji.
+
+#### Uwagi {#notes}
+
+* API Gitea nie potrafi, tak jak GitHub, tworzyć commitów poza gałęzią. Synchronizacja commituje bezpośrednio na synchronizowaną gałąź, gdy może ją przesunąć do przodu, a w przeciwnym razie na gałąź tymczasową, którą potem scala się przez pull request (`GitMerge.mjs:16-21`).
+* Synchronizacja działa pod blokadą `gitSync` projektu, wspólną z GitHub Sync i GitLab Sync (`GitMerge.mjs:25-32`).
+* Usunięty projekt zachowuje swój dokument, dopóki nie wygaśnie.
+* Token Gitea użytkownika jest w [Gitea Sync User Credentials](/pl/dev/data-model/gitea-sync-user-credentials-collection).
