@@ -1,0 +1,53 @@
+---
+title: Kolekcja GitHub Sync Project States
+icon: code-branch
+---
+
+`githubSyncProjectStates` przechowuje jeden dokument na każdy projekt połączony z repozytorium GitHub: które to repozytorium i gdzie zatrzymała się ostatnia synchronizacja. Kolekcja należy do modułu web `github-sync` (`services/web/modules/github-sync`). Schemat znajduje się w `services/web/modules/github-sync/app/models/githubSyncProjectStates.mjs`, a cały dostęp przechodzi przez `services/web/modules/github-sync/app/src/SyncStateManager.mjs`.
+
+#### Pola {#fields}
+
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Ustawiane przez Mongoose przy tworzeniu. | |
+| `projectId` | ObjectId | Połączony projekt. Wymagane. Schemat podaje `unique: true`, ale żaden indeks nie jest budowany (zobacz Indeksy). | `githubSyncProjectStates.mjs:8` |
+| `repoFullName` | String | Repozytorium w postaci `owner/name` (`full_name` w GitHub). Wymagane. | `githubSyncProjectStates.mjs:9` |
+| `defaultBranchName` | String | Gałąź, z którą synchronizuje się projekt. Ustawiana przy łączeniu projektu i później niezmieniana: przy imporcie to gałąź wysłana przez formularz importu, przy eksporcie domyślna gałąź nowego repozytorium. Domyślnie `null`. | `githubSyncProjectStates.mjs:10`, `GitHubSyncHandler.mjs:175-181,235-241` |
+| `mergeStatus` | String | `clean`, `conflict` lub `diverged`. Domyślnie `clean`. | `githubSyncProjectStates.mjs:11` |
+| `lastSyncCommit` | String | SHA commita na synchronizowanej gałęzi w chwili ostatniej synchronizacji. Domyślnie `null`. | `githubSyncProjectStates.mjs:12` |
+| `lastSyncVersion` | Number | Wersja historii projektu w chwili ostatniej synchronizacji, z `GET /project/:id/version` usługi project-history, odczytana po opróżnieniu historii. Domyślnie `null`. | `githubSyncProjectStates.mjs:13`, `services/web/modules/github-sync/app/src/HistoryManager.mjs:8-17` |
+| `unmergedBranchName` | String | Podczas konfliktu: tymczasowa gałąź ze zmianami z Overleaf, o nazwie `overleaf-YYYY-MM-DD-HHMMSS`. `null`, gdy nie ma konfliktu. | `githubSyncProjectStates.mjs:14`, `GitMerge.mjs:773-777` |
+| `unmergedBranchHead` | String | Podczas konfliktu: commit head tej gałęzi. Domyślnie `null`. | `githubSyncProjectStates.mjs:15` |
+| `conflictVersion` | Number | Podczas konfliktu: wersja historii projektu w chwili zapisania konfliktu. Domyślnie `null`. | `githubSyncProjectStates.mjs:16` |
+| `__v` | Number | Klucz wersji Mongoose. Schemat go nie wyłącza. | Domyślnie w Mongoose |
+
+#### Kto zapisuje {#who-writes-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `SyncStateManager.mjs:9-14` (`createProjectState`) | Tworzy dokument: po zaimportowaniu repozytorium jako nowego projektu (`services/web/modules/github-sync/app/src/GitHubSyncHandler.mjs:175-181`) albo po wyeksportowaniu projektu do nowego repozytorium (`GitHubSyncHandler.mjs:235-241`, tylko właściciel, odmowa, gdy projekt jest już połączony). |
+| `SyncStateManager.mjs:16-21` (`updateProjectState`) | `$set` zmienionych pól. `getMergeOverview` ustawia `mergeStatus: 'diverged'`, gdy synchronizowana gałąź nie bazuje już na `lastSyncCommit`: compare w GitHub odpowiada `diverged` lub `behind` (`GitHubApiClient.mjs:382-400`) albo commit zniknął, a użytkownik może wypychać (`GitHubSyncHandler.mjs:123,126-137`). Synchronizacja (`services/web/modules/github-sync/app/src/GitMerge.mjs`) po powodzeniu przesuwa `lastSyncCommit`/`lastSyncVersion` (na przykład `:143,173,224`), zapisuje konflikt w `unmergedBranchName`, `unmergedBranchHead` i `conflictVersion` (`:207-213`) i czyści je po jego rozwiązaniu (`:250-257`). |
+| `SyncStateManager.mjs:23-25` (`removeProjectState`) | Usuwa dokument, gdy właściciel odłącza projekt (`GitHubSyncHandler.mjs:83-97`) i gdy wygasa usunięty projekt (`services/web/modules/github-sync/index.mjs:56-58`). |
+
+#### Kto odczytuje {#who-reads-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `GitHubSyncHandler.mjs:39-60` (`getProjectState`) | Przekazuje edytorowi `mergeStatus`, `repoFullName` i `unmergedBranchName`. Bez dokumentu odpowiada `need-export`, wartością, która nigdy nie jest zapisywana. |
+| `GitHubSyncHandler.mjs:110-143` (`getMergeOverview`) | Porównuje `lastSyncCommit` i `lastSyncVersion` z GitHub i historią projektu, aby wypisać nowe commity. |
+| `GitHubSyncHandler.mjs:200` (`exportProject`) | Odmawia eksportu projektu, który jest już połączony. |
+| `GitMerge.mjs:27` (`doGitMergeWithoutLock`) | Wczytuje stan na początku synchronizacji. |
+
+#### Indeksy {#indexes}
+
+| Nazwa | Klucze | Opcje | Migracja |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+
+`autoIndex` w Mongoose jest wyłączony (`services/web/app/src/infrastructure/Mongoose.mjs:7`), więc `unique: true` ze schematu na `projectId` niczego nie tworzy. `tools/migrations/20190912145010_create_githubSyncProjectStates_indexes.mjs` (`project_id` i `owner_id` z upstream) ma tylko tag `saas` i nie uruchamia się w CE.
+
+#### Uwagi {#notes}
+
+* Synchronizacja działa pod blokadą `gitSync` projektu (`GitMerge.mjs:17-24`). GitLab Sync i Gitea Sync biorą tę samą blokadę, więc dla projektu naraz działa tylko jedna synchronizacja.
+* Usunięty projekt zachowuje swój dokument, dopóki nie wygaśnie.
+* Token GitHub użytkownika jest w [GitHub Sync User Credentials](/pl/dev/data-model/github-sync-user-credentials-collection).

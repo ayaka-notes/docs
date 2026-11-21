@@ -1,0 +1,54 @@
+---
+title: Kolekce Gitea Sync Project States
+icon: code-pull-request
+---
+
+`giteaSyncProjectStates` uchovává jeden dokument pro každý projekt propojený s repozitářem Gitea: o jaký repozitář jde a kde skončila poslední synchronizace. Kolekce patří do webového modulu `gitea-sync` (`services/web/modules/gitea-sync`). Schéma je v `services/web/modules/gitea-sync/app/models/giteaSyncProjectStates.mjs` a veškerý přístup prochází přes `services/web/modules/gitea-sync/app/src/SyncStateManager.mjs`. Pole jsou stejná jako v [GitHub Sync Project States](/cs/dev/data-model/github-sync-project-states-collection).
+
+#### Pole {#fields}
+
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Nastavuje Mongoose při vytvoření. | |
+| `projectId` | ObjectId | Propojený projekt. Povinné. Schéma uvádí `unique: true`, ale žádný index se nevytváří (viz Indexy). | `giteaSyncProjectStates.mjs:8` |
+| `repoFullName` | String | Repozitář ve tvaru `owner/name` (`full_name` v Gitea). Povinné. | `giteaSyncProjectStates.mjs:9`, `GiteaApiClient.mjs:315` |
+| `defaultBranchName` | String | Větev, se kterou se projekt synchronizuje. Nastaví se při propojení projektu a pak se nemění: při importu je to větev odeslaná importním formulářem, při exportu výchozí větev nového repozitáře, nebo `main`, když ji API nevrátí. Výchozí `null`. | `giteaSyncProjectStates.mjs:10`, `GiteaSyncHandler.mjs:175-181,233-239`, `GiteaApiClient.mjs:314-317` |
+| `mergeStatus` | String | `clean`, `conflict` nebo `diverged`. Výchozí `clean`. | `giteaSyncProjectStates.mjs:11` |
+| `lastSyncCommit` | String | SHA commitu na synchronizované větvi při poslední synchronizaci. Výchozí `null`. | `giteaSyncProjectStates.mjs:12` |
+| `lastSyncVersion` | Number | Verze historie projektu při poslední synchronizaci, z `GET /project/:id/version` služby project-history, načtená po vyprázdnění historie. Výchozí `null`. | `giteaSyncProjectStates.mjs:13`, `services/web/modules/gitea-sync/app/src/HistoryManager.mjs:8-17` |
+| `unmergedBranchName` | String | Během konfliktu: dočasná větev se změnami z Overleafu pojmenovaná `overleaf-YYYY-MM-DD-HHMMSS`. `null`, když konflikt není. | `giteaSyncProjectStates.mjs:14`, `GitMerge.mjs:814-818` |
+| `unmergedBranchHead` | String | Během konfliktu: hlavní commit této větve. Výchozí `null`. | `giteaSyncProjectStates.mjs:15` |
+| `conflictVersion` | Number | Během konfliktu: verze historie projektu v okamžiku zaznamenání konfliktu. Výchozí `null`. | `giteaSyncProjectStates.mjs:16` |
+| `__v` | Number | Klíč verze Mongoose. Schéma ho nevypíná. | Výchozí v Mongoose |
+
+#### Kdo zapisuje {#who-writes-it}
+
+| Kód | Co dělá |
+| ---- | ------------ |
+| `SyncStateManager.mjs:9-14` (`createProjectState`) | Vytvoří dokument: po importu repozitáře jako nového projektu (`services/web/modules/gitea-sync/app/src/GiteaSyncHandler.mjs:175-181`) nebo po exportu projektu do nového repozitáře (`GiteaSyncHandler.mjs:233-239`, jen vlastník, odmítnuto, pokud už je propojen). |
+| `SyncStateManager.mjs:16-21` (`updateProjectState`) | `$set` změněných polí. `getMergeOverview` nastaví `mergeStatus: 'diverged'`, když `lastSyncCommit` už není předkem synchronizované větve (`services/web/modules/gitea-sync/app/src/GiteaApiClient.mjs:431`), nebo commit zmizel a uživatel může pushovat (`GiteaSyncHandler.mjs:123,126-137`). Synchronizace (`services/web/modules/gitea-sync/app/src/GitMerge.mjs`) při úspěchu posune `lastSyncCommit`/`lastSyncVersion` (například `:152,189,231`), zaznamená konflikt pomocí `unmergedBranchName`, `unmergedBranchHead` a `conflictVersion` (`:214-220`) a po jeho vyřešení je vymaže (`:257-264`). |
+| `SyncStateManager.mjs:23-25` (`removeProjectState`) | Smaže dokument, když vlastník zruší propojení projektu (`GiteaSyncHandler.mjs:83-97`) a když vyprší smazaný projekt (`services/web/modules/gitea-sync/index.mjs:46-48`). |
+
+#### Kdo čte {#who-reads-it}
+
+| Kód | Co dělá |
+| ---- | ------------ |
+| `GiteaSyncHandler.mjs:39-60` (`getProjectState`) | Předá editoru `mergeStatus`, `repoFullName` a `unmergedBranchName`. Bez dokumentu odpoví `need-export`, hodnotou, která se nikdy neukládá. |
+| `GiteaSyncHandler.mjs:110-143` (`getMergeOverview`) | Porovná `lastSyncCommit` a `lastSyncVersion` s Gitea a historií projektu a vypíše nové commity. |
+| `GiteaSyncHandler.mjs:200` (`exportProject`) | Odmítne exportovat projekt, který už je propojen. |
+| `GitMerge.mjs:36` (`doGitMergeWithoutLock`) | Načte stav na začátku synchronizace. |
+
+#### Indexy {#indexes}
+
+| Název | Klíče | Volby | Migrace |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+
+`autoIndex` v Mongoose je vypnutý (`services/web/app/src/infrastructure/Mongoose.mjs:7`), takže `unique: true` ze schématu na `projectId` nic nevytvoří. Žádná migrace pro tuto kolekci nevytváří indexy.
+
+#### Poznámky {#notes}
+
+* API Gitea neumí na rozdíl od GitHubu vytvářet commity mimo větev. Synchronizace commituje přímo na synchronizovanou větev, když se může posunout dopředu, jinak na dočasnou větev, která se pak sloučí přes pull request (`GitMerge.mjs:16-21`).
+* Synchronizace běží pod zámkem projektu `gitSync`, sdíleným s GitHub Sync a GitLab Sync (`GitMerge.mjs:25-32`).
+* Smazaný projekt si ponechá svůj dokument, dokud nevyprší.
+* Token Gitea uživatele je v [Gitea Sync User Credentials](/cs/dev/data-model/gitea-sync-user-credentials-collection).

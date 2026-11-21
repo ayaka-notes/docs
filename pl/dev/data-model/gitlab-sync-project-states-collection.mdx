@@ -1,0 +1,54 @@
+---
+title: Kolekcja GitLab Sync Project States
+icon: code-merge
+---
+
+`gitlabSyncProjectStates` przechowuje jeden dokument na każdy projekt połączony z projektem GitLab: które to repozytorium i gdzie zatrzymała się ostatnia synchronizacja. Kolekcja należy do modułu web `gitlab-sync` (`services/web/modules/gitlab-sync`). Schemat znajduje się w `services/web/modules/gitlab-sync/app/models/gitlabSyncProjectStates.mjs`, a cały dostęp przechodzi przez `services/web/modules/gitlab-sync/app/src/SyncStateManager.mjs`. Pola są takie same jak w [GitHub Sync Project States](/pl/dev/data-model/github-sync-project-states-collection).
+
+#### Pola {#fields}
+
+| Pole | Typ | Znaczenie | Źródło |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Ustawiane przez Mongoose przy tworzeniu. | |
+| `projectId` | ObjectId | Połączony projekt. Wymagane. Schemat podaje `unique: true`, ale żaden indeks nie jest budowany (zobacz Indeksy). | `gitlabSyncProjectStates.mjs:8` |
+| `repoFullName` | String | Ścieżka projektu GitLab wraz z przestrzenią nazw (`path_with_namespace` w GitLab), na przykład `group/subgroup/name`. Wymagane. | `gitlabSyncProjectStates.mjs:9`, `GitLabApiClient.mjs:347` |
+| `defaultBranchName` | String | Gałąź, z którą synchronizuje się projekt. Ustawiana przy łączeniu projektu i później niezmieniana: przy imporcie to gałąź wysłana przez formularz importu, przy eksporcie domyślna gałąź nowego repozytorium albo `main`, gdy API jej nie podaje. Domyślnie `null`. | `gitlabSyncProjectStates.mjs:10`, `GitLabSyncHandler.mjs:175-181,234-240`, `GitLabApiClient.mjs:346-349` |
+| `mergeStatus` | String | `clean`, `conflict` lub `diverged`. Domyślnie `clean`. | `gitlabSyncProjectStates.mjs:11` |
+| `lastSyncCommit` | String | SHA commita na synchronizowanej gałęzi w chwili ostatniej synchronizacji. Domyślnie `null`. | `gitlabSyncProjectStates.mjs:12` |
+| `lastSyncVersion` | Number | Wersja historii projektu w chwili ostatniej synchronizacji, z `GET /project/:id/version` usługi project-history, odczytana po opróżnieniu historii. Domyślnie `null`. | `gitlabSyncProjectStates.mjs:13`, `services/web/modules/gitlab-sync/app/src/HistoryManager.mjs:8-17` |
+| `unmergedBranchName` | String | Podczas konfliktu: tymczasowa gałąź ze zmianami z Overleaf, o nazwie `overleaf-YYYY-MM-DD-HHMMSS`. `null`, gdy nie ma konfliktu. | `gitlabSyncProjectStates.mjs:14`, `GitMerge.mjs:817-821` |
+| `unmergedBranchHead` | String | Podczas konfliktu: commit head tej gałęzi. Domyślnie `null`. | `gitlabSyncProjectStates.mjs:15` |
+| `conflictVersion` | Number | Podczas konfliktu: wersja historii projektu w chwili zapisania konfliktu. Domyślnie `null`. | `gitlabSyncProjectStates.mjs:16` |
+| `__v` | Number | Klucz wersji Mongoose. Schemat go nie wyłącza. | Domyślnie w Mongoose |
+
+#### Kto zapisuje {#who-writes-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `SyncStateManager.mjs:9-14` (`createProjectState`) | Tworzy dokument: po zaimportowaniu repozytorium jako nowego projektu (`services/web/modules/gitlab-sync/app/src/GitLabSyncHandler.mjs:175-181`) albo po wyeksportowaniu projektu do nowego repozytorium (`GitLabSyncHandler.mjs:234-240`, tylko właściciel, odmowa, gdy projekt jest już połączony). |
+| `SyncStateManager.mjs:16-21` (`updateProjectState`) | `$set` zmienionych pól. `getMergeOverview` ustawia `mergeStatus: 'diverged'`, gdy synchronizowana gałąź nie zawiera już `lastSyncCommit` (sprawdzenie merge base, `services/web/modules/gitlab-sync/app/src/GitLabApiClient.mjs:460`) albo commit zniknął, a użytkownik może wypychać (`GitLabSyncHandler.mjs:123,126-137`). Synchronizacja (`services/web/modules/gitlab-sync/app/src/GitMerge.mjs`) po powodzeniu przesuwa `lastSyncCommit`/`lastSyncVersion` (na przykład `:152,189,231`), zapisuje konflikt w `unmergedBranchName`, `unmergedBranchHead` i `conflictVersion` (`:214-220`) i czyści je po jego rozwiązaniu (`:257-264`). |
+| `SyncStateManager.mjs:23-25` (`removeProjectState`) | Usuwa dokument, gdy właściciel odłącza projekt (`GitLabSyncHandler.mjs:83-97`) i gdy wygasa usunięty projekt (`services/web/modules/gitlab-sync/index.mjs:46-48`). |
+
+#### Kto odczytuje {#who-reads-it}
+
+| Kod | Co robi |
+| ---- | ------------ |
+| `GitLabSyncHandler.mjs:39-60` (`getProjectState`) | Przekazuje edytorowi `mergeStatus`, `repoFullName` i `unmergedBranchName`. Bez dokumentu odpowiada `need-export`, wartością, która nigdy nie jest zapisywana. |
+| `GitLabSyncHandler.mjs:110-143` (`getMergeOverview`) | Porównuje `lastSyncCommit` i `lastSyncVersion` z GitLab i historią projektu, aby wypisać nowe commity. |
+| `GitLabSyncHandler.mjs:200` (`exportProject`) | Odmawia eksportu projektu, który jest już połączony. |
+| `GitMerge.mjs:36` (`doGitMergeWithoutLock`) | Wczytuje stan na początku synchronizacji. |
+
+#### Indeksy {#indexes}
+
+| Nazwa | Klucze | Opcje | Migracja |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+
+`autoIndex` w Mongoose jest wyłączony (`services/web/app/src/infrastructure/Mongoose.mjs:7`), więc `unique: true` ze schematu na `projectId` niczego nie tworzy. Żadna migracja nie tworzy indeksów dla tej kolekcji.
+
+#### Uwagi {#notes}
+
+* API GitLab nie potrafi, tak jak GitHub, przesunąć gałęzi na dowolny commit. Synchronizacja commituje bezpośrednio na synchronizowaną gałąź, gdy może ją przesunąć do przodu, a w przeciwnym razie na gałąź tymczasową, którą potem scala się przez merge request (`GitMerge.mjs:16-21`).
+* Synchronizacja działa pod blokadą `gitSync` projektu, wspólną z GitHub Sync i Gitea Sync (`GitMerge.mjs:25-32`).
+* Usunięty projekt zachowuje swój dokument, dopóki nie wygaśnie.
+* Token GitLab użytkownika jest w [GitLab Sync User Credentials](/pl/dev/data-model/gitlab-sync-user-credentials-collection).

@@ -1,0 +1,53 @@
+---
+title: GitHub Sync Project States 集合
+icon: code-branch
+---
+
+`githubSyncProjectStates` 为每个关联到 GitHub 仓库的项目保存一个文档：关联的是哪个仓库，以及上一次同步停在哪里。 该集合属于 `github-sync` web 模块（`services/web/modules/github-sync`）。schema 位于 `services/web/modules/github-sync/app/models/githubSyncProjectStates.mjs`，所有访问都经过 `services/web/modules/github-sync/app/src/SyncStateManager.mjs`。
+
+#### 字段 {#fields}
+
+| 字段 | 类型 | 含义 | 来源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 创建时由 Mongoose 设置。 | |
+| `projectId` | ObjectId | 关联的项目。必填。schema 写了 `unique: true`，但不会建立任何索引（见“索引”）。 | `githubSyncProjectStates.mjs:8` |
+| `repoFullName` | String | 以 `owner/name` 形式表示的仓库（GitHub 的 `full_name`）。必填。 | `githubSyncProjectStates.mjs:9` |
+| `defaultBranchName` | String | 项目同步所用的分支。在关联项目时设置，之后不再更改：导入时为导入表单提交的分支；导出时为新仓库的默认分支。默认 `null`。 | `githubSyncProjectStates.mjs:10`, `GitHubSyncHandler.mjs:175-181,235-241` |
+| `mergeStatus` | String | `clean`、`conflict` 或 `diverged`。默认 `clean`。 | `githubSyncProjectStates.mjs:11` |
+| `lastSyncCommit` | String | 上次同步时已同步分支上的提交 SHA。默认 `null`。 | `githubSyncProjectStates.mjs:12` |
+| `lastSyncVersion` | Number | 上次同步时的项目历史版本，在刷新历史后从 project-history 的 `GET /project/:id/version` 读取。默认 `null`。 | `githubSyncProjectStates.mjs:13`, `services/web/modules/github-sync/app/src/HistoryManager.mjs:8-17` |
+| `unmergedBranchName` | String | 发生冲突时：存放 Overleaf 更改的临时分支，命名为 `overleaf-YYYY-MM-DD-HHMMSS`。没有冲突时为 `null`。 | `githubSyncProjectStates.mjs:14`, `GitMerge.mjs:773-777` |
+| `unmergedBranchHead` | String | 发生冲突时：该分支的头提交。默认 `null`。 | `githubSyncProjectStates.mjs:15` |
+| `conflictVersion` | Number | 发生冲突时：记录冲突时的项目历史版本。默认 `null`。 | `githubSyncProjectStates.mjs:16` |
+| `__v` | Number | Mongoose 版本键。schema 没有关闭它。 | Mongoose 默认 |
+
+#### 写入方 {#who-writes-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `SyncStateManager.mjs:9-14` (`createProjectState`) | 创建文档：将仓库导入为新项目之后（`services/web/modules/github-sync/app/src/GitHubSyncHandler.mjs:175-181`），或将项目导出到新仓库之后（`GitHubSyncHandler.mjs:235-241`，仅限所有者，已关联时拒绝）。 |
+| `SyncStateManager.mjs:16-21` (`updateProjectState`) | 对更改的字段执行 `$set`。当已同步分支不再基于 `lastSyncCommit` 时，`getMergeOverview` 会设置 `mergeStatus: 'diverged'`：GitHub 的 compare 返回 `diverged` 或 `behind`（`GitHubApiClient.mjs:382-400`），或者该提交已不存在且用户有推送权限（`GitHubSyncHandler.mjs:123,126-137`）。 同步（`services/web/modules/github-sync/app/src/GitMerge.mjs`）成功时会更新 `lastSyncCommit`/`lastSyncVersion`（例如 `:143,173,224`），用 `unmergedBranchName`、`unmergedBranchHead` 和 `conflictVersion` 记录冲突（`:207-213`），并在冲突解决后清除它们（`:250-257`）。 |
+| `SyncStateManager.mjs:23-25` (`removeProjectState`) | 在所有者取消关联项目时（`GitHubSyncHandler.mjs:83-97`）以及已删除项目过期时（`services/web/modules/github-sync/index.mjs:56-58`）删除文档。 |
+
+#### 读取方 {#who-reads-it}
+
+| 代码 | 作用 |
+| ---- | ------------ |
+| `GitHubSyncHandler.mjs:39-60` (`getProjectState`) | 向编辑器提供 `mergeStatus`、`repoFullName` 和 `unmergedBranchName`。没有文档时返回 `need-export`，这个值从不存储。 |
+| `GitHubSyncHandler.mjs:110-143` (`getMergeOverview`) | 将 `lastSyncCommit` 和 `lastSyncVersion` 与 GitHub 及项目历史进行比较，列出新的提交。 |
+| `GitHubSyncHandler.mjs:200` (`exportProject`) | 拒绝导出已关联的项目。 |
+| `GitMerge.mjs:27` (`doGitMergeWithoutLock`) | 在同步开始时加载状态。 |
+
+#### 索引 {#indexes}
+
+| 名称 | 键 | 选项 | 迁移 |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+
+Mongoose 的 `autoIndex` 已关闭（`services/web/app/src/infrastructure/Mongoose.mjs:7`），因此 schema 中 `projectId` 上的 `unique: true` 不会创建任何索引。 `tools/migrations/20190912145010_create_githubSyncProjectStates_indexes.mjs`（上游的 `project_id` 和 `owner_id`）只带有 `saas` 标签，不会在 CE 中运行。
+
+#### 说明 {#notes}
+
+* 同步在项目的 `gitSync` 锁下运行（`GitMerge.mjs:17-24`）。GitLab Sync 和 Gitea Sync 使用同一把锁，因此每个项目同一时间只运行一个同步。
+* 已删除的项目会保留其文档，直到项目过期。
+* 用户的 GitHub 令牌位于 [GitHub Sync User Credentials](/zh-Hans/dev/data-model/github-sync-user-credentials-collection)。
