@@ -1,0 +1,54 @@
+---
+title: Gitea Sync Project States-collectie
+icon: code-pull-request
+---
+
+`giteaSyncProjectStates` bevat één document per project dat aan een Gitea-repository is gekoppeld: welke repository, en waar de laatste synchronisatie is gebleven. De collectie hoort bij de webmodule `gitea-sync` (`services/web/modules/gitea-sync`). Het schema staat in `services/web/modules/gitea-sync/app/models/giteaSyncProjectStates.mjs`, en alle toegang loopt via `services/web/modules/gitea-sync/app/src/SyncStateManager.mjs`. De velden zijn dezelfde als in [GitHub Sync Project States](/nl/dev/data-model/github-sync-project-states-collection).
+
+#### Velden {#fields}
+
+| Veld | Type | Betekenis | Bron |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Door Mongoose ingesteld bij het aanmaken. | |
+| `projectId` | ObjectId | Het gekoppelde project. Verplicht. Het schema zegt `unique: true`, maar er wordt geen index gebouwd (zie Indexen). | `giteaSyncProjectStates.mjs:8` |
+| `repoFullName` | String | De repository als `owner/name` (`full_name` van Gitea). Verplicht. | `giteaSyncProjectStates.mjs:9`, `GiteaApiClient.mjs:315` |
+| `defaultBranchName` | String | De branch waarmee het project synchroniseert. Ingesteld bij het koppelen van het project en daarna niet meer gewijzigd: bij import de branch die het importformulier meestuurt; bij export de standaardbranch van de nieuwe repository, of `main` als de API er geen geeft. Standaard `null`. | `giteaSyncProjectStates.mjs:10`, `GiteaSyncHandler.mjs:175-181,233-239`, `GiteaApiClient.mjs:314-317` |
+| `mergeStatus` | String | `clean`, `conflict` of `diverged`. Standaard `clean`. | `giteaSyncProjectStates.mjs:11` |
+| `lastSyncCommit` | String | De commit-SHA op de gesynchroniseerde branch bij de laatste synchronisatie. Standaard `null`. | `giteaSyncProjectStates.mjs:12` |
+| `lastSyncVersion` | Number | De versie van de projectgeschiedenis bij de laatste synchronisatie, uit `GET /project/:id/version` van project-history, gelezen na een flush van de geschiedenis. Standaard `null`. | `giteaSyncProjectStates.mjs:13`, `services/web/modules/gitea-sync/app/src/HistoryManager.mjs:8-17` |
+| `unmergedBranchName` | String | Tijdens een conflict: de tijdelijke branch met de wijzigingen uit Overleaf, met de naam `overleaf-YYYY-MM-DD-HHMMSS`. `null` als er geen conflict is. | `giteaSyncProjectStates.mjs:14`, `GitMerge.mjs:814-818` |
+| `unmergedBranchHead` | String | Tijdens een conflict: de head-commit van die branch. Standaard `null`. | `giteaSyncProjectStates.mjs:15` |
+| `conflictVersion` | Number | Tijdens een conflict: de versie van de projectgeschiedenis toen het conflict werd vastgelegd. Standaard `null`. | `giteaSyncProjectStates.mjs:16` |
+| `__v` | Number | De versiesleutel van Mongoose. Het schema schakelt die niet uit. | Mongoose-standaard |
+
+#### Wie schrijft {#who-writes-it}
+
+| Code | Wat het doet |
+| ---- | ------------ |
+| `SyncStateManager.mjs:9-14` (`createProjectState`) | Maakt het document aan: na het importeren van een repository als nieuw project (`services/web/modules/gitea-sync/app/src/GiteaSyncHandler.mjs:175-181`), of na het exporteren van een project naar een nieuwe repository (`GiteaSyncHandler.mjs:233-239`, alleen eigenaar, geweigerd als het al gekoppeld is). |
+| `SyncStateManager.mjs:16-21` (`updateProjectState`) | `$set` van de gewijzigde velden. `getMergeOverview` zet `mergeStatus: 'diverged'` als `lastSyncCommit` geen voorouder meer is van de gesynchroniseerde branch (`services/web/modules/gitea-sync/app/src/GiteaApiClient.mjs:431`), of de commit is verdwenen en de gebruiker mag pushen (`GiteaSyncHandler.mjs:123,126-137`). Een synchronisatie (`services/web/modules/gitea-sync/app/src/GitMerge.mjs`) verplaatst bij succes `lastSyncCommit`/`lastSyncVersion` (bijvoorbeeld `:152,189,231`), legt een conflict vast met `unmergedBranchName`, `unmergedBranchHead` en `conflictVersion` (`:214-220`), en wist die zodra het is opgelost (`:257-264`). |
+| `SyncStateManager.mjs:23-25` (`removeProjectState`) | Verwijdert het document als de eigenaar het project ontkoppelt (`GiteaSyncHandler.mjs:83-97`) en als een verwijderd project verloopt (`services/web/modules/gitea-sync/index.mjs:46-48`). |
+
+#### Wie leest {#who-reads-it}
+
+| Code | Wat het doet |
+| ---- | ------------ |
+| `GiteaSyncHandler.mjs:39-60` (`getProjectState`) | Geeft de editor `mergeStatus`, `repoFullName` en `unmergedBranchName`. Zonder document antwoordt het `need-export`, een waarde die nooit wordt opgeslagen. |
+| `GiteaSyncHandler.mjs:110-143` (`getMergeOverview`) | Vergelijkt `lastSyncCommit` en `lastSyncVersion` met Gitea en de projectgeschiedenis om de nieuwe commits op te sommen. |
+| `GiteaSyncHandler.mjs:200` (`exportProject`) | Weigert een project te exporteren dat al gekoppeld is. |
+| `GitMerge.mjs:36` (`doGitMergeWithoutLock`) | Laadt de status aan het begin van een synchronisatie. |
+
+#### Indexen {#indexes}
+
+| Naam | Sleutels | Opties | Migratie |
+| ---- | ---- | ------- | --------- |
+| `_id_` | `_id: 1` | | default |
+
+Mongoose `autoIndex` staat uit (`services/web/app/src/infrastructure/Mongoose.mjs:7`), dus de `unique: true` van het schema op `projectId` maakt niets aan. Geen enkele migratie maakt indexen aan voor deze collectie.
+
+#### Opmerkingen {#notes}
+
+* De API van Gitea kan geen commits buiten een branch maken zoals die van GitHub. Een synchronisatie commit direct op de gesynchroniseerde branch als die vooruit kan, of anders op een tijdelijke branch die daarna via een pull request wordt samengevoegd (`GitMerge.mjs:16-21`).
+* Een synchronisatie draait onder de `gitSync`-lock van het project, gedeeld met GitHub Sync en GitLab Sync (`GitMerge.mjs:25-32`).
+* Een verwijderd project houdt zijn document tot het project verloopt.
+* Het Gitea-token van de gebruiker staat in [Gitea Sync User Credentials](/nl/dev/data-model/gitea-sync-user-credentials-collection).
