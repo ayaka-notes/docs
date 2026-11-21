@@ -3,49 +3,84 @@ title: Docs-collectie
 icon: file-lines
 ---
 
-`Docs`: Docs is de interne term van Overleaf voor een bewerkbaar bestand, bijvoorbeeld een gewoon `tex`-bestand of een `.bib`-bestand.  Het slaat de bestandsinhoud, revisie-informatie en de verwijderstatus op.
+`docs` bevat de inhoud van de bewerkbare tekstbestanden van een project (Overleaf noemt ze docs), bijvoorbeeld `main.tex` of `sample.bib`. Eén document per doc: de regels, de opmerkingen en bijgehouden wijzigingen, twee tellers en de verwijderstatus. De bestandsnaam en de plaats in de boom staan hier niet, maar in `projects.rootFolder` (zie [Projects-collectie](/nl/dev/data-model/projects-collection)). Binaire bestanden staan hier ook niet.
 
-#### Kernidentificatie
+Behalve migraties en onderhoudsscripts schrijft alleen docstore deze collectie, in `services/docstore/app/js/MongoManager.js`. Er is geen Mongoose-model; web en document-updater benaderen haar via de HTTP-API van docstore (`services/docstore/app.js:31-70`). In de kolom Bron staan losse bestandsnamen onder `services/docstore/app/js/`.
 
-* `_id`: Unieke MongoDB-ObjectId die dit documentrecord identificeert.
-* `project_id`: Verwijzing naar het project (`Project._id`) waartoe dit bestand behoort.
-* `name`: Bestandsnaam zoals weergegeven in de bestandsboom van het project (bijv. `main.tex`, `sample.bib`).
+#### Velden {#fields}
 
-#### Revisies en versiebeheer
+| Veld | Type | Betekenis | Bron |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Doc-id, gelijk aan de `_id` van het doc-item in `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Project van de doc. | `MongoManager.js:144` |
+| `lines` | Array of String | De tekst, één element per regel. Ontbreekt zolang de doc gearchiveerd is (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Opmerkingen en bijgehouden wijzigingen, zie hieronder. Ontbreekt zolang de doc gearchiveerd is. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | De eigen teller van docstore. Begint bij 1 en gaat met 1 omhoog telkens wanneer `lines` of `ranges` verandert. Elke update controleert de oude `rev`, zodat twee schrijvers elkaar niet kunnen overschrijven. Geen geschiedenisversie. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | De OT-versie van de doc uit document-updater, opgeslagen bij een flush. docstore weigert een flush met een lagere versie. Oudere docs hielden die bij in de collectie `docOps`; de migratie `20231105000000_move_doc_versions_from_docops_to_docs` heeft haar hierheen verplaatst. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true` als de doc uit het project is verwijderd. Ontbreekt bij docs die nooit zijn verwijderd. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Wanneer de doc is verwijderd. | `HttpController.js:87` |
+| `name` | String | Bestandsnaam op het moment van verwijderen. Alleen ingesteld als de doc wordt verwijderd; levende docs hebben hier geen `name`. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true` als `lines`, `ranges` en `rev` naar de persistor van docstore zijn verplaatst (`Settings.docstore.bucket`, sleutel `<project_id>/<doc_id>`) en `lines` en `ranges` uit Mongo zijn verwijderd. Wordt weer verwijderd wanneer de doc wordt teruggelezen. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Vergrendeling die wordt vastgehouden terwijl de doc wordt gearchiveerd. | `MongoManager.js:177-193` |
 
-* `rev`: Revisienummer van dit document binnen de projectgeschiedenis.
-* `version`: Interne schema- of formaatversie die door de editorbackend wordt gebruikt.
+#### Ranges {#ranges}
 
-Deze velden worden gebruikt door het eigen versiebeheersysteem van Overleaf om incrementele bewerkingen bij te houden en geschiedenis en terugdraaien te ondersteunen.
+`ranges` heeft twee arrays. document-updater bouwt ze met `libraries/ranges-tracker/index.cjs`; docstore zet vóór het opslaan id's om in ObjectIds en `ts` in Dates (`RangeManager.js:41-63`). Een doc zonder opmerkingen of bijgehouden wijzigingen heeft `ranges: {}` of geen `ranges`.
 
-#### Bestandsinhoud
+| Veld | Type | Betekenis | Bron |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Tekstfragmenten met opmerkingen. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Opmerking-id. Het is gelijk aan `op.t`, het thread-id van de opmerking in de collectie `rooms`; docstore dwingt af dat ze overeenkomen. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | De tekst in de doc waarbij de opmerking hoort (niet het bericht van de opmerking). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Tekenoffset van het begin van `op.c` in de doc. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Thread-id, zie `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | `user_id` en `ts` van de opmerking. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Bijgehouden wijzigingen, gesorteerd op positie. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Id van de wijziging. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Ingevoegde tekst of verwijderde tekst. Een van de twee. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Tekenoffset van de wijziging. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Auteur. Wijzigingen van anonieme bewerkers behouden de string `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Wanneer de wijziging is gemaakt. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Array van strings die de bestandsinhoud regel voor regel weergeeft.\
-    Elk element komt overeen met één logische regel in het bronbestand.
+De tekst van een opmerking en de antwoorden staat niet in `docs`: die staat in de collectie `messages`, in de room waarvan `thread_id` het opmerking-id is. Of een opmerking is opgelost, wordt op die room opgeslagen, niet hier; docstore laat een meegestuurde `resolved`-vlag vallen (`RangeManager.js:59-61`). Zie [Rooms-collectie](/nl/dev/data-model/rooms-collection) en [Messages-collectie](/nl/dev/data-model/messages-collection).
 
-    In dit voorbeeld bevat het een BibTeX-item:
+#### Wie schrijft {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Datastructuur gereserveerd voor editorannotaties of bijgehouden bereiken\
-  (bijv. selecties, opmerkingen of het bijhouden van wijzigingen). Leeg wanneer er geen actieve bereiken zijn. `op` Operatie-object dat de opmerking aan een specifieke positie in het document koppelt.
-  * `op.c` — Geselecteerde tekst van de opmerking (tekeninhoud)
-  * `op.p` — Ankerpositie (tekenoffset)
-  * `id` Unieke ObjectId van deze opmerking.
-  * `metadata` Informatie over auteur en tijdstip.
+| Code | Wat het doet |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Maakt een doc aan of werkt die bij: `lines`, `ranges` en `version`. Web roept het aan wanneer een doc wordt aangemaakt en wanneer document-updater een geopende doc flusht (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Markeert een doc als verwijderd met `deleted`, `deletedAt` en `name`. |
+| `DocArchiveManager.js:29-88` | Archiveert een doc: kopieert `lines`, `ranges` en `rev` naar de persistor en stelt `inS3` in. Draait voor een heel project wanneer het wordt gedeactiveerd, en voor één doc bij verwijderen wanneer `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Haalt een gearchiveerde doc terug naar Mongo wanneer die wordt gelezen (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Verwijdert alle docs van een project wanneer het project wordt vernietigd. |
 
-#### Verwijderstatus
+#### Wie leest {#who-reads-it}
 
-* `deleted`:\
-  Geeft aan of dit document uit het project is verwijderd.
-* `deletedAt`:\
-  Tijdstip waarop het document is verwijderd.
+| Code | Wat het doet |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Laadt een doc (via web) wanneer iemand die opent. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Alle leesbewerkingen van web: één doc, alle docs van een project, alle ranges, verwijderde docs. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Kopieert een project; flusht eerst document-updater. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Toont de verwijderde docs van een project in het beheerpaneel. |
 
-Verwijderde documenten worden doorgaans bewaard voor het herstellen van de geschiedenis en het bekijken van versies, in plaats van direct uit de database te worden verwijderd.
+#### Indexen {#indexes}
 
-Hier is een echt voorbeeld van Overleaf-`docs`.
+Ze komen allemaal uit migraties met de tag `server-ce` in `tools/migrations/`.
 
-<Accordion title="Een eenvoudig voorbeeld">
+| Naam | Sleutels | Opties | Migratie |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Opmerkingen {#notes}
+
+* Zolang een doc geopend is, staat de nieuwste tekst in document-updater (Redis), niet hier. Mongo wordt pas bijgewerkt wanneer document-updater flusht (`services/document-updater/app/js/PersistenceManager.js:128-160`). Code die de docs van een heel project leest, moet eerst `flushProjectToMongo` aanroepen, zoals `ProjectDuplicator` doet.
+* Verwijderde docs blijven met `deleted: true` in deze collectie totdat het project wordt vernietigd. docstore geeft er maximaal `MAX_DELETED_DOCS` (standaard 2000) van terug, nieuwste eerst (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Het geschiedenispaneel gebruikt ze niet; dat leest history-v1.
+* De tellers `rev` en `version` hebben niets te maken met de projectgeschiedenisversies in history-v1.
+
+Hier zijn echte voorbeelden van Overleaf-`docs`.
+
+<Accordion title="Een verwijderde doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Hier is een echt voorbeeld van Overleaf-`docs`.
 
 </Accordion>
 
-<Accordion title="Een complex voorbeeld">
+<Accordion title="Een doc met opmerkingen">
 
 ```json5
 {

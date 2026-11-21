@@ -3,49 +3,84 @@ title: Docs Koleksiyonu
 icon: file-lines
 ---
 
-`Docs`: Docs, Overleaf'in düzenlenebilir bir dosya için kullandığı dahili terimdir; örneğin saf bir `tex` dosyası veya bir `.bib` dosyası. Dosya içeriğini, revizyon bilgilerini ve silinme durumunu saklar.
+`docs`, bir projenin düzenlenebilir metin dosyalarının (Overleaf bunlara doc der) içeriğini tutar, örneğin `main.tex` veya `sample.bib`. Her doc için bir belge: satırları, yorumları ve izlenen değişiklikleri, iki sayaç ve silinme durumu. Dosya adı ve ağaçtaki yeri burada değil, `projects.rootFolder` içindedir (bkz. [Projects Koleksiyonu](/tr/dev/data-model/projects-collection)). İkili dosyalar da burada değildir.
 
-#### Temel Kimlik Bilgileri
+Migration'lar ve bakım betikleri dışında bu koleksiyona yalnızca docstore yazar, `services/docstore/app/js/MongoManager.js` içinde. Mongoose modeli yoktur; web ve document-updater ona docstore HTTP API'si üzerinden erişir (`services/docstore/app.js:31-70`). Kaynak sütununda yolsuz dosya adları `services/docstore/app/js/` altındadır.
 
-* `_id`: Bu belge kaydını tanımlayan benzersiz MongoDB ObjectId değeri.
-* `project_id`: Bu dosyanın ait olduğu projeye (`Project._id`) referans.
-* `name`: Proje dosya ağacında gösterilen dosya adı (ör. `main.tex`, `sample.bib`).
+#### Alanlar {#fields}
 
-#### Revizyon ve Sürümleme
+| Alan | Tür | Anlam | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Doc kimliği; `projects.rootFolder` içindeki doc girdisinin `_id` değeriyle aynıdır. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Doc'un projesi. | `MongoManager.js:144` |
+| `lines` | Array of String | Metin, satır başına bir öğe. Doc arşivlendiği sürece yoktur (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Yorumlar ve izlenen değişiklikler, aşağıya bakın. Doc arşivlendiği sürece yoktur. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | docstore'un kendi sayacı. 1'den başlar ve `lines` veya `ranges` her değiştiğinde 1 artar. Her güncelleme eski `rev` ile eşleşir, böylece iki yazıcı birbirinin üzerine yazamaz. Geçmiş sürümü değildir. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | document-updater'dan gelen doc'un OT sürümü; flush sırasında kaydedilir. docstore daha düşük sürümlü bir flush'ı reddeder. Eski doc'lar bunu `docOps` koleksiyonunda tutardı; `20231105000000_move_doc_versions_from_docops_to_docs` migration'ı onu buraya taşıdı. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | Doc projeden silindiğinde `true`. Hiç silinmemiş doc'larda yoktur. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Doc'un silindiği zaman. | `HttpController.js:87` |
+| `name` | String | Silme anındaki dosya adı. Yalnızca doc silindiğinde ayarlanır; canlı doc'larda burada `name` yoktur. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `lines`, `ranges` ve `rev` docstore persistor'una (`Settings.docstore.bucket`, anahtar `<project_id>/<doc_id>`) taşındığında ve `lines` ile `ranges` Mongo'dan kaldırıldığında `true`. Doc geri okunduğunda yeniden kaldırılır. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Doc arşivlenirken tutulan kilit. | `MongoManager.js:177-193` |
 
-* `rev`: Bu belgenin proje geçmişi içindeki revizyon numarası.
-* `version`: Editör arka ucu tarafından kullanılan dahili şema veya biçim sürümü.
+#### Ranges {#ranges}
 
-Bu alanlar, Overleaf'in özel sürümleme sistemi tarafından artımlı düzenlemeleri izlemek ve geçmiş ile geri alma işlemlerini desteklemek için kullanılır.
+`ranges` iki dizi içerir. document-updater bunları `libraries/ranges-tracker/index.cjs` ile oluşturur; docstore kaydetmeden önce kimlikleri ObjectId'ye, `ts` değerini Date'e dönüştürür (`RangeManager.js:41-63`). Yorumu veya izlenen değişikliği olmayan bir doc'ta `ranges: {}` bulunur ya da hiç `ranges` yoktur.
 
-#### Dosya İçeriği
+| Alan | Tür | Anlam | Kaynak |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Yorum yapılmış metin aralıkları. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Yorum kimliği. `rooms` koleksiyonundaki yorumun konu kimliği olan `op.t` ile aynıdır; docstore eşleşmelerini zorunlu kılar. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Doc'ta yorum yapılan metin (yorum mesajı değil). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | `op.c` başlangıcının doc içindeki karakter konumu. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Konu kimliği, bkz. `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | Yorumun `user_id` ve `ts` değerleri. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | İzlenen değişiklikler, konuma göre sıralı. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Değişikliğin kimliği. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Eklenen metin veya silinen metin. İkisinden biri. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Değişikliğin karakter konumu. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Yazar. Anonim düzenleyicilerin yaptığı değişiklikler `anonymous-user` dizesini korur. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Değişikliğin yapıldığı zaman. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Dosya içeriğini satır satır temsil eden dizeler dizisi.\
-    Her öğe, kaynak dosyadaki bir mantıksal satıra karşılık gelir.
+Bir yorumun ve yanıtlarının metni `docs` içinde değildir: `messages` koleksiyonunda, `thread_id` değeri yorum kimliği olan room içindedir. Bir yorumun çözülüp çözülmediği burada değil o room üzerinde saklanır; docstore gönderilen bir `resolved` bayrağını atar (`RangeManager.js:59-61`). Bkz. [Rooms Koleksiyonu](/tr/dev/data-model/rooms-collection) ve [Messages Koleksiyonu](/tr/dev/data-model/messages-collection).
 
-    Bu örnekte bir BibTeX girdisi saklanmaktadır:
+#### Kim yazar {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Editör açıklamaları veya izlenen aralıklar için ayrılmış veri yapısı\
-  (ör. seçimler, yorumlar veya değişiklik izleme). Etkin aralık olmadığında boştur. `op`, yorumu belgedeki belirli bir konuma bağlayan işlem nesnesidir.
-  * `op.c` — Yorum yapılan seçili metin (karakter içeriği)
-  * `op.p` — Bağlantı konumu (karakter ofseti)
-  * `id` Bu yorum girdisinin benzersiz ObjectId değeri.
-  * `metadata` Yazar ve zaman damgası bilgileri.
+| Kod | Ne yapar |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Bir doc oluşturur veya günceller: `lines`, `ranges` ve `version`. Web bunu bir doc oluşturulduğunda ve document-updater açık bir doc'u flush ettiğinde çağırır (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Bir doc'u `deleted`, `deletedAt` ve `name` ile silinmiş olarak işaretler. |
+| `DocArchiveManager.js:29-88` | Bir doc'u arşivler: `lines`, `ranges` ve `rev` değerlerini persistor'a kopyalar ve `inS3` ayarlar. Bir proje devre dışı bırakıldığında tüm proje için, `ARCHIVE_ON_SOFT_DELETE=true` olduğunda da silme sırasında tek bir doc için çalışır (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Arşivlenmiş bir doc okunduğunda onu Mongo'ya geri getirir (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Proje yok edildiğinde projenin tüm doc'larını siler. |
 
-#### Silinme Durumu
+#### Kim okur {#who-reads-it}
 
-* `deleted`:\
-  Bu belgenin projeden silinip silinmediğini belirtir.
-* `deletedAt`:\
-  Belgenin ne zaman silindiğini kaydeden zaman damgası.
+| Kod | Ne yapar |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Biri bir doc'u açtığında onu (web üzerinden) yükler. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Web'in tüm okumaları: bir doc, bir projenin tüm doc'ları, tüm ranges, silinmiş doc'lar. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Bir projeyi kopyalar; önce document-updater'ı flush eder. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Yönetim panelinde bir projenin silinmiş doc'larını listeler. |
 
-Silinen belgeler genellikle veritabanından hemen kaldırılmak yerine geçmişi kurtarma ve sürümlere göz atma amacıyla saklanır.
+#### İndeksler {#indexes}
 
-Aşağıda bir Overleaf `docs` kaydı için gerçek bir örnek bulunmaktadır.
+Hepsi `tools/migrations/` içindeki `server-ce` etiketli migration'lardan gelir.
 
-<Accordion title="Basit Bir Örnek">
+| Ad | Anahtarlar | Seçenekler | Migration |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Notlar {#notes}
+
+* Bir doc açıkken en yeni metni burada değil, document-updater'da (Redis) bulunur. Mongo yalnızca document-updater flush ettiğinde güncellenir (`services/document-updater/app/js/PersistenceManager.js:128-160`). Tüm bir projenin doc'larını okuyan kod, `ProjectDuplicator` gibi önce `flushProjectToMongo` çağırmalıdır.
+* Silinmiş doc'lar proje yok edilene kadar `deleted: true` ile bu koleksiyonda kalır. docstore bunlardan en fazla `MAX_DELETED_DOCS` (varsayılan 2000) tanesini, en yenisi önce olmak üzere döndürür (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Geçmiş paneli bunları kullanmaz; history-v1'i okur.
+* `rev` ve `version` sayaçlarının history-v1'deki proje geçmişi sürümleriyle ilgisi yoktur.
+
+Overleaf `docs` için gerçek örnekler aşağıdadır.
+
+<Accordion title="Silinmiş bir doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Aşağıda bir Overleaf `docs` kaydı için gerçek bir örnek bulunmaktadır.
 
 </Accordion>
 
-<Accordion title="Karmaşık Bir Örnek">
+<Accordion title="Yorumlu bir doc">
 
 ```json5
 {
