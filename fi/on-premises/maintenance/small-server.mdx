@@ -1,0 +1,89 @@
+---
+title: Pieni palvelin
+icon: memory
+---
+
+Ayakaleaf Pro toimii palvelimella, jossa on 2 suoritinydintä ja 2 Gt muistia, Git-integraatio mukaan lukien, kun lisäät 2 Gt swapia. Ilman swapia siltä loppuu muisti käynnistyksen aikana. Vaiheen 2 asetukset puolittavat sen jälkeen lähes swapin käytön.
+
+<Info>
+
+Mittasimme tämän Ayakaleaf Pro 6.3.1:llä ja Toolkitilla QEMU/KVM-virtuaalikoneessa (2 vCPU / 2 GiB, Ubuntu 24.04), kun hiekkalaatikkokäännökset (`texlive-basic:2025.1`) ja Git-integraatio olivat käytössä.
+
+</Info>
+
+## Miksi 2 Gt ei oletuksena riitä {#why-2-gb-is-not-enough-by-default}
+
+Joutokäynnillä ja oletusasetuksilla Ayakaleaf Pro tarvitsee noin 1,9 GiB. Ubuntu ja Docker käyttävät jo 364 MiB 2 GiB:n koneesta, joten jäljelle jää noin 1600 MiB.
+
+| Komponentti            | Muisti joutokäynnillä | Huomautukset                                                       |
+| -------------------- | ----------- | ----------------------------------------------------------- |
+| 12 Node.js-prosessia | 1620 MiB    | `web` ja `web-api` kumpikin noin 255 MiB, muut 85–150 MiB |
+| Git-integraatio      | 135 MiB     | Java ottaa puolet muistista, 1 GiB, enimmäiskeoksi      |
+| MongoDB 8.0          | 125 MiB     | sen välimuisti voi kasvaa noin 512 MiB:iin                         |
+| Redis 7.4            | 30 MiB      |                                                             |
+
+## 1. Lisää 2 Gt swapia {#1-add-2-gb-of-swap}
+
+Tämä on tärkein vaihe.
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+## 2. Pienennä muistinkäyttöä {#2-lower-memory-use}
+
+Lisää nämä rivit tiedostoon `config/variables.env`. Myös Git-integraation kontti lukee tämän tiedoston.
+
+```bash title="variables.env"
+NODE_OPTIONS=--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs --max-semi-space-size=1
+MALLOC_ARENA_MAX=2
+JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC
+```
+
+Rajoittaaksesi MongoDB:n välimuistia lisää `mongo`-merkintä `services`-kohtaan tiedostossa `config/docker-compose.override.yml` (samassa tiedostossa, jossa Ayakaleaf Pro -levykuva määritetään):
+
+```yml title="docker-compose.override.yml"
+services:
+    mongo:
+        command: "--replSet overleaf --wiredTigerCacheSizeGB 0.25"
+```
+
+Suorita sitten `bin/up -d`.
+
+| Asetus                                       | Vaikutus                                                         |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| `--max-semi-space-size=1`                     | Node.js-prosessit käyttävät yhteensä 470 MiB vähemmän; käännösajat pysyvät ennallaan |
+| `MALLOC_ARENA_MAX=2`                          | Node.js-prosessit käyttävät yhteensä 65 MiB vähemmän                     |
+| `JAVA_TOOL_OPTIONS=-Xmx160m -XX:+UseSerialGC` | Git-integraation keko rajoitetaan 160 MiB:iin 1 GiB:n sijaan |
+| `--wiredTigerCacheSizeGB 0.25`                | MongoDB:n välimuisti rajoitetaan 256 MiB:iin noin 512 MiB:n sijaan |
+
+<Warning>
+
+`NODE_OPTIONS` korvaa levykuvassa asetetun arvon, joten rivillä on säilytettävä `--require /overleaf/.pnp.cjs --import /overleaf/.pnp.register.mjs`. Ilman niitä Node.js-palvelut eivät pysty lataamaan pakettejaan eivätkä käynnisty. `--optimize-for-size`-valitsinta ei voi käyttää: Node.js ei hyväksy sitä `NODE_OPTIONS`-muuttujassa.
+
+`--replSet overleaf` on se, minkä Toolkit oletuksena välittää MongoDB:lle. Säilytä se.
+
+</Warning>
+
+160 MiB:n keolla suuren projektin kloonaaminen tai push Gitin kautta voi kuluttaa muistin loppuun, jolloin Git-integraation kontti käynnistyy uudelleen. Emme testanneet tätä. Jos näin käy, kasvata `-Xmx`-arvoa.
+
+## Tulokset {#results}
+
+Jokainen testi käänsi 33-sivuisen LuaLaTeX-asiakirjan, jossa oli `fontspec` ja 30 TikZ-kuvaa; samanaikaiset käännökset olivat eri projekteja.
+
+| Kokoonpano                         | 1 käännös | 2 yhtä aikaa                 | 3 yhtä aikaa | Swapin käytön huippu |
+| ----------------------------- | --------- | ------------------------- | --------- | ------------- |
+| Oletus, ei swapia              | muisti loppuu käynnistyksessä | | |      |
+| Vain vaihe 2, ei swapia          | 21 s      | `web` lopetettu, 502-virheitä  | ei testattu |              |
+| Vain vaihe 1                   | 21 s      | 23 s                      | 36 s      | 1267 MiB      |
+| Vaiheet 1 ja 2                 | 22 s      | 23 s                      | 33 s      | 743 MiB       |
+
+Ilman swapia yksi muistin loppumisesta johtuva lopetus johtaa seuraavaan: `web` käynnistyy uudelleen, sen käynnistys tarvitsee taas muistia, ja palvelin jumittuu kovaan nollaukseen asti. Swapin kanssa kolme samanaikaista käännöstä kestää suunnilleen yhtä kauan kuin yksi, koska swapiin siirtyvät käyttämättömät Node.js-sivut.
+
+Ei testattu: Gitin kloonaus- ja push-kuormitus, monta yhtä aikaa muokkaavaa käyttäjää ja swap hitailla levyillä (isäntämme käytti SSD-levyä).
+
+## Kubernetes {#kubernetes}
+
+Kubernetes-oppaamme poistaa swapin käytöstä solmuissa ([Solmujen valmistelu](/fi/on-premises/installation/using-kubernetes/0.-prepare-the-nodes)), joten siellä pätee vain vaihe 2. Lisää `NODE_OPTIONS` ja `MALLOC_ARENA_MAX` ConfigMapiin `overleaf-env` ([Instanssin mukauttaminen](/fi/on-premises/installation/using-kubernetes/4.-personalizing-your-instance)). MongoDB:n välimuisti on jo asetettu kohdassa [MongoDB:n ja Redisin käyttöönotto](/fi/on-premises/installation/using-kubernetes/3.-deploy-mongodb-and-redis).
