@@ -1,0 +1,52 @@
+---
+title: Project History Blobs-samlingen
+icon: cubes
+---
+
+`projectHistoryBlobs` inneholder ett dokument per prosjekthistorikk: metadataene (hash og størrelser) for hver blob som history-v1 har lagret for prosjektet. En blob er innholdet i en fil eller et doc på et tidspunkt i historikken. Selve bytene er objekter i bucketen for prosjektblobber. Det finnes ikke noe Mongoose-skjema: history-v1 skriver samlingen i `services/history-v1/storage/lib/blob_store/mongo.js`, som den bruker for historikk-id-er på 24 heksadesimale tegn, som i CE (`services/history-v1/storage/lib/blob_store/index.js:108-116`).
+
+#### Felter {#fields}
+
+| Felt | Type | Betydning | Kilde |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Prosjektets historikk-id, verdien i `projects.overleaf.history.id`. | `mongo.js:37-40` |
+| `blobs` | Object | Blobposter gruppert i bøtter. Nøkkelen til en bøtte er de første 3 heksadesimale sifrene i hashen. | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | Opptil 8 poster der hashen begynner med `abc`. Når en bøtte allerede har 8, går neste post til [Project-History-Sharded-Blobs-samlingen](/no/dev/data-model/project-history-sharded-blobs-collection). | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | Hashen, 20 byte: git-blob-SHA-1, `sha1("blob " + byteLength + "\0" + content)` (`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`). Den heksadesimale formen er hashen som brukes andre steder, for eksempel `fileRefs.hash` i prosjekter. | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | Innholdets lengde i byte. | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | Innholdets lengde som tekst; `null` når innholdet ikke er redigerbar tekst (binært, eller for stort til å redigere) (`blob_utils.js:116-130`). | `mongo.js:474` |
+
+#### Hvem skriver {#who-writes-it}
+
+| Kode | Hva den gjør |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`: setter inn `{ _id, blobs: {} }` når history-v1 oppretter prosjekthistorikken (`services/history-v1/storage/lib/chunk_store/index.js:67-68`). |
+| `mongo.js:370-390` | `insertBlob`: `$addToSet` av posten i bøtten så lenge bøtten har færre enn 8 poster, ellers i den shardede samlingen. Kjører etter at bytene er lastet opp, fra `putString`, `putBlob` og `copyBlob` (`blob_store/index.js:223-237`, `271-278`, `456-467`). |
+| `mongo.js:54-105` | `clone`: kopierer bøttene til en annen historikk-id, for history-v1 `POST /projects/:project_id/clone`. Ingenting i web kaller den ruten (se [Project History Chunks-samlingen](/no/dev/data-model/project-history-chunks-collection)). |
+| `mongo.js:413-422` | `deleteBlobs`: sletter dokumentet og prosjektets shardede dokumenter, ved history-v1 `DELETE /projects/:project_id` (`services/history-v1/api/controllers/projects.js:361-373`). |
+
+Hvor nye blobber kommer fra:
+
+* Filopplastinger: web sender filen til history-v1 `PUT /projects/:project_id/blobs/:hash` (`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`).
+* Prosjektkopier: web ber history-v1 kopiere bloben til hver fil med `POST /projects/:project_id/blobs/:hash?copyFrom=` (`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`).
+* Doc-tekst: når history-v1 skriver en chunk, lagrer den teksten i hvert doc, og kommentarene og de sporede endringene som JSON, som blobber (`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`).
+
+#### Hvem leser {#who-reads-it}
+
+| Kode | Hva den gjør |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`: én blob via hash; leter i den shardede samlingen når bøtten er full. Brukes av `BlobStore.getBlob` (`blob_store/index.js:376-387`) for blobrutene (`projects.js:416-480`), og før en innsetting for å hoppe over blobber som allerede finnes (`blob_store/index.js:441-448`). |
+| `mongo.js:165-260` | `findBlobs`: mange blobber på én gang, for å laste inn filene i en chunk. |
+| `mongo.js:265-309` | `getProjectBlobs`: alle blobber i et prosjekt. |
+| `mongo.js:316-363` | `getProjectBlobsBatch`: alle blobber i flere prosjekter, for history-v1 `POST /projects/blob-stats` (`projects.js:620`). Modulen admin-tools viser resultatet som prosjektstørrelse (`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`). |
+
+#### Indekser {#indexes}
+
+Bare standardindeksen på `_id`. Ingen migrering i `tools/migrations/` legger til noen.
+
+#### Merknader {#notes}
+
+* Bytene i en blob ligger under nøkkelen `<project key>/<hash[0:2]>/<hash[2:]>` (`blob_store/index.js:51-53`) i bucketen `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET` (`services/history-v1/config/custom-environment-variables.json:49-52`). Prosjektnøkkelen er historikk-id-en fylt ut med nuller, snudd og delt opp i 3/3/resten av tegnene (`libraries/object-persistor/src/ProjectKey.js:8-15`).
+* En blob lagres én gang per prosjekt: innsetting av en hash prosjektet allerede har, hoppes over (`blob_store/index.js:227-230`, `249-252`).
+* Tomt innhold trenger ingen post; `getBlob` besvarer det uten oppslag (`blob_store/index.js:378-380`).
+* `projectHistoryGlobalBlobs` leses ved oppstart (`blob_store/index.js:138-148`), men ingen CE-kode skriver den, så i CE er hver blob en prosjektblob.
