@@ -1,0 +1,52 @@
+---
+title: Project History Blobs 集合
+icon: cubes
+---
+
+`projectHistoryBlobs` 中每個專案歷史一個文件：history-v1 為該專案儲存的每個 blob 的中繼資料（雜湊與大小）。blob 是某個檔案或 doc 在其歷史中某一時刻的內容。位元組本身是專案 blob bucket 中的物件。沒有 Mongoose schema：history-v1 在 `services/history-v1/storage/lib/blob_store/mongo.js` 中寫入此集合，它用於 24 個十六進位字元的歷史 id，CE 中正是如此（`services/history-v1/storage/lib/blob_store/index.js:108-116`）。
+
+#### 欄位 {#fields}
+
+| 欄位 | 型別 | 含義 | 來源 |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | 專案的歷史 id，即 `projects.overleaf.history.id` 中的值。 | `mongo.js:37-40` |
+| `blobs` | Object | 依桶分組的 blob 記錄。桶的鍵是雜湊的前 3 個十六進位數字。 | `mongo.js:39`, `429-431` |
+| `blobs.<abc>` | Array of Object | 最多 8 筆雜湊以 `abc` 開頭的記錄。當一個桶已有 8 筆時，下一筆記錄會進入 [Project History Sharded Blobs 集合](/zh-TW/dev/data-model/project-history-sharded-blobs-collection)。 | `mongo.js:23`, `375-389` |
+| `blobs.<abc>[].h` | Binary | 雜湊，20 位元組：git blob SHA-1，`sha1("blob " + byteLength + "\0" + content)`（`libraries/overleaf-editor-core/lib/blob_utils.js:36-43`）。它的十六進位形式就是其他地方使用的雜湊，例如專案中的 `fileRefs.hash`。 | `mongo.js:472` |
+| `blobs.<abc>[].b` | Number | 內容的位元組長度。 | `mongo.js:473` |
+| `blobs.<abc>[].s` | Number | 內容作為文字的長度；內容不是可編輯文字（二進位，或太大而無法編輯）時為 `null`（`blob_utils.js:116-130`）。 | `mongo.js:474` |
+
+#### 寫入方 {#who-writes-it}
+
+| 程式碼 | 作用 |
+| ---- | ------------ |
+| `services/history-v1/storage/lib/blob_store/mongo.js:34-47` | `initialize`：history-v1 建立專案歷史時插入 `{ _id, blobs: {} }`（`services/history-v1/storage/lib/chunk_store/index.js:67-68`）。 |
+| `mongo.js:370-390` | `insertBlob`：桶中記錄少於 8 筆時以 `$addToSet` 把記錄加入其桶，否則寫入分片集合。在位元組上傳之後執行，由 `putString`、`putBlob` 與 `copyBlob` 呼叫（`blob_store/index.js:223-237`, `271-278`, `456-467`）。 |
+| `mongo.js:54-105` | `clone`：把桶複製到另一個歷史 id，用於 history-v1 的 `POST /projects/:project_id/clone`。Web 中沒有任何程式碼呼叫該路由（請參閱 [Project History Chunks 集合](/zh-TW/dev/data-model/project-history-chunks-collection)）。 |
+| `mongo.js:413-422` | `deleteBlobs`：在 history-v1 的 `DELETE /projects/:project_id` 上刪除該文件以及專案的分片文件（`services/history-v1/api/controllers/projects.js:361-373`）。 |
+
+新 blob 的來源：
+
+* 檔案上傳：web 把檔案傳送到 history-v1 的 `PUT /projects/:project_id/blobs/:hash`（`services/web/app/src/Features/History/HistoryManager.mjs:164-169`, `services/history-v1/api/controllers/projects.js:376-402`）。
+* 專案複製：web 請 history-v1 透過 `POST /projects/:project_id/blobs/:hash?copyFrom=` 複製每個檔案的 blob（`services/web/app/src/Features/Project/ProjectDuplicator.mjs:333-338`, `HistoryManager.mjs:177-187`, `projects.js:521-555`）。
+* Doc 文字：history-v1 寫入 chunk 時，會把每個 doc 的文字及其註解與追蹤修訂（JSON）存為 blob（`chunk_store/index.js:402-405`, `libraries/overleaf-editor-core/lib/file_data/string_file_data.js:166-173`）。
+
+#### 讀取方 {#who-reads-it}
+
+| 程式碼 | 作用 |
+| ---- | ------------ |
+| `mongo.js:113-157` | `findBlob`：依雜湊查找一個 blob；桶已滿時到分片集合中查找。由 `BlobStore.getBlob`（`blob_store/index.js:376-387`）用於 blob 路由（`projects.js:416-480`），並在插入前用於略過已存在的 blob（`blob_store/index.js:441-448`）。 |
+| `mongo.js:165-260` | `findBlobs`：一次查找多個 blob，用於載入一個 chunk 的檔案。 |
+| `mongo.js:265-309` | `getProjectBlobs`：一個專案的所有 blob。 |
+| `mongo.js:316-363` | `getProjectBlobsBatch`：多個專案的所有 blob，用於 history-v1 的 `POST /projects/blob-stats`（`projects.js:620`）。admin-tools 模組把結果顯示為專案大小（`services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-405`）。 |
+
+#### 索引 {#indexes}
+
+只有預設的 `_id` 索引。`tools/migrations/` 中沒有遷移新增其他索引。
+
+#### 備註 {#notes}
+
+* blob 的位元組位於 bucket `OVERLEAF_EDITOR_PROJECT_BLOBS_BUCKET`（`services/history-v1/config/custom-environment-variables.json:49-52`）中的鍵 `<project key>/<hash[0:2]>/<hash[2:]>`（`blob_store/index.js:51-53`）。專案鍵是以零填補的歷史 id，反轉後依 3/3/其餘字元切分（`libraries/object-persistor/src/ProjectKey.js:8-15`）。
+* 每個專案只儲存一次某個 blob：插入專案已有的雜湊會被略過（`blob_store/index.js:227-230`, `249-252`）。
+* 空內容不需要記錄；`getBlob` 不需查找就能回傳它（`blob_store/index.js:378-380`）。
+* `projectHistoryGlobalBlobs` 會在啟動時讀取（`blob_store/index.js:138-148`），但沒有 CE 程式碼寫入它，因此在 CE 中每個 blob 都是專案 blob。
