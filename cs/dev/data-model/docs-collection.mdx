@@ -3,49 +3,84 @@ title: Kolekce Docs
 icon: file-lines
 ---
 
-`Docs`: Docs je interní označení Overleafu pro upravitelný soubor, například čistý soubor `tex` nebo soubor `.bib`. Ukládá obsah souboru, informace o revizích a stav smazání.
+`docs` uchovává obsah upravitelných textových souborů projektu (Overleaf jim říká docs), například `main.tex` nebo `sample.bib`. Jeden dokument na každý doc: jeho řádky, komentáře a sledované změny, dva čítače a stav smazání. Název souboru a jeho místo ve stromu tu nejsou, jsou v `projects.rootFolder` (viz [Kolekce Projects](/cs/dev/data-model/projects-collection)). Binární soubory tu také nejsou.
 
-#### Základní identifikace
+Kromě migrací a údržbových skriptů do této kolekce zapisuje jen docstore, v `services/docstore/app/js/MongoManager.js`. Model Mongoose neexistuje; web a document-updater k ní přistupují přes HTTP API docstore (`services/docstore/app.js:31-70`). Ve sloupci Zdroj jsou samotné názvy souborů v `services/docstore/app/js/`.
 
-* `_id`: Jedinečný MongoDB ObjectId identifikující tento záznam dokumentu.
-* `project_id`: Odkaz na projekt (`Project._id`), ke kterému tento soubor patří.
-* `name`: Název souboru, jak se zobrazuje ve stromu souborů projektu (např. `main.tex`, `sample.bib`).
+#### Pole {#fields}
 
-#### Revize a verzování
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `_id` | ObjectId | Id doc, stejné jako `_id` položky doc v `projects.rootFolder`. | `MongoManager.js:142-147` |
+| `project_id` | ObjectId | Projekt doc. | `MongoManager.js:144` |
+| `lines` | Array of String | Text, jeden prvek na řádek. Chybí, dokud je doc archivovaný (`inS3: true`). | `DocManager.js:314-316`, `MongoManager.js:203` |
+| `ranges` | Object | Komentáře a sledované změny, viz níže. Chybí, dokud je doc archivovaný. | `DocManager.js:317-319`, `RangeManager.js:36-65` |
+| `rev` | Number | Vlastní čítač docstore. Začíná na 1 a zvýší se o 1 při každé změně `lines` nebo `ranges`. Každá aktualizace porovnává starý `rev`, takže dva zapisovatelé se nemohou navzájem přepsat. Nejde o verzi historie. | `MongoManager.js:115-136`, `:145`, `:254-269` |
+| `version` | Number | Verze OT doc z document-updater, uložená při flushi. docstore odmítne flush s nižší verzí. Starší docs ji uchovávaly v kolekci `docOps`; migrace `20231105000000_move_doc_versions_from_docops_to_docs` ji přesunula sem. | `DocManager.js:283-290`, `:320-322` |
+| `deleted` | Boolean | `true`, když byl doc z projektu smazán. Chybí u docs, které nikdy smazány nebyly. | `services/docstore/app/js/HttpController.js:80-90` |
+| `deletedAt` | Date | Kdy byl doc smazán. | `HttpController.js:87` |
+| `name` | String | Název souboru v okamžiku smazání. Nastaví se jen při smazání doc; živé docs zde `name` nemají. | `HttpController.js:88`, `services/web/app/src/Features/Docstore/DocstoreManager.mjs:28-36` |
+| `inS3` | Boolean | `true`, když byly `lines`, `ranges` a `rev` přesunuty do persistoru docstore (`Settings.docstore.bucket`, klíč `<project_id>/<doc_id>`) a `lines` a `ranges` byly odstraněny z Mongo. Znovu se odstraní, když se doc načte zpět. | `MongoManager.js:198-206`, `:213-237`, `DocArchiveManager.js:43`, `:64-69` |
+| `archivingUntil` | Date | Zámek držený během archivace doc. | `MongoManager.js:177-193` |
 
-* `rev`: Číslo revize tohoto dokumentu v rámci historie projektu.
-* `version`: Interní verze schématu nebo formátu používaná backendem editoru.
+#### Ranges {#ranges}
 
-Tato pole využívá vlastní systém verzování Overleafu ke sledování přírůstkových úprav a k podpoře historie a vracení změn.
+`ranges` má dvě pole. document-updater je sestavuje pomocí `libraries/ranges-tracker/index.cjs`; docstore před uložením převede id na ObjectId a `ts` na Date (`RangeManager.js:41-63`). Doc bez komentářů a sledovaných změn má `ranges: {}` nebo žádné `ranges`.
 
-#### Obsah souboru
+| Pole | Typ | Význam | Zdroj |
+| ----- | ---- | ------- | ------ |
+| `ranges.comments` | Array of Object | Okomentované úseky textu. | `libraries/ranges-tracker/index.cjs:217-236` |
+| `ranges.comments.id` | ObjectId | Id komentáře. Rovná se `op.t`, id vlákna komentáře v kolekci `rooms`; docstore vynucuje jejich shodu. | `RangeManager.js:54-57` |
+| `ranges.comments.op.c` | String | Okomentovaný text v doc (nikoli zpráva komentáře). | `index.cjs:226-230` |
+| `ranges.comments.op.p` | Number | Posun ve znacích začátku `op.c` v doc. | `index.cjs:226-230` |
+| `ranges.comments.op.t` | ObjectId | Id vlákna, viz `id`. | `index.cjs:226-230`, `RangeManager.js:57` |
+| `ranges.comments.metadata` | Object | `user_id` a `ts` komentáře. | `index.cjs:232`, `RangeManager.js:62` |
+| `ranges.changes` | Array of Object | Sledované změny, seřazené podle pozice. | `index.cjs:640-660` |
+| `ranges.changes.id` | ObjectId | Id změny. | `index.cjs:643-647`, `RangeManager.js:51` |
+| `ranges.changes.op.i` / `op.d` | String | Vložený nebo smazaný text. Jedno z obojího. | `index.cjs:640-660` |
+| `ranges.changes.op.p` | Number | Posun změny ve znacích. | `index.cjs:640-660` |
+| `ranges.changes.metadata.user_id` | ObjectId or String | Autor. Změny anonymních editorů si ponechávají řetězec `anonymous-user`. | `RangeManager.js:45-46`, `DocManager.js:192` |
+| `ranges.changes.metadata.ts` | Date | Kdy byla změna provedena. | `RangeManager.js:42-43` |
 
-*   `lines`:\
-    Pole řetězců představujících obsah souboru řádek po řádku.\
-    Každý prvek odpovídá jednomu logickému řádku zdrojového souboru.
+Text komentáře a jeho odpovědí v `docs` není: je v kolekci `messages`, v room, jejíž `thread_id` je id komentáře. Zda je komentář vyřešený, se ukládá na této room, ne zde; docstore zahodí příznak `resolved`, pokud jej někdo pošle (`RangeManager.js:59-61`). Viz [Kolekce Rooms](/cs/dev/data-model/rooms-collection) a [Kolekce Messages](/cs/dev/data-model/messages-collection).
 
-    V tomto příkladu ukládá záznam BibTeX:
+#### Kdo zapisuje {#who-writes-it}
 
-    * `@article{greenwade93, ... }`
-* `ranges`: Datová struktura vyhrazená pro anotace editoru nebo sledované rozsahy\
-  (např. výběry, komentáře nebo sledování změn). Je prázdná, pokud nejsou přítomny žádné aktivní rozsahy. `op` je objekt operace, který váže komentář ke konkrétní pozici v dokumentu.
-  * `op.c` — komentovaný vybraný text (obsah znaků)
-  * `op.p` — pozice ukotvení (posun ve znacích)
-  * `id` Jedinečný ObjectId tohoto záznamu komentáře.
-  * `metadata` Informace o autorovi a časové razítko.
+| Kód | Co dělá |
+| ---- | ------------ |
+| `DocManager.js:223-338` (`POST /project/:project_id/doc/:doc_id`) | Vytvoří nebo aktualizuje doc: `lines`, `ranges` a `version`. Web to volá při vytvoření doc a když document-updater provádí flush otevřeného doc (`services/web/app/src/Features/Project/ProjectEntityUpdateHandler.mjs:174`). |
+| `DocManager.js:346-366` (`PATCH /project/:project_id/doc/:doc_id`) | Označí doc jako smazaný pomocí `deleted`, `deletedAt` a `name`. |
+| `DocArchiveManager.js:29-88` | Archivuje doc: zkopíruje `lines`, `ranges` a `rev` do persistoru a nastaví `inS3`. Běží pro celý projekt, když je deaktivován, a pro jeden doc při smazání, když `ARCHIVE_ON_SOFT_DELETE=true` (`DocManager.js:355-363`). |
+| `DocArchiveManager.js:150-174` | Vrátí archivovaný doc do Mongo, když se čte (`DocManager.js:40-41`). |
+| `MongoManager.js:272-274` | Smaže všechny docs projektu, když je projekt zničen. |
 
-#### Stav smazání
+#### Kdo čte {#who-reads-it}
 
-* `deleted`:\
-  Určuje, zda byl tento dokument z projektu smazán.
-* `deletedAt`:\
-  Časové razítko zaznamenávající, kdy byl dokument smazán.
+| Kód | Co dělá |
+| ---- | ------------ |
+| `services/document-updater/app/js/PersistenceManager.js:18-30` | Načte doc (přes web), když jej někdo otevře. |
+| `services/web/app/src/Features/Docstore/DocstoreManager.mjs` | Všechna čtení web: jeden doc, všechny docs projektu, všechny ranges, smazané docs. |
+| `services/web/app/src/Features/Project/ProjectDuplicator.mjs:49` | Kopíruje projekt; nejprve provede flush document-updater. |
+| `services/web/modules/admin-tools/app/src/AdminProjectManager.mjs:395-413` | Vypíše smazané docs projektu v administrátorském panelu. |
 
-Smazané dokumenty se obvykle uchovávají kvůli obnově historie a procházení verzí, místo aby byly okamžitě odstraněny z databáze.
+#### Indexy {#indexes}
 
-Zde je skutečný příklad Overleaf `docs`.
+Všechny pocházejí z migrací se značkou `server-ce` v `tools/migrations/`.
 
-<Accordion title="Jednoduchý příklad">
+| Název | Klíče | Volby | Migrace |
+| ---- | ---- | ------- | --------- |
+| `project_id_deleted_deletedAt_1` | `project_id: 1, deleted: 1, deletedAt: -1` | | `20210408123210_create_docs_project_id_deleted_deletedAt_index` |
+| `project_id_1_inS3_1_deleted_1` | `project_id: 1, inS3: 1, deleted: 1` | | `20250321092555_add_deleted_to_project_id_in_s3_index` |
+
+#### Poznámky {#notes}
+
+* Dokud je doc otevřený, jeho nejnovější text je v document-updater (Redis), ne zde. Mongo se aktualizuje až při flushi document-updater (`services/document-updater/app/js/PersistenceManager.js:128-160`). Kód, který čte docs celého projektu, by měl nejprve zavolat `flushProjectToMongo`, jako to dělá `ProjectDuplicator`.
+* Smazané docs zůstávají v této kolekci s `deleted: true`, dokud není projekt zničen. docstore jich vrátí nejvýše `MAX_DELETED_DOCS` (výchozí 2000), nejnovější první (`MongoManager.js:29-44`, `services/docstore/config/settings.defaults.cjs:40`). Panel historie je nepoužívá; čte history-v1.
+* Čítače `rev` a `version` nesouvisejí s verzemi historie projektu v history-v1.
+
+Zde jsou skutečné příklady `docs` v Overleafu.
+
+<Accordion title="Smazaný doc">
 
 ```json5
 {
@@ -74,7 +109,7 @@ Zde je skutečný příklad Overleaf `docs`.
 
 </Accordion>
 
-<Accordion title="Složitější příklad">
+<Accordion title="Doc s komentáři">
 
 ```json5
 {
